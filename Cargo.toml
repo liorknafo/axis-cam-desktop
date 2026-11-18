@@ -30,9 +30,9 @@ sha2 = "0.10"
 clipper2 = "0.6.0"
 fidget = { version = "=0.4.3", default-features = false, features = ["mesh"] }
 toml_edit = "0.25"
-uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "4279351e8f5aaf57d93d550de480e2c8e84cd7c9", default-features = false }
+uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "bb3ae02961f3d3c5a9008700ffdbedcf77f3b0f1", default-features = false }
 # The UC100 run by uc100-server on a Raspberry Pi, across the network ("Network (Pi)").
-uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "e47e440eef7068bb1dd27de1a3ac63ec1fbedcba" }
+uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "00d74fd9d45ce59e34be292d8cf6a612caec0bc2" }
 # The GPU stock mesher (`gpu_mesh`), on the wgpu iced already draws with.
 wgpu = "27"
 bytemuck = { version = "1", features = ["derive"] }
@@ -57,6 +57,11 @@ strip = true
 opt-level = 2
 [profile.dev.package.fidget-mesh]
 opt-level = 2
+
+[target.'cfg(unix)'.dev-dependencies]
+# Asks each of the test process's open files what it is (`fstat`), with no
+# duplicate or close (`mcp::runner`'s tests); already in the tree.
+libc = "0.2"
 
 [dev-dependencies]
 # Lay a page out on the software renderer, with no window, to read its widget

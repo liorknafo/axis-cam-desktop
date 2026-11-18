@@ -8621,6 +8621,12 @@ impl App {
                 if repeat || !self.jog_pad_shown() {
                     return Task::none();
                 }
+                // It may jog once the focus check answers: a Cycle Start
+                // waiting for the machine never starts before or after it
+                // (LIO-562).
+                if let Some(c) = &mut self.control {
+                    c.cancel_press("A jog key");
+                }
                 self.jog_key = Some((axis, negative));
                 return iced::advanced::widget::operate(control::typing())
                     .map(move |typing| Message::JogKeyChecked(axis, negative, typing));
@@ -8675,7 +8681,8 @@ impl App {
             // connected. Not connected, Esc is free off the Control page, which
             // keeps it for the E-stop.
             Message::EscapeKey => {
-                if let Some(c) = &self.control {
+                if let Some(c) = &mut self.control {
+                    c.cancel_press("E-stop (Esc)");
                     c.send(uc100::controller::Command::EStop);
                 } else if self.esc_closes_pinned_help() {
                     // The pinned card first, then the Import from path field.
@@ -8698,11 +8705,24 @@ impl App {
             // something else cannot start the machine.
             Message::HoldKey => {
                 use uc100::controller::{Command, State};
-                if let Some(c) = &self.control {
+                let jog_pad_shown = self.jog_pad_shown();
+                if let Some(c) = &mut self.control {
+                    // A Cycle Start waiting for the machine never starts
+                    // after it (LIO-562).
+                    // A jog or move sent before it may run unseen yet: the
+                    // hold goes to the machine anyway (ignored while Idle).
+                    if c.cancel_press("Hold (Space)") {
+                        c.send(Command::FeedHold);
+                        return Task::none();
+                    }
                     match c.snapshot.state {
+                        // Refused, the state is from before and nothing
+                        // reaches the machine: the status line keeps the
+                        // refusal (LIO-561).
+                        _ if c.pi_refused().is_some() => {}
                         Some(State::Run) if c.probe_moving() => self.status = ui::PROBE_HOLD.into(),
                         Some(State::Run) => c.send(Command::FeedHold),
-                        Some(State::Hold) if self.jog_pad_shown() => c.send(Command::Resume),
+                        Some(State::Hold) if jog_pad_shown => c.send(Command::Resume),
                         _ => {}
                     }
                 }
@@ -10000,6 +10020,9 @@ impl App {
                 }
                 if let Some(c) = &mut self.control {
                     c.refresh();
+                    // A Cycle Start press waiting for the machine to show
+                    // what was sent before it (LIO-562).
+                    c.cycle_pending(&self.doc);
                     // "Connecting to <machine>…" until the driver reports a
                     // state, then "Connected to <machine>: <state>" following
                     // it until another message replaces it. A note said after

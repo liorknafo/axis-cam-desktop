@@ -4,6 +4,7 @@ use crate::model::{Fields, Machine, get, post_setting};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use uc100::config::MachineConfig;
 use uc100::controller::{Bar, Block, Command, Controller, ProbeResult, Snapshot, State};
@@ -1048,6 +1049,16 @@ pub fn probe_spot(o: crate::orient::Orient, refs: [crate::post::At; 2]) -> Strin
     }
 }
 
+/// The touch-off spot of the stock top at `refs` on a machine of
+/// orientation `o`, as Work zero's steps say it: "the front-left corner",
+/// "the centre".
+pub fn touch_spot(o: crate::orient::Orient, refs: [crate::post::At; 2]) -> String {
+    match probe_spot(o, refs).as_str() {
+        "its centre" => "the centre".to_string(),
+        spot => spot.to_string(),
+    }
+}
+
 /// How far a corner probe steps along each side from where it starts
 /// before it probes the other side (mm): it starts outside the corner, less
 /// than this off both sides.
@@ -1159,10 +1170,6 @@ pub const BOSS_DEPTH: f64 = 3.;
 const BOSS_SIDES: [(usize, f64); 4] = [(0, 1.), (0, -1.), (1, 1.), (1, -1.)];
 
 /// Where to put the tip for Pin centre, with its button for `{}`.
-/// Why a run that starts partway cannot touch off or probe its work zero
-/// when the check did not work out the stock its start leaves.
-const PARTWAY_UNKNOWN: &str =
-    "The check did not work out the stock the start leaves: check the setup again.";
 const PIN_HOW: &str = "Take the part off the pins, jog the tip over the middle of pin 1, a few mm above its top, and press {} again.";
 
 /// What a `Routine` is for.
@@ -2385,8 +2392,12 @@ struct Held {
 /// The driver's controller: in AXIS CAM (USB or the simulator), or run by
 /// uc100-server on a Raspberry Pi across the network.
 enum Driver {
-    Local(Controller),
-    Remote(uc100_remote::RemoteController),
+    /// With the commands sent to it, as its `Snapshot::commands` counts
+    /// them: every one but `Shutdown`.
+    Local(Controller, AtomicU64),
+    /// With every message handed to the link so far (`handed`): unlike the
+    /// link's own `sent`, never less for one dropped on its way.
+    Remote(uc100_remote::RemoteController, AtomicU64),
 }
 
 impl Driver {
@@ -2394,20 +2405,80 @@ impl Driver {
     /// Pi cannot take now is dropped, never sent later, with a note.
     fn send(&self, command: Command) -> bool {
         match self {
-            Driver::Local(c) => {
+            Driver::Local(c, sent) => {
+                if !matches!(command, Command::Shutdown) {
+                    sent.fetch_add(1, Ordering::SeqCst);
+                }
                 c.send(command);
                 true
             }
-            Driver::Remote(r) => r.send(command),
+            Driver::Remote(r, handed) => counted(handed, r.send(command)),
         }
     }
 
-    fn snapshot(&self) -> Snapshot {
+    /// Stop after step on the Pi (`RemoteController::stop_after`); false
+    /// here.
+    fn stop_after(&self, ranges: Vec<std::ops::RangeInclusive<u32>>) -> bool {
         match self {
-            Driver::Local(c) => c.snapshot(),
-            Driver::Remote(r) => r.snapshot(),
+            Driver::Local(..) => false,
+            Driver::Remote(r, handed) => counted(handed, r.stop_after(ranges)),
         }
     }
+
+    /// A tool run to the Pi (`RemoteController::send_tool_run`); false here.
+    fn send_tool_run(
+        &self,
+        id: u64,
+        job: Command,
+        ranges: Vec<std::ops::RangeInclusive<u32>>,
+        lift: Option<f64>,
+        made_from: u64,
+    ) -> bool {
+        match self {
+            Driver::Local(..) => false,
+            Driver::Remote(r, handed) => {
+                counted(handed, r.send_tool_run(id, job, ranges, lift, made_from))
+            }
+        }
+    }
+
+    /// Every message handed to the controller or the link so far: it only
+    /// grows, so a press tells anything sent after it, whatever was dropped
+    /// meanwhile (`cycle_pending`).
+    fn handed(&self) -> u64 {
+        match self {
+            Driver::Local(_, n) | Driver::Remote(_, n) => n.load(Ordering::SeqCst),
+        }
+    }
+
+    /// The controller's state, and on the Pi how far it has applied this
+    /// computer's messages as of that state (None until a snapshot has come
+    /// on the link's current connection).
+    fn snapshot(&self) -> (Snapshot, Option<uc100_remote::client::Ack>) {
+        match self {
+            Driver::Local(c, _) => (c.snapshot(), None),
+            Driver::Remote(r, _) => r.acked(),
+        }
+    }
+
+    /// The messages sent so far: to the controller here, or on the link's
+    /// current connection to the Pi (None before its first snapshot). It
+    /// changes with each message sent; on the Pi also with one dropped
+    /// before it went.
+    fn sent(&self) -> Option<u64> {
+        match self {
+            Driver::Local(_, sent) => Some(sent.load(Ordering::SeqCst)),
+            Driver::Remote(r, _) => r.acked().1.map(|a| a.sent),
+        }
+    }
+}
+
+/// `ok`, counted in `handed` when true.
+fn counted(handed: &AtomicU64, ok: bool) -> bool {
+    if ok {
+        handed.fetch_add(1, Ordering::SeqCst);
+    }
+    ok
 }
 
 /// A tool run left running on the Pi when the link was closed
@@ -2422,6 +2493,29 @@ pub struct PiRun {
 /// How long the Pi, the link live, may show neither having nor having
 /// ended a tool run sent to it before it is taken as lost on the way.
 const JOB_REACH: Duration = Duration::from_secs(3);
+
+/// What the run says of a tool run the Pi did not start because the
+/// snapshot it was made from was behind the machine (`run_outcome`). It
+/// says "not started", which puts the run back (`Run::refresh`).
+pub const STALE_TOOL_RUN: &str = "Tool run not started: the Pi's machine changed after the state it was made from (a command reached the Pi in between), so it could have cut from an old work zero or position. Nothing moved; press Cycle Start again.";
+
+/// How long a Cycle Start press waits for the machine to show everything
+/// this computer sent before it (`cycle_pending`); the Pi answers within a
+/// snapshot or two (20 ms apart while it acts, 500 ms on a still machine).
+pub const PRESS_WAIT: Duration = Duration::from_secs(5);
+
+/// A Cycle Start press waiting for the machine to show everything this
+/// computer sent before it (`Connection::cycle_pending`).
+struct Press {
+    at: Instant,
+    /// The messages sent when it was pressed (`Driver::sent`), and every
+    /// one handed on so far (`Driver::handed`, which never falls).
+    sent: Option<u64>,
+    handed: u64,
+    /// The run's check it was pressed for (`Run::epoch`): another setup
+    /// picked, or the setup checked again, is another run.
+    epoch: u64,
+}
 
 /// A running driver controller for one machine.
 /// A machine position declaration sent and not yet in the driver's log
@@ -2479,6 +2573,10 @@ pub struct Connection {
     /// when the link fails while it crosses.
     #[cfg(test)]
     pub lose_next_job: bool,
+    /// Tests: the next tool run goes to the Pi as made from this snapshot,
+    /// not from `snapshot`.
+    #[cfg(test)]
+    pub made_from: Option<u64>,
     /// When Stop after step was last armed or disarmed on the Pi: until the
     /// Pi has answered, the run keeps the choice rather than the Pi's.
     stop_sent: Option<Instant>,
@@ -2486,6 +2584,13 @@ pub struct Connection {
     pub config: MachineConfig,
     /// The driver's state at the last tick.
     pub snapshot: Snapshot,
+    /// On the Pi, how far it had applied this computer's messages as of
+    /// `snapshot`, and that snapshot's number (`RemoteController::acked`):
+    /// None until a snapshot has come on the link's current connection.
+    ack: Option<uc100_remote::client::Ack>,
+    /// A Cycle Start press waiting for the machine to show everything this
+    /// computer sent before it (`cycle_pending`, LIO-562).
+    press: Option<Press>,
     /// Machine positions still to declare (axis, value), sent one at a time
     /// (`declaring`): the driver drops a second `SetMachine` until it has
     /// re-read the position.
@@ -2680,7 +2785,7 @@ impl Connection {
         Ok(Self::with(
             m,
             cfg,
-            Driver::Local(controller),
+            Driver::Local(controller, AtomicU64::new(0)),
             Some(nap),
             journal,
         ))
@@ -2702,7 +2807,13 @@ impl Connection {
         let cfg = profile(m)?;
         let journal = state_dir.join(format!("{}-pi-journal.json", m.id));
         let remote = uc100_remote::RemoteController::start(cfg.clone(), address, token);
-        let mut c = Self::with(m, cfg, Driver::Remote(remote), None, journal);
+        let mut c = Self::with(
+            m,
+            cfg,
+            Driver::Remote(remote, AtomicU64::new(0)),
+            None,
+            journal,
+        );
         c.pi = Some(address.to_owned());
         // The tool run last sent, to follow again if the Pi still has it or
         // has ended it since (`take_reattach`).
@@ -2747,8 +2858,12 @@ impl Connection {
             reattach_said: None,
             #[cfg(test)]
             lose_next_job: false,
+            #[cfg(test)]
+            made_from: None,
             stop_sent: None,
             snapshot: Snapshot::default(),
+            ack: None,
+            press: None,
             declare: VecDeque::new(),
             declaring: None,
             held: None,
@@ -2864,7 +2979,7 @@ impl Connection {
         if !self.simulated {
             return;
         }
-        if let Driver::Remote(_) = self.driver
+        if let Driver::Remote(..) = self.driver
             && !(self.link.as_ref())
                 .is_some_and(|l| l.live && l.state == uc100_remote::LinkState::Controlling)
         {
@@ -3039,7 +3154,7 @@ impl Connection {
     /// kept on disk first, for when this computer does not follow it
     /// (`adopt_pi_stop`).
     fn send_tool_run(&mut self, job: Command, run: &crate::run::Run) -> bool {
-        let (Driver::Remote(_), Command::Job { .. }) = (&self.driver, &job) else {
+        let (Driver::Remote(..), Command::Job { .. }) = (&self.driver, &job) else {
             return self.try_send(job);
         };
         let s = &self.snapshot;
@@ -3074,12 +3189,19 @@ impl Connection {
         if std::mem::take(&mut self.lose_next_job) {
             return true;
         }
-        let sent = match &self.driver {
-            Driver::Remote(remote) => {
-                remote.send_tool_run(pending.id, job, run.stop_ranges(), run.step_lift())
-            }
-            Driver::Local(_) => false,
-        };
+        // Made from `snapshot`: the Pi refuses it if that snapshot does not
+        // show every command its controller had been sent (`cycle_pending`
+        // waited for this computer's own).
+        let made_from = self.ack.as_ref().map_or(0, |a| a.seq);
+        #[cfg(test)]
+        let made_from = self.made_from.take().unwrap_or(made_from);
+        let sent = self.driver.send_tool_run(
+            pending.id,
+            job,
+            run.stop_ranges(),
+            run.step_lift(),
+            made_from,
+        );
         if !sent {
             let _ = std::fs::remove_file(&path);
         }
@@ -3148,6 +3270,9 @@ impl Connection {
                     return;
                 }
             },
+            // Never started (refused, made from a stale snapshot): nothing
+            // was cut, and the run says why and keeps its start.
+            (None, false) if end.message.contains(crate::run::NOT_STARTED) => return,
             (None, false) => {
                 self.pi_note = Some(format!(
                     "The Pi's tool run ended short ({}): where it stopped is not known, so pick the start.",
@@ -3227,19 +3352,27 @@ impl Connection {
     /// Asks the Pi for control of the machine (granted when no other
     /// computer has it).
     pub fn take_control(&self) {
-        if let Driver::Remote(r) = &self.driver {
+        if let Driver::Remote(r, _) = &self.driver {
             r.take_control();
         }
     }
 
     pub fn refresh(&mut self) {
-        self.snapshot = self.driver.snapshot();
-        if let Driver::Remote(r) = &self.driver {
+        (self.snapshot, self.ack) = self.driver.snapshot();
+        if let Driver::Remote(r, _) = &self.driver {
             let link = r.link();
             let new = link.note_seq.saturating_sub(self.notes_seen) as usize;
             if new > 0 {
                 self.pi_note = link.notes.iter().rev().take(new).next().cloned();
                 self.notes_seen = link.note_seq;
+            }
+            // Let in after a refusal: its reason, or a command not sent
+            // for it, is no longer so (LIO-561).
+            if let Some(why) = self.pi_refused()
+                && !matches!(link.state, uc100_remote::LinkState::Refused(_))
+                && (self.pi_note.as_deref()).is_some_and(|n| n == why || n == NOT_SENT_PI_REFUSED)
+            {
+                self.pi_note = None;
             }
             self.pi_was_live |= link.live;
             self.link = Some(link);
@@ -3685,6 +3818,24 @@ impl Connection {
             }
             return;
         }
+        // A press waiting for the machine starts the run as it was pressed,
+        // or not at all: any other run action ends it, and Stop cancels it
+        // with the machine Idle too.
+        if !matches!(action, R::CycleStart) {
+            let cancelled = self.cancel_press(match action {
+                R::Stop => "Stop",
+                R::Hold => "Hold",
+                _ => "",
+            });
+            // The snapshot can still say Idle while a jog or move sent
+            // before the press runs: Stop and Hold go to the machine anyway
+            // (the driver ignores them while Idle).
+            match action {
+                R::Stop if cancelled => return self.send(Command::Stop),
+                R::Hold if cancelled => return self.send(Command::FeedHold),
+                _ => {}
+            }
+        }
         // Hold, Resume and Stop act on the machine, followed or not: after
         // reconnecting to a Pi that runs a tool run, and for a watcher
         // (E-stop, Hold and Stop only).
@@ -3723,40 +3874,31 @@ impl Connection {
                 if run.running.is_some() && matches!(state, Some(State::Run | State::Hold)) =>
             {
                 match &self.driver {
-                    Driver::Local(_) => run.stop_after = !run.stop_after,
+                    Driver::Local(..) => run.stop_after = !run.stop_after,
                     // The Pi decides: it is sent the lines where a step ends.
-                    Driver::Remote(remote) => {
+                    Driver::Remote(..) => {
                         let want = !run.stop_after;
                         let ranges = if want { run.stop_ranges() } else { vec![] };
                         if want && ranges.is_empty() {
                             self.pi_note = Some(
                                 "Stop after step: no step of this tool run ends ahead.".into(),
                             );
-                        } else if remote.stop_after(ranges) {
+                        } else if self.driver.stop_after(ranges) {
                             run.stop_after = want;
                             self.stop_sent = Some(Instant::now());
                         }
                     }
                 }
             }
-            R::CycleStart => {
-                if let Some(job) = run.cycle_start(self, doc) {
-                    let name = match &job {
-                        Command::Job { name, .. } => Some(name.clone()),
-                        _ => None,
-                    };
-                    if !self.send_tool_run(job, &run) {
-                        let why = self
-                            .pi_note
-                            .clone()
-                            .unwrap_or_else(|| "the link to the Pi is down".into());
-                        run.not_started(format!(
-                            "The tool run was not sent ({why}). Nothing moved."
-                        ));
-                    } else if self.pi.is_some() {
-                        (self.job_missing, self.job_name) = (None, name);
-                    }
-                }
+            // It waits for the machine to show what was sent before it
+            // (`cycle_pending`).
+            R::CycleStart if self.press.is_none() && run.problems(self, doc).is_empty() => {
+                self.press = Some(Press {
+                    at: Instant::now(),
+                    sent: self.driver.sent(),
+                    handed: self.driver.handed(),
+                    epoch: run.epoch,
+                });
             }
             R::RecordReference if self.manual() => {
                 run.record_reference(self, self.snapshot.work_pos[2])
@@ -3777,6 +3919,137 @@ impl Connection {
             _ => {}
         }
         self.run = Some(run);
+        self.cycle_pending(doc);
+    }
+
+    /// A Cycle Start press waits until the snapshot shows everything this
+    /// computer sent before it (on the Pi: every message the Pi had applied;
+    /// here: every command the controller had taken), so the tool run is
+    /// made from the work offset and position a Zero, Set Z, jog or probe
+    /// sent just before it left, never from older ones (LIO-562). Called on
+    /// the press and after each tick's `refresh`. It starts then, made from
+    /// that snapshot. It is dropped, nothing sent, with the reason in the
+    /// run's outcome, when anything else stands in the way meanwhile, when
+    /// this computer sends anything after the press (a jog, a Stop: then
+    /// never a start later by surprise), when another setup is picked or
+    /// the setup is checked again (`Run::epoch`), or after `PRESS_WAIT`.
+    pub fn cycle_pending(&mut self, doc: &crate::model::Document) {
+        let Some(press) = self.press.take() else {
+            return;
+        };
+        let Some(mut run) = self.run.take() else {
+            return;
+        };
+        let machine = if self.pi.is_some() {
+            "the Pi"
+        } else {
+            "the controller"
+        };
+        let dropped = if run.epoch != press.epoch {
+            Some("Cycle Start did not start the tool run: the setup was picked or checked again while it waited for the machine. The tool run was not sent; press Cycle Start again.".into())
+        } else if let Some(why) = run.problems(self, doc).into_iter().next() {
+            Some(format!(
+                "Cycle Start did not start the tool run: {why} The tool run was not sent."
+            ))
+        } else if self.driver.handed() != press.handed || self.driver.sent() != press.sent {
+            Some("Cycle Start did not start the tool run: something was sent to the machine after it was pressed, or a message on its way was dropped. The tool run was not sent; press Cycle Start again.".into())
+        } else if press.at.elapsed() > PRESS_WAIT {
+            // Never late, even with the answer there by now (a stalled app).
+            Some(format!(
+                "Cycle Start did not start the tool run: {machine} had not applied what this computer sent before it within {} s. The tool run was not sent; press Cycle Start again.",
+                PRESS_WAIT.as_secs()
+            ))
+        } else if self.shows_all_sent() {
+            self.start_tool_run(&mut run, doc);
+            None
+        } else {
+            self.press = Some(press);
+            None
+        };
+        if let Some(why) = dropped {
+            run.press_dropped(why);
+        }
+        self.run = Some(run);
+    }
+
+    /// Machine positions are still being declared, one at a time
+    /// (`declare`, after Set machine zero or a reference): a tool run made
+    /// now would be made from a machine position about to change, and
+    /// starting it would drop the rest (LIO-562).
+    pub fn declaring_machine(&self) -> bool {
+        !self.declare.is_empty() || self.declaring.is_some()
+    }
+
+    /// Cancels a Cycle Start press waiting for the machine, if one does:
+    /// by the operator's `by` (Stop, Hold, the Space or Esc key, a jog
+    /// key), or with `by` empty by a change to the run; whether one did.
+    /// The tool run was not sent. What was sent before it may still be
+    /// moving the machine, unseen yet: Stop and Hold go to it too.
+    pub fn cancel_press(&mut self, by: &str) -> bool {
+        if self.press.take().is_none() {
+            return false;
+        }
+        if let Some(run) = &mut self.run {
+            run.press_dropped(match by {
+                "" => "Cycle Start did not start the tool run: the run was changed while it waited for the machine. The tool run was not sent; press Cycle Start again.".into(),
+                by => format!("{by} cancelled Cycle Start while it waited for the machine: the tool run was not sent."),
+            });
+        }
+        true
+    }
+
+    /// A Cycle Start press waits (`cycle_pending`).
+    pub fn press_waits(&self) -> bool {
+        self.press.is_some()
+    }
+
+    /// Tests: the waiting press was pressed `by` earlier.
+    #[cfg(test)]
+    pub fn age_press(&mut self, by: Duration) {
+        if let Some(p) = &mut self.press {
+            p.at -= by;
+        }
+    }
+
+    /// Tests: the number of the snapshot `refresh` read, on the Pi.
+    #[cfg(test)]
+    pub fn ack_seq(&self) -> Option<u64> {
+        self.ack.as_ref().map(|a| a.seq)
+    }
+
+    /// The snapshot (`refresh`) shows everything this computer has sent so
+    /// far: here every command the controller has taken counts; on the Pi
+    /// the snapshot's `applied` covers every message sent on the link's
+    /// current connection, and no newer snapshot has come since (its counts
+    /// would be another's).
+    fn shows_all_sent(&self) -> bool {
+        match &self.driver {
+            Driver::Local(_, sent) => self.snapshot.commands >= sent.load(Ordering::SeqCst),
+            Driver::Remote(r, _) => match (&self.ack, r.acked().1) {
+                (Some(then), Some(now)) => then.seq == now.seq && then.applied >= now.sent,
+                _ => false,
+            },
+        }
+    }
+
+    /// Starts the run's next tool run, made from `snapshot`.
+    fn start_tool_run(&mut self, run: &mut crate::run::Run, doc: &crate::model::Document) {
+        let Some(job) = run.cycle_start(self, doc) else {
+            return;
+        };
+        let name = match &job {
+            Command::Job { name, .. } => Some(name.clone()),
+            _ => None,
+        };
+        if !self.send_tool_run(job, run) {
+            let why = self
+                .pi_note
+                .clone()
+                .unwrap_or_else(|| "the link to the Pi is down".into());
+            run.not_started(format!("The tool run was not sent ({why}). Nothing moved."));
+        } else if self.pi.is_some() {
+            (self.job_missing, self.job_name) = (None, name);
+        }
     }
 
     /// Why a probe moving `axes` cannot start now; None when it can.
@@ -4108,7 +4381,7 @@ impl Connection {
             .filter(|r| r.partway())
             .map(|r| r.partly())
         {
-            Some(None) => Err(PARTWAY_UNKNOWN.to_string()),
+            Some(None) => Err(crate::run::PARTWAY_UNKNOWN.to_string()),
             Some(Some(partly)) if p.probe.is_ok() && !partly.cut.is_empty() => Err(format!(
                 "The operations before the start cut the stock's {}, where a probe finds this work zero.",
                 partly.cut.join(", ")
@@ -4140,26 +4413,10 @@ impl Connection {
     }
 
     /// Why Zero Z on the stock top and Probe Z cannot set the work Z of a
-    /// run that starts partway (`run::Run::partway`): the check cannot tell
-    /// the surface the operations before its start leave where the stock
-    /// top is touched off. None when it can, or the run starts at the
-    /// setup's first operation.
+    /// run that starts partway (`run::Run::partway_blocked`). None when they
+    /// can, or the run starts at the setup's first operation.
     pub fn partway_blocked(&self) -> Option<String> {
-        let run = self.run.as_ref().filter(|r| r.partway())?;
-        let Some(partly) = run.partly() else {
-            return Some(PARTWAY_UNKNOWN.into());
-        };
-        if partly.surface.is_some() {
-            return None;
-        }
-        Some(if partly.cut.is_empty() {
-            "The check cannot tell the surface the operations before the start leave where the stock top is touched off.".into()
-        } else {
-            format!(
-                "The operations before the start cut the stock's {}, and the check cannot tell the surface they left where the stock top is touched off.",
-                partly.cut.join(", ")
-            )
-        })
+        self.run.as_ref()?.partway_blocked()
     }
 
     /// An axis's Set field, when it is a number.
@@ -5144,22 +5401,9 @@ impl Connection {
     }
 
     /// Where the operator touches off the setup to run, in plan mm, and the
-    /// work position that is there (`post::touch_point` less the datum).
-    /// None when it is not on the stock top: a Model origin whose stock top
-    /// an earlier setup cut.
+    /// work position that is there (`run::Run::touch_off`).
     pub fn touch_off(&self) -> Option<([f32; 3], [f64; 3])> {
-        let run = self.run.as_ref()?;
-        let p = run.checked()?.first()?;
-        if p.located.is_some_and(|(_, top)| top.is_none()) {
-            return None;
-        }
-        let mut at = crate::post::touch_point(&p.origin, p.stock)?;
-        // A run that starts partway touches off on the surface the
-        // operations before it leave there, when the check knows it.
-        if run.partway() {
-            at[2] = run.partly()?.surface?;
-        }
-        Some((at, std::array::from_fn(|a| (at[a] - p.datum[a]) as f64)))
+        self.run.as_ref()?.touch_off()
     }
 
     /// Why Probe corner or Probe centre cannot start now; None when it can.
@@ -5690,11 +5934,19 @@ impl Connection {
         if let Some(line) = end.stopped_after {
             run.stopped_on_pi(line, end.unattended);
         }
+        // Made from a snapshot that did not show a command the Pi's
+        // controller had taken (from another computer, or the Pi's own):
+        // never started. Put back as `NOT_STARTED` says (LIO-562).
+        let message = if !end.ok && end.message.contains(uc100_remote::wire::STALE) {
+            STALE_TOOL_RUN.into()
+        } else {
+            end.message.clone()
+        };
         Some(uc100::controller::ProgramOutcome {
             // Its own: later than any the run started after.
             seq: u64::MAX,
             ok: end.ok,
-            message: end.message.clone(),
+            message,
         })
     }
 
@@ -5838,11 +6090,11 @@ impl Connection {
     /// Disconnect: the Pi keeps the UC100 and a running tool run goes on.
     pub fn close(self) {
         match self.driver {
-            Driver::Local(controller) => {
+            Driver::Local(controller, _) => {
                 controller.send(Command::Disconnect);
                 controller.shutdown();
             }
-            Driver::Remote(remote) => remote.shutdown(),
+            Driver::Remote(remote, _) => remote.shutdown(),
         }
     }
 }
@@ -6153,6 +6405,19 @@ soft_max = 0.0
     /// Refreshes `c` until `ok` holds of its snapshot; fails once the
     /// driver has looped for `secs` (4 ms a loop, later under load), or
     /// ten times that on the clock.
+    /// Cycle Start, then as the app's ticks do until the press is over:
+    /// it waits for the machine to show what was sent before it (LIO-562).
+    fn cycle_start(c: &mut Connection, doc: &crate::model::Document) {
+        c.run_act(crate::run::Action::CycleStart, doc);
+        let cap = Instant::now() + PRESS_WAIT * 2;
+        while c.press_waits() {
+            assert!(Instant::now() < cap, "Cycle Start still waits");
+            std::thread::sleep(Duration::from_millis(5));
+            c.refresh();
+            c.cycle_pending(doc);
+        }
+    }
+
     fn until(c: &mut Connection, secs: f64, what: &str, ok: impl Fn(&Snapshot) -> bool) {
         let loops = (secs * 250.) as u64;
         let cap = Instant::now() + Duration::from_secs_f64(secs * 10.).max(Duration::from_secs(60));
@@ -6742,7 +7007,6 @@ spindle_max_rpm = 24000
     #[test]
     fn a_bar_in_the_chuck_runs_setup_1_then_its_indexed_setup() {
         use crate::indexed::tests::{bar_job, cutter, on_the_bar, prism};
-        use crate::run::Action as R;
         let dir = tempfile::tempdir().unwrap();
         let mesh = prism(30.);
         let mut op = on_the_bar(&cutter("12"));
@@ -6832,7 +7096,7 @@ spindle_max_rpm = 24000
                 }
             }
             let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
-            c.run_act(R::CycleStart, &doc);
+            cycle_start(&mut c, &doc);
             assert!(c.run.as_ref().unwrap().running.is_some(), "{si}");
             let mut reached = vec![false; angles.len()];
             let cap = Instant::now() + Duration::from_secs(600);
@@ -7131,7 +7395,7 @@ spindle_max_rpm = 24000
                 continue;
             }
             let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
-            c.run_act(R::CycleStart, &doc);
+            cycle_start(&mut c, &doc);
             assert!(c.run.as_ref().unwrap().running.is_some());
             let cap = Instant::now() + Duration::from_secs(600);
             while !(c.snapshot.program_outcome.as_ref()).is_some_and(|o| o.seq > seq) {
@@ -7282,7 +7546,6 @@ spindle_max_rpm = 24000
     #[test]
     fn a_four_angle_bar_job_on_the_library_rotary_machine_exports_and_runs() {
         use crate::indexed::tests::{height, prism};
-        use crate::run::Action as R;
         let dir = tempfile::tempdir().unwrap();
         let mesh = prism(30.);
         let job = |mesh: &crate::mesh::Mesh, x0, stickout, bar, controller| {
@@ -7350,7 +7613,7 @@ spindle_max_rpm = 24000
         }
         assert_eq!(turns, [90., 180., -90., 0.]);
         let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
-        c.run_act(R::CycleStart, &doc);
+        cycle_start(&mut c, &doc);
         assert!(c.run.as_ref().unwrap().running.is_some());
         let mut reached = [false; 4];
         let cap = Instant::now() + Duration::from_secs(600);
@@ -7657,7 +7920,7 @@ spindle_max_rpm = 24000
         // picked as after it.
         let run_to_end = |c: &mut Connection| {
             let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
-            c.run_act(R::CycleStart, &doc);
+            cycle_start(c, &doc);
             assert!(
                 c.run.as_ref().unwrap().running.is_some(),
                 "{:?}",
@@ -7978,7 +8241,7 @@ spindle_max_rpm = 24000
         );
         // Cycle Start; Hold in the middle of the turn to 180, then Resume.
         let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
-        c.run_act(R::CycleStart, &doc);
+        cycle_start(&mut c, &doc);
         assert!(
             c.run.as_ref().unwrap().running.is_some(),
             "{:?}",
@@ -8089,7 +8352,7 @@ spindle_max_rpm = 24000
             assert_eq!((&t[..2], t[3]), (&moves[over].0[..2], 0.), "{moves:?}");
         }
         let seq = c.snapshot.program_outcome.as_ref().map_or(0, |o| o.seq);
-        c.run_act(R::CycleStart, &at_zero);
+        cycle_start(&mut c, &at_zero);
         assert!(c.run.as_ref().unwrap().running.is_some());
         let mut reached = [false; 4];
         let cap = Instant::now() + Duration::from_secs(600);
@@ -9121,7 +9384,7 @@ probe = { pin = 13, active_low = true }
         let raw = |c: &Connection, what: &str, ok: &dyn Fn(&Snapshot) -> bool| {
             let cap = Instant::now() + Duration::from_secs(60);
             loop {
-                let s = c.driver.snapshot();
+                let s = c.driver.snapshot().0;
                 if ok(&s) {
                     return s;
                 }

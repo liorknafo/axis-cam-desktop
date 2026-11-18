@@ -254,6 +254,25 @@ pub const PI_LOST: &str = "The link to the Pi is not answering: wait for it to r
 /// link was never live yet: nothing was lost (LIO-519).
 pub const PI_CONNECTING: &str = "Connecting to the Pi: wait for it.";
 
+/// What the Run panel says while a Cycle Start press waits for the Pi to
+/// apply what this computer sent before it (`Connection::cycle_pending`).
+pub const PI_APPLYING: &str =
+    "Cycle Start waits for the Pi to apply what this computer sent before it…";
+
+/// The same on USB and the simulator: the controller takes a command
+/// within milliseconds.
+pub const CONTROLLER_TAKING: &str =
+    "Cycle Start waits for the controller to take what was sent before it…";
+
+/// Why Cycle Start waits while machine positions are declared axis by axis
+/// (`Connection::declaring_machine`).
+pub const DECLARING: &str = "The machine position is being set, axis by axis: wait for it.";
+
+/// Why a run that starts partway cannot touch off or probe its work zero
+/// when the check did not work out the stock its start leaves.
+pub const PARTWAY_UNKNOWN: &str =
+    "The check did not work out the stock the start leaves: check the setup again.";
+
 /// A setup being run on the connected machine, tool run by tool run.
 pub struct Run {
     pub setup: usize,
@@ -1511,18 +1530,47 @@ impl Run {
     /// down to the next step, all rapids in the air), so that its planner,
     /// which the stop slows down from, is there; the tool, behind it by the
     /// motion buffer, comes up to it and stops.
+    /// Paused at a program's pause (M0) that comes after a step's end, as a
+    /// Boring's to set the head for the next pass does after the pass's
+    /// last visit, it stops there too, the step done, the pause not yet
+    /// answered (LIO-558).
     pub fn stop_due(&mut self, s: &uc100::controller::Snapshot) -> bool {
-        if !self.stop_after || self.stopping.is_some() || s.state != Some(State::Run) {
+        let paused = matches!(s.state, Some(State::Paused(_)));
+        if !self.stop_after || self.stopping.is_some() || !(paused || s.state == Some(State::Run)) {
             return false;
         }
         let Some((_, _, block)) = self.progress(s.current_line) else {
             return false;
+        };
+        let block = match paused {
+            true => match self.pause_after(block) {
+                Some(b) => b,
+                None => return false,
+            },
+            false => block,
         };
         let Some(step) = self.step_end(block) else {
             return false;
         };
         self.stopping = Some(step);
         true
+    }
+
+    /// The pause (M0) block the machine is paused at, its driver's line on
+    /// block `block`: the line stays the last move's, the rise before the
+    /// pause, so the pause is the first after it, with no feed move between.
+    fn pause_after(&self, block: usize) -> Option<usize> {
+        let blocks = self.running_blocks()?;
+        for (b, at) in blocks.iter().enumerate().skip(block) {
+            match at {
+                Block::Pause { .. } => return Some(b),
+                Block::Move {
+                    kind: Kind::Feed, ..
+                } => return None,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// Stop after step on the Pi (`uc100_remote`): the running tool run's
@@ -1582,6 +1630,15 @@ impl Run {
         (self.xy, self.zero, self.last, self.touched) = (xy, zero, last, touched);
         (self.stopping, self.stop_after) = (None, false);
         self.outcome = Some((false, why));
+    }
+
+    /// A Cycle Start press that waited for the machine was dropped, nothing
+    /// sent (`Connection::cycle_pending`): `why` says so where a tool run's
+    /// outcome is said.
+    pub fn press_dropped(&mut self, why: String) {
+        if self.running.is_none() {
+            self.outcome = Some((false, why));
+        }
     }
 
     /// The step (operation index in the setup, step) Stop after step stops
@@ -1652,6 +1709,12 @@ impl Run {
         if self.running.is_some() {
             return vec!["A tool run is running.".into()];
         }
+        if c.press_waits() {
+            return vec![match c.pi {
+                Some(_) => PI_APPLYING.into(),
+                None => CONTROLLER_TAKING.into(),
+            }];
+        }
         if c.pi_down() {
             // Never live since it connected: nothing to reconnect yet
             // (LIO-519).
@@ -1719,6 +1782,9 @@ impl Run {
         }
         if !c.idle() {
             e.push("The machine is not Idle.".into());
+        }
+        if c.declaring_machine() {
+            e.push(DECLARING.into());
         }
         // No machine position on X, Y or Z, or no soft limits in the profile,
         // does not stop Cycle Start (`limits_unchecked`). On A it does: the
@@ -2051,6 +2117,49 @@ impl Run {
             || self.skips.iter().any(cut)
             || self.cut_steps.iter().any(steps);
         self.checked().is_some() && (self.at_step().is_some() || !self.started() && early)
+    }
+
+    /// Where the operator touches off its setup, in plan mm, and the work
+    /// position that is there (`post::touch_point` less the datum). None
+    /// when it is not on the stock top: a Model origin whose stock top an
+    /// earlier setup cut. A run that starts partway touches off on the
+    /// surface the operations before it leave there, when the check knows
+    /// it (`partly`), and is None when not (`partway_blocked`).
+    pub fn touch_off(&self) -> Option<([f32; 3], [f64; 3])> {
+        let p = self.checked()?.first()?;
+        if p.located.is_some_and(|(_, top)| top.is_none()) {
+            return None;
+        }
+        let mut at = crate::post::touch_point(&p.origin, p.stock)?;
+        if self.partway() {
+            at[2] = self.partly()?.surface?;
+        }
+        Some((at, std::array::from_fn(|a| (at[a] - p.datum[a]) as f64)))
+    }
+
+    /// Why Zero Z on the stock top and Probe Z cannot set the work Z of a
+    /// run that starts partway (`partway`): the check cannot tell the
+    /// surface the operations before its start leave where the stock top
+    /// is touched off. None when it can, or the run starts at the setup's
+    /// first operation.
+    pub fn partway_blocked(&self) -> Option<String> {
+        if !self.partway() {
+            return None;
+        }
+        let Some(partly) = self.partly() else {
+            return Some(PARTWAY_UNKNOWN.into());
+        };
+        if partly.surface.is_some() {
+            return None;
+        }
+        Some(if partly.cut.is_empty() {
+            "The check cannot tell the surface the operations before the start leave where the stock top is touched off.".into()
+        } else {
+            format!(
+                "The operations before the start cut the stock's {}, and the check cannot tell the surface they left where the stock top is touched off.",
+                partly.cut.join(", ")
+            )
+        })
     }
 
     /// The start at a step Cycle Start starts at (`start_step`), while its
@@ -2844,6 +2953,11 @@ pub struct Step {
     /// How many of its moves feed: the running program's marks count a
     /// drilling operation's holes by them (`step_marks`).
     pub feeds: usize,
+    /// The pass it is in (from 0), of a plan cut in passes with a stop
+    /// before each to set the tool to its size, a Boring's (`Stop::size`):
+    /// each pass goes round every hole, so its steps are its visits of them
+    /// (LIO-558). None for any other plan, or one of a single pass.
+    pub pass: Option<usize>,
 }
 
 /// The steps of one operation of a setup, as the run's check found them
@@ -2864,9 +2978,12 @@ pub struct OpSteps {
 
 impl OpSteps {
     /// What its steps are called: holes, levels when each cuts at one Z,
-    /// else passes.
+    /// else passes. A plan cut in passes (`Step::pass`) is named by them,
+    /// each a visit of its holes (`label`).
     pub fn kind(&self) -> (&'static str, &'static str) {
-        if self.hole {
+        if self.passes() > 0 {
+            ("Pass", "Passes")
+        } else if self.hole {
             ("Hole", "Holes")
         } else if self.steps.iter().all(|s| s.z.is_some()) {
             ("Level", "Levels")
@@ -2889,21 +3006,127 @@ impl OpSteps {
         }
     }
 
-    /// Step `s`'s label: "Level 14", "Hole 3", "Pass 2".
-    pub fn label(&self, s: usize) -> String {
-        format!("{} {}", self.kind().0, s + 1)
+    /// How many passes its plan is cut in (`Step::pass`): 0 for one not
+    /// cut in passes.
+    pub fn passes(&self) -> usize {
+        (self.steps.iter())
+            .filter_map(|s| s.pass)
+            .max()
+            .map_or(0, |p| p + 1)
     }
 
-    /// Steps `range`'s label: "Levels 5–9", or one step's.
-    pub fn labels(&self, range: std::ops::RangeInclusive<usize>) -> String {
-        match range.end() - range.start() {
-            0 => self.label(*range.start()),
-            _ => format!(
-                "{} {}–{}",
-                self.kind().1,
-                range.start() + 1,
-                range.end() + 1
+    /// Step `s` of a plan cut in passes as (its pass, its hole in the pass,
+    /// the pass's holes), from 0: each pass visits the holes in the same
+    /// order, so hole 2 of a pass is hole 2 of every other.
+    fn in_pass(&self, s: usize) -> Option<(usize, usize, usize)> {
+        let pass = self.steps.get(s)?.pass?;
+        let first = (self.steps.iter()).position(|t| t.pass == Some(pass))?;
+        let holes = (self.steps.iter()).filter(|t| t.pass == Some(pass)).count();
+        Some((pass, s - first, holes))
+    }
+
+    /// Whether each of its passes is a single hole's: then a step is a pass.
+    fn one_hole(&self) -> bool {
+        self.steps.len() == self.passes()
+    }
+
+    /// How many steps it has, as its row says: "5 levels", "6 holes"; a
+    /// plan cut in passes counts its passes and holes, "3 passes · 2 holes",
+    /// not its visits (LIO-558), or "3 passes" of one hole.
+    pub fn count(&self) -> String {
+        let (n, kind) = (self.steps.len(), self.kind().1.to_lowercase());
+        match self.passes() {
+            0 => format!("{n} {kind}"),
+            p if self.one_hole() => format!("{p} {kind}"),
+            p => {
+                let holes = self.in_pass(0).map_or(0, |h| h.2);
+                let noun = if holes == 1 { "hole" } else { "holes" };
+                format!("{p} {kind} · {holes} {noun}")
+            }
+        }
+    }
+
+    /// Step `s`'s label: "Level 14", "Hole 3", "Pass 2"; a visit of a hole
+    /// of a plan cut in passes says both, "Pass 2 · Hole 1" (LIO-558).
+    pub fn label(&self, s: usize) -> String {
+        match self.in_pass(s) {
+            Some((p, _, _)) if self.one_hole() => format!("Pass {}", p + 1),
+            Some((p, h, _)) => format!("Pass {} · Hole {}", p + 1, h + 1),
+            None => format!("{} {}", self.kind().0, s + 1),
+        }
+    }
+
+    /// Steps `range`'s label: "Levels 5–9", or one step's. Of a plan cut in
+    /// passes: "Pass 2 · Holes 1–3" within a pass, "Passes 1–2" for whole
+    /// passes, else from the first's label to the last's.
+    /// Step `s`'s label with how many there are, as the run line says
+    /// where the job is: "Level 3 of 9"; a visit of a plan cut in passes
+    /// counts each, "Pass 1 of 3 · Hole 2 of 2", never "of 6" visits
+    /// (LIO-558).
+    pub fn label_of(&self, s: usize) -> String {
+        match self.in_pass(s) {
+            Some((p, _, _)) if self.one_hole() => format!("Pass {} of {}", p + 1, self.passes()),
+            Some((p, h, n)) => format!(
+                "Pass {} of {} · Hole {} of {n}",
+                p + 1,
+                self.passes(),
+                h + 1
             ),
+            None => format!("{} of {}", self.label(s), self.steps.len()),
+        }
+    }
+
+    /// The lines a folded run of steps `range` shows as (`ui::step_list`):
+    /// itself, but a plan cut in passes splits one that starts or ends
+    /// partway through a pass and runs into another into the rest of the
+    /// pass it starts in, the whole passes after it and the start of the
+    /// pass it ends in, so that a line reads "Passes 2–10" or "Pass 11 ·
+    /// Holes 1–3", never "Pass 1 · Hole 2 – Pass 11 · Hole 1" (LIO-558).
+    pub fn folds(
+        &self,
+        range: std::ops::RangeInclusive<usize>,
+    ) -> Vec<std::ops::RangeInclusive<usize>> {
+        let (a, b) = (*range.start(), *range.end());
+        let (Some((pa, ha, na)), Some((pb, hb, nb))) = (self.in_pass(a), self.in_pass(b)) else {
+            return vec![range];
+        };
+        if pa == pb || (ha == 0 && hb + 1 == nb) {
+            return vec![range];
+        }
+        let mut out = vec![];
+        // The rest of the pass it starts in.
+        let mut whole = a;
+        if ha > 0 {
+            whole = a + (na - ha);
+            out.push(a..=whole - 1);
+        }
+        // The whole passes, then the start of the pass it ends in.
+        let tail = (hb + 1 < nb).then_some(b - hb);
+        let last = tail.map_or(b, |t| t - 1);
+        if whole <= last {
+            out.push(whole..=last);
+        }
+        out.extend(tail.map(|t| t..=b));
+        out
+    }
+
+    pub fn labels(&self, range: std::ops::RangeInclusive<usize>) -> String {
+        let (a, b) = (*range.start(), *range.end());
+        if a == b {
+            return self.label(a);
+        }
+        let (Some((pa, ha, _)), Some((pb, hb, nb))) = (self.in_pass(a), self.in_pass(b)) else {
+            return format!("{} {}–{}", self.kind().1, a + 1, b + 1);
+        };
+        let whole = ha == 0 && hb + 1 == nb;
+        if whole && pa == pb {
+            format!("Pass {}", pa + 1)
+        } else if whole {
+            format!("Passes {}–{}", pa + 1, pb + 1)
+        } else if pa == pb {
+            format!("Pass {} · Holes {}–{}", pa + 1, ha + 1, hb + 1)
+        } else {
+            format!("{} – {}", self.label(a), self.label(b))
         }
     }
 }
@@ -2918,7 +3141,9 @@ const AT_CLEARANCE: f32 = 0.01;
 /// A drilling plan's steps are its holes (`Plan::holes`): it splits only
 /// where one starts, so a deep drilling's pecks and a helical milling's
 /// rings, which rise to the clearance too when it is at the retract height,
-/// are in the step of their hole (LIO-549, LIO-555).
+/// are in the step of their hole (LIO-549, LIO-555). A plan cut in passes,
+/// a Boring's, goes round its holes each pass: a step is one visit, and
+/// says its pass (`Step::pass`, LIO-558).
 pub fn plan_steps(plan: &crate::simulation::Plan) -> Vec<Step> {
     use crate::simulation::Motion;
     let moves = &plan.moves;
@@ -2955,9 +3180,22 @@ pub fn plan_steps(plan: &crate::simulation::Plan) -> Vec<Step> {
             fed = Some(i);
         }
     }
+    // Where each pass is set, of a plan cut in more than one (`Step::pass`).
+    let mut sets: Vec<usize> = (plan.stops.iter())
+        .filter(|s| s.size.is_some())
+        .map(|s| s.at)
+        .collect();
+    sets.sort_unstable();
     let ends = starts.iter().skip(1).copied().chain([moves.len()]);
     (starts.iter().zip(ends))
         .map(|(&a, b)| {
+            // Set before its first feed move, the stop after the retract
+            // that starts it.
+            let first_feed = (a..b).find(|&i| feed(i)).unwrap_or(a);
+            let pass = (sets.len() > 1).then(|| {
+                sets.partition_point(|&at| at <= first_feed)
+                    .saturating_sub(1)
+            });
             let level: Vec<f32> = (moves[a..b].iter())
                 .filter(|m| m.motion == Motion::Feed && (m.from[2] - m.to[2]).abs() < 1e-4)
                 .map(|m| m.to[2])
@@ -2974,6 +3212,7 @@ pub fn plan_steps(plan: &crate::simulation::Plan) -> Vec<Step> {
                     .iter()
                     .filter(|m| m.motion == Motion::Feed)
                     .count(),
+                pass,
             }
         })
         .collect()
@@ -3037,7 +3276,8 @@ pub fn fingerprint(plan: &crate::simulation::Plan, tool: &str) -> u64 {
 /// where the one after them starts, as the plan moves between two of its
 /// steps; cut first, the plan starts where the first kept step does, which
 /// a program enters as it enters an operation. Its stops follow their moves,
-/// and a drilling plan's kept steps are its holes (`Plan::holes`).
+/// but for a pass's setting cut after the plan has cut (`Step::pass`), and a
+/// drilling plan's kept steps are its holes (`Plan::holes`).
 pub fn cut_plan(
     plan: &crate::simulation::Plan,
     steps: &[Step],
@@ -3085,14 +3325,30 @@ pub fn cut_plan(
                 .push(plan.keep_air.get(i).copied().unwrap_or(false));
         }
     }
+    let kept = |s: usize| !cut.contains(&s);
+    // A pass's setting of the tool (`Step::pass`) cut with the pass's first
+    // visit goes before its first visit sent, when the plan cut at an
+    // earlier pass's setting before it: the visit skipped alone, the holes
+    // after it are not cut at that pass's size yet (LIO-558). Cut before
+    // anything sent, as a start at a step is, the tool is taken as set for
+    // the pass under way.
+    let moved = |s: &Stop| -> Option<usize> {
+        s.size?;
+        let c = steps.iter().position(|t| t.moves.contains(&s.at))?;
+        let pass = steps[c].pass?;
+        let t = (c + 1..steps.len()).find(|&t| kept(t) && steps[t].pass == Some(pass))?;
+        (0..t).any(kept).then_some(())?;
+        new[steps[t].moves.start]
+    };
     out.stops = (plan.stops.iter())
         .filter_map(|s| {
             Some(Stop {
-                at: new.get(s.at).copied().flatten()?,
+                at: new.get(s.at).copied().flatten().or_else(|| moved(s))?,
                 ..s.clone()
             })
         })
         .collect();
+    out.stops.sort_by_key(|s| s.at);
     out
 }
 
@@ -3646,6 +3902,23 @@ pub struct TabletRun {
     /// starts there (`Checked::starts`). A file from before them has none.
     #[serde(default)]
     pub starts: Vec<TabletOpStart>,
+    /// The job line its way out starts on: the spindle and coolant off,
+    /// the retract, the end (`way_out_line`). A tablet job that skips its
+    /// last steps ends with the lines from there (LIO-567).
+    #[serde(default)]
+    pub way_out: Option<u32>,
+    /// Its starts at each step of its operations after the step's first
+    /// (LIO-567), in order: as a start at a step on the Run panel, the
+    /// steps before it taken as cut, each checked so (`check_steps`). The
+    /// tablet starts at a step with one, and joins them to skip steps. A
+    /// file from before them has none.
+    #[serde(default)]
+    pub step_starts: Vec<TabletStepStart>,
+    /// For a later tool run, started at its first operation with the tool
+    /// runs before taken as cut: its work zero on the stock they left
+    /// (LIO-548). Null for the first tool run, and in a file from before.
+    #[serde(default)]
+    pub zero: Option<TabletZero>,
 }
 
 /// A tool run started at one of its operations after the first, as Cycle
@@ -3661,6 +3934,97 @@ pub struct TabletOpStart {
     pub lift: Lift,
     pub actions: Vec<TabletLine>,
     pub steps: Vec<TabletStep>,
+    /// The job line of its way down onto its first point (LIO-567): the
+    /// lines before it take the tool across in the air from wherever it
+    /// stands, which is where the tablet's Stop after step stops a job
+    /// that goes on here after a skipped step.
+    #[serde(default)]
+    pub entry: Option<u32>,
+    /// As `TabletRun::way_out`.
+    #[serde(default)]
+    pub way_out: Option<u32>,
+    /// Its work zero on the stock the operations before it left (LIO-548);
+    /// null when it cannot start there, and in a file from before.
+    #[serde(default)]
+    pub zero: Option<TabletZero>,
+}
+
+/// A tool run started at a step of one of its operations after the step's
+/// first (LIO-567), as Cycle Start sends it from a start at a step: the
+/// setup checked with that operation's steps before it taken as cut
+/// (`check_steps`), its own job (its lines numbered from 1), its steps from
+/// there on, and the lift; or why it cannot start there.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletStepStart {
+    /// The operation it starts at (its index in the setup) and the step.
+    pub operation: usize,
+    pub step: usize,
+    /// Why it cannot start there, as the Run panel says; its job is empty then.
+    pub problems: Vec<String>,
+    pub lift: Lift,
+    /// Without the wait over the step's entry (`wait`). With `rest`, only
+    /// its lines before the rest.
+    pub actions: Vec<TabletLine>,
+    /// Its job goes on as its tool run's own does (`TabletRun::actions`)
+    /// from line `rest[0]` on, each of those lines its line `rest[0]` is
+    /// `rest[1]` here, after `actions`: the same blocks from the step on,
+    /// carried once, not once per step (`share`). None: `actions` is all.
+    #[serde(default)]
+    pub rest: Option<[u32; 2]>,
+    pub steps: Vec<TabletStep>,
+    /// As `TabletOpStart::entry`.
+    pub entry: Option<u32>,
+    /// Started here by the operator, the job waits over the step's entry
+    /// with the spindle on until Resume feeds in, as `Run::job_actions`
+    /// makes it: a pause with this reason after the last action on or
+    /// before line `entry`. Not when the tablet's job goes on here after a
+    /// skipped step.
+    pub wait: String,
+    /// As `TabletRun::way_out`.
+    pub way_out: Option<u32>,
+}
+
+/// The work zero of a start partway through a setup (`Run::partway`) on
+/// the stock the operations before it left, as the Work zero tab guides
+/// it: X and Y stay those they were cut with, and the tool tip touched off
+/// at the stock top's touch-off spot sets Z (`Run::touch_off`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletZero {
+    /// The work Z the touch-off at `spot` sets: the height of the surface
+    /// they left there. Null when the check cannot tell it (`blocked`).
+    pub set_z: Option<f64>,
+    /// Why the touch-off cannot set Z, as the Work zero tab says
+    /// (`Run::partway_blocked`); null when it can.
+    pub blocked: Option<String>,
+    /// What of the stock the work zero is found on they cut ("top"): empty
+    /// when they left it as the setup's first operation finds it
+    /// (`Partly::cut`).
+    pub cut: Vec<String>,
+    /// They cut below the stock top somewhere over it: a touch plate laid
+    /// on the top may not lie at a height the check knows.
+    pub top_cut: bool,
+    /// The stock top's work Z before the setup's first operation.
+    pub top: f64,
+    /// Where on the stock top the tool tip touches off, in the computer's
+    /// words for the machine's orientation: "the front-left corner", "the
+    /// centre". Null when the work zero is not on the stock.
+    pub spot: Option<String>,
+    /// The stock-top spots a probe finds the work zero from on the stock
+    /// they left, each with why it cannot (`Partly::probe_from`).
+    pub probe_from: Vec<TabletSpot>,
+}
+
+/// A stock-top spot a probe starts from: X and Y each on the stock's −
+/// side, its middle or its + side.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TabletSpot {
+    pub x: crate::post::At,
+    pub y: crate::post::At,
+    /// Why a probe cannot find the work zero from there; null when it can.
+    pub problem: Option<String>,
 }
 
 /// Where a tool run on a setup in the chuck starts from: the tool at the
@@ -3783,9 +4147,18 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
         }
     };
     let (programs, left) = check(doc, mesh, si);
+    let left = Arc::new(left);
     let mut run = Run::new(doc, si, 0);
-    run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+    run.checked_as(Arc::new(programs), Some(left.clone()), None);
     let all = run.programs.clone().expect("checked");
+    // Each start's work zero as the Run panel finds it started there.
+    let mut started = Run::new(doc, si, 0);
+    started.checked_as(all.clone(), Some(left), None);
+    let orient = crate::orient::Orient::of(&setup.machine);
+    let mut zero = |i: usize, k: usize| {
+        started.start_at(i, k);
+        tablet_zero(&started, orient)
+    };
     let programs = match all.as_ref() {
         Ok(p) => p,
         Err(why) => {
@@ -3821,19 +4194,24 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
                     Some(_) => Err(vec![CHUCK_STARTS.to_string()]),
                     None => tablet_job_from(&mut run, p, i, k),
                 };
-                let (actions, steps, at_lift, problems) = match job {
-                    Ok((a, s, l)) => (a, s, l, vec![]),
-                    Err(why) => (vec![], vec![], lift, why),
+                let (actions, steps, at_lift, problems, zero) = match job {
+                    Ok((a, s, l)) => (a, s, l, vec![], zero(i, k)),
+                    Err(why) => (vec![], vec![], lift, why, None),
                 };
+                let blocks = p.from(k).ok().filter(|_| problems.is_empty());
                 TabletOpStart {
                     operation: p.indexes[k],
                     problems,
                     lift: at_lift,
                     actions,
                     steps,
+                    entry: blocks.and_then(entry_line),
+                    way_out: blocks.and_then(way_out_line),
+                    zero,
                 }
             })
             .collect();
+        let step_starts = tablet_step_starts(doc, mesh, si, &run, p, lift, &actions);
         let o = &p.ops[0];
         out.tool_runs.push(TabletRun {
             name: format!("{} · tool run {} of {count}", run.name, i + 1),
@@ -3854,9 +4232,221 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
             actions,
             steps,
             starts,
+            way_out: way_out_line(&p.blocks),
+            step_starts,
+            zero: if i > 0 { zero(i, 0) } else { None },
         });
     }
     out
+}
+
+/// The work zero of `run`, started partway (`Run::partway`), on the stock
+/// the operations before its start left (`TabletZero`), on a machine of
+/// orientation `orient`; None when it does not start partway.
+fn tablet_zero(run: &Run, orient: crate::orient::Orient) -> Option<TabletZero> {
+    if !run.partway() {
+        return None;
+    }
+    let p = run.checked()?.first()?;
+    let partly = run.partly();
+    let blocked = run.partway_blocked();
+    let set_z = run.touch_off().map(|(_, work)| work[2]);
+    Some(TabletZero {
+        set_z,
+        // Not on the stock top, the touch-off cannot set Z either, as
+        // Probe Z says (`Connection::stock_top`).
+        blocked: blocked.or_else(|| {
+            set_z
+                .is_none()
+                .then(|| crate::post::STOCK_TOP_CUT.to_string())
+        }),
+        cut: partly.as_ref().map_or_else(Vec::new, |x| x.cut.clone()),
+        top_cut: partly.as_ref().is_some_and(|x| x.top_cut),
+        top: (p.stock.max[2] - p.datum[2]) as f64,
+        spot: (crate::post::references(&p.origin))
+            .map(|refs| crate::control::touch_spot(orient, refs)),
+        probe_from: (partly.as_ref())
+            .map_or(&[][..], |x| &x.probe_from[..])
+            .iter()
+            .map(|([x, y], ok)| TabletSpot {
+                x: *x,
+                y: *y,
+                problem: ok.clone().err(),
+            })
+            .collect(),
+    })
+}
+
+/// The job line of the first way down onto a point of `blocks` (its first
+/// `Block::Descend`): the lines before it take the tool across in the air.
+fn entry_line(blocks: &[Block]) -> Option<u32> {
+    (blocks.iter())
+        .position(|b| matches!(b, Block::Descend { .. }))
+        .map(|i| i as u32 + 1)
+}
+
+/// The job line a program's way out starts on: its last `Block::Stop`, the
+/// spindle and coolant off, after which it only retracts, turns A back to
+/// 0 and ends (`post::blocks`).
+fn way_out_line(blocks: &[Block]) -> Option<u32> {
+    (blocks.iter())
+        .rposition(|b| matches!(b, Block::Stop))
+        .map(|i| i as u32 + 1)
+}
+
+/// The tablet's starts of tool run `p` of setup `si` at each step of its
+/// operations after the step's first (LIO-567), as the Run panel's start at
+/// a step: the setup checked again with the operation's steps before it
+/// taken as cut (`check_steps`), the program from that operation lowered
+/// as `tablet_job_from` lowers it, its steps from the start on, and where
+/// it waits (`Run::job_actions`); or why it cannot start there. `base` is
+/// the run of the setup's own check, whose steps they are; `lift` the tool
+/// run's, said with a refused start; `own` its actions, which each start
+/// shares the rest of its job with (`share`).
+fn tablet_step_starts(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    base: &Run,
+    p: &Checked,
+    lift: Lift,
+    own: &[TabletLine],
+) -> Vec<TabletStepStart> {
+    let mut out = vec![];
+    for &oi in &p.indexes {
+        let Some(os) = base.op_steps(oi) else {
+            continue;
+        };
+        for n in 1..os.steps.len() {
+            let mut start = TabletStepStart {
+                operation: oi,
+                step: n,
+                problems: vec![],
+                lift,
+                actions: vec![],
+                rest: None,
+                steps: vec![],
+                entry: None,
+                wait: format!(
+                    "Over the entry of {}: Resume feeds in.",
+                    base.step_label(oi, n)
+                ),
+                way_out: None,
+            };
+            match tablet_step_job(doc, mesh, si, p.chuck.is_some(), oi, n) {
+                Ok((mut actions, steps, lift, entry, way_out)) => {
+                    start.rest = share(&mut actions, own);
+                    (start.actions, start.steps, start.lift) = (actions, steps, lift);
+                    (start.entry, start.way_out) = (entry, way_out);
+                }
+                Err(why) => start.problems = why,
+            }
+            out.push(start);
+        }
+    }
+    out
+}
+
+/// The lines a start's `actions` ends with that its tool run's `own` end
+/// with too, but for a line number shifted by the same for each: cut off
+/// `actions`, and said as `TabletStepStart::rest`. Whole lines only, at
+/// least one; and only when the tool run's lines from there, renumbered,
+/// are exactly the lines cut off (`rest_of`). None: nothing cut.
+fn share(actions: &mut Vec<TabletLine>, own: &[TabletLine]) -> Option<[u32; 2]> {
+    let (mut i, mut j) = (actions.len(), own.len());
+    let mut shift = None;
+    while i > 0 && j > 0 {
+        let (a, b) = (&actions[i - 1], &own[j - 1]);
+        let d = a.line as i64 - b.line as i64;
+        if a.action != b.action || shift.is_some_and(|s| s != d) {
+            break;
+        }
+        (shift, i, j) = (Some(d), i - 1, j - 1);
+    }
+    // From a line's first action in both.
+    let split = |v: &[TabletLine], k: usize| k > 0 && k < v.len() && v[k - 1].line == v[k].line;
+    while i < actions.len() && (split(actions, i) || split(own, j)) {
+        (i, j) = (i + 1, j + 1);
+    }
+    if i >= actions.len() || j >= own.len() || (i > 0 && actions[i - 1].line >= actions[i].line) {
+        return None;
+    }
+    let rest = [own[j].line, actions[i].line];
+    (rest_of(own, rest) == actions[i..]).then(|| {
+        actions.truncate(i);
+        rest
+    })
+}
+
+/// The lines a `TabletStepStart::rest` stands for: its tool run's `own`
+/// from line `rest[0]` on, line `rest[0]` numbered `rest[1]`.
+fn rest_of(own: &[TabletLine], rest: [u32; 2]) -> Vec<TabletLine> {
+    (own.iter())
+        .filter(|l| l.line >= rest[0])
+        .map(|l| TabletLine {
+            line: l.line - rest[0] + rest[1],
+            action: l.action.clone(),
+        })
+        .collect()
+}
+
+/// The job of a start at step `n` of operation `oi` of setup `si` for the
+/// tablet (`tablet_step_starts`): its actions, its steps from there on, its
+/// lift, entry and way out; or why it cannot start there. Not in the chuck
+/// (`chuck`), whose way in is checked only over a tool run's first point.
+#[allow(clippy::type_complexity)]
+fn tablet_step_job(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    chuck: bool,
+    oi: usize,
+    n: usize,
+) -> Result<
+    (
+        Vec<TabletLine>,
+        Vec<TabletStep>,
+        Lift,
+        Option<u32>,
+        Option<u32>,
+    ),
+    Vec<String>,
+> {
+    if chuck {
+        return Err(vec![CHUCK_STARTS.into()]);
+    }
+    let (programs, left) = check_steps(doc, mesh, si, &[], &[(oi, (0..n).collect())]);
+    let mut run = Run::new(doc, si, 0);
+    // The steps before it taken as cut by the start, as `start_at_step`
+    // makes it: the running program's marks count the steps sent after them.
+    run.start_step = Some((oi, n));
+    run.checked_as(Arc::new(Ok(programs?)), Some(Arc::new(left)), None);
+    if run.start_step != Some((oi, n)) {
+        return Err(vec![format!(
+            "The check did not find {} of this operation again, so the tablet cannot start there. Check the setup again on the computer.",
+            run.step_label(oi, n)
+        )]);
+    }
+    let all = run.programs.clone().expect("checked");
+    let programs = all.as_ref().as_ref().map_err(Clone::clone)?;
+    let Some((i, p, k)) = (programs.iter().enumerate())
+        .find_map(|(i, p)| Some((i, p, p.indexes.iter().position(|&o| o == oi)?)))
+    else {
+        return Err(vec![
+            "The check sends this operation in no tool run, so the tablet cannot start at its steps. Check the setup again on the computer.".into(),
+        ]);
+    };
+    let (actions, mut steps, lift) = tablet_job_from(&mut run, p, i, k)?;
+    // Those before it are the start's, cut already.
+    steps.retain(|t| t.operation != oi || t.step >= n);
+    let blocks = p.from(k)?;
+    Ok((
+        actions,
+        steps,
+        lift,
+        entry_line(blocks),
+        way_out_line(blocks),
+    ))
 }
 
 /// Why a tablet's tool run on a setup in the chuck does not start at a later
@@ -5150,6 +5740,277 @@ pub(crate) mod tests {
         }
     }
 
+    /// The tablet file's starts at steps (LIO-567): one at each step of each
+    /// operation after its first, each the Run panel's start at that step.
+    /// Made into machine coordinates with the wait over the step's entry put
+    /// after the last action on or before its `entry`, as the tablet puts
+    /// it, it is the job Cycle Start sends at that step (`job_actions`),
+    /// from the setup checked with the steps before it taken as cut
+    /// (`check_steps`). Its steps start at that one, numbered as the tool
+    /// run's, and each ends where Stop after step stops; its lines before
+    /// `entry` take the tool across in the air, and from `way_out` on it only
+    /// stops the spindle, retracts and ends, as do the tool run's and each
+    /// start at an operation.
+    #[test]
+    fn a_tablet_start_at_each_step_sends_what_a_start_at_a_step_sends() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        let s = tablet_runs(&doc, Ok(&mesh), 0);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let offset = [120., 90., -35., 0., 0., 0.];
+        // Only stops the spindle (and coolant), lifts and ends from there.
+        let out = |actions: &[TabletLine], from: Option<u32>| {
+            let from = from.expect("a way out");
+            let kinds: Vec<&str> = (actions.iter().filter(|l| l.line >= from))
+                .map(|l| match &l.action {
+                    TabletAction::Spindle {
+                        state: Spindle::Off,
+                        ..
+                    } => "off",
+                    TabletAction::Coolant {
+                        flood: false,
+                        mist: false,
+                    } => "off",
+                    TabletAction::Move { lift: true, .. } => "lift",
+                    TabletAction::End => "end",
+                    a => panic!("{a:?} in the way out"),
+                })
+                .filter(|k| *k != "off")
+                .collect();
+            assert_eq!(kinds, ["lift", "end"]);
+        };
+        let mut count = 0;
+        for r in &s.tool_runs {
+            out(&r.actions, r.way_out);
+            for st in &r.starts {
+                out(&st.actions, st.way_out);
+                assert!(st.entry.is_some_and(|e| e > 1), "{:?}", st.entry);
+            }
+            for o in &r.operations {
+                let steps = r.steps.iter().filter(|t| t.operation == o.index).count();
+                let mine: Vec<usize> = (r.step_starts.iter())
+                    .filter(|t| t.operation == o.index)
+                    .map(|t| t.step)
+                    .collect();
+                assert_eq!(
+                    mine,
+                    (1..steps.max(1)).collect::<Vec<_>>(),
+                    "{} {}",
+                    r.name,
+                    o.name
+                );
+            }
+            for st in &r.step_starts {
+                let (oi, n) = (st.operation, st.step);
+                // The Run panel's start at that step; one its check refuses
+                // is refused on the tablet, saying the same.
+                let mut run = Run::new(&doc, 0, 0);
+                run.start_step = Some((oi, n));
+                let (programs, left) = check_steps(&doc, &mesh, 0, &[], &[(oi, (0..n).collect())]);
+                if let Err(why) = &programs {
+                    assert_eq!(&st.problems, why, "{} {oi} {n}", r.name);
+                    assert!(st.actions.is_empty() && st.entry.is_none());
+                    continue;
+                }
+                assert!(
+                    st.problems.is_empty(),
+                    "{} {oi} {n}: {:?}",
+                    r.name,
+                    st.problems
+                );
+                count += 1;
+                run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+                assert_eq!(run.start_step, Some((oi, n)));
+                let p = (run.checked().unwrap().iter())
+                    .find(|p| p.indexes.contains(&oi))
+                    .unwrap()
+                    .clone();
+                let k = p.indexes.iter().position(|&o| o == oi).unwrap();
+                let label = run.step_label(oi, n);
+                assert_eq!(
+                    st.wait,
+                    format!("Over the entry of {label}: Resume feeds in.")
+                );
+                let entry = st.entry.unwrap();
+                // Its lines, and the rest its tool run's own from there,
+                // carried once (`share`): all of it from its step's moves on.
+                let rest = st
+                    .rest
+                    .unwrap_or_else(|| panic!("{} at {label}: nothing shared", r.name));
+                let mut actions = st.actions.clone();
+                actions.extend(rest_of(&r.actions, rest));
+                assert!(st.actions.iter().all(|l| l.line < rest[1]));
+                let at = (actions.iter())
+                    .rposition(|l| l.line <= entry)
+                    .map_or(0, |i| i + 1);
+                let mut waits = actions.clone();
+                waits.insert(
+                    at,
+                    TabletLine {
+                        line: entry,
+                        action: TabletAction::Pause {
+                            reason: st.wait.clone(),
+                        },
+                    },
+                );
+                for start in [[-5., -7., -30., 0., 0., 0.], [3., 4., -1., 0., 0., 0.]] {
+                    assert_eq!(
+                        tablet_job_of(&waits, st.lift, offset, start),
+                        run.job_actions(&p, k, offset, start, Some((oi, n)))
+                            .unwrap(),
+                        "{} at {label}",
+                        r.name
+                    );
+                }
+                // Across in the air before the entry: no feed.
+                assert!(
+                    actions
+                        .iter()
+                        .filter(|l| l.line < entry)
+                        .all(|l| !matches!(l.action, TabletAction::Move { feed: Some(_), .. }))
+                );
+                out(&actions, st.way_out);
+                let first = st.steps.first().unwrap();
+                assert_eq!((first.operation, first.step), (oi, n));
+                // In order, the first's lines from its way in on, as a start
+                // at an operation's.
+                let mut last = 0;
+                for t in &st.steps {
+                    assert_eq!(t.label, run.op_steps(t.operation).unwrap().label(t.step));
+                    let [a, b] = t.lines.unwrap_or_else(|| panic!("{label} {}", t.label));
+                    assert!(a > last && b >= a, "{label} {} {:?}", t.label, t.lines);
+                    last = b;
+                    assert!(!t.end_lines.is_empty(), "{label} {}", t.label);
+                }
+                let want: Vec<(usize, usize)> = (r.steps.iter())
+                    .skip_while(|t| (t.operation, t.step) != (oi, n))
+                    .map(|t| (t.operation, t.step))
+                    .collect();
+                let got: Vec<(usize, usize)> =
+                    st.steps.iter().map(|t| (t.operation, t.step)).collect();
+                assert_eq!(got, want);
+            }
+        }
+        // Pocket's later levels and holes 2 to 5 start; Face's pass 2 too,
+        // once the check takes pass 1 as cut without refusing the work zero
+        // (LIO-568).
+        assert!(count >= 9, "{count}");
+    }
+
+    /// Each start partway through the setup carries its work zero on the
+    /// stock the operations before it left (LIO-548), as the Work zero tab
+    /// finds it for a run started there: the Z the touch-off sets, or why
+    /// it cannot, what they cut, where the tool tip touches off and the
+    /// spots a probe can find the zero from. The setup's own start has none.
+    #[test]
+    fn the_tablet_file_carries_each_partway_starts_work_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        let s = tablet_runs(&doc, Ok(&mesh), 0);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let (programs, left) = check(&doc, &mesh, 0);
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+        let p = run.checked().unwrap()[0].clone();
+        let top = (p.stock.max[2] - p.datum[2]) as f64;
+        assert!(s.tool_runs[0].zero.is_none());
+        let mut zeros = vec![];
+        for (i, r) in s.tool_runs.iter().enumerate() {
+            let starts: Vec<_> = (r.starts.iter())
+                .map(|st| (p_index(&run, i, st.operation), &st.zero))
+                .collect();
+            for (k, zero) in [(0, &r.zero)]
+                .into_iter()
+                .chain(starts)
+                .skip(usize::from(i == 0))
+            {
+                run.start_at(i, k);
+                assert!(run.partway(), "{i} {k}");
+                let zero = zero.as_ref().unwrap_or_else(|| panic!("{i} {k}"));
+                let partly = run.partly().unwrap();
+                assert_eq!(zero.set_z, run.touch_off().map(|(_, w)| w[2]), "{i} {k}");
+                assert_eq!(zero.blocked, run.partway_blocked(), "{i} {k}");
+                assert_eq!(zero.cut, partly.cut, "{i} {k}");
+                assert_eq!(zero.top_cut, partly.top_cut, "{i} {k}");
+                assert_eq!(zero.top, top);
+                assert_eq!(zero.probe_from.len(), partly.probe_from.len());
+                for (t, ([x, y], ok)) in zero.probe_from.iter().zip(&partly.probe_from) {
+                    assert_eq!((t.x, t.y, t.problem.clone()), (*x, *y, ok.clone().err()));
+                }
+                zeros.push((i, k, zero.clone()));
+            }
+        }
+        // The face cut the top 4 mm down where the work zero (the stock
+        // top's centre) is touched off: the pocket's start touches off on
+        // that floor. The drill's touches off on the pocket's floor, cut
+        // there by the flat end mill, which the check knows exactly. Every
+        // stock-top spot a probe would start from was cut.
+        let [(0, 1, pocket), (1, 0, drill)] = &zeros[..] else {
+            panic!("{zeros:?}")
+        };
+        for z in [pocket, drill] {
+            assert_eq!(z.blocked, None);
+            assert_eq!(z.spot.as_deref(), Some("the centre"));
+            assert_eq!(z.top, 0.);
+            assert!(
+                z.top_cut && z.cut.first().is_some_and(|c| c == "top face"),
+                "{z:?}"
+            );
+            assert_eq!(z.probe_from.len(), 9);
+            assert!(z.probe_from.iter().all(|s| s.problem.is_some()), "{z:?}");
+        }
+        assert_eq!(pocket.set_z, Some(-4.));
+        assert!((drill.set_z.unwrap() + 15.8).abs() < 1e-5, "{drill:?}");
+        // As runs.json says it.
+        let json = serde_json::to_value(&s.tool_runs[1].zero).unwrap();
+        assert_eq!(json["spot"], "the centre");
+        assert_eq!(json["probeFrom"][0]["x"], "mid");
+        assert!(json["setZ"].is_number() && json["topCut"] == true, "{json}");
+    }
+
+    /// Where the check cannot tell the surface the operations before a
+    /// start left at the touch-off spot, the start's work zero has no Z to
+    /// set, and says why as the Work zero tab does; not partway, none.
+    #[test]
+    fn a_tablet_start_partway_whose_surface_the_check_cannot_tell_has_no_z_to_set() {
+        let (doc, _) = fixture::job();
+        let plan = fixture::plan([0., 0., 15.], &[(Motion::Feed, [10., 0., 5.], 600.)]);
+        let mut p = checked(vec![fixture::facing_op(); 2], &[&plan, &plan]);
+        let cut = Partly {
+            cut: vec!["top face".into()],
+            surface: None,
+            top_cut: true,
+            probe_from: vec![],
+        };
+        p.partly = vec![cut.clone(), cut];
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(Arc::new(Ok(vec![p])), None, None);
+        let orient = crate::orient::Orient::Right;
+        assert_eq!(tablet_zero(&run, orient), None);
+        run.start_at(0, 1);
+        let zero = tablet_zero(&run, orient).unwrap();
+        assert_eq!(zero.set_z, None);
+        assert_eq!(
+            zero.blocked.as_deref(),
+            Some(
+                "The operations before the start cut the stock's top face, and the check cannot tell the surface they left where the stock top is touched off."
+            )
+        );
+        assert_eq!(zero.blocked, run.partway_blocked());
+        assert_eq!(zero.spot.as_deref(), Some("the centre"));
+    }
+
+    /// The index in tool run `i`'s program of its operation `oi` (an index
+    /// in the setup).
+    fn p_index(run: &Run, i: usize, oi: usize) -> usize {
+        let p = &run.checked().unwrap()[i];
+        p.indexes.iter().position(|&o| o == oi).unwrap()
+    }
+
     /// A tablet file from before the starts (LIO-476) still reads: its tool
     /// runs have none.
     #[test]
@@ -5157,6 +6018,11 @@ pub(crate) mod tests {
         let json = r#"{"name":"Top · tool run 1 of 1","tool":{"number":1,"name":"Flat 10","label":"T1 Flat 10"},"toolChange":false,"operations":[{"index":0,"name":"Face"}],"lift":{"z":15.0,"machine":false},"start":null,"actions":[],"steps":[]}"#;
         let r: TabletRun = serde_json::from_str(json).unwrap();
         assert!(r.starts.is_empty());
+        // Nor a work zero for a start partway (LIO-548).
+        assert!(r.zero.is_none());
+        let start = r#"{"operation":1,"problems":[],"lift":{"z":15.0,"machine":false},"actions":[],"steps":[]}"#;
+        let st: TabletOpStart = serde_json::from_str(start).unwrap();
+        assert!(st.zero.is_none());
     }
 
     /// A tablet start at a second and a third operation (LIO-476), their
@@ -5996,6 +6862,7 @@ pub(crate) mod tests {
         assert_eq!(labels, ["Hole 1", "Hole 2", "Hole 3", "Hole 4", "Hole 5"]);
         assert_eq!(drill.labels(0..=4), "Holes 1–5");
         assert_eq!(drill.labels(1..=1), "Hole 2");
+        assert_eq!(drill.label_of(1), "Hole 2 of 5");
         // Each step all the pecks of one hole.
         for (s, step) in drill.steps.iter().enumerate() {
             let at: Vec<_> = (feeds.iter())
@@ -6070,6 +6937,275 @@ pub(crate) mod tests {
                 t.end_lines
             );
         }
+    }
+
+    /// A Boring's steps are its visits of its holes, a pass at a time, and
+    /// are called so (LIO-558): two Ø32 bores 70 mm apart, drilled Ø12,
+    /// milled to Ø31.4 and bored to Ø32 in 3 passes (Ø31.65 and Ø31.9 at
+    /// 0.15 a pass on the radius, then the size). The head goes round both
+    /// bores each pass, rising to the clearance between them, so its 6 steps
+    /// are "Pass 1 · Hole 1" to "Pass 3 · Hole 2", not "Hole 1" to "Hole 6",
+    /// hole 2 the same bore in every pass, and its row counts "3 passes · 2
+    /// holes". The running program's marks count a visit a step, each pass's
+    /// pause to set the head between its first visit and the visit before,
+    /// and the tablet file names them the same. A start at "Pass 2 · Hole 2"
+    /// sends the rest with the third pass's pause only: the head is set for
+    /// the second, which took hole 1; "Pass 2 · Hole 1" skipped alone, the
+    /// second pass's pause goes before "Pass 2 · Hole 2" instead, the head
+    /// still set for the first. A Boring of one bore reads "Pass 1" to
+    /// "Pass 3".
+    #[test]
+    fn a_borings_steps_are_named_by_pass_and_hole() {
+        use crate::cam::boring::tests::{
+            drill, drilling, end_mill, head, job, on_uc100, ring_triangles,
+        };
+        use crate::model::{BORE_RETRACTS, BORING, HELICAL_MILLING, Machine};
+        let dir = tempfile::tempdir().unwrap();
+        // `n` bores, each drilled, milled and bored (operation 2).
+        let bored = |n: usize| {
+            let tris: Vec<[[f32; 3]; 3]> = (0..n)
+                .flat_map(|k| {
+                    let x = 70. * k as f32;
+                    (ring_triangles(32., 60., 28.).into_iter())
+                        .map(move |t| t.map(|p| [p[0] + x, p[1], p[2]]))
+                })
+                .collect();
+            let mesh = crate::mesh::normalize(tris).unwrap();
+            let t = drill("12");
+            let mut d = drilling(&mesh, &t, "Deep drilling");
+            d.p.insert("peck".into(), "12".into());
+            d.p.insert("breakthrough".into(), "4.5".into());
+            let m = end_mill("10");
+            let mut h = drilling(&mesh, &m, HELICAL_MILLING);
+            for (k, v) in [("bore_allowance", "0.6"), ("rpm", "8000"), ("feed", "800")] {
+                h.p.insert(k.into(), v.into());
+            }
+            let b = head(BORE_RETRACTS[0]);
+            let mut o = drilling(&mesh, &b, BORING);
+            o.p.insert("hole_diameter".into(), "32".into());
+            o.p.insert("bore_cut".into(), "0.15".into());
+            let (doc, all) = job(&mesh, Machine::new(3), vec![(t, d), (m, h), (b, o)]);
+            for r in &all {
+                assert!(r.is_ok(), "{:?}", r.as_ref().err());
+            }
+            (on_uc100(doc, dir.path()), mesh)
+        };
+        let oi = 2;
+        let (doc, mesh) = bored(2);
+        let sims = simulated(&doc, &mesh, 0);
+        let steps = op_steps(&doc, 0, &sims);
+        let bore = steps.iter().find(|s| s.op == oi).unwrap();
+        let plan = &(sims.iter().find(|s| s.0 == oi).unwrap().1.as_ref())
+            .unwrap()
+            .plan;
+        let sets: Vec<usize> = (plan.stops.iter())
+            .filter(|s| s.size.is_some())
+            .map(|s| s.at)
+            .collect();
+        assert_eq!(sets.len(), 3, "{:?}", plan.stops);
+        assert_eq!(
+            (plan.holes.len(), bore.steps.len(), bore.passes()),
+            (6, 6, 3)
+        );
+        let labels: Vec<String> = (0..6).map(|s| bore.label(s)).collect();
+        let named = [
+            "Pass 1 · Hole 1",
+            "Pass 1 · Hole 2",
+            "Pass 2 · Hole 1",
+            "Pass 2 · Hole 2",
+            "Pass 3 · Hole 1",
+            "Pass 3 · Hole 2",
+        ];
+        assert_eq!(labels, named);
+        assert_eq!(bore.kind(), ("Pass", "Passes"));
+        assert_eq!(bore.count(), "3 passes · 2 holes");
+        // The run line counts passes and holes, not visits.
+        assert_eq!(bore.label_of(3), "Pass 2 of 3 · Hole 2 of 2");
+        assert_eq!(bore.labels(0..=5), "Passes 1–3");
+        assert_eq!(bore.labels(2..=3), "Pass 2");
+        assert_eq!(bore.labels(2..=5), "Passes 2–3");
+        assert_eq!(bore.labels(1..=2), "Pass 1 · Hole 2 – Pass 2 · Hole 1");
+        assert_eq!(bore.labels(0..=4), "Pass 1 · Hole 1 – Pass 3 · Hole 1");
+        // Folded in the step list, a run is split where passes start.
+        assert_eq!(bore.folds(1..=4), [1..=1, 2..=3, 4..=4]);
+        assert_eq!(bore.folds(1..=5), [1..=1, 2..=5]);
+        assert_eq!(bore.folds(0..=4), [0..=3, 4..=4]);
+        assert_eq!(
+            bore.folds(0..=5),
+            vec![0..=5; 1],
+            "whole passes are one line"
+        );
+        assert_eq!(
+            bore.folds(2..=3),
+            vec![2..=3; 1],
+            "one whole pass is one line"
+        );
+        // Each step one visit, in to the bore's top and one cut down it;
+        // hole 1 and hole 2 are the same two bores in every pass, and each
+        // pass is set before its first visit.
+        let xy = |p: [f32; 3]| [0, 1].map(|k| (p[k] * 100.).round() as i64);
+        let per = bore.steps[0].feeds;
+        let at: Vec<[i64; 2]> = (bore.steps.iter())
+            .map(|st| {
+                assert_eq!(st.feeds, per, "{st:?}");
+                let cuts: Vec<usize> = (st.moves.clone())
+                    .filter(|&i| plan.moves[i].motion == Motion::Feed)
+                    .filter(|&i| plan.moves[i].cutting_pass)
+                    .collect();
+                assert_eq!(cuts.len(), 1, "{st:?}");
+                xy(plan.moves[cuts[0]].to)
+            })
+            .collect();
+        assert_ne!(at[0], at[1]);
+        assert_eq!((&at[2..4], &at[4..6]), (&at[0..2], &at[0..2]));
+        for (p, &set) in sets.iter().enumerate() {
+            let first = &bore.steps[2 * p];
+            let feed = (first.moves.clone())
+                .find(|&i| plan.moves[i].motion == Motion::Feed)
+                .unwrap();
+            assert!(first.moves.start <= set && set <= feed, "pass {p}");
+        }
+        // Three passes of three holes: a range within a pass says its holes.
+        let mut three = bore.clone();
+        three.steps = (0..6)
+            .map(|s| Step {
+                pass: Some(s / 3),
+                ..bore.steps[0].clone()
+            })
+            .collect();
+        assert_eq!(three.labels(0..=1), "Pass 1 · Holes 1–2");
+        assert_eq!(three.labels(4..=5), "Pass 2 · Holes 2–3");
+        assert_eq!(three.labels(3..=5), "Pass 2");
+        assert_eq!(three.count(), "2 passes · 3 holes");
+        assert_eq!(three.folds(1..=4), [1..=2, 3..=4]);
+        assert_eq!(three.labels(1..=2), "Pass 1 · Holes 2–3");
+        // The program: a visit a step, done only once the head leaves it,
+        // each pause between the visit before and its pass's first.
+        let programs =
+            crate::post::checked_to_start(&doc, &mesh, 0, &sims, PostSettings::for_uc100, &[])
+                .unwrap();
+        let fed_of = |p: &Checked| -> (usize, Vec<usize>, Vec<usize>) {
+            let k = p.indexes.iter().position(|&o| o == oi).unwrap();
+            let fed = (0..p.blocks.len())
+                .filter(
+                    |&b| matches!(p.blocks[b], Block::Move { op, kind: Kind::Feed, .. } if op == k),
+                )
+                .collect();
+            let pauses = (0..p.blocks.len())
+                .filter(|&b| matches!(p.blocks[b], Block::Pause { op, .. } if op == k))
+                .collect();
+            (k, fed, pauses)
+        };
+        let p = programs.iter().find(|p| p.indexes.contains(&oi)).unwrap();
+        let (k, fed, pauses) = fed_of(p);
+        let mark_ops: Vec<Option<MarkOp>> = (p.indexes.iter())
+            .map(|&o| steps.iter().find(|s| s.op == o).map(|s| s.mark_op(&[])))
+            .collect();
+        let marks = step_marks(&p.blocks, &mark_ops);
+        // A visit's feed moves, their first block and their last.
+        let visits = |fed: &[usize]| -> Vec<(usize, usize)> {
+            assert_eq!(fed.len() % per, 0);
+            (fed.chunks(per)).map(|v| (v[0], v[per - 1])).collect()
+        };
+        let of_feed: Vec<usize> = fed.iter().map(|&b| marks[b].unwrap().1).collect();
+        let by_visit: Vec<usize> = (0..6).flat_map(|s| vec![s; per]).collect();
+        assert_eq!(of_feed, by_visit);
+        let v = visits(&fed);
+        assert_eq!(pauses.len(), 3);
+        assert!(pauses[0] < v[0].0);
+        for q in 1..3 {
+            assert!(
+                v[2 * q - 1].1 < pauses[q] && pauses[q] < v[2 * q].0,
+                "pass {q}"
+            );
+        }
+        for (b, m) in marks.iter().enumerate() {
+            let Some((o, s, true)) = *m else { continue };
+            if o != k {
+                continue;
+            }
+            if let Some(&next) = fed.iter().find(|&&f| f > b) {
+                assert_eq!(
+                    marks[next].unwrap().1,
+                    s + 1,
+                    "block {b} said visit {s} done"
+                );
+            }
+        }
+        // The tablet file names them the same.
+        let tablet = tablet_runs(&doc, Ok(&mesh), 0);
+        assert!(tablet.problems.is_empty(), "{:?}", tablet.problems);
+        let said: Vec<&str> = (tablet.tool_runs.iter())
+            .flat_map(|r| &r.steps)
+            .filter(|t| t.operation == oi)
+            .map(|t| t.label.as_str())
+            .collect();
+        assert_eq!(said, named);
+        // Started at "Pass 2 · Hole 2": that visit and the third pass, set
+        // once, before it.
+        let (started, _) = check_steps(&doc, &mesh, 0, &[], &[(oi, vec![0, 1, 2])]);
+        let started = started.unwrap();
+        let p = started.iter().find(|p| p.indexes.contains(&oi)).unwrap();
+        let (_, fed, pauses) = fed_of(p);
+        let v = visits(&fed);
+        assert_eq!((v.len(), pauses.len()), (3, 1));
+        assert!(v[0].1 < pauses[0] && pauses[0] < v[1].0);
+        let Block::Pause { message, .. } = &p.blocks[pauses[0]] else {
+            unreachable!()
+        };
+        assert!(message.contains("pass 3 of 3"), "{message}");
+        // "Pass 2 · Hole 1" skipped alone: the head is still set for the
+        // first pass after "Pass 1 · Hole 2", so the program still pauses to
+        // set it for the second, before "Pass 2 · Hole 2", the spindle
+        // stopped.
+        let (skipping, _) = check_steps(&doc, &mesh, 0, &[], &[(oi, vec![2])]);
+        let skipping = skipping.unwrap();
+        let p = skipping.iter().find(|p| p.indexes.contains(&oi)).unwrap();
+        let (_, fed, pauses) = fed_of(p);
+        let v = visits(&fed);
+        assert_eq!((v.len(), pauses.len()), (5, 3));
+        assert!(v[1].1 < pauses[1] && pauses[1] < v[2].0);
+        let said = |b: usize| match &p.blocks[b] {
+            Block::Pause { message, .. } => message.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            said(pauses[1]).contains("pass 2 of 3"),
+            "{}",
+            said(pauses[1])
+        );
+        assert!(
+            said(pauses[2]).contains("pass 3 of 3"),
+            "{}",
+            said(pauses[2])
+        );
+        let actions = lower(p, 0, [100., 100., -100., 0., 0., 0.], [0.; 6]).unwrap();
+        let mut on = false;
+        let mut paused = 0;
+        for l in &actions {
+            match &l.action {
+                uc100::gcode::Action::Spindle { state, .. } => {
+                    on = *state != uc100::gcode::Spindle::Off
+                }
+                uc100::gcode::Action::Pause { reason } => {
+                    assert!(!on, "paused with the spindle on: {reason}");
+                    paused += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(paused, 3);
+        // One bore: a step is a pass.
+        let (doc, mesh) = bored(1);
+        let sims = simulated(&doc, &mesh, 0);
+        let one = (op_steps(&doc, 0, &sims).into_iter())
+            .find(|s| s.op == oi)
+            .unwrap();
+        let labels: Vec<String> = (0..one.steps.len()).map(|s| one.label(s)).collect();
+        assert_eq!(labels, ["Pass 1", "Pass 2", "Pass 3"]);
+        assert_eq!(one.count(), "3 passes");
+        assert_eq!(one.label_of(1), "Pass 2 of 3");
+        assert_eq!(one.labels(1..=2), "Passes 2–3");
     }
 
     /// A helical-milled bore is one step, all its rings (LIO-555): the
@@ -6587,6 +7723,7 @@ pub(crate) mod tests {
                 z: Some(5.),
                 seconds: 1.,
                 feeds: 1,
+                pass: None,
             };
             Left {
                 steps: vec![OpSteps {

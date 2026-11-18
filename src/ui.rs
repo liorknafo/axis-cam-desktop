@@ -9158,13 +9158,22 @@ fn chip<'a>(label: &str, background: Color) -> Element<'a, Message> {
         })
         .into()
 }
+/// What the MACHINE bar's state pill says while the Pi refuses this
+/// computer: the banner over the Control page says why (LIO-561).
+pub(crate) const PILL_REFUSED: &str = "Refused";
+
 /// The machine's state on the MACHINE bar, a fixed width so that nothing
-/// beside it moves as it changes; "Tool change" while one is due.
+/// beside it moves as it changes; "Tool change" while one is due,
+/// "Refused" while the Pi refuses this computer.
 fn state_pill<'a>(c: &crate::control::Connection) -> Element<'a, Message> {
     use uc100::controller::State;
     let state = c.snapshot.state.as_ref();
     let tool_change = phase(Some(c)) == Phase::ToolChange && state == Some(&State::Idle);
     let (label, background) = match state {
+        // Turned away, not connecting: it won't get in until the Pi or this
+        // app is changed. In the banner's colour, which says why; over a
+        // state last known before the refusal (LIO-561).
+        _ if c.pi_refused().is_some() => (PILL_REFUSED, WARN),
         _ if tool_change => ("Tool change", Color::from_rgb8(209, 139, 22)),
         None => ("Connecting…", Color::from_rgb8(106, 118, 134)),
         Some(State::Idle) => ("Idle", Color::from_rgb8(47, 138, 87)),
@@ -9272,7 +9281,9 @@ fn machine_bar(app: &App) -> Element<'_, Message> {
             bar = bar.push(chip("SIMULATED", Color::from_rgb8(194, 122, 18)));
         }
         bar = bar.push(state_pill(c));
-        if c.snapshot.state == Some(State::EStop) {
+        // Not while the Pi refuses this computer: the E-stop is only the
+        // state last known, and a Reset would not be sent (LIO-561).
+        if c.snapshot.state == Some(State::EStop) && c.pi_refused().is_none() {
             bar = bar.push(primary("Reset", Message::MachineReset));
         }
         bar = bar.push(estop());
@@ -9808,6 +9819,16 @@ pub(crate) fn run_line(
     let s = &c.snapshot;
     let state = s.state.as_ref();
     let plain = |t: &str| vec![(t.to_string(), INK)];
+    // Refused, this computer can start nothing (a tool run the Pi took
+    // before goes on there), and a state known from before is not the
+    // machine's now: not "E-stop: press Reset", with no Reset to press
+    // (LIO-561). As the run's problems say it (LIO-519).
+    if let Some(why) = c.pi_refused() {
+        return (
+            vec![(format!("The Pi refused this computer: {why}"), AMBER)],
+            vec![],
+        );
+    }
     if state == Some(&State::EStop) {
         let why = s
             .estop_reason
@@ -9854,32 +9875,40 @@ pub(crate) fn run_line(
         let blocks = run.running_blocks().map_or(1, <[_]>::len);
         // The step being cut, of how many, when the operation has steps.
         let step = (run.step_at(s.current_line))
-            .and_then(|(oi, n, _)| Some((oi, n, run.op_steps(oi)?.steps.len())))
-            .filter(|t| t.2 > 1)
-            .map_or(String::new(), |(oi, n, count)| {
-                format!(" · {} of {count}", run.step_label(oi, n))
+            .and_then(|(oi, n, _)| Some((n, run.op_steps(oi)?)))
+            .filter(|(_, os)| os.steps.len() > 1)
+            .map_or(String::new(), |(n, os)| {
+                format!(" · {}", os.label_of(n).to_lowercase())
             });
+        // Compact, the line is cut short: the step comes first, "pass 1 of
+        // 3 · hole 2 of 2" whole, then where the job is (LIO-558).
+        let (first, within) = match Fit::of(app).narrow {
+            true => (step, String::new()),
+            false => (String::new(), step),
+        };
         let mut parts = vec![
             ("Cutting ".into(), INK),
             (p.ops[op].name.clone(), INK),
-            (
-                // Where the job is, as the Steps page says it (LIO-431).
-                format!(
-                    " · Setup {} of {} · operation {} of {}{step} · tool run {} of {} · block {} of {blocks}",
-                    run.setup + 1,
-                    app.doc.setups.len(),
-                    op + 1,
-                    p.ops.len(),
-                    i + 1,
-                    programs.len(),
-                    block + 1
-                ),
-                MUTED,
-            ),
+            (first, MUTED),
         ];
         if run.stop_after {
-            parts.insert(2, (" · stops after this step".into(), AMBER));
+            parts.push((" · stops after this step".into(), AMBER));
         }
+        parts.push((
+            // Where the job is, as the Steps page says it (LIO-431).
+            format!(
+                " · Setup {} of {} · operation {} of {}{within} · tool run {} of {} · block {} of {blocks}",
+                run.setup + 1,
+                app.doc.setups.len(),
+                op + 1,
+                p.ops.len(),
+                i + 1,
+                programs.len(),
+                block + 1
+            ),
+            MUTED,
+        ));
+        parts.retain(|(t, _)| !t.is_empty());
         return (parts, vec![]);
     }
     let mut problems = run.problems(c, &app.doc);
@@ -10004,7 +10033,9 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
             widget::tooltip::Position::Bottom,
         )
     };
-    let line: Element<_> = if c.probe_moving() {
+    // Not over a refusal: a probe move known from before is not the
+    // machine's now, and Stop now cannot reach it (LIO-561).
+    let line: Element<_> = if c.probe_moving() && c.pi_refused().is_none() {
         text(PROBE_HOLD)
             .size(13)
             .color(WARN)
@@ -10095,7 +10126,11 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
         .push(after)
         .push(big(
             "Stop now",
-            msg(crate::run::busy(state) && !c.pi_down(), R::Stop),
+            // And while a Cycle Start waits for the machine: it cancels it.
+            msg(
+                (crate::run::busy(state) || c.press_waits()) && !c.pi_down(),
+                R::Stop,
+            ),
         ));
     container(
         row![picker, what, buttons]
@@ -12381,7 +12416,35 @@ fn step_list<'a>(
     };
     let mut col = column![].spacing(2);
     let lh = step_line(fit) - 2.;
-    for r in step_lines(os.steps.len(), &keep, shown.lines) {
+    // A folded run of a Boring's visits split where its passes start
+    // (`OpSteps::folds`).
+    let lines: Vec<std::ops::RangeInclusive<usize>> =
+        (step_lines(os.steps.len(), &keep, shown.lines).into_iter())
+            .flat_map(|r| {
+                if r.start() == r.end() {
+                    vec![r]
+                } else {
+                    os.folds(r)
+                }
+            })
+            .collect();
+    let label_of = |r: &std::ops::RangeInclusive<usize>| {
+        if r.start() == r.end() {
+            os.label(*r.start())
+        } else {
+            os.labels(r.clone())
+        }
+    };
+    // The labels' column, as wide as the widest of them ("Pass 12 · Holes
+    // 3–9"), estimated from the characters, wide side, up to what leaves
+    // the steps' state beside them room; never less than a level's.
+    let base = if fit.narrow { 74. } else { 84. };
+    let widest = (lines.iter())
+        .map(|r| label_of(r).chars().count())
+        .max()
+        .unwrap_or(0);
+    let label_width = (widest as f32 * 5.4).clamp(base, base + 46.);
+    for r in lines {
         let first = *r.start();
         let one = r.start() == r.end();
         let stage = stages[first];
@@ -12424,11 +12487,7 @@ fn step_list<'a>(
         } else {
             space().width(13).into()
         };
-        let label = if one {
-            os.label(first)
-        } else {
-            os.labels(r.clone())
-        };
+        let label = label_of(&r);
         let font = Font {
             style: if one {
                 iced::font::Style::Normal
@@ -12445,12 +12504,16 @@ fn step_list<'a>(
         let ink = if one { INK } else { MUTED };
         let face = row![
             mark,
-            text(label)
-                .size(11)
-                .font(font)
-                .color(ink)
-                .width(if fit.narrow { 74 } else { 84 })
-                .wrapping(Wrapping::None),
+            // Clipped, never over the state beside it.
+            container(
+                text(label)
+                    .size(11)
+                    .font(font)
+                    .color(ink)
+                    .wrapping(Wrapping::None)
+            )
+            .width(label_width)
+            .clip(true),
             container(
                 text(detail)
                     .size(11)
@@ -12547,26 +12610,41 @@ fn step_list<'a>(
                 .then_some(Message::Run(R::StartStep)),
             false,
         );
+        let (picked_label, time) = (os.labels(p.clone()), format!("· {}", clock(seconds(&p))));
+        // The hint only beside a label it leaves room for, as a Boring's
+        // "Pass 1 · Hole 2 – Pass 3 · Hole 1" may not: the box is the
+        // Operations column less 86 px, widths estimated wide side.
+        let hint = "Shift-click picks a range";
+        let hinted = !fit.narrow
+            && picked_label.chars().count() as f32 * 6.4
+                + time.chars().count() as f32 * 5.6
+                + hint.chars().count() as f32 * 4.8
+                + 8.
+                <= fit.program() - 86.;
         let mut head = row![
-            bold(os.labels(p.clone()), 12),
-            muted(format!("· {}", clock(seconds(&p)))).size(11),
+            bold(picked_label, 12),
+            muted(time).size(11),
             space().width(Fill),
         ]
         .spacing(4)
         .align_y(Alignment::Center);
-        if !fit.narrow {
-            head = head.push(muted("Shift-click picks a range").size(10));
+        if hinted {
+            head = head.push(muted(hint).size(10));
         }
         out = out.push(
             container(
                 column![
                     head,
+                    // On two lines when "Start at pass 12 · hole 10" leaves
+                    // no room for Clear.
                     row![
                         skip,
                         start,
                         small("Clear", Some(Message::Run(R::ClearSteps)), false)
                     ]
                     .spacing(6)
+                    .wrap()
+                    .vertical_spacing(6)
                 ]
                 .spacing(5),
             )
@@ -12873,10 +12951,8 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
                     let steps = run.op_steps(oi).filter(|s| s.steps.len() > 1);
                     let unfolded = steps.is_some() && run.open == Some(oi);
                     let toggle = steps.map(|s| {
-                        let n = s.steps.len();
-                        let what = s.kind().1.to_lowercase();
                         let m = Message::Run(R::Steps((!unfolded).then_some(oi)));
-                        (unfolded, m, format!("{n} {what}"))
+                        (unfolded, m, s.count())
                     });
                     let op_time = times[i].as_ref().and_then(|t| t.get(k).copied());
                     list = list.push(op_row(
@@ -13032,10 +13108,7 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
         } else {
             "the stock top"
         };
-        let spot = match crate::control::probe_spot(c.orient, refs).as_str() {
-            "its centre" => "the centre".to_string(),
-            spot => spot.to_string(),
-        };
+        let spot = crate::control::touch_spot(c.orient, refs);
         steps.push(format!(
             "3. Jog the tool tip over {spot} of the stock top, then down in 0.1 mm and 0.01 mm steps until it just pinches a sheet of paper on {on}."
         ));
@@ -13047,10 +13120,7 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     } else {
         match (c.touch_off(), crate::post::references(&p.origin)) {
             (Some((_, work)), Some(refs)) => {
-                let spot = match crate::control::probe_spot(c.orient, refs).as_str() {
-                    "its centre" => "the centre".to_string(),
-                    spot => spot.to_string(),
-                };
+                let spot = crate::control::touch_spot(c.orient, refs);
                 steps.push(format!("3. Jog the tool tip over {spot} of the stock top, then down in 0.1 mm and 0.01 mm steps until it just pinches a sheet of paper on the stock top."));
                 let zero = match crate::post::stock_zero(&p.origin) {
                     None => " on Model origin".to_string(),

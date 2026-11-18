@@ -2362,6 +2362,21 @@ flood = { pin = 8 }
         let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
     }
 
+    /// Cycle Start, then ticks until the press is over: it waits for the
+    /// machine to show what was sent before it (LIO-562).
+    fn cycle_start(a: &mut App) {
+        let _ = a.update(Message::Run(crate::run::Action::CycleStart));
+        let mut deadline = Deadline::new(2. * crate::control::PRESS_WAIT.as_secs_f64());
+        while conn(a).press_waits() {
+            assert!(
+                deadline.within(&conn(a).snapshot),
+                "Cycle Start still waits"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let _ = a.update(Message::Tick);
+        }
+    }
+
     fn run_of(a: &App) -> &crate::run::Run {
         conn(a).run.as_ref().expect("a setup to run")
     }
@@ -3660,10 +3675,25 @@ flood = { pin = 8 }
     /// command pressed say it was refused, not connecting or not answering;
     /// nothing is sent. Paired again, the Pi lets it in at its next try and
     /// the status line says "Connected to <machine>: <state>", the refusal
-    /// gone (LIO-519).
+    /// gone (LIO-519). The MACHINE bar's state pill says "Refused" while
+    /// refused, also over a state known before, never "Connecting…"; for
+    /// an E-stop last known, no Reset beside it and the run bar says the
+    /// refusal, not to press Reset (LIO-561).
     #[test]
     fn a_refusing_pi_is_said_on_the_status_line_until_it_lets_this_computer_in() {
         use crate::control::{Action as A, NOT_SENT_PI_REFUSED};
+        use crate::ui::PILL_REFUSED;
+        // The pill's word: the one of the two on the page.
+        let pill = |a: &App| {
+            let texts = page_texts(a);
+            let has = |w: &str| texts.iter().any(|t| t == w);
+            match (has(PILL_REFUSED), has("Connecting…")) {
+                (true, false) => PILL_REFUSED,
+                (false, true) => "Connecting…",
+                (false, false) => "",
+                _ => panic!("{texts:?}"),
+            }
+        };
         let dir = tempfile::tempdir().unwrap();
         let (mut a, server) = pi_app(dir.path());
         a.page = Page::Control;
@@ -3691,6 +3721,8 @@ flood = { pin = 8 }
         let _ = a.update(Message::Tick);
         let why = conn(&a).pi_refused().unwrap().to_string();
         assert!(why.contains("not paired"), "{why}");
+        assert!(conn(&a).snapshot.state.is_none());
+        assert_eq!(pill(&a), PILL_REFUSED);
         assert_eq!(
             a.status,
             format!("The Pi of {name} refused this computer: {why}")
@@ -3712,8 +3744,15 @@ flood = { pin = 8 }
                 "{}",
                 a.status
             );
+            assert_eq!(pill(&a), PILL_REFUSED);
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
+        // The Pi's note is the refusal while refused.
+        let note = conn(&a).pi_note.clone();
+        assert!(
+            note.as_deref() == Some(why.as_str()) || note.as_deref() == Some(NOT_SENT_PI_REFUSED),
+            "{note:?}"
+        );
         // Paired again: let in at the next try, within 5 s, the Pi's state
         // not known yet: connecting, the refusal gone.
         std::fs::rename(&kept, &clients).unwrap();
@@ -3727,8 +3766,15 @@ flood = { pin = 8 }
         }
         let _ = a.update(Message::Tick);
         assert!(conn(&a).snapshot.state.is_none() && conn(&a).pi_down());
+        // Nor is the refusal left as the Pi's note (LIO-561).
+        let note = conn(&a).pi_note.clone();
+        assert!(
+            note.as_deref() != Some(why.as_str()) && note.as_deref() != Some(NOT_SENT_PI_REFUSED),
+            "{note:?}"
+        );
         assert_eq!(a.status, format!("Connecting to {name}…"));
         assert_eq!(problems(&a), vec![crate::run::PI_CONNECTING.to_string()]);
+        assert_eq!(pill(&a), "Connecting…");
         // Through the client's silence time and its reconnect: still so.
         let end = std::time::Instant::now() + std::time::Duration::from_secs(4);
         while std::time::Instant::now() < end {
@@ -3746,6 +3792,12 @@ flood = { pin = 8 }
         );
         let p = problems(&a);
         assert!(!p.iter().any(|t| t.contains("refused")), "{p:?}");
+        assert_eq!(pill(&a), "");
+        // The simulated UC100 starts in E-stop: the bar offers Reset and
+        // the run bar says to press it.
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| t == "Reset"), "{texts:?}");
+        assert!(texts.iter().any(|t| t.starts_with("E-stop:")), "{texts:?}");
         // Live and then cut: a lost link, as before.
         gate.set_cut(true);
         pi_live(&mut a, false, "the link lost");
@@ -3755,6 +3807,124 @@ flood = { pin = 8 }
             "{}",
             a.status
         );
+        assert_eq!(pill(&a), "");
+        // Forgotten while the link was down: refused at its next try, the
+        // Pi's state known from before. The pill says refused, not that
+        // state (LIO-561).
+        std::fs::rename(&clients, &kept).unwrap();
+        gate.set_cut(false);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        while conn(&a).pi_refused().is_none() {
+            let _ = a.update(Message::Tick);
+            assert!(std::time::Instant::now() < end, "never refused again");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = a.update(Message::Tick);
+        assert_eq!(
+            conn(&a).snapshot.state,
+            Some(uc100::controller::State::EStop)
+        );
+        assert_eq!(pill(&a), PILL_REFUSED);
+        // Nor the E-stop's Reset beside it: it would not be sent; and the
+        // run bar says the refusal, not "E-stop: press Reset".
+        let texts = page_texts(&a);
+        assert!(!texts.iter().any(|t| t == "Reset"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.starts_with("E-stop:")), "{texts:?}");
+        let (line, _) = crate::ui::run_line(&a, conn(&a));
+        let why = conn(&a).pi_refused().unwrap().to_string();
+        assert_eq!(line[0].0, format!("The Pi refused this computer: {why}"));
+        // A probe move known from before: neither the run bar nor Space
+        // says "Stop now aborts it", which cannot reach the machine.
+        let status = a.status.clone();
+        if let Some(c) = a.control.as_mut() {
+            c.snapshot.state = Some(uc100::controller::State::Run);
+            c.snapshot.program_name = Some("Probe".into());
+        }
+        assert!(conn(&a).probe_moving() && conn(&a).pi_refused().is_some());
+        let texts = page_texts(&a);
+        assert!(
+            !texts.iter().any(|t| t == crate::ui::PROBE_HOLD),
+            "{texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|t| t.starts_with("The Pi refused this computer: ")),
+            "{texts:?}"
+        );
+        let _ = a.update(Message::HoldKey);
+        assert_eq!(a.status, status);
+    }
+
+    /// Renders the Control page while the Pi refuses this computer: first
+    /// refused (the Pi's state never known), and refused again after a live
+    /// link (its state known from before), to `$AXIS_RENDER_DIR` (default
+    /// /tmp/pi-refused), at 1440 × 900 and 1120 × 690 (LIO-561). Not a
+    /// check: run it with --ignored.
+    #[test]
+    #[ignore]
+    fn render_the_pi_refusing_this_computer() {
+        use crate::ui::ControlTab as T;
+        let out = std::path::PathBuf::from(
+            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/pi-refused".into()),
+        );
+        let shot = |a: &mut App, name: &str| {
+            let _ = a.update(Message::Tick);
+            for (w, h) in [(1440., 900.), (1120., 690.)] {
+                let size = iced::Size::new(w, h);
+                let _ = a.update(Message::Resized(size));
+                let dir = out.join(format!("{w}x{h}"));
+                std::fs::create_dir_all(&dir).unwrap();
+                render_png(a, size, &dir.join(format!("{name}.png")));
+            }
+        };
+        let refused = |a: &mut App| {
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(12);
+            while conn(a).pi_refused().is_none() {
+                let _ = a.update(Message::Tick);
+                assert!(std::time::Instant::now() < end, "never refused");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(T::Machine));
+        let gate = Gate::to(server.addr(), false);
+        let _ = a.update(Message::PiAddress(gate.addr.to_string()));
+        let clients = uc100_remote::data::Data {
+            dir: dir.path().join("pi"),
+        }
+        .clients_file();
+        let kept = dir.path().join("clients-kept.toml");
+        std::fs::rename(&clients, &kept).unwrap();
+        let _ = a.update(Message::Connect);
+        refused(&mut a);
+        shot(&mut a, "1-refused");
+        // Let in and live, in E-stop with Reset beside it; then forgotten
+        // and the link cut and back. Then the same in Idle.
+        let again = |a: &mut App, name: &str| {
+            std::fs::rename(&kept, &clients).unwrap();
+            gate.set_open(true);
+            pi_live(a, true, "the link live");
+            shot(a, &format!("{name}-connected"));
+            gate.set_cut(true);
+            pi_live(a, false, "the link lost");
+            std::fs::rename(&clients, &kept).unwrap();
+            gate.set_cut(false);
+            refused(a);
+            shot(a, &format!("{name}-refused-after-live"));
+        };
+        again(&mut a, "2-estop");
+        // Let in at its next try (within 5 s), Idle after a Reset.
+        std::fs::rename(&kept, &clients).unwrap();
+        pi_live(&mut a, true, "the link live again");
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(uc100::controller::State::Idle)
+        });
+        std::fs::rename(&clients, &kept).unwrap();
+        again(&mut a, "3-idle");
     }
 
     /// Renders the Control page's Machine tab while connecting to the Pi
@@ -4788,7 +4958,17 @@ flood = { pin = 8 }
                 },
             }]),
         };
-        assert!(other.send_tool_run(99, job, vec![], None));
+        // Made from a snapshot that shows all it sent (LIO-562).
+        let mut deadline = Deadline::new(5.);
+        let made_from = loop {
+            let (snapshot, ack) = other.acked();
+            if let Some(a) = ack.filter(|a| a.applied >= a.sent) {
+                break a.seq;
+            }
+            assert!(deadline.within(&snapshot), "the other's ack");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(other.send_tool_run(99, job, vec![], None, made_from));
         let mut deadline = Deadline::new(10.);
         while !other.link().tool_run_ends.iter().any(|e| e.id == 99) {
             assert!(deadline.within(&other.snapshot()), "the other's end");
@@ -4856,7 +5036,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
         a.control.as_mut().unwrap().lose_next_job = true;
-        let _ = a.update(Message::Run(R::CycleStart));
+        cycle_start(&mut a);
         assert!(run_of(&a).running.is_some());
         let started = std::time::Instant::now();
         run_until(&mut a, 10.0, "the lost tool run put back", |r| {
@@ -4885,7 +5065,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
         a.control.as_mut().unwrap().lose_next_job = true;
-        let _ = a.update(Message::Run(R::CycleStart));
+        cycle_start(&mut a);
         assert!(run_of(&a).running.is_some());
         let _ = a.update(Message::Disconnect);
         assert!(a.pi_run.is_some());
@@ -4902,6 +5082,419 @@ flood = { pin = 8 }
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
         let _ = a.update(Message::Run(R::CycleStart));
         run_until(&mut a, 60.0, "tool run 1", |r| r.done[0]);
+    }
+
+    /// LIO-562: X set to 7 here (as Zero, Set Z or a probe sets the work
+    /// offset) and Cycle Start pressed at once, before a snapshot shows it.
+    /// The press waits for one that does, saying so, and the tool run is
+    /// made from the new work offset, the one the machine has.
+    fn cycle_start_after_set_work(a: &mut App, waits: &str) {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(a, 0);
+        assert!(problems(a).is_empty(), "{:?}", problems(a));
+        let before = conn(a).snapshot.work_offset;
+        conn(a).send(Command::SetWork { axis: 0, value: 7. });
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(a).press_waits() && run_of(a).running.is_none());
+        assert_eq!(problems(a), [waits]);
+        cycle_start(a);
+        let offset = run_of(a).running.as_ref().expect("started").offset;
+        assert!(
+            (offset[0] - (before[0] - 7.)).abs() < 1e-9,
+            "{offset:?} {before:?}"
+        );
+        assert_eq!(offset, conn(a).snapshot.work_offset);
+        tick_until(a, 5.0, "the tool run", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+    }
+
+    #[test]
+    fn cycle_start_on_the_pi_waits_for_the_pi_to_apply_a_new_work_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _server) = pi_app(dir.path());
+        zeroed(&mut a);
+        cycle_start_after_set_work(&mut a, crate::run::PI_APPLYING);
+    }
+
+    #[test]
+    fn cycle_start_here_waits_for_the_controller_to_take_a_new_work_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        cycle_start_after_set_work(&mut a, crate::run::CONTROLLER_TAKING);
+    }
+
+    /// LIO-562: Set machine zero declares the axes one at a time; until the
+    /// last is in, Cycle Start waits, so no tool run is made from a machine
+    /// position about to change (starting one would drop the rest).
+    #[test]
+    fn cycle_start_waits_while_machine_zero_declares_the_axes() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Machine(crate::control::Action::MachineZero(None)));
+        assert!(conn(&a).declaring_machine());
+        assert!(
+            problems(&a).iter().any(|p| p == crate::run::DECLARING),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(!conn(&a).press_waits() && run_of(&a).running.is_none());
+        let mut deadline = Deadline::new(10.);
+        while conn(&a).declaring_machine() {
+            assert!(deadline.within(&conn(&a).snapshot), "still declaring");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            let _ = a.update(Message::Tick);
+        }
+        assert!(run_of(&a).running.is_none());
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+    }
+
+    /// LIO-562: a waiting press never starts after something else was sent,
+    /// after `PRESS_WAIT`, or for another run (the setup picked or checked
+    /// again); it says why, nothing moved, and Cycle Start can be pressed
+    /// again.
+    #[test]
+    fn a_waiting_cycle_start_is_dropped_by_a_later_send_or_after_its_wait() {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let set = |a: &App, value| {
+            conn(a).send(Command::SetWork { axis: 0, value });
+        };
+        let dropped = |a: &mut App, why: &str| {
+            assert!(!conn(a).press_waits() && run_of(a).running.is_none());
+            let (ok, message) = run_of(a).outcome.clone().unwrap();
+            assert!(!ok && message.contains(why), "{message}");
+            assert!(message.contains("The tool run was not sent"), "{message}");
+            let s = server.snapshot().unwrap();
+            assert_eq!((s.state, s.program_name), (Some(State::Idle), None));
+            tick_for(a, 100);
+            assert!(problems(a).is_empty(), "{:?}", problems(a));
+        };
+        // Sent after the press.
+        set(&a, 7.);
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(&a).press_waits());
+        set(&a, 8.);
+        cycle_start(&mut a);
+        dropped(
+            &mut a,
+            "something was sent to the machine after it was pressed",
+        );
+        // Never applied in time: checked with no snapshot since the press.
+        set(&a, 9.);
+        let _ = a.update(Message::Run(R::CycleStart));
+        let c = a.control.as_mut().unwrap();
+        c.age_press(crate::control::PRESS_WAIT + std::time::Duration::from_secs(1));
+        c.cycle_pending(&a.doc);
+        dropped(
+            &mut a,
+            "the Pi had not applied what this computer sent before it within 5 s",
+        );
+        // Expired, though the Pi has applied it by the next tick: still
+        // dropped, never a start late.
+        set(&a, 9.5);
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(&a).press_waits());
+        pi_until(&server, 5.0, "the Set work", |s| {
+            (s.work_pos[0] - 9.5).abs() < 1e-9
+        });
+        let c = a.control.as_mut().unwrap();
+        c.age_press(crate::control::PRESS_WAIT + std::time::Duration::from_secs(1));
+        let _ = a.update(Message::Tick);
+        dropped(&mut a, "within 5 s");
+        // The setup picked again, or checked again, and its check answered
+        // before the next tick: another run, so not started.
+        for again in [R::Setup(0), R::Check] {
+            set(&a, 11.);
+            let _ = a.update(Message::Run(R::CycleStart));
+            assert!(conn(&a).press_waits());
+            let _ = a.update(Message::Run(again));
+            answer_skips(&mut a, 0);
+            cycle_start(&mut a);
+            dropped(
+                &mut a,
+                "the setup was picked or checked again while it waited",
+            );
+        }
+        // Another Run action meanwhile.
+        set(&a, 10.);
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(&a).press_waits());
+        let _ = a.update(Message::Run(R::ClearSteps));
+        dropped(&mut a, "the run was changed while it waited");
+        // And it starts when pressed again.
+        cycle_start(&mut a);
+        let offset = run_of(&a).running.as_ref().expect("started").offset;
+        assert_eq!(offset, conn(&a).snapshot.work_offset);
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+    }
+
+    /// LIO-562: Stop (the button, enabled while a press waits, or MCP's
+    /// stop), Hold and the Space key cancel a Cycle Start waiting for the
+    /// machine, with the machine Idle: nothing starts after it (sol rounds
+    /// 2 and 3).
+    #[test]
+    fn stop_hold_and_space_cancel_a_waiting_cycle_start() {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        tick_for(&mut a, 100);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let before = server.snapshot().unwrap().machine_pos;
+        let cases = [
+            (Message::Run(R::Stop), "Stop cancelled"),
+            (Message::Run(R::Hold), "Hold cancelled"),
+            (Message::HoldKey, "Hold (Space) cancelled"),
+        ];
+        for (k, (cancel, said)) in cases.into_iter().enumerate() {
+            conn(&a).send(Command::SetWork {
+                axis: 0,
+                value: 7. + k as f64,
+            });
+            let _ = a.update(Message::Run(R::CycleStart));
+            assert!(conn(&a).press_waits(), "{said}");
+            let _ = a.update(cancel);
+            assert!(
+                !conn(&a).press_waits() && run_of(&a).running.is_none(),
+                "{said}"
+            );
+            let (ok, message) = run_of(&a).outcome.clone().unwrap();
+            assert!(!ok && message.starts_with(said), "{message}");
+            tick_for(&mut a, 300);
+            assert!(run_of(&a).running.is_none(), "{said}");
+            let s = server.snapshot().unwrap();
+            assert_eq!(
+                (s.state, s.program_name),
+                (Some(State::Idle), None),
+                "{said}"
+            );
+            assert_eq!(s.machine_pos, before, "{said}");
+        }
+    }
+
+    /// LIO-562: a jog key cancels a waiting Cycle Start at once, on the Pi
+    /// and here: the key jogs only once the focus check answers, and a tick
+    /// before that answer must not start the tool run (sol round 4).
+    #[test]
+    fn a_jog_key_cancels_a_waiting_cycle_start_before_its_focus_check() {
+        use crate::run::Action as R;
+        use uc100::controller::Command;
+        for pi in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut a, _server) = if pi {
+                let (a, server) = pi_app(dir.path());
+                (a, Some(server))
+            } else {
+                (run_app(dir.path()), None)
+            };
+            zeroed(&mut a);
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(&mut a, 0);
+            tick_for(&mut a, 100);
+            assert!(a.jog_pad_shown());
+            conn(&a).send(Command::SetWork { axis: 0, value: 7. });
+            let _ = a.update(Message::Run(R::CycleStart));
+            assert!(conn(&a).press_waits(), "pi {pi}");
+            // The focus check's answer has not come; ticks do.
+            let _ = a.update(Message::JogKey(0, false, false));
+            assert!(!conn(&a).press_waits(), "pi {pi}");
+            let (ok, message) = run_of(&a).outcome.clone().unwrap();
+            assert!(
+                !ok && message.starts_with("A jog key cancelled Cycle Start"),
+                "{message}"
+            );
+            tick_for(&mut a, 300);
+            assert!(run_of(&a).running.is_none(), "pi {pi}");
+            let _ = a.update(Message::JogKeyUp);
+        }
+    }
+
+    /// LIO-562: Stop now, enabled while a Cycle Start waits, also stops a
+    /// jog sent just before it that the snapshot does not show yet (the
+    /// Pi's snapshots held back a moment): the driver takes Stop while
+    /// Idle as nothing, so it goes whatever the snapshot says (astra
+    /// round 1).
+    #[test]
+    fn stop_during_the_wait_stops_a_jog_not_shown_yet() {
+        use crate::control::Action as C;
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        let gate = Gate::to(server.addr(), false);
+        gate.set_open(true);
+        let _ = a.update(Message::PiAddress(gate.addr.to_string()));
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        tick_for(&mut a, 100);
+        let x0 = server.snapshot().unwrap().machine_pos[0];
+        // Snapshots held back, well inside the link's live window.
+        gate.set_open(false);
+        let _ = a.update(Message::Machine(C::JogStep(Some(100.))));
+        let _ = a.update(Message::Machine(C::JogSpeed(1.)));
+        let _ = a.update(Message::Machine(C::JogPress(0, false)));
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(&a).press_waits());
+        pi_until(&server, 1., "the jog on the Pi", |s| {
+            s.state != Some(State::Idle)
+        });
+        assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+        let clicks = crate::ui::probe::clicks(
+            crate::ui::run_bar(&a, conn(&a)),
+            iced::Size::new(1440., 200.),
+        );
+        let stop = (clicks.into_iter())
+            .find(|m| matches!(m, Message::Run(R::Stop)))
+            .expect("Stop now enabled while Cycle Start waits");
+        let _ = a.update(stop);
+        assert!(!conn(&a).press_waits() && run_of(&a).running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.starts_with("Stop cancelled Cycle Start"),
+            "{message}"
+        );
+        assert!(message.contains("the tool run was not sent"), "{message}");
+        // Stopped at once, far short of the 100 mm step.
+        pi_until(&server, 0.5, "the jog stopped", |s| {
+            s.state == Some(State::Idle)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let s = server.snapshot().unwrap();
+        assert_eq!(s.state, Some(State::Idle));
+        assert!(
+            (s.machine_pos[0] - x0).abs() < 10.,
+            "{} from {x0}",
+            s.machine_pos[0]
+        );
+        gate.set_open(true);
+        tick_for(&mut a, 300);
+        assert!(run_of(&a).running.is_none());
+    }
+
+    /// LIO-562: Space cancels a waiting Cycle Start on USB too.
+    #[test]
+    fn space_cancels_a_waiting_cycle_start_here() {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        tick_for(&mut a, 100);
+        let before = conn(&a).snapshot.machine_pos;
+        conn(&a).send(Command::SetWork { axis: 0, value: 7. });
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(&a).press_waits());
+        let _ = a.update(Message::HoldKey);
+        assert!(!conn(&a).press_waits());
+        tick_for(&mut a, 300);
+        assert!(run_of(&a).running.is_none());
+        let s = &conn(&a).snapshot;
+        assert_eq!(
+            (s.state.clone(), s.machine_pos),
+            (Some(State::Idle), before)
+        );
+    }
+
+    /// LIO-562: the link's `sent` falls for a message dropped on its way,
+    /// so a Stop that cuts a long queued message leaves it where it was at
+    /// the press. The press still tells the Stop and starts nothing (sol
+    /// round 2).
+    #[test]
+    fn a_waiting_cycle_start_is_dropped_by_a_stop_that_cuts_a_queued_message() {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        tick_for(&mut a, 100);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let before = server.snapshot().unwrap().machine_pos;
+        // A comment-only MDI line long enough to go in parts, cut by the
+        // Stop before its last part.
+        conn(&a).send(Command::Mdi(format!(
+            "({})",
+            "queued comment ".repeat(1_000_000)
+        )));
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(conn(&a).press_waits());
+        conn(&a).send(Command::Stop);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.contains("something was sent to the machine after it was pressed"),
+            "{message}"
+        );
+        tick_for(&mut a, 300);
+        let s = server.snapshot().unwrap();
+        assert_eq!((s.state, s.program_name), (Some(State::Idle), None));
+        assert_eq!(s.machine_pos, before);
+    }
+
+    /// LIO-562: a tool run made from a snapshot that does not show a
+    /// command the Pi's controller had taken (here sent as made from the
+    /// snapshot before a Set work) is refused by the Pi. The run says why
+    /// and that nothing moved, and Cycle Start runs it once pressed again.
+    #[test]
+    fn a_tool_run_the_pi_refuses_as_made_from_an_old_snapshot_is_put_back() {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Tick);
+        let old = conn(&a).ack_seq().expect("a snapshot from the Pi");
+        let before = conn(&a).snapshot.work_offset;
+        conn(&a).send(Command::SetWork { axis: 0, value: 7. });
+        tick_until(&mut a, 1.0, "the Set work", |s| s.work_offset != before);
+        a.control.as_mut().unwrap().made_from = Some(old);
+        cycle_start(&mut a);
+        run_until(&mut a, 5.0, "the refusal", |r| r.running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(!ok, "{message}");
+        assert_eq!(message, crate::control::STALE_TOOL_RUN);
+        let s = server.snapshot().unwrap();
+        assert_eq!((s.state, s.program_name), (Some(State::Idle), None));
+        assert!(!run_of(&a).done[0] && !run_of(&a).started());
+        // Never started: no note that where it stopped is not known (astra
+        // round 1).
+        tick_for(&mut a, 300);
+        assert!(
+            !(conn(&a).pi_note.as_deref()).is_some_and(|n| n.contains("where it stopped")),
+            "{:?}",
+            conn(&a).pi_note
+        );
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        cycle_start(&mut a);
+        tick_until(&mut a, 5.0, "the tool run", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
     }
 
     /// Machine zero on the Pi declares X, Y and Z one after another, each
@@ -5577,7 +6170,7 @@ flood = { pin = 8 }
         assert!(skip(&mut a, 1, Some(Cut)) && skip(&mut a, 3, Some(Left)));
         assert_eq!(sent(&a), [vec![0, 2]]);
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
-        let _ = a.update(Message::Run(R::CycleStart));
+        cycle_start(&mut a);
         let names: Vec<String> = (run_of(&a).running_blocks().unwrap().iter())
             .filter_map(|b| match b {
                 crate::post::Block::Start { op, .. } => {
@@ -6324,7 +6917,7 @@ flood = { pin = 8 }
         check_run_pictured(&mut a, dir.path(), 0);
         let notes: Vec<String> = (run_of(&a).steps.iter())
             .filter(|s| s.steps.len() > 1)
-            .map(|s| format!("{} {}", s.steps.len(), s.kind().1.to_lowercase()))
+            .map(|s| s.count())
             .collect();
         assert!(!notes.is_empty());
         // A text cut by its row is laid out narrower than it is alone.
@@ -6377,6 +6970,294 @@ flood = { pin = 8 }
                 && t.ends_with("and the stock is cut away where it goes.")),
             "{texts:?}"
         );
+    }
+
+    /// Two Ø32 bores 70 mm apart in `a`'s machine, on the Control page and
+    /// checked: drilled Ø12 (operation 0), then, given a cut, milled to
+    /// Ø31.4 (operation 1) and bored in 0.15 mm passes, 3 of them, else
+    /// bored straight from the drilling at the default cut, 35 passes (the
+    /// Boring is operation 1). Returns the Boring's index.
+    fn bored_twice(a: &mut App, dir: &std::path::Path, cut: Option<&str>) -> usize {
+        use crate::cam::boring::tests::{
+            drill, drilling, end_mill, head, job, on_uc100, ring_triangles,
+        };
+        use crate::model::{BORE_RETRACTS, BORING, HELICAL_MILLING, Machine};
+        let tris: Vec<[[f32; 3]; 3]> = (0..2)
+            .flat_map(|k| {
+                let x = 70. * k as f32;
+                (ring_triangles(32., 60., 28.).into_iter())
+                    .map(move |t| t.map(|p| [p[0] + x, p[1], p[2]]))
+            })
+            .collect();
+        let mesh = crate::mesh::normalize(tris).unwrap();
+        let t = drill("12");
+        let mut d = drilling(&mesh, &t, "Deep drilling");
+        d.p.insert("peck".into(), "12".into());
+        d.p.insert("breakthrough".into(), "4.5".into());
+        let mut ops = vec![(t, d)];
+        let b = head(BORE_RETRACTS[0]);
+        let mut o = drilling(&mesh, &b, BORING);
+        o.p.insert("hole_diameter".into(), "32".into());
+        if let Some(cut) = cut {
+            let m = end_mill("10");
+            let mut h = drilling(&mesh, &m, HELICAL_MILLING);
+            for (k, v) in [("bore_allowance", "0.6"), ("rpm", "8000"), ("feed", "800")] {
+                h.p.insert(k.into(), v.into());
+            }
+            ops.push((m, h));
+            o.p.insert("bore_cut".into(), cut.into());
+        }
+        let oi = ops.len();
+        ops.push((b, o));
+        let (doc, all) = job(&mesh, Machine::new(3), ops);
+        assert!(all.iter().all(|r| r.is_ok()), "{all:?}");
+        let mut doc = on_uc100(doc, dir);
+        let machine = a.doc.machines[0].clone();
+        doc.setups[0].machine = machine.clone();
+        doc.machines = vec![machine];
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Control;
+        zeroed(a);
+        check_run_pictured(a, dir, 0);
+        oi
+    }
+
+    /// LIO-558: Stop after step armed in a Boring's last visit of a pass
+    /// stops at the pause to set the head for the next pass, the visit
+    /// done: two bores in 3 passes, started at "Pass 1 · Hole 2", Stop after
+    /// step armed while it bores. The machine pauses at the head-setting
+    /// M0 (the spindle off, the tool at the clearance), and the run stops
+    /// there without the pause being answered: "Stopped after pass 1 ·
+    /// hole 2", Cycle Start then starting at "Pass 2 · Hole 1", whose
+    /// program pauses first to set the head for pass 2.
+    #[test]
+    fn stop_after_step_stops_at_a_borings_pause_between_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let seen = stop_at_a_borings_head_pause(&mut a, dir.path());
+        assert!(seen, "it stopped before the pause to set the head");
+        cycle_start_sets_the_head_for_pass_2(&mut a);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// LIO-577: as above with Network (Pi), the Pi stopping the tool run
+    /// itself (LIO-570). It stops at the head-setting pause's own line,
+    /// the last line the Pi's driver logged pausing at, for pass 2 of 3,
+    /// and the Pi's driver never resumes from that pause: the spindle off
+    /// there, the tool over the stock.
+    #[test]
+    fn stop_after_step_on_the_pi_stops_at_a_borings_pause_between_passes() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        stop_at_a_borings_head_pause(&mut a, dir.path());
+        let end = (conn(&a)
+            .link
+            .as_ref()
+            .unwrap()
+            .tool_run_ends
+            .last()
+            .cloned())
+        .expect("the Pi told the tool run's end");
+        let fired = end.stopped_after.expect("stopped by Stop after step");
+        let s = server.snapshot().unwrap();
+        let head = (s.log.iter())
+            .rposition(|l| l.starts_with("Line ") && l.contains("pass 2 of 3"))
+            .unwrap_or_else(|| panic!("never paused to set the head: {:?}", s.log));
+        let paused: u32 = (s.log[head].strip_prefix("Line "))
+            .and_then(|l| l.split_once(':')?.0.parse().ok())
+            .expect(&s.log[head]);
+        assert_eq!(
+            fired,
+            paused,
+            "the Pi stopped elsewhere than the pause: {:?}",
+            &s.log[head..]
+        );
+        assert!(
+            !s.log[head..].iter().any(|l| l.starts_with("Resumed")),
+            "the pause was answered: {:?}",
+            &s.log[head..]
+        );
+        assert_eq!(s.state, Some(State::Idle));
+        assert_eq!(s.spindle, Some(uc100::gcode::Spindle::Off));
+        assert!(s.work_pos[2] > 0.5, "stopped at work Z {}", s.work_pos[2]);
+        cycle_start_sets_the_head_for_pass_2(&mut a);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// The LIO-558 scenario on `a` (a `run_app`, or on the Pi): Stop after
+    /// step armed in the Boring's last hole of pass 1, the run ends
+    /// "Stopped after pass 1 · hole 2" with the spindle off, Cycle Start
+    /// then starting at "pass 2 · hole 1". Whether this computer saw the
+    /// machine paused to set the head for pass 2.
+    fn stop_at_a_borings_head_pause(a: &mut App, dir: &std::path::Path) -> bool {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let oi = bored_twice(a, dir, Some("0.15"));
+        assert_eq!(run_of(a).op_steps(oi).unwrap().steps.len(), 6);
+        let _ = a.update(Message::Run(R::Steps(Some(oi))));
+        let _ = a.update(Message::Run(R::PickStep(oi, 1)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(a, 0);
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::KeepToolZ));
+        assert!(problems(a).is_empty(), "{:?}", problems(a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(a, 5., "over the entry", |s| {
+            matches!(s.state, Some(State::Paused(_)))
+        });
+        let _ = a.update(Message::Run(R::Resume));
+        tick_until(a, 5., "boring hole 2", |s| {
+            s.state == Some(State::Run) && s.work_pos[2] < -1.
+        });
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        assert!(run_of(a).stop_after);
+        // The run line says the visit, "pass 1 of 3 · hole 2 of 2": first
+        // when the window is compact and the line is cut short, else where
+        // the Steps page has it, after the operation.
+        for (w, h) in [(1120., 690.), (1440., 900.)] {
+            let _ = a.update(Message::Resized(iced::Size::new(w, h)));
+            let (parts, _) = crate::ui::run_line(a, conn(a));
+            let line: String = parts.iter().map(|(t, _)| t.as_str()).collect();
+            let (step, setup) = (
+                line.find(" · pass 1 of 3 · hole 2 of 2").expect(&line),
+                line.find(" · Setup 1 of 1").expect(&line),
+            );
+            let stops = line.find(" · stops after this step").expect(&line);
+            assert_eq!(step < setup, w < 1360., "{w}: {line}");
+            assert!(stops < setup, "{w}: {line}");
+        }
+        let mut deadline = Deadline::new(20.);
+        let mut set = false;
+        while run_of(a).running.is_some() {
+            let _ = a.update(Message::Tick);
+            set |= matches!(&conn(a).snapshot.state,
+                Some(State::Paused(why)) if why.contains("pass 2 of 3"));
+            assert!(
+                deadline.within(&conn(a).snapshot),
+                "the run never ended, the machine {:?}",
+                conn(a).snapshot.state
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let outcome = run_of(a).outcome.clone().unwrap();
+        assert_eq!(outcome.1, "Stopped after pass 1 · hole 2", "{outcome:?}");
+        assert_eq!(conn(a).snapshot.spindle, Some(uc100::gcode::Spindle::Off));
+        tick_until(a, 5., "Idle after the stop", |s| {
+            s.state == Some(State::Idle)
+        });
+        answer_skips(a, 0);
+        assert_eq!(run_of(a).at_step(), Some((oi, 2)));
+        let label = run_of(a).step_label(oi, 2);
+        assert_eq!(label, "pass 2 · hole 1");
+        set
+    }
+
+    /// After `stop_at_a_borings_head_pause`: Cycle Start goes on from
+    /// "pass 2 · hole 1", its program pausing first to set the head for
+    /// pass 2, the spindle off, before it cuts. Stopped there.
+    fn cycle_start_sets_the_head_for_pass_2(a: &mut App) {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::KeepToolZ));
+        assert!(problems(a).is_empty(), "{:?}", problems(a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(
+            a,
+            10.,
+            "the pause to set the head for pass 2",
+            |s| matches!(&s.state, Some(State::Paused(why)) if why.contains("pass 2 of 3")),
+        );
+        let s = &conn(a).snapshot;
+        assert_eq!(s.spindle, Some(uc100::gcode::Spindle::Off));
+        assert!(s.work_pos[2] > 0.5, "paused at work Z {}", s.work_pos[2]);
+        assert!(run_of(a).running.is_some());
+        let _ = a.update(Message::Run(R::Stop));
+        run_until(a, 10., "the stop at the pause", |r| r.running.is_none());
+    }
+
+    /// LIO-558: a Boring's steps, its visits of its holes, laid out whole
+    /// in the step list. Two Ø32 bores drilled Ø12 and bored straight from
+    /// there at the default cut, 35 passes of 2 visits, started at "Pass 12
+    /// · Hole 1": at 1440 × 900 and 1120 × 690, and by touch, no folded
+    /// line runs from one pass's holes into another's, each label is laid
+    /// out as wide as it is alone (not cut), and what it says of the step
+    /// ("taken as cut", "starts here") starts right of it, never over it.
+    #[test]
+    fn a_borings_step_lines_are_whole_and_clear_of_their_state() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        bored_twice(&mut a, dir.path(), None);
+        let os = run_of(&a).op_steps(1).expect("the Boring's steps").clone();
+        assert_eq!((os.passes(), os.steps.len()), (35, 70));
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 22)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, 22)));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Job));
+        let alone = |s: &str, italic: bool, window| {
+            let mut t = iced::widget::text(s.to_string()).size(11);
+            if italic {
+                t = t.font(iced::Font {
+                    style: iced::font::Style::Italic,
+                    ..iced::Font::DEFAULT
+                });
+            }
+            crate::ui::probe::placed(t.into(), window)[0].1.width
+        };
+        let states = ["taken as cut", "starts here", "done", "skipped", "cutting"];
+        for (w, h, touch) in [
+            (1440., 900., false),
+            (1120., 690., false),
+            (1120., 690., true),
+        ] {
+            crate::ui::TOUCH.with(|t| t.set(touch));
+            let window = iced::Size::new(w, h);
+            let _ = a.update(Message::Resized(window));
+            // Pictures of it when AXIS_RENDER_DIR says where.
+            if let Ok(out) = std::env::var("AXIS_RENDER_DIR") {
+                let name = format!("boring-steps-{w}{}.png", if touch { "-touch" } else { "" });
+                render_png(&a, window, &std::path::Path::new(&out).join(name));
+            }
+            let placed = crate::ui::probe::placed(a.view(), window);
+            let lines: Vec<&(String, iced::Rectangle)> = (placed.iter())
+                .filter(|(t, _)| t.starts_with("Pass"))
+                .collect();
+            // As many lines as the room takes, at least the folded passes
+            // before and after the start and its pass's two visits.
+            assert!(lines.len() >= 4, "{w} x {h}: {lines:?}");
+            let mut stated = 0;
+            for (t, at) in &lines {
+                assert!(!t.contains(" – "), "{w} x {h}: \"{t}\" runs across passes");
+                let folded = t.starts_with("Passes") || t.contains("Holes");
+                let natural = alone(t, folded, window);
+                assert!(
+                    at.width >= natural - 0.5,
+                    "{w} x {h}: \"{t}\" is cut to {} of {natural}",
+                    at.width
+                );
+                if let Some((s, state)) = (placed.iter()).find(|(s, b)| {
+                    states.contains(&s.as_str()) && (b.center_y() - at.center_y()).abs() < 4.
+                }) {
+                    stated += 1;
+                    assert!(
+                        at.x + at.width <= state.x,
+                        "{w} x {h}: \"{t}\" at {at:?} runs under \"{s}\" at {state:?}"
+                    );
+                }
+            }
+            assert!(stated >= 2, "{w} x {h}: {lines:?}");
+            assert!(
+                lines.iter().any(|(t, _)| t.starts_with("Passes")),
+                "{w} x {h}: {lines:?}"
+            );
+        }
+        crate::ui::TOUCH.with(|t| t.set(false));
+        let _ = a.update(Message::Disconnect);
     }
 
     /// `shot` of the Control page with Move to open and `targets` typed
@@ -8839,9 +9720,10 @@ flood = { pin = 8 }
         assert!(a.run_stock().is_none() && a.live_stock().is_some());
     }
 
-    /// The driver refuses a job sent while it is not idle for it: for a few
-    /// milliseconds after a work or machine zero it re-anchors its position,
-    /// while the app's snapshot still says Idle. Such a Cycle Start ran
+    /// A Cycle Start pressed while the app's snapshot still says Idle but
+    /// a move was just sent waits for the snapshot that shows the move
+    /// (LIO-562), and then starts nothing: the machine is not Idle. Before,
+    /// the job was sent and the driver refused it. Either way it ran
     /// nothing, so it does not count as the setup's first tool run: the
     /// work-zero steps stay and the X/Y work zero is not held yet (#168).
     #[test]
@@ -8859,14 +9741,17 @@ flood = { pin = 8 }
         assert!(work_zero_steps(&a, conn(&a)).is_some());
         let has = |a: &App, text: &str| problems(a).iter().any(|p| p.contains(text));
         // The machine starts a slow move; the app, with no tick since, still
-        // sees it Idle and sends the job, which the driver refuses.
+        // sees it Idle. The press waits for the snapshot that shows the
+        // move, sends nothing, and says why.
         conn(&a).send(Command::Mdi("G1 X5 F600".into()));
         let _ = a.update(Message::Run(R::CycleStart));
-        assert!(run_of(&a).running.is_some());
-        run_until(&mut a, 5.0, "the refusal", |r| r.running.is_none());
+        assert!(conn(&a).press_waits() && run_of(&a).running.is_none());
+        assert_eq!(problems(&a), [crate::run::CONTROLLER_TAKING]);
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_none());
         let (ok, message) = run_of(&a).outcome.clone().unwrap();
         assert!(
-            !ok && message.contains("not started, the machine is not idle"),
+            !ok && message.contains("did not start the tool run: The machine is not Idle."),
             "{message}"
         );
         assert!(!run_of(&a).done[0] && run_of(&a).next == 0);
@@ -9431,7 +10316,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::Machine(Action::Spindle(Spindle::Cw)));
         tick_until(&mut a, 2.0, "CW", |s| s.spindle == Some(Spindle::Cw));
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
-        let _ = a.update(Message::Run(R::CycleStart));
+        cycle_start(&mut a);
         assert!(run_of(&a).running.is_some());
         tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
         let _ = a.update(Message::Run(R::Stop));
