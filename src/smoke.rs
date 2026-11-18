@@ -7037,6 +7037,7 @@ flood = { pin = 8 }
         let mut a = run_app(dir.path());
         let seen = stop_at_a_borings_head_pause(&mut a, dir.path());
         assert!(seen, "it stopped before the pause to set the head");
+        cycle_start_sets_the_head_for_pass_2(&mut a);
         let _ = a.update(Message::Disconnect);
     }
 
@@ -7081,6 +7082,7 @@ flood = { pin = 8 }
         assert_eq!(s.state, Some(State::Idle));
         assert_eq!(s.spindle, Some(uc100::gcode::Spindle::Off));
         assert!(s.work_pos[2] > 0.5, "stopped at work Z {}", s.work_pos[2]);
+        cycle_start_sets_the_head_for_pass_2(&mut a);
         let _ = a.update(Message::Disconnect);
     }
 
@@ -7150,6 +7152,30 @@ flood = { pin = 8 }
         let label = run_of(a).step_label(oi, 2);
         assert_eq!(label, "pass 2 · hole 1");
         set
+    }
+
+    /// After `stop_at_a_borings_head_pause`: Cycle Start goes on from
+    /// "pass 2 · hole 1", its program pausing first to set the head for
+    /// pass 2, the spindle off, before it cuts. Stopped there.
+    fn cycle_start_sets_the_head_for_pass_2(a: &mut App) {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::KeepToolZ));
+        assert!(problems(a).is_empty(), "{:?}", problems(a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(
+            a,
+            10.,
+            "the pause to set the head for pass 2",
+            |s| matches!(&s.state, Some(State::Paused(why)) if why.contains("pass 2 of 3")),
+        );
+        let s = &conn(a).snapshot;
+        assert_eq!(s.spindle, Some(uc100::gcode::Spindle::Off));
+        assert!(s.work_pos[2] > 0.5, "paused at work Z {}", s.work_pos[2]);
+        assert!(run_of(a).running.is_some());
+        let _ = a.update(Message::Run(R::Stop));
+        run_until(a, 10., "the stop at the pause", |r| r.running.is_none());
     }
 
     /// LIO-558: a Boring's steps, its visits of its holes, laid out whole
