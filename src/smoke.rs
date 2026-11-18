@@ -14612,6 +14612,37 @@ flood = { pin = 8 }
                 && line.ends_with("Home in the Machine tab to turn them on."),
             "{line}"
         );
+        // An E-stop with A at 15°, away from its zero mark: A cannot jog
+        // until it has a position, so the Machine tab says to set A where it
+        // stands, jog it to the mark and set it again, and that works
+        // (review).
+        let _ = a.update(Message::MachineEStop);
+        tick_until(&mut a, 2.0, "E-stop", |s| !s.referenced[3]);
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        assert!(conn(&a).jog_blocked(3).is_some());
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Machine));
+        let note = "Home references X and Y on their switches, in the homing order. Z and A have none: jog Z to the top, then Set machine zero here, or Keep the last position AXIS CAM saved at the last disconnect if nothing moved the machine since. A jogs only once it has a machine position: if it is not at its zero mark, press A beside Set machine zero here, jog A to the mark, then press A again. Every E-stop clears the machine position: home and set it again after one.";
+        let texts = page_texts(&a);
+        assert!(texts.iter().any(|t| t == note), "{texts:?}");
+        let area = iced::Rectangle::new(iced::Point::ORIGIN, WINDOW);
+        let press_a = (crate::ui::probe::clicks_in(a.view(), WINDOW, area, 5.).into_iter())
+            .find(|m| matches!(m, Message::Machine(Action::MachineZero(Some(3)))))
+            .expect("A beside Set machine zero here");
+        let _ = a.update(press_a.clone());
+        tick_until(&mut a, 3.0, "A set where it stands", |s| s.referenced[3]);
+        assert_eq!(conn(&a).jog_blocked(3), None);
+        let _ = a.update(Message::Machine(Action::JogAngle(Some(15.))));
+        let _ = a.update(Message::Machine(Action::JogPress(3, true)));
+        tick_until(&mut a, 3.0, "A jogged 15° back to its mark", |s| {
+            s.state == Some(State::Idle) && (s.machine_pos[3] + 15.).abs() < 1e-3
+        });
+        let _ = a.update(press_a);
+        tick_until(&mut a, 3.0, "A set at its mark", |s| {
+            s.referenced[3] && s.machine_pos[3].abs() < 1e-3
+        });
     }
 
     /// Ticks for `ms` milliseconds.

@@ -13558,7 +13558,8 @@ pub(crate) fn zero_ends(o: crate::orient::Orient, at: &str) -> String {
 }
 /// Where machine zero is for `axes` on a machine of orientation `o`, after
 /// `at`: X and Y at their minimum ends, Z at the top, a rotary axis at its
-/// zero mark.
+/// zero mark (said with "at" only: it cannot be jogged there before it has
+/// a machine position, see `rotary_zero_note`).
 pub(crate) fn zero_places(o: crate::orient::Orient, axes: &[usize], at: &str) -> String {
     let places: Vec<String> = (axes.iter())
         .map(|&a| match a {
@@ -13591,15 +13592,39 @@ fn move_there_waits(o: crate::orient::Orient, home: &[usize], set: &[usize]) -> 
 /// Set machine zero or Keep the last position the others (LIO-573).
 fn mixed_zero_note(o: crate::orient::Orient, homed: &[usize], declared: &[usize]) -> String {
     let one = declared.len() == 1;
+    let lin: Vec<usize> = declared.iter().copied().filter(|&a| a < 3).collect();
+    let jog = if lin.is_empty() {
+        String::new()
+    } else {
+        format!("jog {}, then ", zero_places(o, &lin, "to"))
+    };
     format!(
-        "Home references {} on {} switch{}, in the homing order. {} {} none: jog {}, then Set machine zero here, or Keep the last position AXIS CAM saved at the last disconnect if nothing moved the machine since. Every E-stop clears the machine position: home and set it again after one.",
+        "Home references {} on {} switch{}, in the homing order. {} {} none: {jog}Set machine zero here, or Keep the last position AXIS CAM saved at the last disconnect if nothing moved the machine since.{} Every E-stop clears the machine position: home and set it again after one.",
         crate::control::axis_list(homed),
         if homed.len() == 1 { "its" } else { "their" },
         if homed.len() == 1 { "" } else { "es" },
         crate::control::axis_list(declared),
         if one { "has" } else { "have" },
-        zero_places(o, declared, "to"),
+        rotary_zero_note(declared),
     )
+}
+/// How a rotary axis of `axes` without a switch gets to its zero mark,
+/// after a space: it jogs only once it has a machine position, so it is set
+/// where it stands first (its button beside Set machine zero here), jogged
+/// to the mark, and set again. Empty without one.
+fn rotary_zero_note(axes: &[usize]) -> String {
+    let rot: Vec<usize> = axes.iter().copied().filter(|&a| a >= 3).collect();
+    match rot.as_slice() {
+        [] => String::new(),
+        [a] => format!(
+            " {n} jogs only once it has a machine position: if it is not at its zero mark, press {n} beside Set machine zero here, jog {n} to the mark, then press {n} again.",
+            n = AXES[*a]
+        ),
+        _ => format!(
+            " {} jog only once they have a machine position: one not at its zero mark, press its button beside Set machine zero here, jog it to the mark, then press its button again.",
+            crate::control::axis_list(&rot)
+        ),
+    }
 }
 fn machine_zero_note(o: crate::orient::Orient) -> String {
     format!(
