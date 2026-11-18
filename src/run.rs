@@ -2175,18 +2175,7 @@ impl Run {
         if partly.surface.is_some() {
             return None;
         }
-        // Partway by steps of its own operation taken as cut alone, those
-        // steps cut it (LIO-568).
-        let start =
-            (self.checked()).and_then(|c| c.get(self.next)?.indexes.get(self.from).copied());
-        let ops_before = (self.next, self.from) != (0, 0)
-            || (self.skips.iter()).any(|s| s.1 == Skip::Cut && start.is_some_and(|o| s.0 < o))
-            || (self.cut_steps.iter()).any(|c| start.is_some_and(|o| c.0 < o));
-        let by = if ops_before {
-            "the operations before the start"
-        } else {
-            "the steps taken as cut"
-        };
+        let by = self.cut_by();
         Some(if partly.cut.is_empty() {
             format!(
                 "The check cannot tell the surface {by} leave where the stock top is touched off."
@@ -2202,6 +2191,23 @@ impl Run {
                 partly.cut.join(", ")
             )
         })
+    }
+
+    /// What cut the stock a run that starts partway (`partway`) starts
+    /// from, as its messages say it: "the operations before the start", or
+    /// "the steps taken as cut" when it is partway by steps of its own
+    /// operation alone (LIO-568).
+    pub fn cut_by(&self) -> &'static str {
+        let start =
+            (self.checked()).and_then(|c| c.get(self.next)?.indexes.get(self.from).copied());
+        let ops_before = (self.next, self.from) != (0, 0)
+            || (self.skips.iter()).any(|s| s.1 == Skip::Cut && start.is_some_and(|o| s.0 < o))
+            || (self.cut_steps.iter()).any(|c| start.is_some_and(|o| c.0 < o));
+        if ops_before {
+            "the operations before the start"
+        } else {
+            "the steps taken as cut"
+        }
     }
 
     /// What a run that starts partway (`partway`) takes as cut before its
@@ -8045,6 +8051,7 @@ pub(crate) mod tests {
                 "{why}"
             );
             assert_eq!(r.touch_off(), None);
+            assert_eq!(r.cut_by(), "the steps taken as cut");
         }
         // Starting at Pass 1, Cycle Start waits for the work zero, kept or
         // set again.

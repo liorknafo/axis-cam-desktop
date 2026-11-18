@@ -13163,9 +13163,10 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
             "3. Jog the tool tip over {spot} of the stock top, then down in 0.1 mm and 0.01 mm steps until it just pinches a sheet of paper on {on}."
         ));
         steps.push(format!(
-            "4. Set Z{}: that point becomes Z{}. X and Y stay as they are: they must be those the operations before the start were cut with (the stock not moved since), or probed from a spot they left. {checks}",
+            "4. Set Z{}: that point becomes Z{}. X and Y stay as they are: they must be those {} were cut with (the stock not moved since), or probed from a spot they left. {checks}",
             crate::post::exact_mm(work[2] as f32),
-            crate::post::exact_mm(work[2] as f32)
+            crate::post::exact_mm(work[2] as f32),
+            run.cut_by()
         ));
     } else {
         match (c.touch_off(), crate::post::references(&p.origin)) {
