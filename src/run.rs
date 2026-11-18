@@ -273,11 +273,11 @@ pub const DECLARING: &str = "The machine position is being set, axis by axis: wa
 pub const PARTWAY_UNKNOWN: &str =
     "The check did not work out the stock the start leaves: check the setup again.";
 
-/// What a start at a step of a setup's last operation sent cut, said as
-/// `Partly::cut`: the check knows its stock only before that operation,
-/// none after it (`Run::partly`).
+/// What steps taken as cut in the start's operation, the setup's last
+/// operation sent, cut, said as `Partly::cut`: the check knows its stock
+/// only before that operation, none after it (`Run::partly`).
 const STEPS_UNFOLLOWED: &str =
-    "stock the steps before the start cut, which the check does not follow";
+    "stock cut by the steps taken as cut, which the check does not follow";
 
 /// A setup being run on the connected machine, tool run by tool run.
 pub struct Run {
@@ -2182,7 +2182,7 @@ impl Run {
             )
         } else if partly.cut == [STEPS_UNFOLLOWED] {
             // Not a part of the stock: said as the reason it is (LIO-579).
-            "The check does not follow the stock the steps before the start cut, so it cannot tell the surface they left where the stock top is touched off.".into()
+            "The check does not follow the stock cut by the steps taken as cut, so it cannot tell the surface they left where the stock top is touched off.".into()
         } else {
             format!(
                 "{}{} cut the stock's {}, and the check cannot tell the surface they left where the stock top is touched off.",
@@ -6186,7 +6186,7 @@ pub(crate) mod tests {
                 assert_eq!(
                     z.blocked.as_deref(),
                     Some(
-                        "The check does not follow the stock the steps before the start cut, so it cannot tell the surface they left where the stock top is touched off."
+                        "The check does not follow the stock cut by the steps taken as cut, so it cannot tell the surface they left where the stock top is touched off."
                     ),
                     "{n}"
                 );
