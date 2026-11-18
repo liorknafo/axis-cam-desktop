@@ -907,6 +907,10 @@ pub struct Simulation {
     /// work zero was set on, before those steps cut it. None when no step
     /// was carved.
     pub before_steps: Option<crate::volume::Volume>,
+    /// The steps of its plan (`run::Step`, from 0) that check carved into
+    /// `initial_volume`, in order: the stock it starts from has them cut
+    /// (LIO-582). Empty when none was.
+    pub steps_cut: Vec<usize>,
     pub frame: Option<crate::volume::Frame>,
     /// The frame at each A angle of an indexed setup's operation (`indexed`):
     /// a move at A `a` cuts the part posed by the frame listed for `a`.
@@ -959,6 +963,7 @@ impl Simulation {
             volume: None,
             initial_volume: None,
             before_steps: None,
+            steps_cut: vec![],
             frame: None,
             turns: vec![],
             preceding: 0,

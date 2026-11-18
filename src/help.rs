@@ -1903,6 +1903,14 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
             "Make Cycle Start begin with this operation: those before it are taken as cut, and nothing of them is sent. Its tool run starts as after a tool change, with this operation's spindle speed and coolant, across at the clearance plane and down.",
             "Before the setup's first Cycle Start, set the work zero on the stock the operations before it leave, or keep it: Cycle Start waits for that.",
         ),
+        SamePart => (
+            "The part this setup's runs cut earlier this session is still held: what they cut stays the stock's, and the touch-off and probes go by it.",
+            "",
+        ),
+        NewStock => (
+            "New stock is held: what this setup's runs cut earlier this session is forgotten, and the work zero is found on the new stock.",
+            "",
+        ),
         KeepZero => (
             "Keep the work zero as it is for a run that starts partway: it is still the one the operations taken as cut were cut with (the stock has not moved since), or you set Z by hand on a surface they left.",
             "",

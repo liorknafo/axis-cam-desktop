@@ -11692,7 +11692,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
         let blocked = c.partway_blocked();
         buttons = buttons.push(match c.touch_off() {
             _ if blocked.is_some() => small("Zero Z on the stock top", None, false),
-            Some((_, work)) if pins || run.partway() => small(
+            Some((_, work)) if pins || run.on_cut_stock() => small(
                 format!("Set Z{}", crate::post::exact_mm(work[2] as f32)),
                 manual.then_some(Message::Machine(Action::TouchOff)),
                 false,
@@ -11707,6 +11707,45 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
                 manual.then_some(Message::Machine(Action::WorkZero(None))),
                 false,
             ),
+        });
+        // This setup's runs cut a part earlier this session: is it still
+        // the one held? Asked on a row of its own, so the work zero's
+        // buttons keep their room (LIO-582 review).
+        let stock = run.stock_unconfirmed.then(|| {
+            column![
+                text("This setup's runs cut a part this session. Is it still the one held?")
+                    .size(12),
+                row![
+                    small(
+                        "Same part",
+                        (!running).then_some(Message::Run(R::SamePart)),
+                        false,
+                    ),
+                    small(
+                        "New stock loaded",
+                        (!running).then_some(Message::Run(R::NewStock)),
+                        false,
+                    ),
+                ]
+                .spacing(6),
+            ]
+            .spacing(4)
+        });
+        // Another setup's cuts the check does not follow: only new stock
+        // clears them (LIO-582 review).
+        let stock = stock.or_else(|| {
+            run.earlier_unfollowed().then(|| {
+                column![
+                    text("Another setup's run cut this part in a way the check does not follow.")
+                        .size(12),
+                    small(
+                        "New stock loaded",
+                        (!running).then_some(Message::Run(R::NewStock)),
+                        false,
+                    ),
+                ]
+                .spacing(4)
+            })
         });
         if run.partway() {
             buttons = buttons.push(small(
@@ -11748,7 +11787,11 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
                 .align_y(Alignment::Center),
             );
         }
-        col = col.push(rule::horizontal(1)).push(list).push(buttons);
+        col = col.push(rule::horizontal(1)).push(list);
+        if let Some(stock) = stock {
+            col = col.push(stock);
+        }
+        col = col.push(buttons);
     } else if run.checked().is_some() {
         col = col.push(rule::horizontal(1)).push(muted(
             "The setup's work zero was set on the stock before its first tool run: X and Y stay as they are from here.",

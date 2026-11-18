@@ -473,6 +473,8 @@ pub fn run_action(a: &run::Action) -> Class {
         | run::Action::Next(_)
         | run::Action::From(..)
         | run::Action::KeepZero
+        | run::Action::SamePart
+        | run::Action::NewStock
         | run::Action::CycleStart
         | run::Action::Resume
         | run::Action::RecordReference

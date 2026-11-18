@@ -1620,6 +1620,17 @@ pub struct App {
     /// The setup (id) Run on the machine picked while disconnected: Connect
     /// picks it in the Run panel.
     run_on_connect: Option<String>,
+    /// What each setup's runs cut this session (`run::Run::cut_in_run`), by
+    /// setup id: kept when its run is dropped (another setup picked, the
+    /// machine disconnected) and given back when it is picked again, for the
+    /// operator to say whether the same part is still there (LIO-582).
+    run_cuts: Vec<(String, Vec<run::CutInRun>)>,
+    /// For a setup whose run was dropped while a tool run ran: that tool run
+    /// (index, and the operation it started at) and what was cut before it.
+    /// `run_cuts` counts that tool run as cutting all it was to cut; a
+    /// follow of that very tool run on the Pi starts from what was cut
+    /// before it instead, and its outcome says what it cut (LIO-582 review).
+    run_pending: Vec<(String, usize, usize, Vec<run::CutInRun>)>,
     /// The jog key down on the Control page (axis, negative).
     pub jog_key: Option<(usize, bool)>,
     /// Counts the checks of setups to run, so a late answer is ignored.
@@ -2177,6 +2188,8 @@ impl App {
             pi_run: None,
             cnc_over_guide: None,
             run_on_connect: None,
+            run_cuts: vec![],
+            run_pending: vec![],
             jog_key: None,
             run_epoch: 0,
             shift: false,
@@ -3845,6 +3858,10 @@ impl App {
     pub fn disconnect_machine(&mut self) {
         self.switch_machine = None;
         if let Some(mut c) = self.control.take() {
+            if let Some(old) = &c.run {
+                keep_run_cuts(&mut self.run_cuts, old);
+                keep_pending_cuts(&mut self.run_pending, old);
+            }
             c.leaving("disconnected while it ran");
             self.pi_run = c.take_pi_run();
             self.status = match (&c.pi, &self.pi_run) {
@@ -4511,7 +4528,28 @@ impl App {
         c.take_reattach();
         self.run_epoch += 1;
         let skipped = !f.skips.is_empty();
-        c.run = Some(run::Run::following(&self.doc, si, self.run_epoch, f));
+        if let Some(old) = &c.run {
+            keep_run_cuts(&mut self.run_cuts, old);
+            keep_pending_cuts(&mut self.run_pending, old);
+        }
+        let (index, from) = (f.index, f.from);
+        let mut following = run::Run::following(&self.doc, si, self.run_epoch, f);
+        // It follows a tool run cutting the part: the same part (LIO-582).
+        if let Some((_, cuts)) = (self.run_cuts.iter()).find(|(id, _)| *id == following.setup_id) {
+            following.cut_in_run = cuts.clone();
+        }
+        // The very tool run that ran when its run was dropped: what was cut
+        // before it, for its outcome to say what it cut, once the follow
+        // holds and the outcome comes; until then, and if it never does,
+        // the bound above (LIO-582 review).
+        let id = following.setup_id.clone();
+        if let Some(p) =
+            (self.run_pending.iter()).find(|p| p.0 == id && (p.1, p.2) == (index, from))
+        {
+            following.before_follow = Some(p.3.clone());
+        }
+        give_earlier_cuts(&self.run_cuts, &mut following);
+        c.run = Some(following);
         c.probe_spot = None;
         self.run_on_connect = None;
         if self.doc.setups[si].id != self.doc.active {
@@ -8742,8 +8780,19 @@ impl App {
                 self.run_epoch += 1;
                 // Where a run of it stopped, picked once it is checked.
                 let journal = c.journal().filter(|j| j.setup == self.doc.setups[si].id);
+                if let Some(old) = &c.run {
+                    keep_run_cuts(&mut self.run_cuts, old);
+                    keep_pending_cuts(&mut self.run_pending, old);
+                }
                 let mut r = run::Run::new(&self.doc, si, self.run_epoch);
                 r.journal = journal;
+                // What its runs cut this session, until the operator says
+                // whether the same part is still there (LIO-582 review).
+                if let Some((_, cuts)) = (self.run_cuts.iter()).find(|(id, _)| *id == r.setup_id) {
+                    r.cut_in_run = cuts.clone();
+                    r.stock_unconfirmed = true;
+                }
+                give_earlier_cuts(&self.run_cuts, &mut r);
                 c.run = Some(r);
                 // A spot picked to probe from was for the setup before.
                 c.probe_spot = None;
@@ -11665,4 +11714,47 @@ fn computer_name() -> String {
         return "Shop tablet".into();
     }
     run("hostname", &[]).unwrap_or_else(|| "AXIS CAM".into())
+}
+
+/// Keeps what `run` cut this session under its setup in `cuts` (`App::run_cuts`),
+/// a tool run it runs now as far as it may get (`Run::cuts_so_far`), or
+/// forgets it there once nothing is (new stock loaded).
+fn keep_run_cuts(cuts: &mut Vec<(String, Vec<run::CutInRun>)>, run: &run::Run) {
+    // Earlier setups' it forgot (New stock loaded) are forgotten here too.
+    cuts.retain(|(id, _)| {
+        !run.earlier_given.contains(id) || run.earlier_cuts.iter().any(|(e, _)| e == id)
+    });
+    cuts.retain(|(id, _)| *id != run.setup_id);
+    let cut = run.cuts_so_far();
+    if !cut.is_empty() {
+        cuts.push((run.setup_id.clone(), cut));
+    }
+}
+
+/// Gives `run` what the other setups cut this session (`App::run_cuts`,
+/// `run::Run::earlier_cuts`): before it, deleted since or moved after it,
+/// their cuts are in the part, and the check must simulate them as they
+/// were cut before it to be the part's stock (LIO-582 review).
+fn give_earlier_cuts(cuts: &[(String, Vec<run::CutInRun>)], run: &mut run::Run) {
+    run.earlier_cuts = (cuts.iter())
+        .filter(|(id, _)| *id != run.setup_id)
+        .cloned()
+        .collect();
+    run.earlier_given = run.earlier_cuts.iter().map(|(id, _)| id.clone()).collect();
+}
+
+/// Notes in `pending` (`App::run_pending`) the tool run `run` runs as it is
+/// dropped, with what it cut before it; a run dropped with none running has
+/// no tool run of its setup pending.
+fn keep_pending_cuts(
+    pending: &mut Vec<(String, usize, usize, Vec<run::CutInRun>)>,
+    run: &run::Run,
+) {
+    pending.retain(|p| p.0 != run.setup_id);
+    if let Some(r) = &run.running {
+        // Following that tool run already, what was cut before it is the
+        // follow's, not the bound it holds meanwhile (LIO-582 review).
+        let before = (run.before_follow.clone()).unwrap_or_else(|| run.cut_in_run.clone());
+        pending.push((run.setup_id.clone(), r.index, r.from, before));
+    }
 }
