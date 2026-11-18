@@ -1002,7 +1002,7 @@ mod tests {
         let folder = root.join(&id);
         let kept = SessionFile::read(&folder).unwrap().unwrap();
         assert!(kept.log.revision > 0, "{kept:?}");
-        assert!(!held(&folder), "let go at the end");
+        assert_let_go(&folder, "let go at the end");
         let session = Session::open(&root, Some(&id), &user).unwrap();
         let runner = Runner::start(session);
         let read = runner.call("inspect", json!({})).unwrap();
@@ -1047,7 +1047,7 @@ mod tests {
         drop(first);
         let lock = folder.join("lock");
         assert!(lock.is_file(), "the lock file stays with its session");
-        assert!(!held(&folder));
+        assert_let_go(&folder, "let go with the session");
         let dead = json!({"pid": 999_999, "started": "1.000001", "at": 1});
         std::fs::write(&lock, dead.to_string()).unwrap();
         let taken = Session::open(&root, Some(&id), &user).unwrap();
@@ -1055,7 +1055,8 @@ mod tests {
         let owner: Value = serde_json::from_slice(&std::fs::read(&lock).unwrap()).unwrap();
         assert_eq!(owner["pid"], std::process::id());
         drop(taken);
-        assert!(lock.is_file() && !held(&folder), "let go, not deleted");
+        assert!(lock.is_file(), "not deleted");
+        assert_let_go(&folder, "let go");
     }
 
     /// Whether some open of the session in `folder` holds its lock: its
@@ -1068,13 +1069,83 @@ mod tests {
         )
     }
 
+    /// Asserts that this process has let go of the lock of the session in
+    /// `folder` (`why` says when), then waits until no process holds it.
+    ///
+    /// A process another test starts (the STEP converter, `open`, `kill`)
+    /// gets a copy of every open file of this one, the lock file's too,
+    /// until its program starts and the copies close (they are
+    /// close-on-exec). The `flock` is let go only when the last copy
+    /// closes, so the lock can stay held a moment after a dropped
+    /// `Session` closed its file (LIO-566: 1 round in 5 with 4 threads
+    /// starting `true`). So what this process holds is told by its own
+    /// open files, right after the drop: none of them is the lock file.
+    /// The wait then is for a starting program only, so the next open
+    /// does not meet the copy.
+    #[track_caller]
+    fn assert_let_go(folder: &Path, why: &str) {
+        #[cfg(unix)]
+        assert!(
+            !open_here(&folder.join("lock")),
+            "{why}: this process still has the lock file open"
+        );
+        // Windows passes no open file to a program it starts: held is held.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while held(folder) {
+            assert!(
+                cfg!(unix) && std::time::Instant::now() < deadline,
+                "{why}: the lock is still held"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// `assert_let_go` is no weaker than the check it replaced: a session
+    /// still open is caught at once, not waited for.
+    #[test]
+    #[should_panic(expected = "kept: this process still has the lock file open")]
+    #[cfg(unix)]
+    fn a_session_still_open_is_not_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let user = user_workspace(dir.path());
+        let session = Session::open(&root, None, &user).unwrap();
+        let kept = session.clone();
+        drop(session);
+        assert_let_go(&kept.folder, "kept");
+    }
+
+    /// Whether one of this process's open files is the file at `path`:
+    /// each number in `/dev/fd` asked with `fstat`, never duplicated or
+    /// closed (a duplicate would hold its lock too). A number closed since
+    /// it was listed (the listing's own, or another thread's) fails
+    /// `fstat`; one opened again since is some other file.
+    #[cfg(unix)]
+    fn open_here(path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let want = std::fs::metadata(path).unwrap();
+        let fds: Vec<i32> = (std::fs::read_dir("/dev/fd").unwrap().flatten())
+            .filter_map(|e| e.file_name().to_str()?.parse().ok())
+            .collect();
+        fds.into_iter().any(|fd| {
+            // SAFETY: `fstat` only writes the `stat` it is given, all
+            // zeroes a valid value; a closed number is EBADF, not UB.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let got = unsafe { libc::fstat(fd, &raw mut stat) };
+            got == 0 && (stat.st_dev as u64, stat.st_ino as u64) == (want.dev(), want.ino())
+        })
+    }
+
     /// The reviewer's race (LIO-470): many opens of one session at once, its
     /// lock file left by a dead process. The lock is the OS's, held for the
     /// session's life: while one holds it every other open is refused and
     /// writes nothing, the lock file included; racing, exactly one wins;
     /// once it lets go, the next takes it. (`flock` locks an open of the
     /// file, not a process: threads race here as processes do; the
-    /// processes' race is in `tests/mcp_stdio.rs`.)
+    /// processes' race is in `tests/mcp_stdio.rs`.) Programs are started
+    /// all through, as other tests start them in a parallel run: each gets
+    /// a moment's copy of the lock file while a session has it open
+    /// (LIO-566, `assert_let_go`).
     #[test]
     fn of_many_opens_racing_for_a_session_one_wins() {
         let dir = tempfile::tempdir().unwrap();
@@ -1110,6 +1181,23 @@ mod tests {
                 (std::fs::read(&path).unwrap(), modified)
             })
         };
+        // Until `starting` is dropped, by the end or a failed assert.
+        let (starting, stop) = mpsc::channel::<()>();
+        #[cfg(unix)]
+        let starter = std::thread::spawn(move || {
+            // Programs run, and launches that failed: every one must run,
+            // or the copies this test is about were never made.
+            let (mut ran, mut failed) = (0u32, 0u32);
+            while stop.try_recv() == Err(mpsc::TryRecvError::Empty) {
+                match std::process::Command::new("true").status() {
+                    Ok(status) if status.success() => ran += 1,
+                    _ => failed += 1,
+                }
+            }
+            (ran, failed)
+        });
+        #[cfg(not(unix))]
+        let _ = stop;
         for round in 0..20 {
             let opened = race(8);
             let won: Vec<&Session> = opened.iter().filter_map(|r| r.as_ref().ok()).collect();
@@ -1128,7 +1216,16 @@ mod tests {
             assert_eq!(files(), before, "a refused open wrote");
             drop(again);
             drop(opened);
-            assert!(!held(&folder), "let go with the session");
+            assert_let_go(&folder, &format!("round {round}: let go with the session"));
+        }
+        drop(starting);
+        #[cfg(unix)]
+        {
+            let (ran, failed) = starter.join().unwrap();
+            assert!(
+                ran > 0 && failed == 0,
+                "{ran} programs run, {failed} failed"
+            );
         }
         let resumed = Runner::start(Session::open(&root, Some(&id), &user).unwrap());
         assert_eq!(
@@ -1323,7 +1420,7 @@ mod tests {
             "{unsaved}"
         );
         assert!(folder.is_dir());
-        assert!(!held(&folder), "the refusal let go of it");
+        assert_let_go(&folder, "the refusal let go of it");
         // Saved: it goes without asking.
         let session = Session::open(&root, Some(&id), &user).unwrap();
         let runner = Runner::start(session);
