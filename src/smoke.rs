@@ -13350,9 +13350,9 @@ flood = { pin = 8 }
             crate::ui::probe::clicks_in(a.view(), WINDOW, area, 5.)
         };
         assert!(waits(&a), "{:?}", page_texts(&a));
-        let zero = clicks(&a)
-            .into_iter()
-            .find(|m| matches!(m, Message::Machine(Action::MachineZero(None))));
+        let zero = clicks(&a).into_iter().find(
+            |m| matches!(m, Message::Machine(Action::MachineZeroOf(axes)) if axes == &[0, 1, 2]),
+        );
         let moves =
             |a: &App| (clicks(a).iter()).any(|m| matches!(m, Message::Machine(Action::ToSimZero)));
         assert!(!moves(&a));
@@ -14460,9 +14460,24 @@ flood = { pin = 8 }
         assert_eq!(
             c.home_warning().as_deref(),
             Some(
-                "Home moves X and Y with the tool at the height it is, as Z has no home switch: jog Z up clear of the work and the clamps before Home."
+                "Home moves X to its left end, then Y to its front end. Z has no home switch, so the tool travels at the height it is: jog Z up clear of the work and the clamps before Home."
             )
         );
+        // Z with a switch it homes down to, first: raising the tool does
+        // not clear its path (review).
+        {
+            let mut c = c.clone_config();
+            let x = c.axes.get(0).unwrap().clone();
+            *c.axes.get_mut(2).unwrap() = uc100::config::AxisConfig {
+                home_negative: true,
+                ..x
+            };
+            let w = conn(&a).home_warning_with(&c).unwrap();
+            assert_eq!(
+                w,
+                "Home moves Z down to its switch, then X to its left end, then Y to its front end. Z goes down to its switch and X and Y travel with the tool where it is: take the work, the clamps and the vise out of the tool's whole path, down to the bottom of Z's travel, before Home."
+            );
+        }
         assert!(c.homes(0) && c.homes(1) && !c.homes(2) && !c.homes(3));
         assert_eq!(
             c.place(&[0, 1, 2], true, true),
@@ -14549,6 +14564,52 @@ flood = { pin = 8 }
             line.ends_with(
                 "Home X and Y, and Set machine zero for Z in the Machine tab to turn them on."
             ),
+            "{line}"
+        );
+        // The start box's Set machine zero here sets Z alone: an A set and
+        // turned to 15° since keeps its position (review).
+        let _ = a.update(Message::Machine(Action::MachineZero(Some(3))));
+        tick_until(&mut a, 3.0, "A set", |s| s.referenced[3]);
+        mdi(&mut a, "G0 A15");
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::Start));
+        let texts = page_texts(&a);
+        assert!(
+            texts.iter().any(|t| t
+                == "Set machine zero here declares machine zero for Z alone, where it is now: jog Z to the top first."),
+            "{texts:?}"
+        );
+        let area = iced::Rectangle::new(iced::Point::ORIGIN, WINDOW);
+        let clicks = crate::ui::probe::clicks_in(a.view(), WINDOW, area, 5.);
+        assert!(
+            clicks
+                .iter()
+                .any(|m| matches!(m, Message::Machine(Action::KeepPositionOf(x)) if x == &[2])),
+            "{clicks:?}"
+        );
+        let zero = (clicks.into_iter())
+            .find(|m| matches!(m, Message::Machine(Action::MachineZeroOf(x)) if x == &[2]))
+            .expect("Set machine zero here for Z");
+        let _ = a.update(zero);
+        tick_until(&mut a, 3.0, "Z set", |s| s.referenced[2]);
+        tick_for(&mut a, 200);
+        let s = &conn(&a).snapshot;
+        assert!(
+            s.referenced[3] && (s.machine_pos[3] - 15.).abs() < 1e-3,
+            "{:?}",
+            s.machine_pos
+        );
+        assert!(!s.referenced[0] && !s.referenced[1]);
+        let p = problems(&a);
+        assert!(!p.iter().any(|l| l.starts_with("A has")), "{p:?}");
+        assert!(
+            p.iter()
+                .any(|l| l.ends_with("no machine position, so the work zero the steps before hole 3 were cut with is not where it was: Home again in the Machine tab first.")),
+            "{p:?}"
+        );
+        let line = crate::run::limits_unchecked(conn(&a)).unwrap();
+        assert!(
+            line.starts_with("X, Y have no machine position")
+                && line.ends_with("Home in the Machine tab to turn them on."),
             "{line}"
         );
     }

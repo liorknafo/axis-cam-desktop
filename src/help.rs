@@ -1631,7 +1631,7 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
     use crate::control::Action::*;
     match a {
         Home => (
-            "Home every axis on its switch, in the profile's order. This sets machine zero, and the soft limits apply from then on.",
+            "Home the axes with a home switch, in the profile's order. This sets their machine zero, and the soft limits apply once every limited axis has one. An axis without a switch gets its from Set machine zero.",
             "",
         ),
         MachineZero(None) => (
@@ -1640,6 +1640,14 @@ fn machine_help(a: &crate::control::Action) -> (&'static str, &'static str) {
         ),
         MachineZero(Some(_)) => (
             "Declare the current position machine zero for this axis only.",
+            "",
+        ),
+        MachineZeroOf(_) => (
+            "Declare the current position machine zero for the axes named beside it that have no home switch. First jog X and Y to their low ends (the Machine tab names them) and Z to the top.",
+            "",
+        ),
+        KeepPositionOf(_) => (
+            "Take the position shown as the machine position of the axes named beside it. After connecting it is where AXIS CAM last left the machine: use it only if nothing moved the machine since.",
             "",
         ),
         KeepPosition => (
@@ -5056,6 +5064,8 @@ pub(crate) mod tests {
             Ctl::MachineZero(None),
             Ctl::MachineZero(Some(0)),
             Ctl::KeepPosition,
+            Ctl::MachineZeroOf(vec![2]),
+            Ctl::KeepPositionOf(vec![2]),
             Ctl::JogPress(0, false),
             Ctl::JogRelease,
             Ctl::JogStep(None),

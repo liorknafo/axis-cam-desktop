@@ -11366,12 +11366,12 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
             b = b
                 .push(small(
                     "Set machine zero here",
-                    idle(Action::MachineZero(None)),
+                    idle(Action::MachineZeroOf(set.clone())),
                     false,
                 ))
                 .push(small(
                     "Keep the last position",
-                    idle(Action::KeepPosition),
+                    idle(Action::KeepPositionOf(set.clone())),
                     false,
                 ));
         }
@@ -11386,6 +11386,17 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
         }
         if let Some(w) = (!home.is_empty()).then(|| c.home_warning()).flatten() {
             one = one.push(text(w).size(12).color(AMBER));
+        }
+        if !set.is_empty() {
+            one = one.push(
+                text(format!(
+                    "Set machine zero here declares machine zero for {} alone, where {} now: jog {} first.",
+                    crate::control::axis_list(&set),
+                    if set.len() == 1 { "it is" } else { "they are" },
+                    zero_places(c.orient, &set, "to")
+                ))
+                .size(12),
+            );
         }
         one = one.push(b);
     }
@@ -11627,15 +11638,27 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
             list = list.push(text(line).size(12));
         }
         if unplaced {
+            // Home for those with a switch, machine zero for the others
+            // alone (LIO-573).
+            let unset = c.unset_limited_axes();
+            let (home, set): (Vec<usize>, Vec<usize>) = unset.iter().partition(|&&a| c.homes(a));
+            let mut b = row![].spacing(6).align_y(Alignment::Center);
+            if !home.is_empty() {
+                b = b.push(small("Home", idle(Action::Home), false));
+            }
+            if !set.is_empty() {
+                b = b.push(small(
+                    "Set machine zero here",
+                    idle(Action::MachineZeroOf(set.clone())),
+                    false,
+                ));
+            }
             list = list.push(
-                row![
-                    small(
-                        "Set machine zero here",
-                        idle(Action::MachineZero(None)),
-                        false
-                    ),
-                    hint("Work zero", move_there_waits(c.orient), fit.chars(60)),
-                ]
+                b.push(hint(
+                    "Work zero",
+                    move_there_waits(c.orient, &home, &set),
+                    fit.chars(60),
+                ))
                 .spacing(6)
                 .align_y(Alignment::Center),
             );
@@ -13549,11 +13572,19 @@ pub(crate) fn zero_places(o: crate::orient::Orient, axes: &[usize], at: &str) ->
         _ => places.concat(),
     }
 }
-fn move_there_waits(o: crate::orient::Orient) -> String {
-    format!(
-        "Move there waits for machine zero: it rises to the top of Z first. Set it here, with {} (where the simulator starts), or in the Machine tab.",
-        zero_ends(o, "at")
-    )
+/// Why Move there waits, and what the buttons beside it do: Home for
+/// `home` (with a switch), Set machine zero for `set` (LIO-573).
+fn move_there_waits(o: crate::orient::Orient, home: &[usize], set: &[usize]) -> String {
+    let how = if set.is_empty() {
+        "Home here, or in the Machine tab.".to_string()
+    } else {
+        format!(
+            "{} here, with {} (where the simulator starts), or in the Machine tab.",
+            crate::control::place_words(home, set, false, false),
+            zero_places(o, set, "at")
+        )
+    };
+    format!("Move there waits for machine zero: it rises to the top of Z first. {how}")
 }
 /// The Machine tab's note when some axes have a home switch (`homed`) and
 /// others not (`declared`, a rotary A, say): Home gives the first theirs,
