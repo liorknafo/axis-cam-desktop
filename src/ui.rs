@@ -8743,37 +8743,34 @@ pub(crate) fn estop_unreachable_help(why: &str) -> String {
 }
 
 /// The red E-stop: in the top bar on every page while connected, and on the Control page.
-/// While it cannot reach the machine (`estop_unreachable`) it is a dull red,
-/// and its hover help says so and to use the machine's own E-stop
-/// (LIO-580); a press still goes to the link, which drops it.
+/// While it cannot reach the machine (`estop_unreachable`) it is a dull red
+/// (its white label still 4.8:1), and its hover help says so and to use
+/// the machine's own E-stop (LIO-580); a press still goes to the link,
+/// which drops it.
 fn estop<'a>(c: &crate::control::Connection) -> Element<'a, Message> {
     let unreachable = estop_unreachable(c);
     let dull = unreachable.is_some();
-    let b = button(bold("E-STOP", 14).color(if dull {
-        Color::from_rgb8(236, 214, 214)
-    } else {
-        Color::WHITE
-    }))
-    .on_press(Message::MachineEStop)
-    .padding(finger([8, 16], 14, "E-STOP"))
-    .style(move |_, status| button::Style {
-        background: Some(
-            if dull {
-                Color::from_rgb8(146, 104, 104)
-            } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
-                Color::from_rgb8(160, 20, 20)
-            } else {
-                Color::from_rgb8(200, 30, 30)
-            }
-            .into(),
-        ),
-        text_color: Color::WHITE,
-        border: Border {
-            radius: 4.into(),
+    let b = button(bold("E-STOP", 14).color(Color::WHITE))
+        .on_press(Message::MachineEStop)
+        .padding(finger([8, 16], 14, "E-STOP"))
+        .style(move |_, status| button::Style {
+            background: Some(
+                if dull {
+                    Color::from_rgb8(146, 104, 104)
+                } else if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                    Color::from_rgb8(160, 20, 20)
+                } else {
+                    Color::from_rgb8(200, 30, 30)
+                }
+                .into(),
+            ),
+            text_color: Color::WHITE,
+            border: Border {
+                radius: 4.into(),
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    });
+        });
     match unreachable {
         Some(why) => HelpButton::with_help(
             b,
