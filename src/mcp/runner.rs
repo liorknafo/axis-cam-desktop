@@ -1185,12 +1185,16 @@ mod tests {
         let (starting, stop) = mpsc::channel::<()>();
         #[cfg(unix)]
         let starter = std::thread::spawn(move || {
-            let mut started = 0u32;
+            // Programs run, and launches that failed: every one must run,
+            // or the copies this test is about were never made.
+            let (mut ran, mut failed) = (0u32, 0u32);
             while stop.try_recv() == Err(mpsc::TryRecvError::Empty) {
-                let _ = std::process::Command::new("true").status();
-                started += 1;
+                match std::process::Command::new("true").status() {
+                    Ok(status) if status.success() => ran += 1,
+                    _ => failed += 1,
+                }
             }
-            started
+            (ran, failed)
         });
         #[cfg(not(unix))]
         let _ = stop;
@@ -1216,7 +1220,13 @@ mod tests {
         }
         drop(starting);
         #[cfg(unix)]
-        assert!(starter.join().unwrap() > 0, "no program was started");
+        {
+            let (ran, failed) = starter.join().unwrap();
+            assert!(
+                ran > 0 && failed == 0,
+                "{ran} programs run, {failed} failed"
+            );
+        }
         let resumed = Runner::start(Session::open(&root, Some(&id), &user).unwrap());
         assert_eq!(
             resumed.call("inspect", json!({})).unwrap()["project"]["title"],
