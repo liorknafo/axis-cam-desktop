@@ -1101,6 +1101,21 @@ mod tests {
         }
     }
 
+    /// `assert_let_go` is no weaker than the check it replaced: a session
+    /// still open is caught at once, not waited for.
+    #[test]
+    #[should_panic(expected = "kept: this process still has the lock file open")]
+    #[cfg(unix)]
+    fn a_session_still_open_is_not_let_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("mcp-sessions");
+        let user = user_workspace(dir.path());
+        let session = Session::open(&root, None, &user).unwrap();
+        let kept = session.clone();
+        drop(session);
+        assert_let_go(&kept.folder, "kept");
+    }
+
     /// Whether one of this process's open files is the file at `path`:
     /// each in `/dev/fd` asked with `fstat`, never duplicated or closed (a
     /// duplicate would hold its lock too).
