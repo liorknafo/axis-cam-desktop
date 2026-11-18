@@ -2101,6 +2101,55 @@ fn job(name: &str, actions: Vec<Do>) -> Command {
 /// The axes' letters, by the driver's index.
 pub const AXIS_NAMES: [&str; 6] = ["X", "Y", "Z", "A", "B", "C"];
 
+/// "X", "X and Y", "X, Y and Z".
+pub fn axis_list(axes: &[usize]) -> String {
+    let names: Vec<&str> = axes.iter().map(|&a| AXIS_NAMES[a]).collect();
+    match names.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => names.concat(),
+    }
+}
+
+/// The axes of `config` with a home switch (and `enabled`), in its homing
+/// order, then any it leaves out: what Home runs (`Connection::home_axes`).
+fn home_axes_of(config: &MachineConfig, enabled: impl Fn(usize) -> bool) -> Vec<usize> {
+    let order = (config.homing.order.chars()).filter_map(|c| {
+        AXIS_NAMES
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(&c.to_string()))
+    });
+    let mut axes: Vec<usize> = vec![];
+    for a in order.chain(0..6) {
+        let switch = config.axes.get(a).is_some_and(|x| x.home.is_some());
+        if switch && enabled(a) && !axes.contains(&a) {
+            axes.push(a);
+        }
+    }
+    axes
+}
+
+/// What gives axes their machine position, by the Machine tab's buttons:
+/// Home for `home` (with a home switch), Set machine zero for `set`
+/// (without), each named when both are wanted (LIO-573). `again` after an
+/// E-stop; `keep` offers Keep the last position too.
+pub fn place_words(home: &[usize], set: &[usize], again: bool, keep: bool) -> String {
+    let again = if again { " again" } else { "" };
+    let keep = if keep {
+        " (or Keep the last position)"
+    } else {
+        ""
+    };
+    match (home.is_empty(), set.is_empty()) {
+        (false, true) => format!("Home{again}"),
+        (false, false) => format!(
+            "Home {}{again}, and Set machine zero{again} for {}{keep}",
+            axis_list(home),
+            axis_list(set)
+        ),
+        _ => format!("Set machine zero{again}{keep}"),
+    }
+}
+
 /// A rotary axis (A, B, C): in degrees, without switches.
 pub fn rotary(a: usize) -> bool {
     a >= 3
@@ -2153,7 +2202,8 @@ const JOG_START: Duration = Duration::from_millis(400);
 /// What the Control page asks of the connected machine.
 #[derive(Debug, Clone)]
 pub enum Action {
-    /// Home every axis in the profile's order.
+    /// Home the axes with a home switch, in the profile's homing order
+    /// (`Connection::home_axes`); those without are declared instead.
     Home,
     /// Declare the current position machine zero: every axis without a
     /// home switch (A too), or one axis.
@@ -2161,6 +2211,12 @@ pub enum Action {
     /// Declare every axis at the machine position it shows, which after
     /// connecting is where the machine was left.
     KeepPosition,
+    /// Set machine zero for these axes alone, those without a home switch
+    /// among them: a box that names the axes it sets (LIO-573), leaving an
+    /// A that has its position as it is.
+    MachineZeroOf(Vec<usize>),
+    /// Keep the last position of these axes alone, as `MachineZeroOf`.
+    KeepPositionOf(Vec<usize>),
     /// A jog button or key went down: one step, or a continuous jog for as
     /// long as it is held (axis, negative).
     JogPress(usize, bool),
@@ -3507,22 +3563,22 @@ impl Connection {
             return;
         }
         match action {
-            Action::Home if self.idle() && self.home_switches() => self.send(Command::Home(vec![])),
+            Action::Home if self.idle() => {
+                // Named, not the driver's whole `[homing] order`: it refuses
+                // all of a Home that names an axis without a switch, such as
+                // a rotary A at its zero mark (LIO-573).
+                let axes = self.home_axes();
+                if !axes.is_empty() {
+                    self.send(Command::Home(axes));
+                }
+            }
             Action::MachineZero(axis) if self.idle() => {
-                let axes = axis.map_or(0..6, |a| a..a + 1);
-                let zero: Vec<_> = axes
-                    .filter(|&a| self.axis(a) && self.switchless(a))
-                    .map(|a| (a, 0.))
-                    .collect();
-                self.declared(&zero);
+                let axes: Vec<usize> = axis.map_or(0..6, |a| a..a + 1).collect();
+                self.declare_axes(&axes, false);
             }
-            Action::KeepPosition if self.idle() => {
-                let here: Vec<_> = (0..6)
-                    .filter(|&a| self.axis(a) && self.switchless(a))
-                    .map(|a| (a, self.snapshot.machine_pos[a]))
-                    .collect();
-                self.declared(&here);
-            }
+            Action::MachineZeroOf(axes) if self.idle() => self.declare_axes(&axes, false),
+            Action::KeepPosition if self.idle() => self.declare_axes(&[0, 1, 2, 3, 4, 5], true),
+            Action::KeepPositionOf(axes) if self.idle() => self.declare_axes(&axes, true),
             Action::JogPress(axis, negative)
                 if self.manual() && self.axis(axis) && self.jog_blocked(axis).is_none() =>
             {
@@ -4010,20 +4066,16 @@ impl Connection {
         if !self.idle() {
             return Some("The machine is not Idle.".into());
         }
-        let unset: Vec<&str> = (axes.iter())
-            .filter(|&&a| !s.referenced[a])
-            .map(|&a| ["X", "Y", "Z"][a])
+        let unset_axes: Vec<usize> = (axes.iter().copied())
+            .filter(|&a| !s.referenced[a])
             .collect();
+        let unset: Vec<&str> = unset_axes.iter().map(|&a| AXIS_NAMES[a]).collect();
         if !unset.is_empty() {
             return Some(format!(
                 "{} {} no machine position (every E-stop clears it): {} first.",
                 unset.join(", "),
                 if unset.len() == 1 { "has" } else { "have" },
-                if self.home_switches() {
-                    "home"
-                } else {
-                    "set machine zero"
-                }
+                self.place(&unset_axes, false, false)
             ));
         }
         if s.status.as_ref().and_then(|st| st.input_active(pin)) == Some(true) {
@@ -4414,11 +4466,7 @@ impl Connection {
                 "{} {} a machine position first: {}.",
                 names.join(", "),
                 if names.len() == 1 { "needs" } else { "need" },
-                if self.home_switches() {
-                    "home"
-                } else {
-                    "set machine zero"
-                }
+                self.place(&unset, false, false)
             ));
         }
         Ok(())
@@ -4555,6 +4603,25 @@ impl Connection {
                 ) => Some("Probe tip diameter is not set: set it in the Machine library.".into()),
                 _ => None,
             })
+    }
+
+    /// Declares those of `axes` the profile has without a home switch at
+    /// machine zero, or where they show when `keep`.
+    fn declare_axes(&mut self, axes: &[usize], keep: bool) {
+        let here: Vec<_> = (axes.iter().copied())
+            .filter(|&a| self.axis(a) && self.switchless(a))
+            .map(|a| {
+                (
+                    a,
+                    if keep {
+                        self.snapshot.machine_pos[a]
+                    } else {
+                        0.
+                    },
+                )
+            })
+            .collect();
+        self.declared(&here);
     }
 
     /// Declares the machine positions `axes` (axis, value). X or Y declared
@@ -5637,11 +5704,71 @@ impl Connection {
             && self.turning.is_none()
     }
 
-    /// Every enabled axis has a home switch, so Home can run.
-    pub fn home_switches(&self) -> bool {
-        (0..6)
-            .filter_map(|a| self.config.axes.get(a))
-            .all(|a| a.home.is_some())
+    /// An axis of the profile with a home switch: Home gives it its
+    /// machine position, and nothing else does.
+    pub fn homes(&self, a: usize) -> bool {
+        self.axis(a) && self.config.axes.get(a).is_some_and(|x| x.home.is_some())
+    }
+
+    /// The axes Home runs, in the order it runs them: those with a home
+    /// switch, in the profile's homing order, then any it leaves out.
+    /// Empty when none has one. The others (a rotary A without a switch,
+    /// say) get theirs from Set machine zero or Keep the last position,
+    /// as the driver refuses the whole Home if it names one (LIO-573).
+    pub fn home_axes(&self) -> Vec<usize> {
+        home_axes_of(&self.config, |a| self.axis(a))
+    }
+
+    /// The profile's `config`, to try another in a test.
+    #[cfg(test)]
+    pub fn clone_config(&self) -> MachineConfig {
+        self.config.clone()
+    }
+
+    /// What Home does, in order, when it may hit something on its way, for
+    /// the page to say before it is pressed (LIO-573): X or Y moves before
+    /// Z has gone up to its switch (Z has none, or homes later), or Z homes
+    /// down. The tool then sweeps at the height it is, or low, through
+    /// whatever is on the table. None when Z homes up first.
+    pub fn home_warning(&self) -> Option<String> {
+        self.home_warning_with(&self.config)
+    }
+
+    /// `home_warning` with the profile `config`.
+    pub fn home_warning_with(&self, config: &MachineConfig) -> Option<String> {
+        let axes = home_axes_of(config, |a| self.axis(a));
+        let first = *axes.first()?;
+        let low = |a: usize| config.axes.get(a).is_some_and(|x| x.home_negative);
+        if first == 2 && !low(2) {
+            return None;
+        }
+        let moves: Vec<String> = (axes.iter())
+            .map(|&a| match a {
+                2 => format!("Z {} to its switch", if low(2) { "down" } else { "up" }),
+                0 | 1 => format!(
+                    "{} to its {} end",
+                    AXIS_NAMES[a],
+                    self.orient.end(a, !low(a))
+                ),
+                _ => format!("{} to its switch", AXIS_NAMES[a]),
+            })
+            .collect();
+        let why = if axes.contains(&2) && low(2) {
+            "Z goes down to its switch and X and Y travel with the tool where it is: take the work, the clamps and the vise out of the tool's whole path, down to the bottom of Z's travel, before Home."
+        } else if axes.contains(&2) {
+            "X or Y moves before Z rises: jog Z up clear of the work and the clamps before Home."
+        } else {
+            "Z has no home switch, so the tool travels at the height it is: jog Z up clear of the work and the clamps before Home."
+        };
+        Some(format!("Home moves {}. {why}", moves.join(", then ")))
+    }
+
+    /// What gives `axes` their machine position, by the Machine tab's
+    /// buttons: Home for those with a home switch, Set machine zero for
+    /// the others (see `place_words`).
+    pub fn place(&self, axes: &[usize], again: bool, keep: bool) -> String {
+        let (home, set): (Vec<usize>, Vec<usize>) = axes.iter().partition(|&&a| self.homes(a));
+        place_words(&home, &set, again, keep)
     }
 
     /// X, Y and Z all have both soft limits, as `MachineView::envelope`

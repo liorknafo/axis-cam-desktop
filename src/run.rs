@@ -1761,7 +1761,7 @@ impl Run {
                     "{} {} no machine position, so the work zero the steps before {step} were cut with is not where it was: {} in the Machine tab first.",
                     unset.join(", "),
                     if unset.len() == 1 { "has" } else { "have" },
-                    if c.home_switches() { "Home again" } else { "Set machine zero again (or Keep the last position)" }
+                    c.place(&unset_ids(c), true, true)
                 ));
             }
             if !self.tool_kept && !self.touched {
@@ -1790,16 +1790,14 @@ impl Run {
         // does not stop Cycle Start (`limits_unchecked`). On A it does: the
         // driver runs nothing while A has soft limits and no position, and a
         // program never moves an A without one.
-        let a_unset: Vec<&str> = (3..6)
-            .filter(|&a| c.axis(a) && !s.referenced[a])
-            .map(|a| AXES[a])
-            .collect();
+        let a_ids: Vec<usize> = (3..6).filter(|&a| c.axis(a) && !s.referenced[a]).collect();
+        let a_unset: Vec<&str> = a_ids.iter().map(|&a| AXES[a]).collect();
         if !a_unset.is_empty() {
             e.push(format!(
                 "{} {} no machine position (every E-stop clears it), so the soft limits are off. {} in the Machine tab, then Cycle Start.",
                 a_unset.join(", "),
                 if a_unset.len() == 1 { "has" } else { "have" },
-                if c.home_switches() { "Home again" } else { "Set machine zero again" }
+                c.place(&a_ids, true, false)
             ));
         }
         if s.limits_override {
@@ -3695,10 +3693,12 @@ pub(crate) fn ready(doc: &Document, mesh: &Mesh, si: usize, key: u64) -> Ready {
 
 /// X, Y and Z without a machine position (every E-stop clears it).
 fn unset_axes(c: &Connection) -> Vec<&'static str> {
-    (0..3)
-        .filter(|&a| !c.snapshot.referenced[a])
-        .map(|a| AXES[a])
-        .collect()
+    unset_ids(c).into_iter().map(|a| AXES[a]).collect()
+}
+
+/// X, Y and Z without a machine position, by index.
+fn unset_ids(c: &Connection) -> Vec<usize> {
+    (0..3).filter(|&a| !c.snapshot.referenced[a]).collect()
 }
 
 /// What Cycle Start does not check while the profile sets no soft limits on
@@ -3717,16 +3717,16 @@ pub fn limits_unchecked(c: &Connection) -> Option<String> {
         ));
     }
     // An axis without soft limits is not waiting for its position.
-    let unset: Vec<&str> = unset_axes(c)
-        .into_iter()
-        .filter(|n| !unlimited.iter().any(|&a| AXES[a] == *n))
+    let unset_i: Vec<usize> = (unset_ids(c).into_iter())
+        .filter(|a| !unlimited.contains(a))
         .collect();
+    let unset: Vec<&str> = unset_i.iter().map(|&a| AXES[a]).collect();
     if !unset.is_empty() {
         lines.push(format!(
             "{} {} no machine position (every E-stop clears it), so Cycle Start runs with the soft limits off and does not check that the job fits the machine's travel. Make sure the work zero is on the stock (touch it off again after an E-stop, as the drives may lose steps) and watch the machine. {} in the Machine tab to turn them on.",
             unset.join(", "),
             if unset.len() == 1 { "has" } else { "have" },
-            if c.home_switches() { "Home" } else { "Set machine zero" }
+            c.place(&unset_i, false, false)
         ));
     }
     (!lines.is_empty()).then(|| lines.join(" "))

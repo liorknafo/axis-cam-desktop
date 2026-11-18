@@ -415,6 +415,8 @@ pub fn machine(a: &control::Action) -> Class {
         control::Action::Home
         | control::Action::MachineZero(_)
         | control::Action::KeepPosition
+        | control::Action::MachineZeroOf(_)
+        | control::Action::KeepPositionOf(_)
         | control::Action::JogPress(..)
         | control::Action::JogStep(_)
         | control::Action::JogAngle(_)
