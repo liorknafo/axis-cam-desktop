@@ -4431,10 +4431,7 @@ impl Connection {
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::STEPS_UNFOLLOWED] =>
             {
-                Err(format!(
-                    "The check does not follow the {}, where a probe finds this work zero.",
-                    crate::run::STEPS_UNFOLLOWED
-                ))
+                Err("The check does not follow the stock cut by the steps taken as cut where a probe finds this work zero.".into())
             }
             Some((Some(partly), by)) if p.probe.is_ok() && !partly.cut.is_empty() => Err(format!(
                 "{} cut the stock's {}, where a probe finds this work zero.",
