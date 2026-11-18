@@ -262,7 +262,7 @@ pub fn adjust_message(sizes: &[f32], k: usize, dial: f32) -> String {
     let divisions = match (dial > 0.).then(|| head_divisions(out, dial)) {
         Some(Err(count)) => {
             return format!(
-                "{measure} Set the head out from the measured bore to Ø{size:.2}: {size:.2} − measured on the diameter at {dial} a division, {count:.1} divisions from Ø{before:.2}, pass {index} of {of}, then resume."
+                "{measure} Set the head out {size:.2} − measured on the diameter at {dial} a division, {count:.1} divisions from Ø{before:.2}, pass {index} of {of}, then resume."
             );
         }
         Some(Ok(n)) => format!(", {n} divisions of {dial},"),
@@ -645,7 +645,7 @@ pub(crate) mod tests {
                 Some(count) => {
                     let before = sizes[last - 1];
                     assert!(said.starts_with(&format!(
-                        "Boring head: measure the bore, Ø{before:.2} expected. Set the head out from the measured bore to Ø16.50: 16.50 − measured on the diameter at {dial} a division, {count} divisions from Ø{before:.2}, pass {} of {}, then resume.",
+                        "Boring head: measure the bore, Ø{before:.2} expected. Set the head out 16.50 − measured on the diameter at {dial} a division, {count} divisions from Ø{before:.2}, pass {} of {}, then resume.",
                         last + 1,
                         sizes.len()
                     )), "{said}");
@@ -679,6 +679,17 @@ pub(crate) mod tests {
             crate::post::comment(&said).contains("16.50 - measured"),
             "{said}"
         );
+        // All of it fits the G-code comment's 200 characters, even for a
+        // wide bore on a fine dial after many passes.
+        let mut wide: Vec<f32> = (0..99).map(|k| 100. + 0.15 * k as f32).collect();
+        wide.push(116.5);
+        for (sizes, dial) in [(&sizes, 0.0254), (&wide, 0.00254)] {
+            let said = crate::post::comment(&adjust_message(sizes, sizes.len() - 1, dial));
+            assert!(
+                said.ends_with(", then resume.") && said.contains(" - measured"),
+                "{said}"
+            );
+        }
     }
     #[test]
     fn a_reamer_feeds_in_dwells_and_feeds_back_out() {
