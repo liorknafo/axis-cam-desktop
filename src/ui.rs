@@ -10104,7 +10104,11 @@ pub(crate) fn run_bar<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
         .push(after)
         .push(big(
             "Stop now",
-            msg(crate::run::busy(state) && !c.pi_down(), R::Stop),
+            // And while a Cycle Start waits for the machine: it cancels it.
+            msg(
+                (crate::run::busy(state) || c.press_waits()) && !c.pi_down(),
+                R::Stop,
+            ),
         ));
     container(
         row![picker, what, buttons]
