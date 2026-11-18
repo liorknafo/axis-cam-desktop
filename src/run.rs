@@ -7888,8 +7888,21 @@ pub(crate) mod tests {
             }
         }
         // The tablet file: a step a level, each ending somewhere to stop.
+        // Its start at each level after the first says plainly why it is
+        // not there: in the chuck, the tablet starts a tool run only at its
+        // first point, the way in past the jaws it checked (LIO-476,
+        // LIO-567).
         let tablet = tablet_runs(&doc, Ok(&mesh), 0);
         assert!(tablet.problems.is_empty(), "{:?}", tablet.problems);
+        let starts: Vec<_> = (tablet.tool_runs.iter())
+            .flat_map(|r| &r.step_starts)
+            .filter(|st| st.operation == 0)
+            .collect();
+        let at: Vec<usize> = starts.iter().map(|st| st.step).collect();
+        assert_eq!(at, (1..7).collect::<Vec<_>>());
+        for st in &starts {
+            assert_eq!(st.problems, [CHUCK_STARTS], "Level {}", st.step + 1);
+        }
         let tablet: Vec<_> = tablet.tool_runs.iter().flat_map(|r| &r.steps).collect();
         let labels: Vec<&str> = tablet.iter().map(|t| t.label.as_str()).collect();
         assert_eq!(labels, want);
