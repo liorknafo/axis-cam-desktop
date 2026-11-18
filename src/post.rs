@@ -140,7 +140,8 @@ pub fn blend(m: &Machine) -> f32 {
 }
 /// Where a stock-based work zero lies along X or Y of the stock box: on its
 /// − side, midway between its sides, or on its + side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum At {
     Min,
     Mid,

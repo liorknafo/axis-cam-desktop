@@ -13055,10 +13055,7 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
         } else {
             "the stock top"
         };
-        let spot = match crate::control::probe_spot(c.orient, refs).as_str() {
-            "its centre" => "the centre".to_string(),
-            spot => spot.to_string(),
-        };
+        let spot = crate::control::touch_spot(c.orient, refs);
         steps.push(format!(
             "3. Jog the tool tip over {spot} of the stock top, then down in 0.1 mm and 0.01 mm steps until it just pinches a sheet of paper on {on}."
         ));
@@ -13070,10 +13067,7 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     } else {
         match (c.touch_off(), crate::post::references(&p.origin)) {
             (Some((_, work)), Some(refs)) => {
-                let spot = match crate::control::probe_spot(c.orient, refs).as_str() {
-                    "its centre" => "the centre".to_string(),
-                    spot => spot.to_string(),
-                };
+                let spot = crate::control::touch_spot(c.orient, refs);
                 steps.push(format!("3. Jog the tool tip over {spot} of the stock top, then down in 0.1 mm and 0.01 mm steps until it just pinches a sheet of paper on the stock top."));
                 let zero = match crate::post::stock_zero(&p.origin) {
                     None => " on Model origin".to_string(),
