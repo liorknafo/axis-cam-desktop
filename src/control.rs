@@ -1171,6 +1171,30 @@ const BOSS_SIDES: [(usize, f64); 4] = [(0, 1.), (0, -1.), (1, 1.), (1, -1.)];
 
 /// Where to put the tip for Pin centre, with its button for `{}`.
 const PIN_HOW: &str = "Take the part off the pins, jog the tip over the middle of pin 1, a few mm above its top, and press {} again.";
+/// How far pin 1 may be found from its recorded place along a homed X or
+/// Y before the pins' place no longer holds: the plate's squareness limit
+/// (`squareness`).
+pub const PIN_HOMED_LIMIT: f64 = 0.05;
+/// Why Reference X Y from pin 1 is not offered on a machine with home
+/// switches on X and Y (LIO-574).
+pub const PINS_HOMED: &str = "X and Y have home switches: Home gives them their machine position, the same after every Home, so the pins' place recorded after a Home holds again after the next. Nothing is referenced from pin 1: a declared position would take X's and Y's homed reference away.";
+
+/// The button that references `axes` (X and Y, or the one without a home
+/// switch) from pin 1: "Reference X Y from pin 1".
+pub fn pin_label(axes: &[usize]) -> String {
+    let names: Vec<&str> = axes.iter().map(|&a| AXIS_NAMES[a]).collect();
+    format!("Reference {} from pin 1", names.join(" "))
+}
+
+/// `text` about `axes`: "{}" their names ("X and Y"), and "{are}",
+/// "{were}" and "{them}" in their number.
+pub fn pin_words(text: &str, axes: &[usize]) -> String {
+    let one = axes.len() == 1;
+    text.replace("{}", &axis_list(axes))
+        .replace("{are}", if one { "is" } else { "are" })
+        .replace("{were}", if one { "was" } else { "were" })
+        .replace("{them}", if one { "it" } else { "them" })
+}
 
 /// What a `Routine` is for.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1180,8 +1204,10 @@ enum Purpose {
     /// Record the pins' place: pin 1, then pin 2 with pin 1's centre found.
     Record(Option<[f64; 2]>),
     /// Declare machine X and Y so that pin 1's centre is where it was
-    /// recorded.
-    Reference,
+    /// recorded: those of them without a home switch
+    /// (`Connection::pin_axes`), as a declaration takes a homed axis's
+    /// reference away (LIO-574).
+    Reference(&'static [usize]),
 }
 
 /// One driver command of a `Routine`.
@@ -1256,7 +1282,7 @@ impl Routine {
         match self.purpose {
             Purpose::Work => self.feature.how(self.orient),
             Purpose::Record(_) => PIN_HOW.replace("{}", "Record the pins' place"),
-            Purpose::Reference => PIN_HOW.replace("{}", "Reference X Y from pin 1"),
+            Purpose::Reference(axes) => PIN_HOW.replace("{}", &pin_label(axes)),
         }
     }
 
@@ -2646,7 +2672,8 @@ pub struct Connection {
     pub pins: Result<Option<Pins>, Vec<String>>,
     /// X and Y were referenced from pin 1 (or its place recorded) since
     /// connecting: cleared by every E-stop and by declaring X or Y another
-    /// way.
+    /// way. Of an axis with a home switch only Home says where it is, so
+    /// `pins_hold` says whether the pins' place holds (LIO-574).
     pub pin_referenced: bool,
     /// Pin 1's machine X Y just recorded, for the app to keep in the
     /// machine's profile (`take`n there).
@@ -2658,8 +2685,13 @@ pub struct Connection {
     /// are before it probes.
     pin_start: bool,
     /// The pin 1 declarations are in `declare`: once sent, X and Y are
-    /// referenced from it and this is said.
-    referencing: Option<String>,
+    /// referenced from it (when ok) and this is said.
+    referencing: Option<(bool, String)>,
+    /// Reference X Y from pin 1 found pin 1 off its recorded place along a
+    /// homed X or Y by more than `PIN_HOMED_LIMIT`: the plate or the switch
+    /// has moved, and the pins' place holds no more until it is recorded
+    /// again. What to do, as said (LIO-574).
+    pub pins_moved: Option<String>,
     /// Simulated: pin 1's machine X Y. Declaring X or Y moves it in machine
     /// coordinates the other way, as it stays put on the table.
     sim_pins: Option<[f64; 2]>,
@@ -2900,6 +2932,7 @@ impl Connection {
             pin_said: None,
             pin_start: false,
             referencing: None,
+            pins_moved: None,
             sim_pins,
             sim_sent: vec![],
             rotary: Rotary::of(m),
@@ -2937,7 +2970,7 @@ impl Connection {
             .and_then(|r| r.checked()?.first())
             .is_some_and(|p| p.pins.is_some());
         // The test bar on A stands where the block would.
-        let off = pin_probe || (on_pins && !self.pin_referenced) || self.sim_bar().is_some();
+        let off = pin_probe || (on_pins && !self.pins_hold()) || self.sim_bar().is_some();
         if let Some((min, max)) = self.block.filter(|_| !off) {
             out.push(Block { min, max });
         }
@@ -3423,6 +3456,7 @@ impl Connection {
                 self.pin_said = None;
             }
             self.pin_referenced = false;
+            self.pins_moved = None;
         }
         // A probe ends with its outcome, once the machine has stopped.
         if let Some((_, message, result)) = self.probing.as_ref().and_then(|p| self.ended(p.seq)) {
@@ -3470,10 +3504,10 @@ impl Connection {
                     self.sim_pins = Some(at);
                     self.fit_sim_block();
                 }
-            } else if let Some(said) = self.referencing.take() {
+            } else if let Some((ok, said)) = self.referencing.take() {
                 // Every pin 1 declaration is in the driver's log.
-                self.pin_referenced = true;
-                self.pin_said = Some((true, said));
+                self.pin_referenced = ok;
+                self.pin_said = Some((ok, said));
             }
         } else {
             self.declare.clear();
@@ -3481,7 +3515,10 @@ impl Connection {
             if self.referencing.take().is_some() {
                 self.pin_said = Some((
                     false,
-                    "The machine stopped before X and Y were declared from pin 1: reference them again.".into(),
+                    pin_words(
+                        "The machine stopped before {} {were} declared from pin 1: reference {them} again.",
+                        self.pin_axes(),
+                    ),
                 ));
             }
         }
@@ -3492,11 +3529,14 @@ impl Connection {
                 self.pin_start = false;
                 self.pin_said = Some((
                     false,
-                    "The machine stopped before X and Y were declared where they show: reference them again.".into(),
+                    pin_words(
+                        "The machine stopped before {} {were} declared at the position shown: reference {them} again.",
+                        self.pin_axes(),
+                    ),
                 ));
             } else if (0..2).all(|a| self.snapshot.referenced[a]) {
                 self.pin_start = false;
-                self.start_pins(Purpose::Reference);
+                self.start_pins(Purpose::Reference(self.pin_axes()));
             }
         }
         self.send_sim_blocks();
@@ -3765,14 +3805,16 @@ impl Connection {
             }
             Action::ReferencePins if self.reference_blocked().is_none() => {
                 self.pin_said = None;
+                let axes = self.pin_axes();
                 if (0..2).all(|a| self.snapshot.referenced[a]) {
-                    self.start_pins(Purpose::Reference);
+                    self.start_pins(Purpose::Reference(axes));
                 } else {
                     // Short moves from where the tip is: X and Y are declared
                     // where they show first, as the driver probes only an
-                    // axis with a position.
+                    // axis with a position. One with a home switch is homed
+                    // already (`reference_blocked`) and stays so.
                     let at = self.snapshot.machine_pos;
-                    self.declare.extend([(0, at[0]), (1, at[1])]);
+                    self.declare.extend(axes.iter().map(|&a| (a, at[a])));
                     self.pin_start = true;
                 }
             }
@@ -4169,7 +4211,7 @@ impl Connection {
     pub fn pinning(&self) -> Option<bool> {
         match self.routine.as_ref().map(|r| r.purpose) {
             Some(Purpose::Record(_)) => Some(true),
-            Some(Purpose::Reference) => Some(false),
+            Some(Purpose::Reference(_)) => Some(false),
             _ => self.pin_start.then_some(false),
         }
     }
@@ -4633,8 +4675,10 @@ impl Connection {
             if self.referencing.take().is_some() {
                 self.pin_said = Some((
                     false,
-                    "X or Y was set before X and Y were declared from pin 1: reference them again."
-                        .into(),
+                    pin_words(
+                        "X or Y was set before {} {were} declared from pin 1: reference {them} again.",
+                        self.pin_axes(),
+                    ),
                 ));
             }
         }
@@ -4672,15 +4716,78 @@ impl Connection {
 
     /// Why Reference X Y from pin 1 cannot start now; None when it can.
     /// Z needs a machine position; X and Y need none, but the pins' place
-    /// must be recorded.
+    /// must be recorded. X or Y with a home switch is homed first, and only
+    /// the other is declared from the pin; with switches on both there is
+    /// nothing to reference, as Home gives them theirs (LIO-574).
     pub fn reference_blocked(&self) -> Option<String> {
-        self.pin_blocked(&[2]).or_else(|| match self.pins_set() {
-            Ok(Pins { reference: None, .. }) => Some(
-                "The pins' place is not recorded yet: set machine zero, then Record the pins' place."
-                    .into(),
-            ),
-            _ => None,
-        })
+        let axes = self.pin_axes();
+        let need: Vec<usize> = (0..3).filter(|a| !axes.contains(a)).collect();
+        (self.pins_set().err())
+            .or_else(|| axes.is_empty().then(|| PINS_HOMED.to_string()))
+            .or_else(|| self.pin_blocked(&need))
+            .or_else(|| match self.pins_set() {
+                Ok(Pins {
+                    reference: None, ..
+                }) => Some(format!(
+                    "The pins' place is not recorded yet: {}, then Record the pins' place.",
+                    self.place(&[0, 1, 2], false, false)
+                )),
+                _ => None,
+            })
+    }
+
+    /// X and Y without a home switch, which Reference X Y from pin 1
+    /// declares (`Purpose::Reference`). One with a switch gets its machine
+    /// position from Home alone: the driver takes a homed reference away
+    /// from an axis it is declared on (LIO-574).
+    pub fn pin_axes(&self) -> &'static [usize] {
+        match (self.homes(0), self.homes(1)) {
+            (false, false) => &[0, 1],
+            (true, false) => &[1],
+            (false, true) => &[0],
+            (true, true) => &[],
+        }
+    }
+
+    /// X and Y are where the pins' place was recorded in, since the last
+    /// E-stop: homed if they have a home switch, the others referenced from
+    /// pin 1 (or the place recorded) since (LIO-574).
+    pub fn pins_hold(&self) -> bool {
+        self.pins_moved.is_none()
+            && (0..2).all(|a| self.snapshot.referenced[a] && (self.homes(a) || self.pin_referenced))
+    }
+
+    /// Why X and Y are not where the pins' place was recorded in, and what
+    /// puts them back: Home for those with a home switch, Reference X Y
+    /// from pin 1 for the others. None while they are (`pins_hold`).
+    pub fn pins_unheld(&self) -> Option<String> {
+        if self.pins_hold() {
+            return None;
+        }
+        if let Some(moved) = &self.pins_moved {
+            return Some(moved.clone());
+        }
+        let s = &self.snapshot;
+        let unhomed: Vec<usize> = (0..2)
+            .filter(|&a| self.homes(a) && !s.referenced[a])
+            .collect();
+        let axes = self.pin_axes();
+        let unpinned =
+            !axes.is_empty() && !(self.pin_referenced && axes.iter().all(|&a| s.referenced[a]));
+        let (mut not, mut what) = (vec![], vec![]);
+        if !unhomed.is_empty() {
+            not.push(pin_words("{} {are} not homed", &unhomed));
+            what.push("Home".to_string());
+        }
+        if unpinned {
+            not.push(pin_words("{} {are} not referenced from pin 1", axes));
+            what.push(pin_label(axes));
+        }
+        Some(format!(
+            "{} since the machine was connected or E-stopped: {} in the Machine tab first.",
+            not.join(" and "),
+            what.join(", then ")
+        ))
     }
 
     /// How a feature probe for `purpose` ended: in `probed`, or for the pins
@@ -4896,6 +5003,7 @@ impl Connection {
                 }
                 self.recorded = Some(first);
                 self.pin_referenced = true;
+                self.pins_moved = None;
                 self.pin_said = Some((
                     ok,
                     format!(
@@ -4904,7 +5012,7 @@ impl Connection {
                     ),
                 ));
             }
-            Purpose::Reference => {
+            Purpose::Reference(axes) => {
                 let Ok(&Pins {
                     reference: Some(at),
                     ..
@@ -4913,16 +5021,61 @@ impl Connection {
                     return;
                 };
                 let by = [at[0] - w[0], at[1] - w[1]];
-                // Stopped over the pin: X and Y are declared moved by `by`
-                // from here, one a tick (`declare`).
+                // Stopped over the pin: X and Y (those without a home
+                // switch) are declared moved by `by` from here, one a tick
+                // (`declare`).
                 self.declare
-                    .extend([(0, now[0] + by[0]), (1, now[1] + by[1])]);
-                // Until both are logged, X and Y are not referenced from it.
+                    .extend(axes.iter().map(|&a| (a, now[a] + by[a])));
+                // Until all are logged, X and Y are not referenced from it.
                 self.pin_referenced = false;
-                self.referencing = Some(format!(
-                    "X and Y referenced from pin 1: it was found at machine X {:.3} Y {:.3}, {:.3} mm and {:.3} mm from its recorded place X {:.3} Y {:.3}, so X and Y are declared moved by {:+.3} and {:+.3} mm. Every saved work offset, the soft limits and the pins' place hold again.",
-                    w[0], w[1], -by[0], -by[1], at[0], at[1], by[0], by[1]
-                ));
+                let found = format!(
+                    "it was found at machine X {:.3} Y {:.3}, {:.3} mm and {:.3} mm from its recorded place X {:.3} Y {:.3}",
+                    w[0], w[1], -by[0], -by[1], at[0], at[1]
+                );
+                let moved: Vec<String> = axes.iter().map(|&a| format!("{:+.3}", by[a])).collect();
+                // An axis with a home switch keeps what Home gave it: how
+                // far pin 1 is off along it says how well both agree. More
+                // than the plate's squareness allows, and the plate or the
+                // switch has moved: the pins' place holds no more, as the
+                // work offsets from it would be off by that much.
+                let homed: Vec<usize> = (0..2).filter(|a| !axes.contains(a)).collect();
+                let off: Vec<usize> = (homed.iter().copied())
+                    .filter(|&a| by[a].abs() > PIN_HOMED_LIMIT)
+                    .collect();
+                let homed_said: String = (homed.iter())
+                    .map(|&a| {
+                        format!(
+                            " {} has a home switch and keeps the position Home gave it: pin 1 is {:.3} mm from its recorded place along {}.",
+                            AXIS_NAMES[a], -by[a], AXIS_NAMES[a]
+                        )
+                    })
+                    .collect();
+                let head = format!(
+                    "{} referenced from pin 1: {found}, so {} {} declared moved by {} mm.{homed_said}",
+                    axis_list(axes),
+                    axis_list(axes),
+                    if axes.len() == 1 { "is" } else { "are" },
+                    moved.join(" and "),
+                );
+                self.referencing = Some(if off.is_empty() {
+                    self.pins_moved = None;
+                    (
+                        true,
+                        format!(
+                            "{head} Every saved work offset, the soft limits and the pins' place hold again."
+                        ),
+                    )
+                } else {
+                    let moved = pin_words(
+                        &format!(
+                            "Pin 1 is over {PIN_HOMED_LIMIT:.2} mm from its recorded place along {{}}, which keep{} the position Home gave {{them}}: the plate (or the home switch) has moved since the pins' place was recorded, and X and Y from the pins would be off by that much. With the part off the pins, Record the pins' place again in the Machine tab.",
+                            if off.len() == 1 { "s" } else { "" }
+                        ),
+                        &off,
+                    );
+                    self.pins_moved = Some(moved.clone());
+                    (false, format!("{head} {moved}"))
+                });
             }
         }
     }
@@ -5885,7 +6038,10 @@ impl Connection {
         if self.referencing.take().is_some() || std::mem::take(&mut self.pin_start) {
             self.pin_said = Some((
                 false,
-                format!("{name} was not declared: reference X and Y from pin 1 again."),
+                format!(
+                    "{name} was not declared: {}",
+                    pin_words("reference {} from pin 1 again.", self.pin_axes())
+                ),
             ));
         }
         true
@@ -9604,8 +9760,14 @@ probe = { pin = 13, active_low = true }
     /// Opens the simulated `PROBED` machine with the pins of `pinned`,
     /// Idle with machine zero set where it stands.
     fn pinned_machine(dir: &Path) -> Connection {
+        pinned_machine_on(dir, PROBED)
+    }
+
+    /// `pinned_machine` on the profile `text`: the axes with a home switch
+    /// homed, machine zero set on the others.
+    fn pinned_machine_on(dir: &Path, text: &str) -> Connection {
         let profile = dir.join("probed.toml");
-        std::fs::write(&profile, PROBED).unwrap();
+        std::fs::write(&profile, text).unwrap();
         let mut m = Machine::new(3);
         m.p = pinned(&[
             ("probe_tip", "2"),
@@ -9623,11 +9785,278 @@ probe = { pin = 13, active_low = true }
         until(&mut c, 3.0, "Idle after Reset", |s| {
             s.state == Some(State::Idle)
         });
+        let homed = c.home_axes();
+        if !homed.is_empty() {
+            c.act(Action::Home);
+            until(&mut c, 10.0, "homed", |s| {
+                s.state == Some(State::Idle) && homed.iter().all(|&a| s.referenced[a])
+            });
+        }
         c.act(Action::MachineZero(None));
         until(&mut c, 3.0, "X, Y and Z set", |s| {
             s.referenced[..3].iter().all(|r| *r)
         });
         c
+    }
+
+    /// PROBED with a home switch on X, and on Y too with `y`; Z has none.
+    fn switched_probed(y: bool) -> String {
+        let p = PROBED.replace(
+            "dir = { pin = 3 }\n",
+            "dir = { pin = 3 }\nhome = { pin = 11 }\n",
+        );
+        if y {
+            p.replace(
+                "dir = { pin = 5 }\n",
+                "dir = { pin = 5 }\nhome = { pin = 12 }\n",
+            )
+        } else {
+            p
+        }
+    }
+
+    /// E-stops `c` and resets it to Idle: every machine position is gone.
+    fn e_stop_reset(c: &mut Connection) {
+        c.send(Command::EStop);
+        until(c, 3.0, "E-stop", |s| s.state == Some(State::EStop));
+        c.send(Command::Reset);
+        until(c, 3.0, "Idle after Reset", |s| s.state == Some(State::Idle));
+    }
+
+    /// No X or Y declaration in the driver's log: a homed X or Y keeps its
+    /// reference.
+    fn no_xy_declared(c: &Connection) {
+        assert!(
+            !(c.snapshot.log.iter())
+                .any(|l| l.starts_with("X declared") || l.starts_with("Y declared")),
+            "{:?}",
+            c.snapshot.log
+        );
+    }
+
+    /// LIO-574: with home switches on X and Y, Reference X Y from pin 1 is
+    /// not offered and declares nothing: Home gives X and Y their position,
+    /// and the pins' place recorded after one holds after the next. The
+    /// steps and the Fixture pins block say Home for them, Set machine zero
+    /// for Z.
+    #[test]
+    fn with_home_switches_on_x_and_y_home_gives_the_pins_place_back() {
+        use crate::ui::{pin_ready_step, pin_state};
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = pinned_machine_on(dir.path(), &switched_probed(true));
+        assert_eq!(c.home_axes(), [0, 1]);
+        assert!(c.pin_axes().is_empty());
+        assert_eq!(c.reference_blocked().as_deref(), Some(PINS_HOMED));
+        let (held, said) = pin_state(&c);
+        assert!(!held);
+        assert!(
+            said.starts_with("Not recorded yet. Once X, Y and Z have a machine position (Home X and Y, and Set machine zero for Z): "),
+            "{said}"
+        );
+        let pin1 = c.sim_pins.expect("simulated pins");
+        rapid_to(&mut c, [pin1[0] + 0.6, pin1[1] - 0.5, -69.]);
+        assert_eq!(c.record_blocked(), None);
+        c.act(Action::RecordPins);
+        let (ok, said) = pinned_end(&mut c, "Record the pins' place");
+        assert!(ok, "{said}");
+        let at = c.recorded.take().expect("pin 1's place to keep");
+        assert!(c.pins_hold() && c.pins_unheld().is_none());
+        assert_eq!(
+            pin_ready_step(&c),
+            "1. X and Y are homed since the last E-stop, and Z has a machine position."
+        );
+
+        // After an E-stop Home gives X and Y back; Set machine zero, Z.
+        e_stop_reset(&mut c);
+        assert!(!c.pins_hold());
+        assert_eq!(
+            c.pins_unheld().as_deref(),
+            Some(
+                "X and Y are not homed since the machine was connected or E-stopped: Home in the Machine tab first."
+            )
+        );
+        assert_eq!(
+            pin_ready_step(&c),
+            "1. In the Machine tab, Home X and Y, and set machine zero on Z at the top of its travel (after every E-stop or power cycle). X and Y have home switches, so the pins' place holds again after a Home: nothing is referenced from pin 1."
+        );
+        let (held, said) = pin_state(&c);
+        assert!(!held);
+        assert_eq!(
+            said,
+            format!(
+                "Pin 1 is recorded at machine X {:.3} Y {:.3}. After every E-stop or power cycle, Home. X and Y have home switches, so Home gives them their machine position and the pins' place holds again after it: nothing is referenced from pin 1.",
+                at[0], at[1]
+            )
+        );
+        assert!(
+            (c.record_blocked().unwrap())
+                .ends_with("no machine position (every E-stop clears it): Home X and Y, and Set machine zero for Z first."),
+            "{:?}",
+            c.record_blocked()
+        );
+        // Not offered, so it does nothing.
+        c.act(Action::ReferencePins);
+        assert!(c.pinning().is_none() && c.declare.is_empty() && !c.pin_start);
+        c.act(Action::Home);
+        until(&mut c, 10.0, "X and Y homed", |s| {
+            s.state == Some(State::Idle) && s.referenced[0] && s.referenced[1]
+        });
+        assert!(c.pins_hold());
+        assert_eq!(
+            pin_ready_step(&c),
+            "1. In the Machine tab, set machine zero on Z at the top of its travel (after every E-stop or power cycle). X and Y have home switches, so the pins' place holds again after a Home: nothing is referenced from pin 1."
+        );
+        let z = c.snapshot.machine_pos[2];
+        c.declared(&[(2, z)]);
+        until(&mut c, 3.0, "Z declared", |s| s.referenced[2]);
+        assert_eq!(
+            pin_state(&c),
+            (
+                true,
+                format!(
+                    "X and Y are homed, so the pins' place holds: pin 1 recorded at machine X {:.3} Y {:.3}.",
+                    at[0], at[1]
+                )
+            )
+        );
+        // The pins stand where they were recorded, and X and Y were never
+        // declared.
+        let now = c.sim_pins.unwrap();
+        assert!(
+            (0..2).all(|a| (now[a] - at[a]).abs() < 0.01),
+            "{now:?} {at:?}"
+        );
+        no_xy_declared(&c);
+    }
+
+    /// LIO-574: with a home switch on X alone, Reference Y from pin 1 homes
+    /// nothing and declares Y alone, from Y without a machine position too:
+    /// X keeps what Home gave it, and how far pin 1 is from its recorded
+    /// place along X is said.
+    #[test]
+    fn with_a_home_switch_on_x_the_pin_references_y_alone() {
+        use crate::ui::{pin_ready_step, pin_state};
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = pinned_machine_on(dir.path(), &switched_probed(false));
+        assert_eq!(c.pin_axes(), [1]);
+        assert_eq!(pin_label(c.pin_axes()), "Reference Y from pin 1");
+        let pin1 = c.sim_pins.expect("simulated pins");
+        rapid_to(&mut c, [pin1[0] + 0.6, pin1[1] - 0.5, -69.]);
+        c.act(Action::RecordPins);
+        let (ok, said) = pinned_end(&mut c, "Record the pins' place");
+        assert!(ok, "{said}");
+        let at = c.recorded.take().expect("pin 1's place to keep");
+
+        e_stop_reset(&mut c);
+        assert_eq!(
+            c.pins_unheld().as_deref(),
+            Some(
+                "X is not homed and Y is not referenced from pin 1 since the machine was connected or E-stopped: Home, then Reference Y from pin 1 in the Machine tab first."
+            )
+        );
+        let z = c.snapshot.machine_pos[2];
+        c.declared(&[(2, z)]);
+        until(&mut c, 3.0, "Z declared", |s| s.referenced[2]);
+        assert_eq!(
+            pin_ready_step(&c),
+            "1. In the Machine tab, Home, then with the part off the pins Reference Y from pin 1 (after every E-stop or power cycle)."
+        );
+        assert_eq!(
+            c.reference_blocked().as_deref(),
+            Some("X has no machine position (every E-stop clears it): Home first.")
+        );
+        let (_, said) = pin_state(&c);
+        assert!(
+            said.contains("After every E-stop or power cycle, Home, then take the part off the pins, jog the probe a few mm above the middle of pin 1 and press Reference Y from pin 1: Y needs no machine position first, X and Z do. X has a home switch, so Home gives it its position and only Y is declared from the pin. X has no machine position"),
+            "{said}"
+        );
+        c.act(Action::Home);
+        until(&mut c, 10.0, "X homed", |s| {
+            s.state == Some(State::Idle) && s.referenced[0]
+        });
+        assert!(!c.snapshot.referenced[1]);
+        assert_eq!(c.reference_blocked(), None);
+        // Home ran X onto its switch: back over pin 1.
+        assert!(c.snapshot.machine_pos[0].abs() < 1e-3);
+        rapid_to(&mut c, [pin1[0] + 0.6, pin1[1] - 0.5, -69.]);
+        assert_eq!(
+            pin_ready_step(&c),
+            "1. With the part off the pins, jog the probe a few mm above the middle of pin 1 and press Reference Y from pin 1 in the Machine tab: every E-stop clears it."
+        );
+        // Y without a machine position: declared where it shows, then from
+        // the pin; X is not declared.
+        c.act(Action::ReferencePins);
+        assert_eq!(
+            Vec::from(c.declare.clone()),
+            [(1, c.snapshot.machine_pos[1])]
+        );
+        let (ok, said) = pinned_end(&mut c, "Reference Y from pin 1");
+        assert!(ok, "{said}");
+        assert!(said.starts_with("Y referenced from pin 1: "), "{said}");
+        assert!(said.contains(", so Y is declared moved by "), "{said}");
+        assert!(
+            said.contains(" X has a home switch and keeps the position Home gave it: pin 1 is "),
+            "{said}"
+        );
+        assert!(c.pins_hold() && c.snapshot.referenced[0]);
+        let back = c.sim_pins.unwrap();
+        assert!(
+            (0..2).all(|a| (back[a] - at[a]).abs() < 0.01),
+            "{back:?} {at:?}"
+        );
+        assert_eq!(
+            pin_state(&c),
+            (
+                true,
+                format!(
+                    "X is homed and Y referenced from pin 1, recorded at machine X {:.3} Y {:.3}.",
+                    at[0], at[1]
+                )
+            )
+        );
+        assert_eq!(
+            pin_ready_step(&c),
+            "1. X is homed and Y referenced from pin 1 since the last E-stop, and Z has a machine position."
+        );
+        no_x_declared(&c);
+
+        // The plate moved 1 mm along X since: Reference Y finds pin 1 off
+        // along the homed X, says so, and the pins' place holds no more
+        // until it is recorded again.
+        let moved = [at[0] + 1., at[1]];
+        c.sim_pins = Some(moved);
+        c.fit_sim_block();
+        rapid_to(&mut c, [moved[0] + 0.6, moved[1] - 0.5, -69.]);
+        c.act(Action::ReferencePins);
+        let (ok, said) = pinned_end(&mut c, "Reference Y from pin 1, plate moved");
+        assert!(!ok, "{said}");
+        let why = "Pin 1 is over 0.05 mm from its recorded place along X, which keeps the position Home gave it: the plate (or the home switch) has moved since the pins' place was recorded, and X and Y from the pins would be off by that much. With the part off the pins, Record the pins' place again in the Machine tab.";
+        assert!(said.ends_with(why), "{said}");
+        assert!(
+            said.contains("pin 1 is 1.000 mm from its recorded place along X"),
+            "{said}"
+        );
+        assert!(!c.pins_hold() && !c.pin_referenced);
+        assert_eq!(c.pins_unheld().as_deref(), Some(why));
+        assert_eq!(pin_ready_step(&c), format!("1. {why}"));
+        assert!(!pin_state(&c).0 && pin_state(&c).1.ends_with(why));
+        // Recorded again where the plate now is: it holds.
+        rapid_to(&mut c, [moved[0] + 0.6, moved[1] - 0.5, -69.]);
+        c.act(Action::RecordPins);
+        let (ok, said) = pinned_end(&mut c, "Record the pins' place again");
+        assert!(ok, "{said}");
+        assert!(c.pins_hold() && c.pins_moved.is_none());
+        no_x_declared(&c);
+    }
+
+    /// No X declaration in the driver's log: the homed X keeps its
+    /// reference.
+    fn no_x_declared(c: &Connection) {
+        assert!(
+            !(c.snapshot.log.iter()).any(|l| l.starts_with("X declared")),
+            "{:?}",
+            c.snapshot.log
+        );
     }
 
     /// Runs `c` until a pin routine has ended and what it declares is sent.
@@ -9676,7 +10105,7 @@ probe = { pin = 13, active_low = true }
         assert_eq!(
             c.reference_blocked().as_deref(),
             Some(
-                "The pins' place is not recorded yet: set machine zero, then Record the pins' place."
+                "The pins' place is not recorded yet: Set machine zero, then Record the pins' place."
             )
         );
         // The simulator's pins stand in front of its block, pin 1 at X145
