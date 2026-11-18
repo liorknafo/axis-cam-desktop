@@ -1171,6 +1171,10 @@ const BOSS_SIDES: [(usize, f64); 4] = [(0, 1.), (0, -1.), (1, 1.), (1, -1.)];
 
 /// Where to put the tip for Pin centre, with its button for `{}`.
 const PIN_HOW: &str = "Take the part off the pins, jog the tip over the middle of pin 1, a few mm above its top, and press {} again.";
+/// How far pin 1 may be found from its recorded place along a homed X or
+/// Y before the pins' place no longer holds: the plate's squareness limit
+/// (`squareness`).
+pub const PIN_HOMED_LIMIT: f64 = 0.05;
 /// Why Reference X Y from pin 1 is not offered on a machine with home
 /// switches on X and Y (LIO-574).
 pub const PINS_HOMED: &str = "X and Y have home switches: Home gives them their machine position, the same after every Home, so the pins' place recorded after a Home holds again after the next. Nothing is referenced from pin 1: a declared position would take X's and Y's homed reference away.";
@@ -2681,8 +2685,13 @@ pub struct Connection {
     /// are before it probes.
     pin_start: bool,
     /// The pin 1 declarations are in `declare`: once sent, X and Y are
-    /// referenced from it and this is said.
-    referencing: Option<String>,
+    /// referenced from it (when ok) and this is said.
+    referencing: Option<(bool, String)>,
+    /// Reference X Y from pin 1 found pin 1 off its recorded place along a
+    /// homed X or Y by more than `PIN_HOMED_LIMIT`: the plate or the switch
+    /// has moved, and the pins' place holds no more until it is recorded
+    /// again. What to do, as said (LIO-574).
+    pub pins_moved: Option<String>,
     /// Simulated: pin 1's machine X Y. Declaring X or Y moves it in machine
     /// coordinates the other way, as it stays put on the table.
     sim_pins: Option<[f64; 2]>,
@@ -2923,6 +2932,7 @@ impl Connection {
             pin_said: None,
             pin_start: false,
             referencing: None,
+            pins_moved: None,
             sim_pins,
             sim_sent: vec![],
             rotary: Rotary::of(m),
@@ -3446,6 +3456,7 @@ impl Connection {
                 self.pin_said = None;
             }
             self.pin_referenced = false;
+            self.pins_moved = None;
         }
         // A probe ends with its outcome, once the machine has stopped.
         if let Some((_, message, result)) = self.probing.as_ref().and_then(|p| self.ended(p.seq)) {
@@ -3493,10 +3504,10 @@ impl Connection {
                     self.sim_pins = Some(at);
                     self.fit_sim_block();
                 }
-            } else if let Some(said) = self.referencing.take() {
+            } else if let Some((ok, said)) = self.referencing.take() {
                 // Every pin 1 declaration is in the driver's log.
-                self.pin_referenced = true;
-                self.pin_said = Some((true, said));
+                self.pin_referenced = ok;
+                self.pin_said = Some((ok, said));
             }
         } else {
             self.declare.clear();
@@ -4742,7 +4753,8 @@ impl Connection {
     /// E-stop: homed if they have a home switch, the others referenced from
     /// pin 1 (or the place recorded) since (LIO-574).
     pub fn pins_hold(&self) -> bool {
-        (0..2).all(|a| self.snapshot.referenced[a] && (self.homes(a) || self.pin_referenced))
+        self.pins_moved.is_none()
+            && (0..2).all(|a| self.snapshot.referenced[a] && (self.homes(a) || self.pin_referenced))
     }
 
     /// Why X and Y are not where the pins' place was recorded in, and what
@@ -4751,6 +4763,9 @@ impl Connection {
     pub fn pins_unheld(&self) -> Option<String> {
         if self.pins_hold() {
             return None;
+        }
+        if let Some(moved) = &self.pins_moved {
+            return Some(moved.clone());
         }
         let s = &self.snapshot;
         let unhomed: Vec<usize> = (0..2)
@@ -4988,6 +5003,7 @@ impl Connection {
                 }
                 self.recorded = Some(first);
                 self.pin_referenced = true;
+                self.pins_moved = None;
                 self.pin_said = Some((
                     ok,
                     format!(
@@ -5018,24 +5034,48 @@ impl Connection {
                 );
                 let moved: Vec<String> = axes.iter().map(|&a| format!("{:+.3}", by[a])).collect();
                 // An axis with a home switch keeps what Home gave it: how
-                // far pin 1 is off along it says how well both agree.
-                let homed: Vec<String> = (0..2)
-                    .filter(|a| !axes.contains(a))
-                    .map(|a| {
+                // far pin 1 is off along it says how well both agree. More
+                // than the plate's squareness allows, and the plate or the
+                // switch has moved: the pins' place holds no more, as the
+                // work offsets from it would be off by that much.
+                let homed: Vec<usize> = (0..2).filter(|a| !axes.contains(a)).collect();
+                let off: Vec<usize> = (homed.iter().copied())
+                    .filter(|&a| by[a].abs() > PIN_HOMED_LIMIT)
+                    .collect();
+                let homed_said: String = (homed.iter())
+                    .map(|&a| {
                         format!(
                             " {} has a home switch and keeps the position Home gave it: pin 1 is {:.3} mm from its recorded place along {}.",
                             AXIS_NAMES[a], -by[a], AXIS_NAMES[a]
                         )
                     })
                     .collect();
-                self.referencing = Some(format!(
-                    "{} referenced from pin 1: {found}, so {} {} declared moved by {} mm.{} Every saved work offset, the soft limits and the pins' place hold again.",
+                let head = format!(
+                    "{} referenced from pin 1: {found}, so {} {} declared moved by {} mm.{homed_said}",
                     axis_list(axes),
                     axis_list(axes),
                     if axes.len() == 1 { "is" } else { "are" },
                     moved.join(" and "),
-                    homed.concat()
-                ));
+                );
+                self.referencing = Some(if off.is_empty() {
+                    self.pins_moved = None;
+                    (
+                        true,
+                        format!(
+                            "{head} Every saved work offset, the soft limits and the pins' place hold again."
+                        ),
+                    )
+                } else {
+                    let moved = pin_words(
+                        &format!(
+                            "Pin 1 is over {PIN_HOMED_LIMIT:.2} mm from its recorded place along {{}}, which keep{} the position Home gave {{them}}: the plate (or the home switch) has moved since the pins' place was recorded, and X and Y from the pins would be off by that much. With the part off the pins, Record the pins' place again in the Machine tab.",
+                            if off.len() == 1 { "s" } else { "" }
+                        ),
+                        &off,
+                    );
+                    self.pins_moved = Some(moved.clone());
+                    (false, format!("{head} {moved}"))
+                });
             }
         }
     }
@@ -9978,6 +10018,34 @@ probe = { pin = 13, active_low = true }
             pin_ready_step(&c),
             "1. X is homed and Y referenced from pin 1 since the last E-stop, and Z has a machine position."
         );
+        no_x_declared(&c);
+
+        // The plate moved 1 mm along X since: Reference Y finds pin 1 off
+        // along the homed X, says so, and the pins' place holds no more
+        // until it is recorded again.
+        let moved = [at[0] + 1., at[1]];
+        c.sim_pins = Some(moved);
+        c.fit_sim_block();
+        rapid_to(&mut c, [moved[0] + 0.6, moved[1] - 0.5, -69.]);
+        c.act(Action::ReferencePins);
+        let (ok, said) = pinned_end(&mut c, "Reference Y from pin 1, plate moved");
+        assert!(!ok, "{said}");
+        let why = "Pin 1 is over 0.05 mm from its recorded place along X, which keeps the position Home gave it: the plate (or the home switch) has moved since the pins' place was recorded, and X and Y from the pins would be off by that much. With the part off the pins, Record the pins' place again in the Machine tab.";
+        assert!(said.ends_with(why), "{said}");
+        assert!(
+            said.contains("pin 1 is 1.000 mm from its recorded place along X"),
+            "{said}"
+        );
+        assert!(!c.pins_hold() && !c.pin_referenced);
+        assert_eq!(c.pins_unheld().as_deref(), Some(why));
+        assert_eq!(pin_ready_step(&c), format!("1. {why}"));
+        assert!(!pin_state(&c).0 && pin_state(&c).1.ends_with(why));
+        // Recorded again where the plate now is: it holds.
+        rapid_to(&mut c, [moved[0] + 0.6, moved[1] - 0.5, -69.]);
+        c.act(Action::RecordPins);
+        let (ok, said) = pinned_end(&mut c, "Record the pins' place again");
+        assert!(ok, "{said}");
+        assert!(c.pins_hold() && c.pins_moved.is_none());
         no_x_declared(&c);
     }
 

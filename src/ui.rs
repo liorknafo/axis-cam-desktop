@@ -13342,6 +13342,10 @@ pub(crate) fn pin_ready_step(c: &crate::control::Connection) -> String {
             )
         };
     }
+    // Pin 1 off its place along a homed axis: only Record again helps.
+    if let Some(moved) = &c.pins_moved {
+        return format!("1. {moved}");
+    }
     let axes = c.pin_axes();
     let unhomed: Vec<usize> = (0..3).filter(|&a| c.homes(a) && !s.referenced[a]).collect();
     let z_set = !c.homes(2) && !s.referenced[2];
@@ -13408,6 +13412,15 @@ pub(crate) fn pin_state(c: &crate::control::Connection) -> (bool, String) {
                 },
                 at[0],
                 at[1]
+            ),
+        );
+    }
+    if let Some(moved) = &c.pins_moved {
+        return (
+            false,
+            format!(
+                "Pin 1 is recorded at machine X {:.3} Y {:.3}. {moved}",
+                at[0], at[1]
             ),
         );
     }
