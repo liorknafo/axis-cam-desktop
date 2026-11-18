@@ -2175,14 +2175,30 @@ impl Run {
         if partly.surface.is_some() {
             return None;
         }
+        // Partway by steps of its own operation taken as cut alone, those
+        // steps cut it (LIO-568).
+        let start =
+            (self.checked()).and_then(|c| c.get(self.next)?.indexes.get(self.from).copied());
+        let ops_before = (self.next, self.from) != (0, 0)
+            || (self.skips.iter()).any(|s| s.1 == Skip::Cut && start.is_some_and(|o| s.0 < o))
+            || (self.cut_steps.iter()).any(|c| start.is_some_and(|o| c.0 < o));
+        let by = if ops_before {
+            "the operations before the start"
+        } else {
+            "the steps taken as cut"
+        };
         Some(if partly.cut.is_empty() {
-            "The check cannot tell the surface the operations before the start leave where the stock top is touched off.".into()
+            format!(
+                "The check cannot tell the surface {by} leave where the stock top is touched off."
+            )
         } else if partly.cut == [STEPS_UNFOLLOWED] {
             // Not a part of the stock: said as the reason it is (LIO-579).
             "The check does not follow the stock the steps before the start cut, so it cannot tell the surface they left where the stock top is touched off.".into()
         } else {
             format!(
-                "The operations before the start cut the stock's {}, and the check cannot tell the surface they left where the stock top is touched off.",
+                "{}{} cut the stock's {}, and the check cannot tell the surface they left where the stock top is touched off.",
+                by[..1].to_uppercase(),
+                &by[1..],
                 partly.cut.join(", ")
             )
         })
@@ -8021,6 +8037,15 @@ pub(crate) mod tests {
         assert_eq!(skipped.surface, None);
         let centre = (skipped.probe_from.iter()).find(|(r, _)| *r == p.probe.clone().unwrap());
         assert!(centre.is_some_and(|(_, ok)| ok.is_err()), "{centre:?}");
+        // Zero Z and Probe Z say why they cannot set Z, naming the steps.
+        for r in [&first, &second, &run] {
+            let why = r.partway_blocked().unwrap();
+            assert!(
+                why.starts_with("The steps taken as cut cut the stock's "),
+                "{why}"
+            );
+            assert_eq!(r.touch_off(), None);
+        }
         // Starting at Pass 1, Cycle Start waits for the work zero, kept or
         // set again.
         assert!(!run.zeroed);
