@@ -2188,6 +2188,56 @@ impl Run {
         })
     }
 
+    /// What a run that starts partway (`partway`) takes as cut before its
+    /// start, in the setup's order: each operation by name ("Face"), sent
+    /// before it or skipped (`Skip::Cut`), and the steps of the start's own
+    /// operation ("Face pass 2", "Face passes 1–2", "Face, 3 of its
+    /// passes").
+    pub fn taken_as_cut(&self) -> Vec<String> {
+        let Some(programs) = self.checked() else {
+            return vec![];
+        };
+        let Some(p) = programs.get(self.next) else {
+            return vec![];
+        };
+        let start = p.indexes.get(self.from).copied();
+        // The names of operations not sent are the layout's (`layout`).
+        let name = |oi: usize| -> String {
+            let all = (self.layout.as_deref()).and_then(|l| l.as_deref().ok());
+            (all.into_iter().chain([programs]).flatten())
+                .find_map(|p| Some(p.ops[p.indexes.iter().position(|&o| o == oi)?].name.clone()))
+                .unwrap_or_else(|| format!("operation {}", oi + 1))
+        };
+        let mut ops: Vec<usize> = (programs[..self.next].iter())
+            .flat_map(|p| p.indexes.iter().copied())
+            .chain(p.indexes[..self.from.min(p.indexes.len())].iter().copied())
+            .chain(
+                (self.skips.iter())
+                    .filter(|s| s.1 == Skip::Cut && start.is_some_and(|o| s.0 < o))
+                    .map(|s| s.0),
+            )
+            .collect();
+        ops.sort_unstable();
+        ops.dedup();
+        let mut said: Vec<String> = ops.into_iter().map(name).collect();
+        if let Some(oi) = start {
+            let cut = self.cut_of(oi);
+            if let (Some(&first), Some(&last)) = (cut.first(), cut.last()) {
+                let (op, steps) = (name(oi), self.op_steps(oi));
+                said.push(match steps {
+                    Some(s) if last - first + 1 == cut.len() => {
+                        format!("{op} {}", s.labels(first..=last).to_lowercase())
+                    }
+                    _ => {
+                        let kind = steps.map_or("steps", |s| s.kind().1).to_lowercase();
+                        format!("{op}, {} of its {kind}", cut.len())
+                    }
+                });
+            }
+        }
+        said
+    }
+
     /// The start at a step Cycle Start starts at (`start_step`), while its
     /// operation is the start: the operation (index in the setup) and step.
     pub fn at_step(&self) -> Option<(usize, usize)> {
@@ -7888,8 +7938,8 @@ pub(crate) mod tests {
         );
         let (whole, left) = check_steps(&doc, &mesh, 0, &[], &[]);
         let whole = whole.unwrap();
-        let face = left.steps.iter().find(|s| s.op == 0).unwrap();
-        assert!(face.steps.len() >= 2, "{:?}", face.steps.len());
+        let face_steps = left.steps.iter().find(|s| s.op == 0).unwrap().clone();
+        assert!(face_steps.steps.len() >= 2, "{:?}", face_steps.steps.len());
         let (cut, cut_left) = check_steps(&doc, &mesh, 0, &[], &[(0, vec![0])]);
         let cut = cut.unwrap_or_else(|e| panic!("{e:?}"));
         let (p, w) = (&cut[0], &whole[0]);
@@ -7946,9 +7996,15 @@ pub(crate) mod tests {
             let partly = run.partly().unwrap().into_owned();
             (partly, run)
         };
-        let (skipped, _) = partly(0, true);
-        let (started, _) = partly(1, false);
+        let (skipped, first) = partly(0, true);
+        let (started, second) = partly(1, false);
         let (later, run) = partly(1, true);
+        // The Work zero tab says what each takes as cut.
+        let face = doc.setups[0].operations[0].name();
+        let pass = |n: usize| vec![format!("{face} {}", face_steps.label(n).to_lowercase())];
+        assert_eq!(first.taken_as_cut(), pass(0));
+        assert_eq!(second.taken_as_cut(), pass(0));
+        assert_eq!(run.taken_as_cut(), pass(1));
         assert_eq!(skipped, started);
         assert_eq!(later, started);
         assert!(skipped.top_cut && !skipped.cut.is_empty(), "{skipped:?}");

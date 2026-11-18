@@ -13256,12 +13256,7 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
         return vec![];
     };
     let o = &p.ops[run.from.min(p.ops.len() - 1)];
-    let skipped: Vec<&str> = programs[..run.next]
-        .iter()
-        .flat_map(|p| &p.ops)
-        .chain(&p.ops[..run.from])
-        .map(|o| o.name.as_str())
-        .collect();
+    let skipped = run.taken_as_cut();
     let mut steps = vec![format!(
         "This run starts at {} (tool run {}), taking {} as cut: nothing of {} is sent. Load {} and set the work zero on the stock they left.",
         o.name,
