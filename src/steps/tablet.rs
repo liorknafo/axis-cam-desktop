@@ -225,9 +225,7 @@ fn fill(
             back,
             split: (l, r),
         } = parts(&p);
-        let (l, r) = (f32::from(l), f32::from(r));
-        let left_w = ((CARD - 18.) * l / (l + r)).round();
-        let right_w = ((CARD - 18.) * r / (l + r)).round();
+        let (left_w, right_w) = widths((l, r));
         let (rgba, size, _) = drawn(left, (left_w, PICTURE_HEIGHT));
         let picture = named((rgba, size));
         let (rgba, size, taps) = tall(scrollable(right.spacing(10)).into(), right_w, false);
@@ -422,6 +420,15 @@ fn named((rgba, size): (Vec<u8>, (u32, u32))) -> (Png, Vec<u8>) {
         size: [size.0, size.1],
     };
     (png, bytes)
+}
+/// How wide the pictures and the numbers are drawn, the card shared as
+/// `parts` splits it.
+fn widths((l, r): (u16, u16)) -> (f32, f32) {
+    let (l, r) = (f32::from(l), f32::from(r));
+    (
+        ((CARD - 18.) * l / (l + r)).round(),
+        ((CARD - 18.) * r / (l + r)).round(),
+    )
 }
 /// What a press on each of a drawing's controls sends, and where it is.
 type Taps = Vec<(Rectangle, Message)>;
@@ -824,6 +831,136 @@ mod tests {
             assert!(!tiles.is_empty());
             for (r, _) in tiles {
                 assert!(r.height >= 40., "a finger tall: {r:?}");
+            }
+        }
+    }
+
+    /// Every screen of `doc`'s first setup, each hole of a Holes or Bore
+    /// step, laid out as the tablet draws its numbers: their width, and
+    /// their texts with where each is.
+    fn tablet_numbers(doc: &Document, mesh: &Mesh) -> Vec<(f32, Vec<(String, Rectangle)>)> {
+        let shown = super::shown(doc, mesh, 0).unwrap();
+        let mut screens = vec![];
+        for (at, step) in shown.guide.steps.iter().enumerate() {
+            let items = match step {
+                Step::Holes { holes, .. } | Step::Bore { holes, .. } => holes.len().max(1),
+                _ => 1,
+            };
+            for item in 0..items {
+                let p = Page {
+                    doc,
+                    shown: &shown,
+                    key: 0,
+                    at,
+                    item,
+                    reached: 0,
+                    typed: None,
+                    window: WINDOW,
+                    clock: (std::time::Instant::now(), std::time::Instant::now()),
+                    setup: &doc.setups[0],
+                    tablet: true,
+                };
+                let parts = parts(&p);
+                let (_, width) = widths(parts.split);
+                let numbers = scrollable(parts.right.spacing(10)).into();
+                let placed = crate::ui::probe::placed(numbers, Size::new(width, 2400.));
+                screens.push((width, placed));
+            }
+        }
+        screens
+    }
+
+    /// A readout's tag on the tablet's numbers reads whole (LIO-588): beside
+    /// its number on one line, or under it, never squeezed into a column a
+    /// few letters wide nor cut off at the page's right edge. A bore with a
+    /// 0.001" dial: its "what the last pass left" and "out 1.98 on Ø · 78
+    /// divisions" have no room beside the number at the tablet's width.
+    /// Every text of every screen of it, of a drilling and of a slot stays
+    /// within the page.
+    #[test]
+    fn the_tablets_numbers_read_every_tag_whole() {
+        use crate::steps::tests::{bored_job, drilled_job, slot_job};
+        // A tag's one line, at its size.
+        let tag = crate::ui::probe::placed(text("out").size(12).into(), Size::new(400., 400.));
+        let one_line = tag[0].1.height;
+        let (bore, ring) = bored_job(|h| {
+            h.p.insert("dial".into(), "0.0254".into());
+        });
+        // Its passes: each tag after the head's setting and the bore to
+        // measure.
+        let mut tags = 0;
+        for (width, placed) in tablet_numbers(&bore, &ring) {
+            let at = |s: &str| placed.iter().position(|(t, _)| t == s);
+            let readouts = [at("head").map(|i| i + 1), at("bore").map(|i| i + 1)];
+            for value in readouts.into_iter().flatten() {
+                let ((v, vb), (tag, tb)) = (&placed[value], &placed[value + 1]);
+                let beside = tb.height <= one_line + 0.5 && tb.x >= vb.x + vb.width;
+                let under = tb.y >= vb.y + vb.height - 0.5;
+                assert!(
+                    beside || under,
+                    "{tag:?} squeezed beside {v} at {width}: {tb:?}, {v} at {vb:?}"
+                );
+                assert!(
+                    tb.x + tb.width <= width + 0.5,
+                    "{tag:?} past {width}: {tb:?}"
+                );
+                tags += 1;
+            }
+        }
+        assert!(tags >= 20, "{tags} tags");
+        let hole = crate::cam::boring::tests::ring(6.8, 30., 18.5);
+        // Through, on parallels clear of the hole, as
+        // `a_through_drill_is_checked_against_the_parallels_and_the_table_under_them`.
+        let mut drilled = drilled_job(&hole, "6.8", true, "0", "0");
+        let s = &mut drilled.setups[0].p;
+        for (k, v) in [
+            ("stock_bottom", "0"),
+            (crate::parallels::RUN, crate::parallels::FRONT_TO_BACK),
+            (crate::parallels::AT, "-11; 11"),
+            (crate::parallels::HEIGHT, "10"),
+            (crate::parallels::WIDTH, "4"),
+        ] {
+            s.insert(k.into(), v.into());
+        }
+        let (slot, slotted) = slot_job(false, "-5");
+        for (doc, mesh) in [(&bore, &ring), (&drilled, &hole), (&slot, &slotted)] {
+            let screens = tablet_numbers(doc, mesh);
+            assert!(screens.len() > 3, "{}", screens.len());
+            for (width, placed) in screens {
+                for (s, b) in &placed {
+                    assert!(
+                        b.x >= -0.5 && b.x + b.width <= width + 0.5,
+                        "{s:?} past {width}: {b:?} in {placed:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The tablet's numbers of `AXIS_RENDER_PROJECT` (a copy), as
+    /// `save_for_tablet` draws them, into `AXIS_RENDER_DIR`: setup
+    /// `AXIS_RENDER_SETUP` (an index, else every hand setup), each screen's
+    /// numbers `<setup>-<step>-<item>.png` (LIO-588).
+    #[test]
+    #[ignore]
+    fn render_a_projects_tablet_numbers() {
+        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = std::env::var("AXIS_RENDER_PROJECT").unwrap();
+        let doc = crate::storage::load(std::path::Path::new(&path)).unwrap();
+        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        let only = std::env::var("AXIS_RENDER_SETUP")
+            .ok()
+            .map(|s| s.parse::<usize>().unwrap());
+        let (steps, files) = super::steps(&doc, Ok(&mesh));
+        for s in &steps.setups {
+            let si = doc.setups.iter().position(|d| d.id == s.setup).unwrap();
+            if only.is_some_and(|o| o != si) {
+                continue;
+            }
+            for screen in &s.screens {
+                let name = format!("{si}-{:02}-{}.png", screen.step, screen.item);
+                std::fs::write(dir.join(name), &files[&screen.numbers.path]).unwrap();
             }
         }
     }
