@@ -4364,8 +4364,8 @@ fn parts<'a>(p: &Page<'a>) -> Parts<'a> {
                 None if first => vec!["set to".into()],
                 None => vec!["as set".into()],
             };
-            if let (true, Some(d)) = (first, out.filter(|_| *dial > 0.)) {
-                head_tags.push(format!("{} divisions", (d / dial).round()));
+            if let (true, Some(b)) = (first, before.filter(|_| *dial > 0.)) {
+                head_tags.push(crate::cam::boring::divisions_tag(b, *size, *dial));
             }
             right = right.push(readout(
                 Readout {
@@ -6929,6 +6929,56 @@ pub(crate) mod tests {
             ["Ø32.00", "out 0.10 on Ø · 10 divisions"]
         );
     }
+    /// The head's setting on each pass of the Ø32 bore with a dial of 0.01,
+    /// 0.001" and 0.002": the rough passes are whole divisions; the last,
+    /// to the size, is whole on the 0.01 dial, and on the inch dials it is
+    /// set from the measured bore, with the count from the expected bore,
+    /// never a rounded whole count (LIO-585).
+    #[test]
+    fn the_last_bore_pass_between_divisions_says_to_set_from_the_measured_bore() {
+        for (dial, bore, last) in [
+            ("0.01", "Ø31.90", "out 0.10 on Ø · 10 divisions"),
+            (
+                "0.0254",
+                "Ø31.88",
+                "out 0.12 on Ø · (32.00 − measured) ÷ 0.0254 divisions: 4.8 from Ø31.88",
+            ),
+            (
+                "0.0508",
+                "Ø31.85",
+                "out 0.15 on Ø · (32.00 − measured) ÷ 0.0508 divisions: 2.9 from Ø31.85",
+            ),
+        ] {
+            let (doc, mesh) = bored_job(|h| {
+                h.p.insert("dial".into(), dial.into());
+            });
+            let mut a = on_page(doc, mesh);
+            let passes: Vec<usize> = (guide(&a).steps.iter().enumerate())
+                .filter(|(_, s)| matches!(s, Step::Bore { .. }))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(passes.len(), 11, "{dial}");
+            for (k, &at) in passes.iter().enumerate().skip(1) {
+                send(&mut a, GuideAction::Go(at));
+                let t = texts(&a);
+                let tag = &after(&t, "head")[1];
+                if k + 1 < passes.len() {
+                    let whole = tag
+                        .split(" · ")
+                        .nth(1)
+                        .and_then(|n| n.strip_suffix(" divisions"));
+                    assert!(
+                        tag.starts_with("out ") && whole.is_some_and(|n| n.parse::<u32>().is_ok()),
+                        "{dial} pass {}: {tag}",
+                        k + 1
+                    );
+                } else {
+                    assert_eq!(tag, last, "{dial}");
+                    assert_eq!(after(&t, "measure")[1], bore, "{dial}");
+                }
+            }
+        }
+    }
     /// `app` with an A2.5×6.3 centre drilling before its Holes, as Add
     /// would put it there.
     fn centred_app() -> App {
@@ -7069,6 +7119,13 @@ pub(crate) mod tests {
             send(&mut a, GuideAction::Go(at));
             render(&a, (1280, 800), &dir.join(format!("{name}.png")));
         }
+        // The last pass on a 0.001" dial, between divisions (LIO-585).
+        let (doc, mesh) = bored_job(|h| {
+            h.p.insert("dial".into(), "0.0254".into());
+        });
+        let mut a = on_page(doc, mesh);
+        send(&mut a, GuideAction::Go(passes[10]));
+        render(&a, (1280, 800), &dir.join("14-bore-last-inch-dial.png"));
     }
     #[test]
     fn the_face_step_shows_the_tool_the_gear_and_the_depth_and_no_passes() {

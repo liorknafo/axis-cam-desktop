@@ -457,7 +457,7 @@ fn clean(s: &str) -> String {
         .map(|c| match c {
             '(' | ')' => ' ',
             'Ø' | 'ø' => 'D',
-            '·' | '–' | '—' => '-',
+            '·' | '–' | '—' | '−' => '-',
             '×' => 'x',
             c if c.is_ascii_graphic() || c == ' ' => c,
             c if c.is_whitespace() => ' ',
@@ -4909,6 +4909,8 @@ M2
     #[test]
     fn comments_cannot_escape_or_carry_non_ascii() {
         assert_eq!(comment("bad)\nG0 X1\n(Ø·×é"), "bad G0 X1 D-x?");
+        // A minus sign, as a boring pause's "16.50 − measured" (LIO-585).
+        assert_eq!(comment("16.50 − measured"), "16.50 - measured");
     }
     #[test]
     fn controller_and_axes_are_refused_before_any_output() {
