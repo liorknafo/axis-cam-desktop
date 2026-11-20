@@ -1013,4 +1013,31 @@ mod tests {
             }
         }
     }
+
+    /// The computer's own Steps page for setup `AXIS_RENDER_SETUP` (an
+    /// index) of the project at `AXIS_RENDER_PROJECT`, at the steps
+    /// `AXIS_RENDER_STEPS` ("54,55"), each at 1280 × 800 and at the narrow
+    /// 1024 × 700, into `AXIS_RENDER_DIR` as `<setup>-<step>-<width>.png`
+    /// (LIO-588).
+    #[test]
+    #[ignore]
+    fn render_a_projects_steps_at_both_window_sizes() {
+        let var = |k: &str| std::env::var(k).unwrap();
+        let dir = std::path::PathBuf::from(var("AXIS_RENDER_DIR"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut doc =
+            crate::storage::load(std::path::Path::new(&var("AXIS_RENDER_PROJECT"))).unwrap();
+        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        let si: usize = var("AXIS_RENDER_SETUP").parse().unwrap();
+        doc.active = doc.setups[si].id.clone();
+        let mut a = crate::steps::tests::app_of(doc, mesh);
+        for step in var("AXIS_RENDER_STEPS").split(',') {
+            let step: usize = step.trim().parse().unwrap();
+            for (w, h) in [(1280, 800), (1024, 700)] {
+                (a.window_width, a.window_height) = (w as f32, h as f32);
+                let _ = a.update(Message::Guide(GuideAction::Go(step)));
+                crate::steps::tests::render(&a, (w, h), &dir.join(format!("{si}-{step}-{w}.png")));
+            }
+        }
+    }
 }
