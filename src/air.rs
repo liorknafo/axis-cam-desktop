@@ -794,11 +794,16 @@ fn relink(
     (holding, gap): (&[HoldBox], f32),
     blend: f32,
 ) -> (Plan, Option<Trimmed>) {
-    // The plan's clearance: where its rapids cross.
-    let clearance = (plan.moves.iter())
-        .filter(|m| m.motion == Motion::Rapid)
-        .map(|m| m.from[2].max(m.to[2]))
-        .fold(f32::NEG_INFINITY, f32::max);
+    // The plan's clearance: where its rapids cross from its first cut on,
+    // which a run splits its steps at (`run::step_clearance`). A chuck-held
+    // plan comes in from higher, over what the jaws swing
+    // (`indexed::enter_held`); a link up there would be the only rise a
+    // run splits at, and the plan's own retracts to its clearance between
+    // them would join the levels they link in one step (LIO-565).
+    if !plan.moves.iter().any(|m| m.motion == Motion::Rapid) {
+        return (plan, None);
+    }
+    let clearance = crate::run::step_clearance(&plan);
     if !clearance.is_finite() {
         return (plan, None);
     }
@@ -1025,8 +1030,17 @@ fn relink(
                 (Some(a), Some(b)) => (a - b).abs() < 0.005,
                 _ => false,
             };
-        let link = Some(link_at(hop))
-            .filter(|link| across && clear(link))
+        // A stretch straight down, the rest of a plunge whose start touched
+        // the stock, goes on down without rising: up to clearance and
+        // straight back, the sliver it touched would be a step of its own
+        // between two rises to it, the levels either side "passes"
+        // (`run::plan_steps`, LIO-565).
+        let down = j < pieces.len()
+            && end[2] <= start[2]
+            && length([start[0], start[1], 0.], [end[0], end[1], 0.]) <= 1e-5;
+        let link = Some(link_at(start[2]))
+            .filter(|link| down && clear(link))
+            .or_else(|| Some(link_at(hop)).filter(|link| across && clear(link)))
             .unwrap_or_else(|| link_at(clearance));
         let mut was = start;
         let link_seconds: f32 = (link.iter())

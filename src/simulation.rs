@@ -940,6 +940,12 @@ pub struct Simulation {
     /// and the feeds it took (`tooth_load::hold`); None for an operation
     /// whose feed is the programmed one.
     pub held: Option<crate::tooth_load::Held>,
+    /// Where the tool went in the steps of this operation taken as cut
+    /// (`run::check_steps`): a start at a later step comes down the columns
+    /// they cleared, as the whole program does after them, and the export's
+    /// check counts the tool as having been there (`post_check`, LIO-565).
+    /// Empty for every other.
+    pub went: Vec<[f32; 3]>,
 }
 impl Simulation {
     pub fn new(plan: Plan) -> Self {
@@ -970,6 +976,7 @@ impl Simulation {
             tooth_load: None,
             air: None,
             held: None,
+            went: vec![],
         }
     }
     /// The frame move `m` cuts in: the one `turns` lists for its A angle,
