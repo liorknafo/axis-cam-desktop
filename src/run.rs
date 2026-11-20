@@ -7884,7 +7884,11 @@ pub(crate) mod tests {
                 continue;
             }
             if let Some(&next) = fed.iter().find(|&&f| f > b) {
-                assert_eq!(marks[next].unwrap().1, s + 1, "block {b} said level {s} done");
+                assert_eq!(
+                    marks[next].unwrap().1,
+                    s + 1,
+                    "block {b} said level {s} done"
+                );
             }
         }
         // The tablet file: a step a level, each ending somewhere to stop.
