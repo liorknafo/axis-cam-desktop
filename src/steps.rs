@@ -930,11 +930,13 @@ fn readout<'a>(r: Readout, msg: Option<Message>) -> Element<'a, Message> {
     }
     let number = row![
         text(r.axis).size(20).font(mono).color(ink),
+        // A DRO number has no space to wrap at; "M8×1.25 screw" does,
+        // when the page is narrower than it (`Beside`).
         text(r.value)
             .size(if r.big { 40 } else { 28 })
             .font(mono)
             .color(ink)
-            .wrapping(text::Wrapping::None)
+            .wrapping(text::Wrapping::Word)
     ]
     .spacing(10)
     .align_y(Alignment::Center);
@@ -981,7 +983,8 @@ fn readout<'a>(r: Readout, msg: Option<Message>) -> Element<'a, Message> {
 /// bore's size a few letters a line and cut off): a tag with no room beside
 /// the line goes under it, full width, with the ones that always go there;
 /// words with no room beside the number on one line wrap, or at a very
-/// narrow width go over it.
+/// narrow width go over it; a number wider than the page wraps at its
+/// spaces, "M8×1.25 screw" on a Tap's Check.
 struct Beside<'a> {
     /// The words if any, the number, the tags for the right, then those
     /// for under the line.
@@ -1039,7 +1042,10 @@ impl Widget<Message, Theme, iced::Renderer> for Beside<'_> {
         };
         // The words and the number side by side, the words wrapped in the
         // room the number leaves them; over it when that is under a third.
-        let number = lay(at, &free);
+        let mut number = lay(at, &free);
+        if number.size().width > max {
+            number = lay(at, &within(max));
+        }
         let (num_w, num_h) = (number.size().width, number.size().height);
         let mut line = vec![];
         let (line_w, line_h) = if has_lead {

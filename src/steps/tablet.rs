@@ -908,6 +908,30 @@ mod tests {
             }
         }
         assert!(tags >= 20, "{tags} tags");
+        // A Tap's Check: the screw to try, wider than the page in one line.
+        let screw = readout(
+            Readout {
+                order: None,
+                lead: None,
+                axis: String::new(),
+                value: "M8×1.25 screw".into(),
+                lock: None,
+                tags: vec![],
+                lit: Lit::Next,
+                big: true,
+            },
+            None,
+        );
+        // At the numbers' width of a mill's screen (`parts` splits it 11:9).
+        let width = widths((11, 9)).1;
+        let placed = crate::ui::probe::placed(screw, Size::new(width, 600.));
+        let (_, b) = (placed.iter())
+            .find(|(s, _)| s == "M8×1.25 screw")
+            .unwrap_or_else(|| panic!("the screw in {placed:?}"));
+        assert!(
+            b.x + b.width <= width + 0.5,
+            "the screw past {width}: {b:?}"
+        );
         let hole = crate::cam::boring::tests::ring(6.8, 30., 18.5);
         // Through, on parallels clear of the hole, as
         // `a_through_drill_is_checked_against_the_parallels_and_the_table_under_them`.
