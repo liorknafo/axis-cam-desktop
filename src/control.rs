@@ -3784,7 +3784,8 @@ impl Connection {
                     // those the operations before it were cut with, as a
                     // tip jogged over a spot by eye would not find them.
                     let pins = self.run_program().is_ok_and(|p| p.pins.is_some());
-                    let partway = self.run.as_ref().is_some_and(|r| r.partway());
+                    // Started, X and Y are kept as well (LIO-582 review).
+                    let partway = self.run.as_ref().is_some_and(|r| r.on_cut_stock());
                     for (a, value) in work.into_iter().enumerate() {
                         if (pins || partway) && a < 2 {
                             continue;
@@ -4138,13 +4139,20 @@ impl Connection {
         }
         // The plate lies wherever it is put on the top, which the check
         // knows only at the touch-off spot.
-        if let Some(run) = self.run.as_ref().filter(|r| r.partway())
+        if let Some(run) = self.run.as_ref().filter(|r| r.on_cut_stock())
             && run.partly().is_some_and(|p| p.top_cut)
         {
             return Err(format!(
                 "{} cut into the stock top, so a touch plate laid on it may not lie at a height the check knows: Probe Z cannot set Z. Touch the tool tip off at the touch-off spot instead.",
                 capital(run.cut_by())
             ));
+        }
+        // From the setup's start, earlier setups' cuts into the top are
+        // the same to a plate laid anywhere on it (LIO-582 review).
+        if let Some(run) = self.run.as_ref().filter(|r| !r.on_cut_stock())
+            && run.inherited_top_cut()
+        {
+            return Err("Earlier setups cut into the stock top, so a touch plate laid on it may not lie at a height the check knows: Probe Z cannot set Z. Touch the tool tip off at the touch-off spot instead.".into());
         }
         self.touch_off()
             .map(|(_, work)| work[2])
@@ -4419,13 +4427,17 @@ impl Connection {
             return Ok((refs, p));
         }
         // A run that starts partway probes the stock the operations before
-        // it leave: the zero's own spot only where they left it.
+        // it leave: the zero's own spot only where they left it. One with
+        // operations or steps after its start taken as cut, partway or not,
+        // probes none (LIO-582).
+        let later = self.run.as_ref().is_some_and(|r| r.later_cut());
         let own = match self
             .run
             .as_ref()
-            .filter(|r| r.partway())
+            .filter(|r| r.on_cut_stock() || later)
             .map(|r| (r.partly(), r.cut_by()))
         {
+            _ if later && p.probe.is_ok() => Err("Operations or steps after the start are taken as cut, and the check does not follow the stock they cut where a probe finds this work zero.".into()),
             Some((None, _)) => Err(crate::run::PARTWAY_UNKNOWN.to_string()),
             // Not a part of the stock: the reason the check cannot tell it.
             Some((Some(partly), _))
@@ -4440,6 +4452,13 @@ impl Connection {
             )),
             _ => p.probe.clone(),
         };
+        // The zero's own spot is the spots' too: refused there, by a cut
+        // that may reach where a probe touches it, it is refused here, at
+        // the setup's start as partway (LIO-582 review).
+        let own = own.and_then(|refs| match spots.iter().find(|(r, _)| *r == refs) {
+            Some((_, Err(why))) => Err(why.clone()),
+            _ => Ok(refs),
+        });
         match own {
             Ok(refs) => Ok((refs, p)),
             Err(why) if spots.iter().any(|(_, ok)| ok.is_ok()) => Err(format!(
@@ -4457,7 +4476,13 @@ impl Connection {
         let (Some(run), Ok(p)) = (&self.run, self.run_program()) else {
             return vec![];
         };
-        if run.partway() {
+        if run.later_cut() {
+            // What operations or steps after the start, taken as cut, cut is
+            // in no stock the check found (LIO-582).
+            (p.probe_from.iter())
+                .map(|(r, _)| (*r, Err(crate::run::LATER_UNFOLLOWED_WHY.to_string())))
+                .collect()
+        } else if run.on_cut_stock() {
             run.partly().map_or_else(Vec::new, |x| x.probe_from.clone())
         } else {
             p.probe_from.clone()
@@ -10792,6 +10817,117 @@ probe = { pin = 13, active_low = true }
             "{warn}"
         );
         assert_eq!(retract_room(0., -50., 80.), (10., None));
+    }
+
+    /// A Ø1 blind bore between the points the centre's probe spot is
+    /// sampled at (`run::tests::small_bore_job`), at a start after it at an
+    /// operation, at a step, and at the start of a setup after the one that
+    /// bored it (LIO-582 review): Probe centre refuses the zero's own spot,
+    /// whether picked or not, and so do Zero Z on the stock top and Probe Z
+    /// wherever the surface under the touch-off is not proven; a corner far
+    /// from the bore still probes.
+    #[test]
+    fn a_bore_between_the_probe_spots_points_is_probed_on_from_no_spot() {
+        use crate::post::At;
+        let dir = tempfile::tempdir().unwrap();
+        let (doc, mesh) = crate::run::tests::small_bore_job(dir.path());
+        let connect = |doc: &crate::model::Document, si: usize, run: crate::run::Run| {
+            let m = &mut doc.setups[si].machine.clone();
+            m.p.insert("uc100_connection".into(), "Simulated".into());
+            m.p.insert("probe_tip".into(), "0.2".into());
+            assert!(simulated(m));
+            let mut c = Connection::open(m, dir.path()).unwrap();
+            c.run = Some(run);
+            c
+        };
+        let refused = |c: &mut Connection| {
+            let centre = (c.probe_spots().into_iter()).find(|(r, _)| *r == [At::Mid; 2]);
+            assert!(centre.is_some_and(|(_, ok)| ok.is_err()));
+            c.probe_spot = None;
+            assert!(c.edges_setup().is_err());
+            c.probe_spot = Some([At::Mid; 2]);
+            assert!(c.edges_setup().is_err());
+            c.probe_spot = None;
+        };
+        // At the face, the next tool run.
+        let (programs, left) = crate::run::check(&doc, &mesh, 0);
+        let mut run = crate::run::Run::new(&doc, 0, 0);
+        run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+        run.start_at(1, 0);
+        let mut c = connect(&doc, 0, run);
+        refused(&mut c);
+        assert!(c.touch_off().is_none() && c.stock_top().is_err());
+        // A corner far from the bore probes, picked.
+        c.probe_spot = Some([At::Min; 2]);
+        assert_eq!(c.edges_setup().map(|(r, _)| r), Ok([At::Min; 2]));
+        // At the face's second pass, its first taken as cut.
+        let mut stepped = doc.clone();
+        stepped.setups[0].operations[1]
+            .p
+            .insert("stepdown".into(), "0.5".into());
+        let (programs, left) = crate::run::check(&stepped, &mesh, 0);
+        let mut run = crate::run::Run::new(&stepped, 0, 0);
+        run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+        assert!(run.op_steps(1).is_some_and(|s| s.steps.len() >= 2));
+        assert!(run.start_at_step(1, 1));
+        let (programs, left) = crate::run::check_steps(&stepped, &mesh, 0, &[], &[(1, vec![0])]);
+        run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+        assert_eq!(run.at_step(), Some((1, 1)));
+        let mut c = connect(&stepped, 0, run);
+        refused(&mut c);
+        assert!(c.touch_off().is_none() && c.stock_top().is_err());
+        // At the start of a second setup, the face, the first having bored
+        // it: Zero Z on the stock top and Probe Z off, saying why.
+        let mut split = doc.clone();
+        let mut second = split.setups[0].duplicate("G55");
+        second.operations.remove(0);
+        split.setups[0].operations.truncate(1);
+        split.setups.push(second);
+        split.sync_stock_sources();
+        let (programs, left) = crate::run::check(&split, &mesh, 1);
+        let mut run = crate::run::Run::new(&split, 1, 0);
+        run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+        assert!(!run.partway());
+        let mut c = connect(&split, 1, run);
+        refused(&mut c);
+        assert!(c.touch_off().is_none());
+        let why = c.stock_top().unwrap_err();
+        assert!(
+            why.starts_with("Earlier setups may have cut the stock under the stock top"),
+            "{why}"
+        );
+        assert!(c.probe_z_blocked().is_some());
+        // Its work zero on the front-left corner, far from the bore: the
+        // tool tip touches off and a probe probes there, but a touch plate
+        // laid anywhere on the top may lie over the bore, so Probe Z does
+        // not set Z (LIO-582 review).
+        let mut corner = split.clone();
+        (corner.setups[1].p).insert("origin".into(), "Stock top front-left".into());
+        let (programs, left) = crate::run::check(&corner, &mesh, 1);
+        let mut run = crate::run::Run::new(&corner, 1, 0);
+        run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+        assert!(!run.partway() && run.inherited_top_cut());
+        let c = connect(&corner, 1, run);
+        assert!(c.touch_off().is_some());
+        let why = c.stock_top().unwrap_err();
+        assert!(
+            why.starts_with("Earlier setups cut into the stock top, so a touch plate"),
+            "{why}"
+        );
+        assert!(c.probe_z_blocked().is_some());
+        let own = c.edges_setup().map(|(r, _)| r);
+        assert!(own.as_ref().is_ok_and(|r| *r != [At::Mid; 2]), "{own:?}");
+        // Bored nowhere, the same setup probes and touches off as ever.
+        let mut plain = split.clone();
+        plain.setups[0].operations.clear();
+        let (programs, left) = crate::run::check(&plain, &mesh, 1);
+        let mut run = crate::run::Run::new(&plain, 1, 0);
+        run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+        assert!(!run.inherited_top_cut());
+        let mut c = connect(&plain, 1, run);
+        assert_eq!(c.edges_setup().map(|(r, _)| r), Ok([At::Mid; 2]));
+        assert_eq!(c.stock_top(), Ok(0.));
+        c.probe_spot = None;
     }
 }
 #[cfg(test)]

@@ -1606,6 +1606,31 @@ fn stock_zero_cut(
         |p| removed.at(p),
     )
 }
+/// The faces a probe touches for a work zero of `references` `refs`
+/// (`touch_spots`) that a box of `boxes` reaches into anywhere over the
+/// spot it may touch them on, to 0.01 mm inside the stock, named with the
+/// spot: what may have been cut there, proven not to be for any other.
+/// `touch_spots`' points sample the spot only, and a cut narrower than
+/// their spacing would pass between them (LIO-582 review).
+fn spots_boxed(o: Orient, stock: Bounds, refs: [At; 2], boxes: &[Bounds]) -> Vec<String> {
+    (zero_faces(stock, refs).into_iter())
+        .zip(touch_spots(o, stock, refs))
+        .filter(|((_, k, _), (_, points))| {
+            let mut area = Bounds {
+                min: [f32::INFINITY; 3],
+                max: [f32::NEG_INFINITY; 3],
+            };
+            for p in points {
+                area.min = std::array::from_fn(|a| area.min[a].min(p[a]));
+                area.max = std::array::from_fn(|a| area.max[a].max(p[a]));
+            }
+            (area.min[*k], area.max[*k]) = (area.min[*k] - 0.01, area.max[*k] + 0.01);
+            (boxes.iter())
+                .any(|b| (0..3).all(|a| b.min[a] <= area.max[a] && b.max[a] >= area.min[a]))
+        })
+        .map(|((face, ..), (spot, _))| format!("{face} {spot}"))
+        .collect()
+}
 /// `stock_zero_cut`, a point being within a cut's box (`cut_boxes`) where
 /// `boxed` says and where a cut can have removed material where `removed`
 /// says.
@@ -2694,8 +2719,25 @@ pub(crate) fn probe_from(
                 ),
                 (Some(volume), Some(frame)) => {
                     let cut = stock_zero_cut(o, stock, volume, frame, refs, false);
-                    (!cut.is_empty())
-                        .then(|| format!("earlier setups have cut the stock's {}", listed(&cut)))
+                    let near = || {
+                        let removal: Vec<Bounds> = (volume.cuts.iter())
+                            .map(|c| crate::rest::removal_box(c, frame))
+                            .collect();
+                        spots_boxed(o, stock, refs, &removal)
+                    };
+                    if !cut.is_empty() {
+                        Some(format!(
+                            "earlier setups have cut the stock's {}",
+                            listed(&cut)
+                        ))
+                    } else {
+                        // Where no sample point finds a cut, one may pass
+                        // between them (LIO-582 review).
+                        let near = near();
+                        (!near.is_empty()).then(|| {
+                            format!("earlier setups may have cut the stock's {}", listed(&near))
+                        })
+                    }
                 }
                 _ => None,
             }
@@ -3509,12 +3551,19 @@ pub struct Partly {
     /// constant-height sweeps with nothing cut lower (`spot_surface`). The
     /// tool tip touched off anywhere on the spot rests on it. None when not.
     pub surface: Option<f32>,
-    /// They cut below the stock top somewhere over it: a touch plate laid
-    /// on the top may not lie at a height the check knows.
+    /// They, or earlier setups, cut below the stock top somewhere over it:
+    /// a touch plate laid on the top may not lie at a height the check
+    /// knows.
     pub top_cut: bool,
     /// `probe_from` for the stock they leave: each stock-top spot, with why
     /// a probe cannot find the work zero from it.
     pub probe_from: Vec<([At; 2], Result<(), String>)>,
+    /// The steps of its operation (`run::Step`, from 0) a run's check took
+    /// as cut and found this stock with (`Simulation::steps_cut`): it is the
+    /// stock a start at a step, or with those steps skipped, touches off on
+    /// only when they are the ones it takes as cut (`Run::partly`, LIO-582).
+    /// Empty for the stock before the whole operation.
+    pub steps: Vec<usize>,
 }
 /// Check and emit one setup from its `sequence` results (enabled operations only):
 /// one program, or one per run of the same tool in touch-off mode.
@@ -3808,191 +3857,397 @@ pub(crate) fn checked_held(
 /// only, as an earlier setup's cut where the work zero is touched off
 /// refuses the setup (`zero_check`), and the probes' spots already say
 /// theirs (`probe_from`, here `from_spots`). Each point is looked at once.
-fn partly(setup: &Setup, walk: &Walk, from_spots: &[([At; 2], Result<(), String>)]) -> Vec<Partly> {
-    let o = Orient::of(&setup.machine);
-    use std::{cell::RefCell, collections::HashMap};
+/// An operation some of whose steps a run's check carved into the stock it
+/// starts from (`Simulation::steps_cut`) finds the stock it starts from,
+/// those steps cut: the cuts of that stock, its own carved ones with them
+/// (LIO-582).
+fn partly<'a>(
+    setup: &Setup,
+    walk: &Walk<'a>,
+    from_spots: &[([At; 2], Result<(), String>)],
+) -> Vec<Partly> {
     let (stock, top) = (walk.stock, walk.stock.max[2]);
     let sims = &walk.simulations;
     let origin = get(&setup.p, "origin");
     let last = sims[sims.len() - 1];
-    let (Some(refs), Some(volume), Some(frame)) =
-        (references(origin), &last.initial_volume, last.frame)
-    else {
+    let unknown = |why: &str| Partly {
+        cut: vec![why.into()],
+        surface: None,
+        top_cut: true,
+        probe_from: from_spots
+            .iter()
+            .map(|(r, _)| (*r, Err(format!("The check cannot follow the {why}."))))
+            .collect(),
+        steps: vec![],
+    };
+    let Some(refs) = references(origin) else {
         // Nothing to tell the stock by: the first operation finds it as the
-        // setup does, any later one finds it unknown.
-        return (0..sims.len())
-            .map(|j| {
-                if j == 0 {
-                    Partly {
+        // setup does, unless steps of it were cut; any other finds it
+        // unknown.
+        let why = "stock where the work zero is touched off, which the check cannot follow";
+        return (sims.iter().enumerate())
+            .map(|(j, sim)| match j {
+                0 if sim.steps_cut.is_empty() => Partly {
+                    cut: vec![],
+                    surface: Some(top),
+                    top_cut: false,
+                    probe_from: from_spots.to_vec(),
+                    steps: vec![],
+                },
+                _ => Partly {
+                    steps: sim.steps_cut.clone(),
+                    ..unknown(why)
+                },
+            })
+            .collect();
+    };
+    let on = |sim: &'a Simulation| {
+        let (Some(volume), Some(frame)) = (&sim.initial_volume, sim.frame) else {
+            return None;
+        };
+        Some(Stocked::new(
+            setup,
+            stock,
+            refs,
+            volume,
+            frame,
+            last.source.0,
+        ))
+    };
+    let whole = on(last);
+    let followed = "stock where the work zero is touched off, which the check cannot follow";
+    (sims.iter().zip(&walk.ops).enumerate())
+        .map(|(j, (sim, op))| {
+            let reach = op.diameter / 2.;
+            if sim.steps_cut.is_empty() {
+                return match &whole {
+                    Some(w) => w.partly(from_spots, sim.source, reach),
+                    // The first operation finds it as the setup does.
+                    None if j == 0 => Partly {
                         cut: vec![],
                         surface: Some(top),
                         top_cut: false,
                         probe_from: from_spots.to_vec(),
-                    }
-                } else {
-                    let why =
-                        "stock where the work zero is touched off, which the check cannot follow";
-                    Partly {
-                        cut: vec![why.into()],
-                        surface: None,
-                        top_cut: true,
-                        probe_from: from_spots
-                            .iter()
-                            .map(|(r, _)| (*r, Err(format!("The check cannot follow the {why}."))))
-                            .collect(),
-                    }
-                }
-            })
-            .collect();
-    };
-    let own: Vec<&crate::stock_surface::Cut> = volume
-        .cuts
-        .iter()
-        .filter(|c| c.source.0 == last.source.0)
-        .collect();
-    let first = crate::rest::FirstCut::new(own.clone(), frame);
-    let boxes: Vec<(Bounds, (u16, u16))> = own
-        .iter()
-        .map(|c| (crate::rest::cut_box(c, frame), c.source))
-        .collect();
-    let (removed_at, boxed_at) = (RefCell::new(HashMap::new()), RefCell::new(HashMap::new()));
-    let key = |p: [f32; 3]| p.map(f32::to_bits);
-    let removed_by = |p: [f32; 3]| {
-        *removed_at
-            .borrow_mut()
-            .entry(key(p))
-            .or_insert_with(|| first.by(p))
-    };
-    let boxed_by = |p: [f32; 3]| {
-        *boxed_at
-            .borrow_mut()
-            .entry(key(p))
-            .or_insert_with(|| boxes.iter().find(|(b, _)| in_box(p, b)).map(|(_, s)| *s))
-    };
-    // The cuts over the spot, for the reach of each operation's tool.
-    let mut spots: HashMap<u32, Vec<Vec<SpotCut>>> = HashMap::new();
-    // The first operation that cut below the top anywhere over the stock.
-    let below = own
-        .iter()
-        .find(|c| {
-            let b = crate::rest::removal_box(c, frame);
-            b.min[2] < top - 1e-4
-                && (0..2).all(|k| b.min[k] < stock.max[k] && b.max[k] > stock.min[k])
-        })
-        .map(|c| c.source);
-    let bottom = stock_zero(origin).is_some_and(|(_, top)| !top);
-    sims.iter()
-        .zip(&walk.ops)
-        .map(|(sim, op)| {
-            let before = |by: Option<(u16, u16)>| by.is_some_and(|s| s < sim.source);
-            let removed = |p| before(removed_by(p));
-            let boxed = |p| before(boxed_by(p));
-            let cut = zero_cut_where(o, stock, refs, bottom, boxed, removed);
-            let probe_from = from_spots
-                .iter()
-                .map(|(r, ok)| {
-                    let cut = zero_cut_where(o, stock, *r, false, boxed, removed);
-                    let ok = ok.clone().and_then(|()| {
-                        if cut.is_empty() {
-                            Ok(())
-                        } else {
-                            Err(format!(
-                                "The operations before it have cut the stock's {}.",
-                                listed(&cut)
-                            ))
-                        }
-                    });
-                    (*r, ok)
-                })
-                .collect();
-            let reach = op.diameter / 2.;
-            let spot = spots
-                .entry(reach.to_bits())
-                .or_insert_with(|| spot_cuts(&own, frame, stock, refs, reach));
-            Partly {
-                cut,
-                surface: spot_surface(spot, top, sim.source),
-                top_cut: before(below),
-                probe_from,
+                        steps: vec![],
+                    },
+                    None => unknown(followed),
+                };
             }
+            // Its stock holds only cuts before it and its carved steps, all
+            // before the start: every cut of it up to its own counts.
+            let carved =
+                (sim.source.1.checked_add(1)).and_then(|o| Some((on(sim)?, (sim.source.0, o))));
+            let mut partly = match carved {
+                Some((stocked, through)) => stocked.partly(from_spots, through, reach),
+                None => unknown(followed),
+            };
+            partly.steps = sim.steps_cut.clone();
+            partly
         })
         .collect()
 }
-/// A cut over a point of the stock top's touch-off spot (`spot_cuts`): its
-/// operation (`Cut::source`), its lowest tip, and the floor it leaves there
-/// when that is known exactly.
-type SpotCut = ((u16, u16), f32, Option<f32>);
-/// Over each point of the stock top's touch-off spot for `refs`
-/// (`top_spot`) grown by `reach` (the radius of the tool touched off there,
-/// which rests on the highest stock under it) within the stock, at most
-/// 1 mm apart, each of `cuts` whose box holds it below the top of `stock`,
-/// with the floor a flat end mill's constant-height sweep leaves there when
-/// the point is well inside it (0.01 mm) and its flutes reach the top, so
-/// that nothing of the stock stays above.
+/// Which cut (`Cut::source`) first took each point away, by its bits, once
+/// looked up (`Stocked`).
+type BySource = std::cell::RefCell<std::collections::HashMap<[u32; 3], Option<(u16, u16)>>>;
+/// The stock a run's starts partway through a setup touch off on, from one
+/// simulation's volume (`partly`): the setup's own cuts in it, by which of
+/// them first took each point away, looked up once each.
+struct Stocked<'a> {
+    o: Orient,
+    stock: Bounds,
+    refs: [At; 2],
+    bottom: bool,
+    frame: crate::volume::Frame,
+    own: Vec<&'a crate::stock_surface::Cut>,
+    first: crate::rest::FirstCut<'a>,
+    boxes: Vec<(Bounds, (u16, u16))>,
+    removed_at: BySource,
+    boxed_at: BySource,
+    /// The cuts over the spot, for the reach of each operation's tool.
+    spots: std::cell::RefCell<std::collections::HashMap<u32, SpotCuts>>,
+    /// The first operation that cut below the top anywhere over the stock.
+    below: Option<(u16, u16)>,
+    /// The boxes of what earlier setups' cuts removed (`removal_box`), in
+    /// this setup's frame: a floor needs stock under it they did not take.
+    earlier: Vec<Bounds>,
+    /// One of them reaches into the stock top somewhere over the stock: a
+    /// touch plate laid on the top may lie in what it cut (LIO-582 review).
+    earlier_top: bool,
+    /// The boxes of what its own cuts removed (`removal_box`), with their
+    /// operations: a probe spot they reach is not proven uncut.
+    removal: Vec<(Bounds, (u16, u16))>,
+}
+impl<'a> Stocked<'a> {
+    /// The cuts of setup `si` (its index, as `Cut::source` has it) in
+    /// `volume`.
+    fn new(
+        setup: &Setup,
+        stock: Bounds,
+        refs: [At; 2],
+        volume: &'a crate::volume::Volume,
+        frame: crate::volume::Frame,
+        si: u16,
+    ) -> Self {
+        let top = stock.max[2];
+        let own: Vec<&crate::stock_surface::Cut> =
+            volume.cuts.iter().filter(|c| c.source.0 == si).collect();
+        let below = own
+            .iter()
+            .find(|c| {
+                let b = crate::rest::removal_box(c, frame);
+                b.min[2] < top - 1e-4
+                    && (0..2).all(|k| b.min[k] < stock.max[k] && b.max[k] > stock.min[k])
+            })
+            .map(|c| c.source);
+        let removal = (own.iter())
+            .map(|c| (crate::rest::removal_box(c, frame), c.source))
+            .collect();
+        let earlier: Vec<Bounds> = (volume.cuts.iter())
+            .filter(|c| c.source.0 != si)
+            .map(|c| crate::rest::removal_box(c, frame))
+            .collect();
+        let earlier_top = earlier.iter().any(|b| {
+            b.min[2] < top - 1e-4
+                && b.max[2] > top - FLOOR_LEFT
+                && (0..2).all(|k| b.min[k] < stock.max[k] && b.max[k] > stock.min[k])
+        });
+        Stocked {
+            o: Orient::of(&setup.machine),
+            stock,
+            refs,
+            bottom: stock_zero(get(&setup.p, "origin")).is_some_and(|(_, top)| !top),
+            frame,
+            first: crate::rest::FirstCut::new(own.clone(), frame),
+            boxes: own
+                .iter()
+                .map(|c| (crate::rest::cut_box(c, frame), c.source))
+                .collect(),
+            own,
+            removed_at: Default::default(),
+            boxed_at: Default::default(),
+            spots: Default::default(),
+            below,
+            earlier,
+            earlier_top,
+            removal,
+        }
+    }
+    /// `Partly` of the stock the cuts before `until` (a `Cut::source`, not
+    /// one of them) leave, touched off with a tool of radius `reach`, a
+    /// probe from the spots `from_spots` that the setup leaves it.
+    fn partly(
+        &self,
+        from_spots: &[([At; 2], Result<(), String>)],
+        until: (u16, u16),
+        reach: f32,
+    ) -> Partly {
+        let key = |p: [f32; 3]| p.map(f32::to_bits);
+        let before = |by: Option<(u16, u16)>| by.is_some_and(|s| s < until);
+        let removed = |p: [f32; 3]| {
+            before(
+                *(self.removed_at.borrow_mut())
+                    .entry(key(p))
+                    .or_insert_with(|| self.first.by(p)),
+            )
+        };
+        let boxed = |p: [f32; 3]| {
+            before(
+                *self.boxed_at.borrow_mut().entry(key(p)).or_insert_with(|| {
+                    (self.boxes.iter())
+                        .find(|(b, _)| in_box(p, b))
+                        .map(|(_, s)| *s)
+                }),
+            )
+        };
+        let (o, stock) = (self.o, self.stock);
+        let cut = zero_cut_where(o, stock, self.refs, self.bottom, boxed, removed);
+        let before_boxes: Vec<Bounds> = (self.removal.iter())
+            .filter(|(_, s)| *s < until)
+            .map(|(b, _)| *b)
+            .collect();
+        let probe_from = (from_spots.iter())
+            .map(|(r, ok)| {
+                let cut = zero_cut_where(o, stock, *r, false, boxed, removed);
+                let ok = ok.clone().and_then(|()| {
+                    if !cut.is_empty() {
+                        return Err(format!(
+                            "The operations before it have cut the stock's {}.",
+                            listed(&cut)
+                        ));
+                    }
+                    // Where no sample point finds a cut, one may pass
+                    // between them (LIO-582 review).
+                    let near = spots_boxed(o, stock, *r, &before_boxes);
+                    if near.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "The operations before it may have cut the stock's {}.",
+                            listed(&near)
+                        ))
+                    }
+                });
+                (*r, ok)
+            })
+            .collect();
+        let mut spots = self.spots.borrow_mut();
+        let spot = spots.entry(reach.to_bits()).or_insert_with(|| {
+            let own = spot_cuts(&self.own, self.frame, stock, self.refs, reach);
+            own.under(&self.earlier)
+        });
+        Partly {
+            cut,
+            surface: spot_surface(spot, stock.max[2], until),
+            top_cut: before(self.below) || self.earlier_top,
+            probe_from,
+            steps: vec![],
+        }
+    }
+}
+/// The cuts over the stock top's touch-off spot grown by a tool's reach
+/// (`spot_cuts`): the area, in X and Y (mm, `[lo, hi]`), the stock's bottom
+/// (plan Z), and each cut that reaches below the top over it.
+struct SpotCuts {
+    area: [[f32; 2]; 2],
+    bottom: f32,
+    cuts: Vec<SpotCut>,
+    /// The boxes of what earlier setups removed over the area
+    /// (`SpotCuts::under`).
+    earlier: Vec<Bounds>,
+}
+impl SpotCuts {
+    /// With those of `boxes`, what earlier setups' cuts removed, that reach
+    /// over the area.
+    fn under(mut self, boxes: &[Bounds]) -> Self {
+        let [lo, hi] = self.area;
+        self.earlier = (boxes.iter())
+            .filter(|b| (0..2).all(|k| b.min[k] <= hi[k] + 0.001 && b.max[k] >= lo[k] - 0.001))
+            .copied()
+            .collect();
+        self
+    }
+}
+/// How much stock must stay under a floor for the tool to be touched off on
+/// it (mm): a cut that reaches closer to the stock's bottom may have gone
+/// through it, leaving nothing there (LIO-582 review).
+const FLOOR_LEFT: f32 = 0.1;
+/// A cut over the touch-off area (`SpotCuts`): its operation
+/// (`Cut::source`), its lowest tip, and when it is a flat end mill's
+/// constant-height sweep whose flutes reach the top, so that nothing of the
+/// stock stays above it, its floor and the stretch of plane it leaves at
+/// that floor: the segment's ends (X, Y) and how far from it, 0.01 mm
+/// inside the tool's radius.
+struct SpotCut {
+    source: (u16, u16),
+    low: f32,
+    floor: Option<(f32, [f32; 2], [f32; 2], f32)>,
+}
+/// Each of `cuts` whose box reaches below the top of `stock` over the stock
+/// top's touch-off spot for `refs` (`top_spot`) grown by `reach` (the radius
+/// of the tool touched off there, which rests on the highest stock under
+/// it) within the stock.
 fn spot_cuts(
     cuts: &[&crate::stock_surface::Cut],
     frame: crate::volume::Frame,
     stock: Bounds,
     refs: [At; 2],
     reach: f32,
-) -> Vec<Vec<SpotCut>> {
+) -> SpotCuts {
     let top = stock.max[2];
     let spot = top_spot(stock, refs);
     let lo = [0, 1].map(|k| (spot[k].0 - reach).max(stock.min[k]));
     let hi = [0, 1].map(|k| (spot[k].1 + reach).min(stock.max[k]));
-    let n = [0, 1].map(|k| ((hi[k] - lo[k]).ceil() as usize + 1).clamp(11, 61));
-    let near: Vec<(&crate::stock_surface::Cut, Bounds)> = cuts
-        .iter()
+    let cuts = (cuts.iter())
         .map(|c| (*c, crate::rest::removal_box(c, frame)))
         .filter(|(_, b)| {
             b.min[2] < top - 1e-4
                 && (0..2).all(|k| b.min[k] <= hi[k] + 0.001 && b.max[k] >= lo[k] - 0.001)
         })
-        .collect();
-    let at = |k: usize, m: usize| lo[k] + (hi[k] - lo[k]) * m as f32 / (n[k] - 1) as f32;
-    (0..n[0] * n[1])
-        .map(|i| [at(0, i % n[0]), at(1, i / n[0])])
-        .map(|p| {
-            near.iter()
-                .filter_map(|(c, b)| {
-                    let over = (0..2).all(|k| p[k] >= b.min[k] - 0.001 && p[k] <= b.max[k] + 0.001);
-                    if !over {
-                        return None;
-                    }
-                    let floor = (c.shape == crate::simulation::CutterShape::Flat
-                        && c.frame == frame
-                        && c.a[2] == c.b[2]
-                        && c.a[2] + c.flute >= top - 1e-4
-                        && from_segment(p, c.a, c.b) <= c.radius - 0.01)
-                        .then_some(c.a[2]);
-                    Some((c.source, b.min[2], floor))
-                })
-                .collect()
+        .map(|(c, b)| SpotCut {
+            source: c.source,
+            low: b.min[2],
+            floor: (c.shape == crate::simulation::CutterShape::Flat
+                && c.frame == frame
+                && c.a[2] == c.b[2]
+                && c.a[2] + c.flute >= top - 1e-4
+                && c.radius > 0.01)
+                .then_some((c.a[2], [c.a[0], c.a[1]], [c.b[0], c.b[1]], c.radius - 0.01)),
         })
-        .collect()
+        .collect();
+    SpotCuts {
+        area: [lo, hi],
+        bottom: stock.min[2],
+        cuts,
+        earlier: vec![],
+    }
 }
 /// The height of the surface the cuts made before operation `before` leave
-/// over the touch-off spot (`spot_cuts`), when it is one flat face known
-/// exactly: at each point the stock `top` when none of them reaches below
-/// it, otherwise the lowest tip of those that do, which must be the floor
-/// of a flat sweep there; the same at every point, to 0.001 mm. None when not.
-fn spot_surface(spot: &[Vec<SpotCut>], top: f32, before: (u16, u16)) -> Option<f32> {
-    let heights: Vec<f32> = spot
-        .iter()
-        .map(|cuts| {
-            let earlier = || cuts.iter().filter(|c| c.0 < before);
-            let low = earlier().map(|c| c.1).fold(f32::INFINITY, f32::min);
-            if low == f32::INFINITY {
-                return Some(top);
-            }
-            earlier()
-                .filter_map(|c| c.2)
-                .any(|z| (z - low).abs() <= 1e-4)
-                .then_some(low)
-        })
-        .collect::<Option<_>>()?;
-    let low = heights.iter().copied().fold(f32::INFINITY, f32::min);
-    heights.iter().all(|z| z - low <= 1e-3).then_some(low)
+/// over the touch-off area (`spot_cuts`), when it is one flat face known
+/// exactly: the stock `top` when none of them reaches below it there,
+/// otherwise the lowest tip of those that do, when flat sweeps at that
+/// height (to 0.001 mm) cover the whole area (`swept_over`), so that no
+/// stock stands above it anywhere the tool may rest, and stock stays under
+/// it: none of them cut lower there, it is `FLOOR_LEFT` above the stock's
+/// bottom, not cut through, and no earlier setup's cut over the area
+/// reaches into the `FLOOR_LEFT` under it (`SpotCuts::earlier`), which a
+/// cavity opened from the other side would. None when not.
+fn spot_surface(spot: &SpotCuts, top: f32, before: (u16, u16)) -> Option<f32> {
+    let earlier: Vec<&SpotCut> = spot.cuts.iter().filter(|c| c.source < before).collect();
+    let low = earlier.iter().map(|c| c.low).fold(f32::INFINITY, f32::min);
+    let floor = if low == f32::INFINITY { top } else { low };
+    let held = (spot.earlier.iter()).all(|b| b.min[2] >= floor || b.max[2] <= floor - FLOOR_LEFT);
+    if floor < spot.bottom + FLOOR_LEFT || !held {
+        return None;
+    }
+    if low == f32::INFINITY {
+        return Some(top);
+    }
+    let floors: Vec<([f32; 2], [f32; 2], f32)> = (earlier.iter())
+        .filter_map(|c| c.floor)
+        .filter(|f| f.0 - low <= 1e-3)
+        .map(|(_, a, b, r)| (a, b, r))
+        .collect();
+    swept_over(spot.area, &floors).then_some(low)
+}
+/// Whether the rectangle `[lo, hi]` (X, Y, mm) lies within the stretches
+/// `floors` sweep (each a segment's ends and how far from it), proven: it
+/// is split until each piece lies within one of them (a stretch is convex,
+/// so its four corners do), and is not when a piece's centre lies in none,
+/// a piece gets smaller than 0.001 mm first, or the proof takes too long.
+fn swept_over([lo, hi]: [[f32; 2]; 2], floors: &[([f32; 2], [f32; 2], f32)]) -> bool {
+    let within = |p: [f32; 2], &(a, b, r): &([f32; 2], [f32; 2], f32)| {
+        from_segment(p, [a[0], a[1], 0.], [b[0], b[1], 0.]) <= r
+    };
+    let boxed = |&(a, b, r): &([f32; 2], [f32; 2], f32), lo: [f32; 2], hi: [f32; 2]| {
+        (0..2).all(|k| a[k].min(b[k]) - r <= hi[k] && a[k].max(b[k]) + r >= lo[k])
+    };
+    let mut budget = 2_000_000usize;
+    let all: Vec<u32> = (0..floors.len() as u32).collect();
+    let mut pieces = vec![(lo, hi, all)];
+    while let Some((lo, hi, of)) = pieces.pop() {
+        budget = budget.saturating_sub(of.len() + 1);
+        if budget == 0 {
+            return false;
+        }
+        let near: Vec<u32> = (of.into_iter())
+            .filter(|&i| boxed(&floors[i as usize], lo, hi))
+            .collect();
+        let corners = [lo, [hi[0], lo[1]], [lo[0], hi[1]], hi];
+        if (near.iter()).any(|&i| corners.iter().all(|&c| within(c, &floors[i as usize]))) {
+            continue;
+        }
+        let mid = [0, 1].map(|k| (lo[k] + hi[k]) / 2.);
+        let size = [0, 1].map(|k| hi[k] - lo[k]);
+        if size[0].max(size[1]) < 0.001 || !near.iter().any(|&i| within(mid, &floors[i as usize])) {
+            return false;
+        }
+        let k = usize::from(size[1] > size[0]);
+        let (mut left, mut right) = (hi, lo);
+        (left[k], right[k]) = (mid[k], mid[k]);
+        pieces.push((lo, left, near.clone()));
+        pieces.push((right, hi, near));
+    }
+    true
 }
 /// How far point `p` is from the segment `a`–`b`, in X and Y (mm).
 fn from_segment(p: [f32; 2], a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -6299,6 +6554,118 @@ M2
             CutterShape::Flat,
         );
         assert_eq!(surface(&[half], 1), None);
+        // Two passes 20.2 mm apart leave a ridge 0.2 mm wide through the
+        // spot, at the top; one along Y over the middle cuts it away
+        // (LIO-582 review).
+        let along = |y: f32| ([-60., y, 29.], [60., y, 29.], 10., 5., CutterShape::Flat);
+        let across = |x: f32| ([x, -60., 29.], [x, 60., 29.], 10., 5., CutterShape::Flat);
+        let (front, back) = (along(-10.1), along(10.1));
+        assert_eq!(surface(&[front, back], 2), None);
+        assert_eq!(surface(&[front, back, across(0.)], 3), Some(29.));
+        // Two passes along Y that leave of that ridge only 0.1 mm, between
+        // X 0.2 and 0.3: an island no point 0.6 mm apart lands on. Passes
+        // that overlap there cut it; ones that only meet are not proven to.
+        let island = [front, back, across(-9.79), across(10.29)];
+        assert_eq!(surface(&island, 4), None);
+        // A pass through the stock's bottom (Z0) leaves no floor to touch
+        // off on, nor one closer to it than 0.1 mm; one above it does.
+        let at = |z: f32| ([-60., 0., z], [60., 0., z], 10., 40., CutterShape::Flat);
+        assert_eq!(surface(&[at(-1.)], 1), None);
+        assert_eq!(surface(&[at(0.05)], 1), None);
+        assert_eq!(surface(&[at(0.5)], 1), Some(0.5));
+        // A cavity an earlier setup cut from below, Z0 to Z29, and this
+        // setup's pass that takes its 1 mm roof down to Z28.5: no stock under
+        // that floor (LIO-582 review). Under a 0.5 mm roof left, there is.
+        let opened = |cavity: f32, roof: f32| {
+            let mut volume = Volume::new(stock, frame);
+            volume.cut(
+                [-0.001, 0., 0.],
+                [0.001, 0., 0.],
+                15.,
+                cavity,
+                CutterShape::Flat,
+                frame,
+                (0, 0),
+            );
+            volume.cut(
+                [-60., 0., roof],
+                [60., 0., roof],
+                10.,
+                5.,
+                CutterShape::Flat,
+                frame,
+                (1, 0),
+            );
+            let setup = &doc.setups[0];
+            Stocked::new(setup, stock, refs, &volume, frame, 1)
+                .partly(&[], (1, 1), 0.)
+                .surface
+        };
+        assert_eq!(opened(29., 28.5), None);
+        assert_eq!(opened(28., 28.5), Some(28.5));
+        // A Ø0.5 bore and a 0.4 mm slot that pass between the points the
+        // centre's probe spot is sampled at, 0.6 mm apart: the probe may
+        // touch either, so it finds the work zero from there no more, for
+        // this setup's cuts or an earlier one's (LIO-582 review).
+        let centre = [At::Mid; 2];
+        assert_eq!(top_spot(stock, centre), [(-3., 3.), (-3., 3.)]);
+        let bore = (
+            [0.9, 0.3, 28.],
+            [0.901, 0.3, 28.],
+            0.25,
+            5.,
+            CutterShape::Flat,
+        );
+        let slot = (
+            [-60., 0.3, 28.],
+            [60., 0.3, 28.],
+            0.2,
+            5.,
+            CutterShape::Flat,
+        );
+        let probed = |cut: Pass, si: u16| {
+            let mut volume = Volume::new(stock, frame);
+            volume.cut(cut.0, cut.1, cut.2, cut.3, cut.4, frame, (si, 0));
+            let setup = &doc.setups[0];
+            let stocked = Stocked::new(setup, stock, refs, &volume, frame, 1);
+            let ok = stocked.partly(&[(centre, Ok(()))], (1, 1), 0.).probe_from[0]
+                .1
+                .clone();
+            let earlier: Vec<Bounds> = (volume.cuts.iter())
+                .map(|c| crate::rest::removal_box(c, frame))
+                .collect();
+            let o = Orient::of(&setup.machine);
+            (ok, spots_boxed(o, stock, centre, &earlier))
+        };
+        for cut in [bore, slot] {
+            let (ok, near) = probed(cut, 1);
+            let why = ok.unwrap_err();
+            assert!(
+                why.starts_with("The operations before it may have cut the stock's top face"),
+                "{why}"
+            );
+            assert!(
+                near.contains(&"top face at its centre".to_string()),
+                "{near:?}"
+            );
+            // An earlier setup's: the setup's own spot is not proven uncut.
+            let (ok, near) = probed(cut, 0);
+            assert_eq!(ok, Ok(()));
+            assert!(!near.is_empty());
+        }
+        // One beyond the spot leaves it as it was.
+        let away = (
+            [20., 20., 28.],
+            [20.001, 20., 28.],
+            0.25,
+            5.,
+            CutterShape::Flat,
+        );
+        assert_eq!(probed(away, 1), (Ok(()), vec![]));
+        assert_eq!(
+            surface(&[front, back, across(-9.79), across(10.09)], 4),
+            Some(29.)
+        );
         // A ball end mill's floor is not flat.
         let ball = ([-60., 0., 29.], [60., 0., 29.], 10., 5., CutterShape::Ball);
         assert_eq!(surface(&[ball], 1), None);

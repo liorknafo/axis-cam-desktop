@@ -9514,10 +9514,123 @@ flood = { pin = 8 }
         assert_eq!(stages(&a, 1), [Next]);
         // Started: the work zero is kept from here, as after any first tool run.
         assert!(!run_of(&a).partway() && work_zero_steps(&a, conn(&a)).is_none());
+        // But the tool run cut the stock: Zero Z on the stock top, Probe Z
+        // and the probe spots go by the stock the check finds before the
+        // Drilling, not the stock top (LIO-582 review).
+        assert!(run_of(&a).on_cut_stock());
+        let partly = run_of(&a).partly().unwrap().into_owned();
+        assert!(partly.top_cut && !partly.cut.is_empty(), "{partly:?}");
+        assert_eq!(conn(&a).touch_off().map(|(at, _)| at[2]), partly.surface);
+        assert_eq!(
+            conn(&a).partway_blocked().is_some(),
+            partly.surface.is_none()
+        );
+        assert!(conn(&a).stock_top().is_err());
+        let spots = conn(&a).probe_spots();
+        let centre = spots.iter().find(|(r, _)| *r == [crate::post::At::Mid; 2]);
+        assert!(centre.is_some_and(|(_, ok)| ok.is_err()), "{spots:?}");
+        let own = conn(&a).edges_setup().map(|(r, _)| r);
+        assert_ne!(own, Ok([crate::post::At::Mid; 2]));
         // The Contour picked again in the tool run done: cut again from it.
         let _ = a.update(Message::Run(R::From(0, 2)));
         assert_eq!(stages(&a, 0), [Done, Done, Next]);
         assert_eq!(stages(&a, 1), [ToCome]);
+        // What the tool run cut after the Contour is in no stock the check
+        // found for it: nothing sets Z or probes (LIO-582 review).
+        assert!(conn(&a).touch_off().is_none() && conn(&a).stock_top().is_err());
+        let why = conn(&a).partway_blocked().unwrap();
+        assert!(
+            why.starts_with("This run's tool runs have cut the stock since"),
+            "{why}"
+        );
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        assert!(conn(&a).edges_setup().is_err());
+        // So with a start at the Pocket's level 2, or the Face's start,
+        // picked again after the tool run cut them: the check takes what is
+        // before the start as cut, not what the run cut since.
+        let none_set = |a: &App| {
+            assert!(conn(a).touch_off().is_none() && conn(a).stock_top().is_err());
+            assert!(conn(a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+            assert!(conn(a).edges_setup().is_err());
+            conn(a).partway_blocked().unwrap()
+        };
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).op_steps(1).is_some_and(|s| s.steps.len() > 1));
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 1)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, 1)));
+        let why = none_set(&a);
+        assert!(
+            why.starts_with("This run's tool runs have cut the stock since"),
+            "{why}"
+        );
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(
+            (run_of(&a).next, run_of(&a).from, run_of(&a).at_step()),
+            (0, 0, None)
+        );
+        none_set(&a);
+    }
+
+    /// A run started at the Pocket with the Drilling's first hole taken as
+    /// cut (LIO-582): the Drilling cut the stock the start touches off on,
+    /// which the check does not follow, so Zero Z, Probe Z and the probe
+    /// spots set nothing, each saying so.
+    #[test]
+    fn a_partway_start_with_later_steps_taken_as_cut_sets_no_z() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        assert!(run_of(&a).op_steps(3).is_some_and(|s| s.steps.len() > 1));
+        let _ = a.update(Message::Run(R::Steps(Some(3))));
+        let _ = a.update(Message::Run(R::PickStep(3, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).all_cut(), [(3, vec![0])]);
+        assert_eq!((run_of(&a).next, run_of(&a).from), (0, 1));
+        assert!(run_of(&a).partway());
+        assert!(conn(&a).touch_off().is_none());
+        assert_eq!(
+            conn(&a).partway_blocked().as_deref(),
+            Some(
+                "Operations or steps after the start are taken as cut, and the check does not follow the stock they cut, so it cannot tell the surface where the stock top is touched off."
+            )
+        );
+        let why = conn(&a).edges_setup().unwrap_err();
+        assert!(
+            why.starts_with("Operations or steps after the start are taken as cut, and the check does not follow the stock they cut where a probe finds this work zero."),
+            "{why}"
+        );
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        // From the setup's very start, the Face: not partway, Cycle Start
+        // runs on the setup's work zero, but nothing sets Z or probes where
+        // the Drilling's hole may have cut (LIO-582 review).
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        answer_skips(&mut a, 0);
+        assert_eq!((run_of(&a).next, run_of(&a).from), (0, 0));
+        assert_eq!(run_of(&a).all_cut(), [(3, vec![0])]);
+        assert!(!run_of(&a).partway() && run_of(&a).later_cut());
+        assert!(conn(&a).touch_off().is_none());
+        assert!(conn(&a).stock_top().is_err());
+        let why = conn(&a).edges_setup().unwrap_err();
+        assert!(
+            why.starts_with("Operations or steps after the start"),
+            "{why}"
+        );
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        assert!(
+            !problems(&a).iter().any(|p| p.contains("taken as cut")),
+            "{:?}",
+            problems(&a)
+        );
     }
 
     /// A run started at the Drilling with the work zero on the stock top's
