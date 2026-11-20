@@ -13,6 +13,10 @@ use crate::{
     ui::{BLUE, BUTTON_EDGE, HOVER_BUTTON, INK, LINE, MUTED, WARNING, bold, muted, primary},
     viewport,
 };
+use iced::advanced::{
+    Layout, Widget, layout,
+    widget::{Operation, Tree},
+};
 use iced::{
     Alignment, Border, Color, Element, Font,
     Length::{self, Fill, FillPortion},
@@ -909,58 +913,242 @@ fn readout<'a>(r: Readout, msg: Option<Message>) -> Element<'a, Message> {
         weight: iced::font::Weight::Bold,
         ..Font::MONOSPACE
     };
-    let mut line = row![].spacing(10).align_y(Alignment::Center);
+    // The order and the word before the number, which wrap when the
+    // number has no room beside them on one line (LIO-588).
+    let mut lead = row![].spacing(10).align_y(Alignment::Center);
+    let has_lead = r.order.is_some() || r.lead.is_some();
     if let Some(n) = r.order {
         let mark = if r.lit == Lit::Done {
             "✓".to_string()
         } else {
             n.to_string()
         };
-        line = line.push(disc(mark, now, 22.));
+        lead = lead.push(disc(mark, now, 22.));
     }
-    if let Some(lead) = r.lead {
-        line = line.push(text(lead).size(15).color(MUTED));
+    if let Some(words) = r.lead {
+        lead = lead.push(text(words).size(15).color(MUTED));
     }
-    line = line
-        .push(text(r.axis).size(20).font(mono).color(ink))
-        .push(
-            text(r.value)
-                .size(if r.big { 40 } else { 28 })
-                .font(mono)
-                .color(ink)
-                .wrapping(text::Wrapping::None),
-        )
-        .push(space().width(Fill));
-    let mut tags = column![].spacing(2).align_x(Alignment::End);
+    let number = row![
+        text(r.axis).size(20).font(mono).color(ink),
+        // A DRO number has no space to wrap at; "M8×1.25 screw" does,
+        // when the page is narrower than it (`Beside`).
+        text(r.value)
+            .size(if r.big { 40 } else { 28 })
+            .font(mono)
+            .color(ink)
+            .wrapping(text::Wrapping::Word)
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    let mut side: Vec<Element<'a, Message>> = vec![];
     if let Some(axes) = r.lock {
-        tags = tags.push(
+        side.push(
             row![
                 crate::fault::canvas(Lock).width(10).height(12),
                 text(format!("lock {axes}")).size(12).color(MUTED)
             ]
             .spacing(4)
-            .align_y(Alignment::Center),
+            .align_y(Alignment::Center)
+            .into(),
         );
     }
     // A long tag goes under the value, not squeezed beside it a word a
-    // line (LIO-431).
+    // line (LIO-431); so does a short one with no room beside it on one
+    // line, as at the tablet's narrow numbers (LIO-588).
     let said = r.tags.join(" · ");
-    let under = said.chars().count() > 30;
-    if !said.is_empty() && !under {
-        tags = tags.push(text(said.clone()).size(12).color(MUTED));
+    let mut under = vec![];
+    if !said.is_empty() {
+        let tag: Element<'a, Message> = text(said.clone()).size(12).color(MUTED).into();
+        match said.chars().count() > 30 {
+            true => under.push(tag),
+            false => side.push(tag),
+        }
     }
-    line = line.push(tags);
-    let body: Element<'a, Message> = if under {
-        column![line, text(said).size(12).color(MUTED)]
-            .spacing(2)
-            .into()
-    } else {
-        line.into()
-    };
+    let body = Element::new(Beside::new(
+        has_lead.then(|| lead.into()),
+        number,
+        side,
+        under,
+    ));
     let face = boxed(container(body).padding([4, 12]), now).width(Fill);
     match msg {
         Some(m) => tap(face, Some(m), "Reached"),
         None => face.into(),
+    }
+}
+/// A readout's line, its order and words then its number, with its short
+/// tags on the right, each on one line, stacked and centred on the line's
+/// height. Nothing is squeezed or runs past the right edge (LIO-588: at the
+/// tablet's narrow numbers, "what the last pass left" was squeezed beside a
+/// bore's size a few letters a line and cut off): a tag with no room beside
+/// the line goes under it, full width, with the ones that always go there;
+/// words with no room beside the number on one line wrap, or at a very
+/// narrow width go over it; a number wider than the page wraps at its
+/// spaces, "M8×1.25 screw" on a Tap's Check.
+struct Beside<'a> {
+    /// The words if any, the number, the tags for the right, then those
+    /// for under the line.
+    items: Vec<Element<'a, Message>>,
+    lead: bool,
+    side: usize,
+}
+impl<'a> Beside<'a> {
+    /// Room between the words, the number and the tags, and between
+    /// stacked tags.
+    const GAP: f32 = 10.;
+    const STACK: f32 = 2.;
+    fn new(
+        lead: Option<Element<'a, Message>>,
+        number: impl Into<Element<'a, Message>>,
+        side: Vec<Element<'a, Message>>,
+        under: Vec<Element<'a, Message>>,
+    ) -> Self {
+        let n = side.len();
+        let has_lead = lead.is_some();
+        let mut items: Vec<_> = lead.into_iter().collect();
+        items.push(number.into());
+        items.extend(side);
+        items.extend(under);
+        Beside {
+            items,
+            lead: has_lead,
+            side: n,
+        }
+    }
+}
+impl Widget<Message, Theme, iced::Renderer> for Beside<'_> {
+    fn children(&self) -> Vec<Tree> {
+        self.items.iter().map(Tree::new).collect()
+    }
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(&self.items);
+    }
+    fn size(&self) -> Size<Length> {
+        Size::new(Fill, Length::Shrink)
+    }
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let free = layout::Limits::new(Size::ZERO, Size::INFINITE);
+        let max = limits.max().width;
+        let within = |w: f32| layout::Limits::new(Size::ZERO, Size::new(w, f32::INFINITY));
+        let (has_lead, side, count) = (self.lead, self.side, self.items.len());
+        let at = usize::from(has_lead);
+        let mut lay = |k: usize, l: &layout::Limits| {
+            (self.items[k].as_widget_mut()).layout(&mut tree.children[k], renderer, l)
+        };
+        // The words and the number side by side, the words wrapped in the
+        // room the number leaves them; over it when that is under a third.
+        let mut number = lay(at, &free);
+        if number.size().width > max {
+            number = lay(at, &within(max));
+        }
+        let (num_w, num_h) = (number.size().width, number.size().height);
+        let mut line = vec![];
+        let (line_w, line_h) = if has_lead {
+            let mut lead = lay(0, &free);
+            let room = max - Self::GAP - num_w;
+            if lead.size().width > room && room >= max / 3. {
+                lead = lay(0, &within(room));
+            }
+            let (lead_w, lead_h) = (lead.size().width, lead.size().height);
+            if lead_w <= room {
+                let h = lead_h.max(num_h);
+                line.push(lead.move_to(Point::new(0., (h - lead_h) / 2.)));
+                let x = lead_w + Self::GAP;
+                line.push(number.move_to(Point::new(x, (h - num_h) / 2.)));
+                (x + num_w, h)
+            } else {
+                let lead = lay(0, &within(max));
+                let lead_h = lead.size().height;
+                let w = lead.size().width.max(num_w);
+                line.push(lead);
+                line.push(number.move_to(Point::new(0., lead_h + Self::STACK)));
+                (w, lead_h + Self::STACK + num_h)
+            }
+        } else {
+            line.push(number);
+            (num_w, num_h)
+        };
+        // Each tag at its one-line width: beside the line while it has room
+        // there, else under.
+        let mut beside = vec![];
+        let mut below = vec![];
+        for k in at + 1..count {
+            let one_line = lay(k, &free);
+            let room = line_w + Self::GAP + one_line.size().width <= max;
+            if k <= at + side && room {
+                beside.push((k, one_line));
+            } else {
+                below.push(k);
+            }
+        }
+        let side_w = beside
+            .iter()
+            .map(|(_, n)| n.size().width)
+            .fold(0., f32::max);
+        let side_h = beside.iter().map(|(_, n)| n.size().height).sum::<f32>()
+            + Self::STACK * beside.len().saturating_sub(1) as f32;
+        let width = match max.is_finite() {
+            true => max,
+            false => line_w + Self::GAP + side_w,
+        };
+        let top = line_h.max(side_h);
+        let mut nodes: Vec<Option<layout::Node>> = (0..count).map(|_| None).collect();
+        let line_y = (top - line_h) / 2.;
+        for (k, n) in line.into_iter().enumerate() {
+            nodes[k] = Some(n.translate(iced::Vector::new(0., line_y)));
+        }
+        let mut y = (top - side_h) / 2.;
+        for (k, n) in beside {
+            let x = width - n.size().width;
+            let h = n.size().height;
+            nodes[k] = Some(n.move_to(Point::new(x, y)));
+            y += h + Self::STACK;
+        }
+        let mut y = top;
+        for k in below {
+            let n = lay(k, &within(width));
+            y += Self::STACK;
+            let h = n.size().height;
+            nodes[k] = Some(n.move_to(Point::new(0., y)));
+            y += h;
+        }
+        let children = nodes.into_iter().map(|n| n.expect("every item placed"));
+        layout::Node::with_children(Size::new(width, y), children.collect())
+    }
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &iced::advanced::renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        for ((item, t), l) in self.items.iter().zip(&tree.children).zip(layout.children()) {
+            (item.as_widget()).draw(t, renderer, theme, style, l, cursor, viewport);
+        }
+    }
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        operation.traverse(&mut |operation| {
+            for ((item, t), l) in (self.items.iter_mut())
+                .zip(&mut tree.children)
+                .zip(layout.children())
+            {
+                (item.as_widget_mut()).operate(t, l, renderer, operation);
+            }
+        });
     }
 }
 /// The tiles of a section's passes or holes: done, now, next. On the
@@ -6272,7 +6460,7 @@ pub(crate) mod tests {
         on_page(doc, mesh)
     }
     /// `bored_app`'s job, the head edited by `edit`.
-    fn bored_job(edit: impl FnOnce(&mut Tool)) -> (Document, Mesh) {
+    pub(crate) fn bored_job(edit: impl FnOnce(&mut Tool)) -> (Document, Mesh) {
         use crate::cam::boring::tests::{drill, drilling, head, job, ring};
         let mesh = ring(32., 60., 28.);
         let manual = crate::manual::defaults();
@@ -9045,7 +9233,7 @@ pub(crate) mod tests {
     }
     /// A Slot (LIO-445) on the 40 × 30 × 8 slotted plate in the vise, cut
     /// blind to `bottom` or through (LIO-449).
-    fn slot_job(through: bool, bottom: &str) -> (Document, crate::mesh::Mesh) {
+    pub(crate) fn slot_job(through: bool, bottom: &str) -> (Document, crate::mesh::Mesh) {
         let (mut doc, _) = crate::corner::tests::plate_job("Y");
         let mesh = crate::mesh::normalize(crate::cam::arcs::tests::slot(5.)).unwrap();
         let tool = &mut doc.tools[0];
@@ -9158,7 +9346,13 @@ pub(crate) mod tests {
         (doc, g.clone(), top)
     }
     /// `drilled`'s job, its Steps not built.
-    fn drilled_job(mesh: &Mesh, size: &str, through: bool, bottom: &str, air: &str) -> Document {
+    pub(crate) fn drilled_job(
+        mesh: &Mesh,
+        size: &str,
+        through: bool,
+        bottom: &str,
+        air: &str,
+    ) -> Document {
         use crate::cam::boring::tests::{drill, drilling, job};
         let manual = crate::manual::defaults();
         let mut tool = drill(size);
