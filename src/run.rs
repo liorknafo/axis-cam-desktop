@@ -9282,6 +9282,131 @@ pub(crate) mod tests {
         assert!(!cut(&edited(&|_| {})));
     }
 
+    /// A start at a step of a tool run this run cut to its end (LIO-586):
+    /// the tablet fixture's Face and Pocket ran to their end (the driver's
+    /// outcome, through `refresh`), then Face pass 2 is picked to cut again.
+    /// The check takes only pass 1 as cut, but pass 2 cut the touch-off spot
+    /// down to its own floor too: Set Z of pass 1's floor there would set
+    /// the work zero as deep too low as pass 2 cuts. So nothing sets Z from
+    /// the check's stock, and Zero Z on the stock top and the probe spots
+    /// say why, as at the tool run's own start. Before any tool run, and
+    /// after one stopped after pass 1, the same start sets pass 1's floor.
+    #[test]
+    fn a_step_start_in_a_tool_run_cut_to_its_end_sets_no_z() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        let (whole, left) = check_steps(&doc, &mesh, 0, &[], &[]);
+        let (whole, left) = (Arc::new(whole), Arc::new(left));
+        // Face's passes go down: pass 2's floor is below pass 1's.
+        let face = left.steps.iter().find(|s| s.op == 0).unwrap();
+        assert!(face.steps.len() >= 2, "{}", face.steps.len());
+        let (pass_1, pass_2) = (face.steps[0].z.unwrap(), face.steps[1].z.unwrap());
+        assert!(pass_2 < pass_1 - 0.5, "{pass_1} {pass_2}");
+        assert_eq!(whole.as_ref().as_ref().unwrap()[0].indexes, [0, 1]);
+        // Tool run 1 (Face, Pocket) sent from its start, and its outcome:
+        // ended ok, or stopped after a step of the Face (`stopping`).
+        let ran = |ok: bool, stopping: Option<(usize, usize)>| {
+            let mut run = Run::new(&doc, 0, 0);
+            run.checked_as(whole.clone(), Some(left.clone()), None);
+            run.running = Some(Running {
+                index: 0,
+                from: 0,
+                seq: 0,
+                offset: [0.; 6],
+                before: Before {
+                    xy: None,
+                    zero: None,
+                    last: None,
+                    touched: false,
+                },
+                paths: vec![],
+                tip: [0.; 3],
+                start: [0.; 6],
+                print: 0,
+                cut_ops: vec![],
+                on: None,
+                marks: vec![],
+            });
+            run.stopping = stopping;
+            run.refresh(Some(&uc100::controller::ProgramOutcome {
+                seq: 1,
+                ok,
+                message: "m".into(),
+            }));
+            assert!(run.running.is_none());
+            run
+        };
+        // Face pass 2 picked as the start, and the setup checked again
+        // with pass 1 taken as cut.
+        let at_pass_2 = |mut run: Run| {
+            assert!(run.start_at_step(0, 1));
+            let (c, l) = check_steps(&doc, &mesh, 0, &[], &[(0, vec![0])]);
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            assert_eq!((run.next, run.from, run.at_step()), (0, 0, Some((0, 1))));
+            assert!(run.partway() && run.on_cut_stock());
+            run
+        };
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        let on_pass_1 = |run: &Run| {
+            let partly = run.partly().unwrap();
+            assert!(partly.cut != [RUN_UNFOLLOWED], "{:?}", partly.cut);
+            assert!(
+                partly.surface.is_some_and(|z| near(z, pass_1)),
+                "{partly:?}"
+            );
+            let (at, _) = run.touch_off().unwrap();
+            assert!(near(at[2], pass_1), "{at:?}");
+            assert_eq!(run.partway_blocked(), None);
+        };
+        // Before any tool run: pass 1's floor.
+        let mut fresh = Run::new(&doc, 0, 0);
+        fresh.checked_as(whole.clone(), Some(left.clone()), None);
+        on_pass_1(&at_pass_2(fresh));
+        // Stopped after pass 1: pass 2 never cut, pass 1's floor still.
+        let stopped = ran(false, Some((0, 0)));
+        assert_eq!(stopped.cut_in_run.len(), 1);
+        assert_eq!(stopped.cut_in_run[0].1, Some(1));
+        on_pass_1(&at_pass_2(stopped));
+        // Cut to its end, or stopped after pass 2: pass 2 cut there, which
+        // the check's stock before pass 2 does not have.
+        let done = ran(true, None);
+        assert!(done.done[0] && done.next == 1);
+        assert_eq!(
+            done.cut_in_run
+                .iter()
+                .map(|c| (c.0, c.1))
+                .collect::<Vec<_>>(),
+            [(0, None), (1, None)]
+        );
+        for run in [at_pass_2(done), at_pass_2(ran(false, Some((0, 1))))] {
+            let partly = run.partly().unwrap();
+            assert_eq!(partly.cut, [RUN_UNFOLLOWED]);
+            assert_eq!(partly.surface, None);
+            assert!(!partly.probe_from.is_empty());
+            assert!(
+                (partly.probe_from.iter())
+                    .all(|(_, ok)| ok.as_ref().is_err_and(|e| e == RUN_UNFOLLOWED_WHY))
+            );
+            assert_eq!(run.touch_off(), None);
+            assert_eq!(
+                run.partway_blocked().as_deref(),
+                Some(RUN_UNFOLLOWED_BLOCKED)
+            );
+            // As at the tool run's own start, picked again.
+            let mut start = run;
+            start.start_at(0, 0);
+            start.checked_as(whole.clone(), Some(left.clone()), None);
+            assert_eq!((start.next, start.from, start.at_step()), (0, 0, None));
+            assert_eq!(start.touch_off(), None);
+            assert_eq!(
+                start.partway_blocked().as_deref(),
+                Some(RUN_UNFOLLOWED_BLOCKED)
+            );
+        }
+    }
+
     /// A plan's moves cut with another cutter, or at another A, cut other
     /// stock: the journal's fingerprint is the same, the cut print is not
     /// (LIO-582 review: a drill saved at Ø1 after cutting at Ø8).
