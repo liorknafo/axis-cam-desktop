@@ -6022,6 +6022,47 @@ flood = { pin = 8 }
         op.p.insert("feed".into(), "600".into());
     }
 
+    /// An E-stop while a hole is drilled on the Pi (LIO-586 review): where
+    /// the tool stood as the stop's outcome came is not where it stopped,
+    /// the outcome maybe kept for a reconnect and the machine moved since by
+    /// another computer, so all the tool run ran is taken as cut, and a
+    /// start at the hole it stopped in sets no Z from the stock the check
+    /// carves.
+    #[test]
+    fn an_e_stop_mid_step_on_the_pi_takes_all_the_tool_run_ran_as_cut() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _server) = pi_app(dir.path());
+        slow_holes(&mut a);
+        let drill = drilling(&mut a);
+        assert!(drill.steps.len() >= 2);
+        run_until(&mut a, 30.0, "hole 2", |r| {
+            r.step_at(None)
+                .is_some_and(|(oi, s, done)| oi == 1 && s == 1 && !done)
+        });
+        let _ = a.update(Message::MachineEStop);
+        run_until(&mut a, 10.0, "the E-stop", |r| r.running.is_none());
+        let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
+        assert_eq!(cut, [(1, None)]);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        // The start is the hole it stopped in, as after a local E-stop.
+        if run_of(&a).at_step() != Some((1, 1)) {
+            let _ = a.update(Message::Run(R::PickStep(1, 1)));
+            let _ = a.update(Message::Run(R::StartStep));
+            answer_skips(&mut a, 0);
+        }
+        assert_eq!(run_of(&a).at_step(), Some((1, 1)));
+        assert!(conn(&a).touch_off().is_none());
+        let why = conn(&a).partway_blocked().unwrap();
+        assert!(
+            why.starts_with("This run's tool runs have cut the stock since"),
+            "{why}"
+        );
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// An E-stop while a hole is drilled (LIO-275): that hole counts as not
     /// done, the journal keeps the one before it, and it is the start, cut
     /// again from its start.
@@ -6041,6 +6082,12 @@ flood = { pin = 8 }
         });
         let _ = a.update(Message::MachineEStop);
         run_until(&mut a, 5.0, "the E-stop", |r| r.running.is_none());
+        // Cut, for the starts after it: holes 1 and 2, by where the tool
+        // stood as the outcome came (LIO-586 review); hole 3 too when it
+        // stood on hole 2's line, which hole 2's last retract goes along
+        // too, after which hole 3 may have begun.
+        let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
+        assert!(matches!(cut[..], [(1, Some(2 | 3))]), "{cut:?}");
         let journal = a.control.as_ref().unwrap().journal().expect("the journal");
         assert_eq!((journal.op, journal.step), (1, Some(0)), "{journal:?}");
         assert!(journal.why.contains("E-stop"), "{}", journal.why);

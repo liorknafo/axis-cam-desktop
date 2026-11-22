@@ -1655,8 +1655,10 @@ impl Run {
     /// to may lag: snapshots the app missed while busy, or the one with the
     /// outcome, which comes before `track` and gives no line once the
     /// program ended. So the tip's place bounds what it cut (LIO-586
-    /// review). None when it is on none of them, or that one is in no step
-    /// (`mark_step`): where it got is not known.
+    /// review). `at` must be where the tool stopped, not where it went since
+    /// (None: not known, as on the Pi). None when it is not known, the tip
+    /// is on none of them, or that one is in no step (`mark_step`): where
+    /// it got is not known.
     fn reach(&self, at: Option<&[f64; 6]>) -> Option<usize> {
         let (r, at) = (self.running.as_ref()?, at?);
         let p = self.checked()?.get(r.index)?;
@@ -9513,10 +9515,14 @@ pub(crate) mod tests {
         let in_2 = e_stop(mid(two[two.len() / 2]));
         assert_eq!(cuts(&in_2), [(0, Some(2))]);
         refused(at_pass_2(in_2));
-        // On no move: where it got is not known, all it ran may be cut.
+        // On no move, or where it stopped not known (on the Pi): all it
+        // ran may be cut.
         let lost = e_stop([1e3; 6]);
         assert_eq!(cuts(&lost), [(0, None), (1, None)]);
         refused(at_pass_2(lost));
+        let unknown = ran_at(false, None, "E-stop", Some(one[0]), None);
+        assert_eq!(cuts(&unknown), [(0, None), (1, None)]);
+        refused(at_pass_2(unknown));
     }
 
     /// A plan's moves cut with another cutter, or at another A, cut other

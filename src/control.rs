@@ -3426,8 +3426,15 @@ impl Connection {
         self.follow_stop_after();
         let outcome = self.run_outcome();
         let remote = self.pi.is_some();
+        // Where the tool stopped, for what a stop in a step cut (`Run::reach`):
+        // the local driver's position as its outcome comes, the machine
+        // moving only as this computer commands, which it does not while the
+        // job runs. Not the Pi's: its outcome may come long after the stop,
+        // on a reconnect say, the machine moved since by another computer
+        // (LIO-586 review).
+        let at = (!remote).then_some(&self.snapshot.machine_pos);
         if let Some(run) = &mut self.run {
-            run.refresh(outcome.as_ref(), Some(&self.snapshot.machine_pos));
+            run.refresh(outcome.as_ref(), at);
             run.carve(&self.snapshot);
             run.track(&self.snapshot);
             // Stop after step: the driver's Stop as the step ends. On the
