@@ -2885,8 +2885,28 @@ flood = { pin = 8 }
             "{:?}",
             problems(&a)
         );
-        let _ = a.update(Message::Run(R::KeepZero));
+        // The Work zero tab says why and offers Keep this work zero, which
+        // lets Cycle Start go.
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let window = iced::Size::new(1440., 2400.);
+        let texts = crate::ui::probe::texts(a.view(), window).join("\n");
+        assert!(
+            texts.contains("Operations or steps after the start are taken as cut")
+                && texts.contains("then press Keep this work zero"),
+            "{texts}"
+        );
+        let keep = |a: &App| {
+            (crate::ui::probe::clicks(a.view(), window).into_iter())
+                .find(|m| matches!(m, Message::Run(R::KeepZero)))
+        };
+        let _ = a.update(keep(&a).expect("Keep this work zero offered after the Stop"));
         assert!(run_of(&a).zeroed && waits(&a).is_none(), "{:?}", problems(&a));
+        assert!(keep(&a).is_none(), "kept: the button is off");
+        // Another declared after it asks again.
+        assert!(skip(&mut a, 2, Some(Cut)));
+        assert!(!run_of(&a).zeroed && waits(&a).is_some(), "{:?}", problems(&a));
+        assert!(keep(&a).is_some());
         a.touch();
         assert!(run_of(&a).skips.is_empty() && run_of(&a).stale);
     }

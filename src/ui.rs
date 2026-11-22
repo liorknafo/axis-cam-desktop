@@ -11912,6 +11912,21 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
                 .size(12)
                 .color(AMBER),
             );
+        } else if run.later_cut() {
+            // Operations or steps after the start taken as cut since: Cycle
+            // Start waits for the work zero they were cut with, kept here
+            // (LIO-583 review).
+            let why = c.partway_blocked().unwrap_or_default();
+            col = col
+                .push(text(format!(
+                    "{why} Set Z by hand on a surface whose height you know (Set above), then press Keep this work zero, or press it if the work zero is still the one they were cut with."
+                )).size(12))
+                .push(small(
+                    "Keep this work zero",
+                    (c.run_program().is_ok() && !run.zeroed && !running)
+                        .then_some(Message::Run(R::KeepZero)),
+                    run.zeroed,
+                ));
         }
     }
     if run.checked().is_some_and(|p| p.len() > 1) {
