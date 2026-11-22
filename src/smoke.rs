@@ -10087,6 +10087,82 @@ flood = { pin = 8 }
         );
     }
 
+    /// LIO-593: with operations after the start taken as cut, the Work zero
+    /// tab gives why nothing sets Z once, in step 3, which says that Zero Z
+    /// on the stock top and Probe Z are off and, with a probe input, the
+    /// setup's probe too: from the setup's start with the Pocket taken as
+    /// cut, and from the Pocket with the Contour taken as cut, at 1440 × 900.
+    #[test]
+    fn the_work_zero_tab_says_once_why_later_cuts_set_no_z() {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let why = "Operations or steps after the start are taken as cut";
+        let window = iced::Size::new(1440., 900.);
+        for profile in [FAST.to_string(), probe_profile()] {
+            let probe = profile != FAST;
+            for (cut, from) in [(1, 0), (2, 1)] {
+                let at = format!("probe {probe}, op {cut} taken as cut, from op {from}");
+                let dir = tempfile::tempdir().unwrap();
+                let mut a = run_app_of(dir.path(), &profile, &[0, 1, 2, 3]);
+                let _ = a.update(Message::Connect);
+                tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+                    s.state == Some(State::EStop)
+                });
+                let _ = a.update(Message::MachineReset);
+                tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+                    s.state == Some(State::Idle)
+                });
+                zero(&mut a);
+                let _ = a.update(Message::Run(R::Setup(0)));
+                answer_skips(&mut a, 0);
+                if from > 0 {
+                    let _ = a.update(Message::Run(R::From(0, from)));
+                    answer_skips(&mut a, 0);
+                }
+                assert!(skip(&mut a, cut, Some(Skip::Cut)), "{at}");
+                assert_eq!((run_of(&a).next, run_of(&a).from), (0, from), "{at}");
+                assert!(run_of(&a).later_cut(), "{at}");
+                assert!(
+                    conn(&a)
+                        .partway_blocked()
+                        .is_some_and(|b| b.starts_with(why))
+                );
+                a.page = Page::Control;
+                let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+                let _ = a.update(Message::Resized(window));
+                if let Ok(out) = std::env::var("AXIS_RENDER_DIR") {
+                    let name = format!(
+                        "work-zero-later-cut-{cut}-from-{from}{}.png",
+                        if probe { "-probe" } else { "" }
+                    );
+                    let tall = iced::Size::new(window.width, 2400.);
+                    render_png(&a, tall, &std::path::Path::new(&out).join(name));
+                }
+                let texts = crate::ui::probe::texts(a.view(), window);
+                let said: Vec<&String> = texts.iter().filter(|t| t.contains(why)).collect();
+                assert_eq!(said.len(), 1, "{at}: {said:#?}");
+                assert_eq!(said[0].matches(why).count(), 1, "{at}: {}", said[0]);
+                assert!(
+                    said[0].starts_with(&format!("3. {why}")),
+                    "{at}: {}",
+                    said[0]
+                );
+                let off = if probe {
+                    "Zero Z on the stock top and Probe Z are off, and so is Probe centre: set Z by hand"
+                } else {
+                    "Zero Z on the stock top and Probe Z are off: set Z by hand"
+                };
+                assert!(said[0].contains(off), "{at}: {}", said[0]);
+                assert!(
+                    !texts
+                        .iter()
+                        .any(|t| t.contains("where a probe finds this work zero")),
+                    "{at}: {texts:#?}"
+                );
+            }
+        }
+    }
+
     /// A run started at the Drilling with the work zero on the stock top's
     /// front-left corner, which the Contour cut down in part: the check
     /// cannot tell one surface there, so Zero Z on the stock top and Probe Z

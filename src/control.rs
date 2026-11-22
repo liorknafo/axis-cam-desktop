@@ -4433,40 +4433,10 @@ impl Connection {
             return Ok((refs, p));
         }
         // A run that starts partway probes the stock the operations before
-        // it leave: the zero's own spot only where they left it. One with
-        // operations or steps after its start taken as cut, partway or not,
-        // probes none (LIO-582).
-        let later = self.run.as_ref().is_some_and(|r| r.later_cut());
-        let own = match self
-            .run
-            .as_ref()
-            .filter(|r| r.on_cut_stock() || later)
-            .map(|r| (r.partly(), r.cut_by()))
-        {
-            _ if later && p.probe.is_ok() => Err("Operations or steps after the start are taken as cut, and the check does not follow the stock they cut where a probe finds this work zero.".into()),
-            Some((None, _)) => Err(crate::run::PARTWAY_UNKNOWN.to_string()),
-            // Not a part of the stock: the reason the check cannot tell it.
-            Some((Some(partly), _))
-                if p.probe.is_ok() && partly.cut == [crate::run::EARLIER_UNFOLLOWED] =>
-            {
-                Err("Another setup's run cut this part this session in a way the check does not follow, where a probe finds this work zero.".into())
-            }
-            Some((Some(partly), _))
-                if p.probe.is_ok() && partly.cut == [crate::run::STOCK_UNCONFIRMED] =>
-            {
-                Err("This setup's runs cut the stock earlier: say under Work zero whether it is the same part or new stock before a probe finds this work zero.".into())
-            }
-            Some((Some(partly), _))
-                if p.probe.is_ok() && partly.cut == [crate::run::STEPS_UNFOLLOWED] =>
-            {
-                Err("The check does not follow the stock cut by the steps taken as cut where a probe finds this work zero.".into())
-            }
-            Some((Some(partly), by)) if p.probe.is_ok() && !partly.cut.is_empty() => Err(format!(
-                "{} cut the stock's {}, where a probe finds this work zero.",
-                capital(by),
-                partly.cut.join(", ")
-            )),
-            _ => p.probe.clone(),
+        // it leave: the zero's own spot only where they left it.
+        let own = match self.cut_probe_blocked() {
+            Some(why) => Err(why),
+            None => p.probe.clone(),
         };
         // The zero's own spot is the spots' too: refused there, by a cut
         // that may reach where a probe touches it, it is refused here, at
@@ -4481,6 +4451,49 @@ impl Connection {
                 "{why} Pick a spot under Probe from that a probe can reach."
             )),
             Err(why) => Err(why),
+        }
+    }
+
+    /// Why a probe cannot find the work zero of the setup to run at its own
+    /// spot, for what the operations or steps taken as cut cut: a run that
+    /// starts partway probes the stock they leave, and one with operations
+    /// or steps after its start taken as cut, partway or not, probes none
+    /// (LIO-582). The same reason as `partway_blocked`'s, said of a probe,
+    /// where that is Some (LIO-593). None when they leave the zero's own
+    /// spot to the setup's probe (`post::Checked::probe`).
+    pub fn cut_probe_blocked(&self) -> Option<String> {
+        let p = self.run_program().ok()?;
+        let later = self.run.as_ref().is_some_and(|r| r.later_cut());
+        match self
+            .run
+            .as_ref()
+            .filter(|r| r.on_cut_stock() || later)
+            .map(|r| (r.partly(), r.cut_by()))
+        {
+            _ if later && p.probe.is_ok() => Some("Operations or steps after the start are taken as cut, and the check does not follow the stock they cut where a probe finds this work zero.".into()),
+            Some((None, _)) => Some(crate::run::PARTWAY_UNKNOWN.to_string()),
+            // Not a part of the stock: the reason the check cannot tell it.
+            Some((Some(partly), _))
+                if p.probe.is_ok() && partly.cut == [crate::run::EARLIER_UNFOLLOWED] =>
+            {
+                Some("Another setup's run cut this part this session in a way the check does not follow, where a probe finds this work zero.".into())
+            }
+            Some((Some(partly), _))
+                if p.probe.is_ok() && partly.cut == [crate::run::STOCK_UNCONFIRMED] =>
+            {
+                Some("This setup's runs cut the stock earlier: say under Work zero whether it is the same part or new stock before a probe finds this work zero.".into())
+            }
+            Some((Some(partly), _))
+                if p.probe.is_ok() && partly.cut == [crate::run::STEPS_UNFOLLOWED] =>
+            {
+                Some("The check does not follow the stock cut by the steps taken as cut where a probe finds this work zero.".into())
+            }
+            Some((Some(partly), by)) if p.probe.is_ok() && !partly.cut.is_empty() => Some(format!(
+                "{} cut the stock's {}, where a probe finds this work zero.",
+                capital(by),
+                partly.cut.join(", ")
+            )),
+            _ => None,
         }
     }
 
