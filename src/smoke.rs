@@ -7047,6 +7047,135 @@ flood = { pin = 8 }
         );
     }
 
+    /// LIO-592: the Work zero tab's Reference surface row shows its buttons
+    /// and what it says of the reference whole, by touch in a 960 × 552
+    /// window as at the sizes the Control page fits, with a probe input and
+    /// without, before and after a reference is recorded, with no skips and
+    /// with the Pocket taken as cut: each laid out as wide as it is alone
+    /// (not cut by the row) and inside the tab (not cut by its column).
+    #[test]
+    fn the_reference_surface_row_is_whole_by_touch_in_a_small_window() {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let alone = |s: &str, window| {
+            let t = iced::widget::text(s.to_string()).size(12);
+            crate::ui::probe::placed(t.into(), window)[0].1.width
+        };
+        let sizes = [
+            (960., 552., true),
+            (1120., 690., true),
+            (1120., 690., false),
+            (1440., 900., true),
+            (1440., 900., false),
+        ];
+        for profile in [FAST.to_string(), probe_profile()] {
+            let probe = profile != FAST;
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = run_app_of(dir.path(), &profile, &[0, 1, 2, 3]);
+            let _ = a.update(Message::Connect);
+            tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+                s.state == Some(State::EStop)
+            });
+            let _ = a.update(Message::MachineReset);
+            tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+                s.state == Some(State::Idle)
+            });
+            zero(&mut a);
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(&mut a, 0);
+            a.page = Page::Control;
+            let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+            for (case, cut, record) in [
+                ("as-planned", false, false),
+                ("pocket-cut", true, false),
+                ("recorded", true, true),
+            ] {
+                if cut && run_of(&a).skips.is_empty() {
+                    assert!(skip(&mut a, 1, Some(Skip::Cut)));
+                }
+                if record {
+                    let _ = a.update(Message::Run(R::RecordReference));
+                    assert!(run_of(&a).reference.is_some());
+                }
+                assert!(run_of(&a).checked().is_some_and(|p| p.len() > 1));
+                for (w, h, touch) in sizes {
+                    crate::ui::TOUCH.with(|t| t.set(touch));
+                    let window = iced::Size::new(w, h);
+                    let _ = a.update(Message::Resized(window));
+                    let at = format!(
+                        "{w} x {h}{} {case}, probe {probe}",
+                        if touch { " touch" } else { "" }
+                    );
+                    // Pictures of it when AXIS_RENDER_DIR says where.
+                    if let Ok(out) = std::env::var("AXIS_RENDER_DIR") {
+                        let name = format!(
+                            "reference-row-{w}x{h}{}-{case}{}.png",
+                            if touch { "-touch" } else { "" },
+                            if probe { "-probe" } else { "" }
+                        );
+                        let tall = iced::Size::new(w, 2400.);
+                        render_png(&a, tall, &std::path::Path::new(&out).join(name));
+                    }
+                    let placed = crate::ui::probe::placed(a.view(), window);
+                    let tabs = crate::ui::probe::scrollables(a.view(), window);
+                    let heading = (placed.iter())
+                        .position(|(t, _)| t == "Reference surface, for the tool changes")
+                        .unwrap_or_else(|| panic!("{at}: no Reference surface heading"));
+                    let mut labels = vec!["Record reference", "Set Z from reference"];
+                    if probe {
+                        labels.extend(["Probe reference", "Probe Z from reference"]);
+                    }
+                    let state = |t: &str| {
+                        t.starts_with("Reference: Z")
+                            || t.starts_with("Z ")
+                            || t == "Reference surface: not recorded"
+                            || t == "Not recorded"
+                    };
+                    let said_of_probe = |t: &str| t.starts_with("The same with");
+                    let left = placed[heading].1.x;
+                    let row = &placed[heading + 1..];
+                    let mut seen = vec![];
+                    for (t, b) in row.iter().take(12) {
+                        if !(labels.contains(&t.as_str()) || state(t) || said_of_probe(t)) {
+                            continue;
+                        }
+                        seen.push(t.clone());
+                        // The probe's line may wrap, on lines of its own.
+                        let wrapped =
+                            said_of_probe(t) && b.height > 1.5 * 12. * 1.3 && b.x <= left + 0.5;
+                        assert!(
+                            wrapped || b.width >= alone(t, window) - 0.5,
+                            "{at}: \"{t}\" is cut to {b:?}"
+                        );
+                        // Inside the tab that scrolls it: the narrowest
+                        // scrollable across its left edge.
+                        let tab = (tabs.iter())
+                            .map(|(_, r)| *r)
+                            .filter(|r| r.x <= b.x && b.x < r.x + r.width)
+                            .min_by(|p, q| p.width.total_cmp(&q.width))
+                            .unwrap_or_else(|| panic!("{at}: \"{t}\" is in no tab"));
+                        assert!(
+                            b.x + b.width <= tab.x + tab.width + 0.5,
+                            "{at}: \"{t}\" at {b:?} runs past its tab {tab:?}"
+                        );
+                    }
+                    for l in &labels {
+                        assert!(seen.iter().any(|s| s == l), "{at}: no {l} in {row:?}");
+                    }
+                    assert_eq!(
+                        seen.iter().filter(|t| said_of_probe(t)).count(),
+                        usize::from(probe),
+                        "{at}: {seen:?}"
+                    );
+                    let said: Vec<&String> = seen.iter().filter(|t| state(t)).collect();
+                    assert_eq!(said.len(), 1, "{at}: {seen:?}");
+                    assert_eq!(said[0].ends_with("ot recorded"), !record, "{at}: {said:?}");
+                }
+            }
+            crate::ui::TOUCH.with(|t| t.set(false));
+        }
+    }
+
     /// Two Ø32 bores 70 mm apart in `a`'s machine, on the Control page and
     /// checked: drilled Ø12 (operation 0), then, given a cut, milled to
     /// Ø31.4 (operation 1) and bored in 0.15 mm passes, 3 of them, else

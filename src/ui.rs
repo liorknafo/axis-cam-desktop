@@ -11184,10 +11184,14 @@ fn reference_rows<'a>(
                 (None, _, false) => "Reference surface: not recorded".into(),
                 (None, _, true) => "Not recorded".into(),
             })
-            .wrapping(Wrapping::None),
+            .wrapping(Wrapping::Word),
         ]
         .spacing(6)
         .align_y(Alignment::Center)
+        // Where the two buttons leave the state no room, by touch in a
+        // small window, it goes under them, whole (LIO-592).
+        .wrap()
+        .vertical_spacing(6)
     ]
     .spacing(6);
     if c.config.inputs.probe.is_some() {
@@ -11200,18 +11204,18 @@ fn reference_rows<'a>(
                     msg(probe && set_ok, R::ProbeFromReference),
                     false
                 ),
-                hint(
-                    "Probe reference",
-                    if c.direct() {
-                        "The same with the plate's lead on the reference surface, which the tool touches."
-                    } else {
-                        "The same with the touch plate on the reference surface."
-                    },
-                    fit.chars(40)
-                ),
+                muted(if c.direct() {
+                    "The same with the plate's lead on the reference surface, which the tool touches."
+                } else {
+                    "The same with the touch plate on the reference surface."
+                })
+                .wrapping(Wrapping::Word),
             ]
             .spacing(6)
-            .align_y(Alignment::Center),
+            .align_y(Alignment::Center)
+            // Beside the buttons where it fits, else whole under them (LIO-592).
+            .wrap()
+            .vertical_spacing(6),
         );
         if let Some(note) = probe_note(c) {
             col = col.push(note);
