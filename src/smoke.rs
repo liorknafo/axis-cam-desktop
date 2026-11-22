@@ -6063,6 +6063,31 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
     }
 
+    /// An E-stop while a hole is drilled, an MDI sent just before it with
+    /// no snapshot since showing the job going (LIO-586 review): the run
+    /// bar lets one through while it still shows the job paused, and it
+    /// may move the machine once the job has stopped, so where the tool
+    /// stands as the outcome comes is not where it stopped. All the tool
+    /// run ran is taken as cut.
+    #[test]
+    fn a_stop_after_a_command_that_may_move_takes_all_the_tool_run_ran_as_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        slow_holes(&mut a);
+        let drill = drilling(&mut a);
+        assert!(drill.steps.len() >= 2);
+        run_until(&mut a, 30.0, "hole 2", |r| {
+            r.step_at(None)
+                .is_some_and(|(oi, s, done)| oi == 1 && s == 1 && !done)
+        });
+        conn(&a).send(uc100::controller::Command::Mdi("G4 P0".into()));
+        let _ = a.update(Message::MachineEStop);
+        run_until(&mut a, 5.0, "the E-stop", |r| r.running.is_none());
+        let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
+        assert_eq!(cut, [(1, None)]);
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// An E-stop while a hole is drilled (LIO-275): that hole counts as not
     /// done, the journal keeps the one before it, and it is the start, cut
     /// again from its start.
