@@ -1406,8 +1406,12 @@ impl Run {
                 .is_some_and(|s| s.fingerprint == j.fingerprint && s.steps.len() == j.steps);
             if same && j.setup == self.setup_id {
                 // Before the start is picked, which may drop the programs
-                // for a check of it.
-                self.note_journal_cuts(&j);
+                // for a check of it. Only where this session knows nothing
+                // this setup's runs cut (`App::run_cuts`): where it does,
+                // that is all since a journal it did not write.
+                if self.cut_in_run.is_empty() {
+                    self.note_journal_cuts();
+                }
                 self.resume_after(j.op, j.step);
                 self.resumed = Some(j);
             } else {
@@ -1419,39 +1423,19 @@ impl Run {
         }
     }
 
-    /// What the run that stopped where journal `j` says cut, as this run's
-    /// (`cut_in_run`), which only this session's runs keep (LIO-586
-    /// review): every operation before it, in its tool run and before, as
-    /// all cut, for all that is known; and its own up to its last step
-    /// done where it stopped there (Stop after step, or its tool run
-    /// done), or, where that is only the step it was followed in (an
-    /// E-stop), its tool run from it on, all of which it may have cut.
-    fn note_journal_cuts(&mut self, j: &Journal) {
-        let Some(programs) = self.checked() else {
-            return;
-        };
-        let Some((i, k)) = (programs.iter().enumerate())
-            .find_map(|(i, p)| Some((i, p.indexes.iter().position(|&o| o == j.op)?)))
-        else {
-            return;
-        };
-        let before: Vec<usize> = (programs[..i].iter())
+    /// What the run that stopped where a journal says cut, as this run's
+    /// (`cut_in_run`), which only the session it ran in kept (LIO-586
+    /// review). The journal says where it last stopped, not what it cut
+    /// before: all of the setup, run before and cut again from an earlier
+    /// step, say. So every operation of the setup is taken as all cut, and
+    /// no start sets Z from the stock the check carves: the work zero is
+    /// kept, or Z set by hand.
+    fn note_journal_cuts(&mut self) {
+        let ops: Vec<usize> = (self.checked().into_iter().flatten())
             .flat_map(|p| p.indexes.iter().copied())
-            .chain(programs[i].indexes[..k].iter().copied())
             .collect();
-        let rest = programs[i].indexes[k..].to_vec();
-        let exact = j.why.is_empty() || j.why.starts_with("Stop after step");
-        for oi in before {
+        for oi in ops {
             self.note_cut(oi, None);
-        }
-        match (exact, j.step) {
-            (true, Some(s)) => self.note_cut(j.op, Some(s + 1)),
-            (true, None) => {}
-            (false, _) => {
-                for oi in rest {
-                    self.note_cut(oi, None);
-                }
-            }
         }
     }
 
@@ -9564,12 +9548,13 @@ pub(crate) mod tests {
         refused(at_pass_2(unknown));
     }
 
-    /// A journal picked up again, in a new session (LIO-586 review): what
-    /// its run cut is this run's (`cut_in_run`), which only the session
-    /// kept. After Stop after Face pass 1, pass 1, so the start at pass 2
-    /// touches off on its floor; after an E-stop followed in pass 2, which
-    /// may have cut more, the Face's tool run from the Face on, so it sets
-    /// no Z; after the Face's tool run done on the Pi, all of it.
+    /// A journal picked up again, in a new session (LIO-586 review): it
+    /// says where its run last stopped, not what it cut before (all of the
+    /// setup, then Face cut again from pass 1 and stopped after it, say),
+    /// which only that session kept (`cut_in_run`). So every operation is
+    /// taken as cut, and the start at Face pass 2 sets no Z from the
+    /// check's stock, whatever stopped it: Stop after pass 1, an E-stop in
+    /// pass 2, or the Face's tool run done on the Pi.
     #[test]
     fn a_journal_picked_again_keeps_what_its_run_may_have_cut() {
         let dir = tempfile::tempdir().unwrap();
@@ -9618,16 +9603,43 @@ pub(crate) mod tests {
                 Some(RUN_UNFOLLOWED_BLOCKED)
             );
         };
-        let after = at_pass_2(journal(0, Some(0), "Stop after step"));
-        assert_eq!(cuts(&after), [(0, Some(1))]);
-        let (at, _) = after.touch_off().unwrap();
+        for j in [
+            journal(0, Some(0), "Stop after step"),
+            journal(0, Some(0), "an E-stop"),
+            journal(2, None, ""),
+        ] {
+            let run = at_pass_2(j);
+            assert_eq!(cuts(&run), [(0, None), (1, None), (2, None)]);
+            refused(&run);
+            // Keep this work zero stays.
+            assert!(run.partway() && !run.zeroed);
+        }
+        // Without the journal, the same start touches off on pass 1's
+        // floor: it is the journal that tells of the run.
+        let mut fresh = Run::new(&doc, 0, 0);
+        fresh.checked_as(whole.clone(), Some(left.clone()), None);
+        assert!(fresh.start_at_step(0, 1));
+        let (c, l) = check_steps(&doc, &mesh, 0, &[], &[(0, vec![0])]);
+        fresh.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        let (at, _) = fresh.touch_off().unwrap();
         assert!((at[2] - pass_1).abs() < 1e-3, "{at:?} {pass_1}");
-        let e_stop = at_pass_2(journal(0, Some(0), "an E-stop"));
-        assert_eq!(cuts(&e_stop), [(0, None), (1, None)]);
-        refused(&e_stop);
-        let done = at_pass_2(journal(2, None, ""));
-        assert_eq!(cuts(&done), [(0, None), (1, None)]);
-        refused(&done);
+        // In the session that wrote it, which keeps what its runs cut
+        // (Face pass 1, given as `App::run_cuts` does): that, not all.
+        let mut known = Run::new(&doc, 0, 0);
+        known.checked_as(whole.clone(), Some(left.clone()), None);
+        known.note_cut(0, Some(1));
+        let session = known.cut_in_run.clone();
+        let mut run = Run::new(&doc, 0, 0);
+        run.journal = Some(journal(0, Some(0), "Stop after step"));
+        run.cut_in_run = session.clone();
+        run.checked_as(whole.clone(), Some(left.clone()), None);
+        assert!(run.resumed.is_some());
+        assert_eq!(run.cut_in_run, session);
+        let (c, l) = check_steps(&doc, &mesh, 0, &[], &[(0, vec![0])]);
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        assert_eq!(run.at_step(), Some((0, 1)));
+        let (at, _) = run.touch_off().unwrap();
+        assert!((at[2] - pass_1).abs() < 1e-3, "{at:?} {pass_1}");
     }
 
     /// A plan's moves cut with another cutter, or at another A, cut other
