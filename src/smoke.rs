@@ -6088,6 +6088,41 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
     }
 
+    /// Another job sent as the tool run starts, the screen still showing the
+    /// machine idle (a Go Z, LIO-586 review): the driver refuses it, and its
+    /// refusal is not the tool run's, which goes on and is followed to its
+    /// stop, what it cut kept.
+    #[test]
+    fn another_jobs_refusal_does_not_end_the_tool_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        slow_holes(&mut a);
+        drilling(&mut a);
+        conn(&a).send(uc100::controller::Command::Run {
+            name: "Go Z".into(),
+            lines: std::sync::Arc::new(vec!["G0 Z5".into()]),
+        });
+        tick_until(&mut a, 3.0, "the refusal", |s| {
+            (s.program_outcome.as_ref()).is_some_and(|o| o.message.starts_with("Go Z: not started"))
+        });
+        for _ in 0..5 {
+            let _ = a.update(Message::Tick);
+        }
+        assert!(run_of(&a).running.is_some(), "{:?}", run_of(&a).outcome);
+        run_until(&mut a, 30.0, "hole 2", |r| {
+            r.step_at(None)
+                .is_some_and(|(oi, s, done)| oi == 1 && s == 1 && !done)
+        });
+        let _ = a.update(Message::MachineEStop);
+        run_until(&mut a, 5.0, "the E-stop", |r| r.running.is_none());
+        assert!(
+            run_of(&a).cut_in_run.iter().any(|c| c.0 == 1),
+            "{:?}",
+            run_of(&a).cut_in_run
+        );
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// An E-stop while a hole is drilled (LIO-275): that hole counts as not
     /// done, the journal keeps the one before it, and it is the start, cut
     /// again from its start.

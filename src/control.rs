@@ -2618,7 +2618,7 @@ pub struct Connection {
     /// tool run this run follows (`watch_job`).
     job_missing: Option<Instant>,
     /// The name of the last tool run sent, which the Pi's Stop after step
-    /// names when it fires.
+    /// names when it fires, and the driver's refusal of it (`run_outcome`).
     job_name: Option<String>,
     /// The number the last tool run was sent to the Pi with: the Pi tells
     /// its end by it (`run_outcome`).
@@ -4153,8 +4153,11 @@ impl Connection {
                 .clone()
                 .unwrap_or_else(|| "the link to the Pi is down".into());
             run.not_started(format!("The tool run was not sent ({why}). Nothing moved."));
-        } else if self.pi.is_some() {
-            (self.job_missing, self.job_name) = (None, name);
+        } else {
+            if self.pi.is_some() {
+                self.job_missing = None;
+            }
+            self.job_name = name;
         }
     }
 
@@ -6200,10 +6203,20 @@ impl Connection {
     /// The running tool run's outcome. On the Pi, the end the Pi tells of
     /// the tool run sent with `tool_run_id`, never another job's outcome
     /// (of the same name or not); a stop the Pi made after a step is taken
-    /// as that step's first. Otherwise the driver's last.
+    /// as that step's first. Otherwise the driver's last, but for its
+    /// refusal of another job: a Go Z sent as the tool run started, the
+    /// screen still showing the machine idle, is refused while the tool run
+    /// goes on cutting (LIO-586 review).
     fn run_outcome(&mut self) -> Option<uc100::controller::ProgramOutcome> {
         if self.pi.is_none() {
-            return self.snapshot.program_outcome.clone();
+            let o = self.snapshot.program_outcome.clone()?;
+            let ours = |n: &String| o.message.starts_with(&format!("{n}: "));
+            if o.message.contains(crate::run::NOT_STARTED)
+                && !self.job_name.as_ref().is_some_and(ours)
+            {
+                return None;
+            }
+            return Some(o);
         }
         let run = self.run.as_mut().filter(|r| r.running.is_some())?;
         let id = self.tool_run_id?;
