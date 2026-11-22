@@ -10163,6 +10163,104 @@ flood = { pin = 8 }
         }
     }
 
+    /// LIO-593 review: a start at the small bore's face, its surface not
+    /// known where the stock top is touched off, with a corner under Probe
+    /// from that the bore left: step 3 says Probe Z is off, and the probe
+    /// line says only what stops the corner probe (no material, or a stock
+    /// that does not conduct), never Probe Z on the touch plate or the
+    /// reason again.
+    #[test]
+    fn a_blocked_start_with_a_probe_spot_left_offers_no_probe_z() {
+        use crate::post::At;
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = profile_app(dir.path(), &probe_profile());
+        let mut m = a.doc.machines.pop().unwrap();
+        for (k, v) in [("x", "390"), ("y", "280"), ("z", "80"), ("feed", "60000")] {
+            m.p.insert(k.into(), v.into());
+        }
+        let (mut doc, mesh) = crate::run::tests::small_bore_job(dir.path());
+        doc.setups[0].machine = m.clone();
+        doc.machines = vec![m];
+        a.replace_document(doc, None);
+        a.imported_mesh = Some(mesh);
+        a.page = Page::Control;
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 3.0, "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 3.0, "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        zero(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Next(1)));
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert!(run_of(&a).partway());
+        let blocked = conn(&a).partway_blocked().expect("Z blocked at the start");
+        assert!(conn(&a).cut_probe_blocked().is_none());
+        let spot = (conn(&a).probe_spots().into_iter())
+            .find(|(r, ok)| *r != [At::Mid; 2] && ok.is_ok())
+            .map(|(r, _)| r)
+            .expect("a spot the bore left");
+        let _ = a.update(Message::Machine(crate::control::Action::ProbeFrom(Some(
+            spot,
+        ))));
+        assert_eq!(conn(&a).edges_setup().map(|(r, _)| r), Ok(spot));
+        let name = crate::control::probe_name(spot);
+        for (wood, says) in [
+            (
+                false,
+                format!(
+                    "The project has no material: choose a metal one for {name} to touch the stock."
+                ),
+            ),
+            (
+                true,
+                format!("does not conduct, so {name} cannot touch the stock either."),
+            ),
+        ] {
+            if wood {
+                material(&mut a, "Wood and composite");
+                let _ = a.update(Message::Tick);
+            }
+            assert!(conn(&a).sides_blocked().is_some());
+            let steps = crate::ui::work_zero_steps(&a, conn(&a)).unwrap();
+            let three = (steps.iter())
+                .find(|t| t.starts_with("3. "))
+                .unwrap_or_else(|| panic!("{steps:#?}"));
+            assert!(
+                three.starts_with(&format!(
+                    "3. {blocked} Zero Z on the stock top and Probe Z are off: "
+                )),
+                "{three}"
+            );
+            assert!(
+                steps.iter().any(|t| t.ends_with(&says)),
+                "{wood}: {steps:#?}"
+            );
+            assert_eq!(
+                steps
+                    .iter()
+                    .filter(|t| t.contains(blocked.as_str()))
+                    .count(),
+                1,
+                "{wood}: {steps:#?}"
+            );
+            assert!(
+                !steps
+                    .iter()
+                    .any(|t| t.contains("touch plate") || t.contains("Probe Z cannot")),
+                "{wood}: {steps:#?}"
+            );
+        }
+    }
+
     /// A run started at the Drilling with the work zero on the stock top's
     /// front-left corner, which the Contour cut down in part: the check
     /// cannot tell one surface there, so Zero Z on the stock top and Probe Z

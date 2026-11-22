@@ -13283,8 +13283,20 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
                 format!("{} {}", c.sides_blocked().unwrap_or_default(), probe_z(top))
             }
             (Err(why), Ok(top)) => format!("{why} {}", probe_z(top)),
-            // Step 3 says that Probe Z is off, and why (LIO-593).
-            (Ok(_), Err(_)) if blocked.is_some() => c.sides_blocked().unwrap_or_default(),
+            // Step 3 says that Probe Z is off, and why (LIO-593): what stops
+            // the setup's probe alone, without the touch plate's Probe Z
+            // `sides_blocked` offers (LIO-593 review).
+            (Ok((refs, _)), Err(_)) if blocked.is_some() => {
+                let name = crate::control::probe_name(refs);
+                match &c.material {
+                    Some((m, _)) => format!(
+                        "{m} does not conduct, so {name} cannot touch the stock either."
+                    ),
+                    None => format!(
+                        "The project has no material: choose a metal one for {name} to touch the stock."
+                    ),
+                }
+            }
             (Err(_), Err(_)) if same.is_some() => match &p.probe {
                 Ok(refs) => format!(
                     "{} cannot probe from its own spot for that reason either: pick a spot under Probe from in the Probe tab that a probe can reach.",
