@@ -2823,9 +2823,10 @@ impl PiPending {
         Some((serde_json::from_slice(&data).ok()?, own))
     }
 
+    /// Written as this session's (`run::write_own`).
     fn write(&self, path: &Path) -> Result<(), String> {
         let text = serde_json::to_vec(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, text).map_err(|e| e.to_string())
+        crate::run::write_own(path, &text)
     }
 }
 
@@ -3262,13 +3263,10 @@ impl Connection {
         {
             self.pi_note = None;
         }
-        match pending.write(&path) {
-            Ok(()) => crate::run::wrote(&path),
-            Err(e) => {
-                self.pi_note = Some(format!(
-                    "Where a stop after a step would leave this tool run could not be kept: {e}."
-                ))
-            }
+        if let Err(e) = pending.write(&path) {
+            self.pi_note = Some(format!(
+                "Where a stop after a step would leave this tool run could not be kept: {e}."
+            ));
         }
         #[cfg(test)]
         if std::mem::take(&mut self.lose_next_job) {
@@ -3369,13 +3367,14 @@ impl Connection {
             }
         };
         j.time = crate::run::now();
-        if let Err(e) = j.write(&self.journal) {
+        // This session's, as the stops it was made from were.
+        let written = match own {
+            true => j.write_own(&self.journal),
+            false => j.write(&self.journal),
+        };
+        if let Err(e) = written {
             self.pi_note = Some(format!("Where the Pi stopped could not be kept: {e}."));
             return;
-        }
-        // This session's, as the stops it was made from were.
-        if own {
-            crate::run::wrote(&self.journal);
         }
         self.pi_note = Some(what);
         if let Some(run) = &mut self.run {
@@ -6118,15 +6117,11 @@ impl Connection {
         // Followed to its stop: what was kept for not following it is done.
         let _ = std::fs::remove_file(&pending);
         self.z_up = st.up;
-        if let Some(j) = run.journal_of(&st, s.active_wcs, s.work_offset) {
-            match j.write(&self.journal) {
-                Ok(()) => crate::run::wrote(&self.journal),
-                Err(e) => {
-                    if let Some((_, message)) = &mut run.outcome {
-                        *message += &format!(" Where it stopped could not be kept: {e}.");
-                    }
-                }
-            }
+        if let Some(j) = run.journal_of(&st, s.active_wcs, s.work_offset)
+            && let Err(e) = j.write_own(&self.journal)
+            && let Some((_, message)) = &mut run.outcome
+        {
+            *message += &format!(" Where it stopped could not be kept: {e}.");
         }
         // The start after it is next.
         run.resume_after(st.op, st.last);

@@ -789,6 +789,13 @@ impl Journal {
         crate::storage::write_atomic(path, &data)
     }
 
+    /// `write`, as this session's (`write_own`): read back unchanged, it
+    /// is this session's (`read_own`).
+    pub fn write_own(&self, path: &std::path::Path) -> Result<(), String> {
+        let data = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        write_own(path, &data)
+    }
+
     /// How long ago it stopped, at `now` (seconds since 1970): "12 min
     /// ago", "3 h ago", "2 days ago".
     pub fn ago(&self, now: u64) -> String {
@@ -841,7 +848,7 @@ fn version(m: &std::fs::Metadata) -> Option<Version> {
 
 thread_local! {
     /// The versions of the files this session wrote, on the thread that
-    /// runs the app (`wrote`): a journal read back as one of them is this
+    /// runs the app (`write_own`): a journal read back as one of them is this
     /// session's; any other, whatever it holds or when, another session's,
     /// which alone knew what its runs cut (`Run::take_journal`, LIO-586
     /// review).
@@ -849,23 +856,58 @@ thread_local! {
         const { std::cell::RefCell::new(vec![]) };
 }
 
-/// Notes that this session just wrote `path`: a journal, or the Pi's
-/// stops kept for a tool run (`read_own`).
-pub fn wrote(path: &std::path::Path) {
-    if let Some(v) = std::fs::metadata(path).ok().as_ref().and_then(version) {
-        OWN_FILES.with(|o| o.borrow_mut().push((path.to_path_buf(), v)));
-    }
-}
-
-/// Reads `path`, and whether what was read is a version this session
-/// wrote (`wrote`): the version of the very file read, taken from it once
-/// read, so that one changed meanwhile is not.
-pub fn read_own(path: &std::path::Path) -> Option<(Vec<u8>, bool)> {
+/// Reads `path` to the end, and the version of the very file read,
+/// taken from it once read, so that one changed meanwhile is not the one
+/// it was before.
+fn read_version(path: &std::path::Path) -> Option<(Vec<u8>, Option<Version>)> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).ok()?;
     let mut data = vec![];
     file.read_to_end(&mut data).ok()?;
-    let read = file.metadata().ok().as_ref().and_then(version);
+    Some((data, file.metadata().ok().as_ref().and_then(version)))
+}
+
+/// Writes `data` to `path` as `storage::write_atomic` does (a new file,
+/// renamed there), and notes the version this session wrote (`read_own`):
+/// that at `path` once renamed, while it is the very file made (its
+/// inode, taken from it as it was written) and holds what was written. One
+/// put there meanwhile, by another session say, is not noted (LIO-586
+/// review).
+pub fn write_own(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let parent = path.parent().ok_or("Missing parent directory")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let tmp = parent.join(format!(".axis-{}.tmp", uuid::Uuid::new_v4()));
+    let made = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        let made = f.metadata()?;
+        std::fs::rename(&tmp, path)?;
+        Ok(made)
+    })()
+    .map_err(|e: std::io::Error| e.to_string());
+    let made = match made {
+        Ok(m) => version(&m),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    if let (Some(made), Some((read, Some(v)))) = (made, read_version(path))
+        && read == data
+        && (v.dev, v.ino) == (made.dev, made.ino)
+    {
+        OWN_FILES.with(|o| o.borrow_mut().push((path.to_path_buf(), v)));
+    }
+    Ok(())
+}
+
+/// Reads `path`, and whether what was read is a version this session
+/// wrote (`write_own`): the version of the very file read, taken from it
+/// once read, so that one changed meanwhile is not.
+pub fn read_own(path: &std::path::Path) -> Option<(Vec<u8>, bool)> {
+    let (data, read) = read_version(path)?;
     let own = read
         .is_some_and(|v| OWN_FILES.with(|o| o.borrow().iter().any(|(p, w)| p == path && *w == v)));
     Some((data, own))
@@ -9757,7 +9799,7 @@ pub(crate) mod tests {
         on_pass_1(&at_step(run, 0, 1));
     }
 
-    /// A file is this session's only as it wrote it (`wrote`, LIO-586
+    /// A file is this session's only as it wrote it (`write_own`, LIO-586
     /// review): written again since, the same bytes or not, by another
     /// session say, it is not; nor with its modified time put back as it
     /// was (a copy put back with `cp -p`); nor one it never wrote, nor once
@@ -9766,12 +9808,12 @@ pub(crate) mod tests {
     #[test]
     fn a_file_is_this_sessions_only_as_it_wrote_it() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("m-journal.json");
+        let path = dir.path().join("uc100").join("m-journal.json");
         let own = |path: &std::path::Path| read_own(path).map(|(_, own)| own);
         assert_eq!(own(&path), None);
-        std::fs::write(&path, "{}").unwrap();
+        crate::storage::write_atomic(&path, b"{}").unwrap();
         assert_eq!(own(&path), Some(false));
-        wrote(&path);
+        write_own(&path, b"{}").unwrap();
         assert_eq!(own(&path), Some(true));
         let was = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -9781,7 +9823,7 @@ pub(crate) mod tests {
         file.set_modified(was).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), was);
         assert_eq!(own(&path), Some(false));
-        wrote(&path);
+        write_own(&path, b"{}").unwrap();
         assert_eq!(own(&path), Some(true));
         forget_own_files();
         assert_eq!(own(&path), Some(false));
