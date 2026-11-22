@@ -2813,7 +2813,14 @@ struct PiPending {
 
 impl PiPending {
     fn read(path: &Path) -> Option<Self> {
-        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+        Some(Self::read_own(path)?.0)
+    }
+
+    /// `read`, and whether it is as this session wrote it
+    /// (`run::read_own`).
+    fn read_own(path: &Path) -> Option<(Self, bool)> {
+        let (data, own) = crate::run::read_own(path)?;
+        Some((serde_json::from_slice(&data).ok()?, own))
     }
 
     fn write(&self, path: &Path) -> Result<(), String> {
@@ -3308,15 +3315,14 @@ impl Connection {
             return;
         }
         let path = self.pi_pending();
-        let Some(pending) = PiPending::read(&path) else {
+        // Kept by this session as it sent the tool run, or by another
+        // (`Run::journal_own`, LIO-586 review).
+        let Some((pending, own)) = PiPending::read_own(&path) else {
             return;
         };
         let Some(end) = link.tool_run_ends.iter().find(|e| e.id == pending.id) else {
             return;
         };
-        // Kept by this session as it sent the tool run, or by another
-        // (`Run::journal_own`, LIO-586 review).
-        let own = crate::run::own_file(&path);
         let _ = std::fs::remove_file(&path);
         let stopped = end.stopped_after.and_then(|line| {
             let (_, j) = pending.stops.iter().find(|(r, _)| r.contains(&line))?;
@@ -6131,9 +6137,10 @@ impl Connection {
         crate::run::Journal::read(&self.journal)
     }
 
-    /// The journal is as this session wrote it (`run::own_file`).
-    pub fn journal_own(&self) -> bool {
-        crate::run::own_file(&self.journal)
+    /// The journal, and whether it is as this session wrote it
+    /// (`run::read_own`).
+    pub fn journal_own(&self) -> Option<(crate::run::Journal, bool)> {
+        crate::run::Journal::read_own(&self.journal)
     }
 
     /// Keeps where a running tool run is in the journal before the

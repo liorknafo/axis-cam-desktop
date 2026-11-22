@@ -525,7 +525,7 @@ pub struct Run {
     /// the check found of one that no longer holds.
     pub resumed: Option<Journal>,
     pub journal_note: Option<String>,
-    /// `journal` is one this session wrote, unchanged since (`own_file`):
+    /// `journal` is one this session wrote, unchanged since (`read_own`):
     /// what its runs cut is in `cut_in_run`. Else another session's.
     pub journal_own: bool,
     /// The tool run on the Pi this run is to follow once checked, AXIS
@@ -772,7 +772,13 @@ pub struct Journal {
 
 impl Journal {
     pub fn read(path: &std::path::Path) -> Option<Self> {
-        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+        Some(Self::read_own(path)?.0)
+    }
+
+    /// `read`, and whether it is as this session wrote it (`read_own`).
+    pub fn read_own(path: &std::path::Path) -> Option<(Self, bool)> {
+        let (data, own) = read_own(path)?;
+        Some((serde_json::from_slice(&data).ok()?, own))
     }
 
     pub fn write(&self, path: &std::path::Path) -> Result<(), String> {
@@ -801,34 +807,68 @@ pub fn now() -> u64 {
     (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)).map_or(0, |d| d.as_secs())
 }
 
-thread_local! {
-    /// The files of journals this session wrote, each with the time it
-    /// was modified as it was written, on the thread that runs the app
-    /// (`wrote`): one read back unchanged since is this session's; any
-    /// other, whatever it holds or when it was written, another session's,
-    /// which alone knew what its runs cut (`Run::take_journal`, LIO-586
-    /// review).
-    static OWN_FILES: std::cell::RefCell<Vec<(std::path::PathBuf, std::time::SystemTime)>> =
-        const { std::cell::RefCell::new(vec![]) };
+/// One version of a file, as its metadata tells it from any other: on
+/// Unix its device and inode and the times it was modified and changed.
+/// The change time is the system's, set on every write and every time
+/// set, so a copy put back with its modified time (`cp -p`) is not the
+/// version it was copied from. None where it cannot be told (not Unix):
+/// no file is this session's there.
+#[derive(Debug, Clone, PartialEq)]
+struct Version {
+    dev: u64,
+    ino: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
 }
 
-/// The time `path` was last modified.
-fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
-    std::fs::metadata(path).and_then(|m| m.modified()).ok()
-}
-
-/// Notes that this session just wrote `path`: a journal, or the Pi's
-/// stops kept for a tool run (`own_file`).
-pub fn wrote(path: &std::path::Path) {
-    if let Some(t) = modified(path) {
-        OWN_FILES.with(|o| o.borrow_mut().push((path.to_path_buf(), t)));
+fn version(m: &std::fs::Metadata) -> Option<Version> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(Version {
+            dev: m.dev(),
+            ino: m.ino(),
+            modified: (m.mtime(), m.mtime_nsec()),
+            changed: (m.ctime(), m.ctime_nsec()),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = m;
+        None
     }
 }
 
-/// `path` is as this session wrote it (`wrote`).
-pub fn own_file(path: &std::path::Path) -> bool {
-    modified(path)
-        .is_some_and(|t| OWN_FILES.with(|o| o.borrow().iter().any(|(p, w)| p == path && *w == t)))
+thread_local! {
+    /// The versions of the files this session wrote, on the thread that
+    /// runs the app (`wrote`): a journal read back as one of them is this
+    /// session's; any other, whatever it holds or when, another session's,
+    /// which alone knew what its runs cut (`Run::take_journal`, LIO-586
+    /// review).
+    static OWN_FILES: std::cell::RefCell<Vec<(std::path::PathBuf, Version)>> =
+        const { std::cell::RefCell::new(vec![]) };
+}
+
+/// Notes that this session just wrote `path`: a journal, or the Pi's
+/// stops kept for a tool run (`read_own`).
+pub fn wrote(path: &std::path::Path) {
+    if let Some(v) = std::fs::metadata(path).ok().as_ref().and_then(version) {
+        OWN_FILES.with(|o| o.borrow_mut().push((path.to_path_buf(), v)));
+    }
+}
+
+/// Reads `path`, and whether what was read is a version this session
+/// wrote (`wrote`): the version of the very file read, taken from it once
+/// read, so that one changed meanwhile is not.
+pub fn read_own(path: &std::path::Path) -> Option<(Vec<u8>, bool)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut data = vec![];
+    file.read_to_end(&mut data).ok()?;
+    let read = file.metadata().ok().as_ref().and_then(version);
+    let own = read
+        .is_some_and(|v| OWN_FILES.with(|o| o.borrow().iter().any(|(p, w)| p == path && *w == v)));
+    Some((data, own))
 }
 
 /// Tests: AXIS CAM closed, so the files it wrote are another session's to
@@ -1484,7 +1524,7 @@ impl Run {
     /// Where a run of this setup stopped, found while it is open (the Pi
     /// stopped a tool run this computer did not follow): its start is the
     /// step after, now or once it is checked.
-    /// `own`: its stops kept as this session wrote them (`own_file`).
+    /// `own`: its stops kept as this session wrote them (`read_own`).
     pub fn adopt_journal(&mut self, j: Journal, own: bool) {
         if self.running.is_none() && j.setup == self.setup_id {
             self.journal = Some(j);
@@ -9719,22 +9759,32 @@ pub(crate) mod tests {
 
     /// A file is this session's only as it wrote it (`wrote`, LIO-586
     /// review): written again since, the same bytes or not, by another
-    /// session say, it is not; nor is one it never wrote.
+    /// session say, it is not; nor with its modified time put back as it
+    /// was (a copy put back with `cp -p`); nor one it never wrote, nor once
+    /// AXIS CAM is opened again.
+    #[cfg(unix)]
     #[test]
     fn a_file_is_this_sessions_only_as_it_wrote_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("m-journal.json");
-        assert!(!own_file(&path));
+        let own = |path: &std::path::Path| read_own(path).map(|(_, own)| own);
+        assert_eq!(own(&path), None);
         std::fs::write(&path, "{}").unwrap();
-        assert!(!own_file(&path));
+        assert_eq!(own(&path), Some(false));
         wrote(&path);
-        assert!(own_file(&path));
+        assert_eq!(own(&path), Some(true));
+        let was = std::fs::metadata(&path).unwrap().modified().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&path, "{}").unwrap();
-        assert!(!own_file(&path));
+        assert_eq!(own(&path), Some(false));
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(was).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), was);
+        assert_eq!(own(&path), Some(false));
         wrote(&path);
+        assert_eq!(own(&path), Some(true));
         forget_own_files();
-        assert!(!own_file(&path));
+        assert_eq!(own(&path), Some(false));
     }
 
     /// A plan's moves cut with another cutter, or at another A, cut other

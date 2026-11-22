@@ -8784,8 +8784,10 @@ impl App {
                 }
                 self.run_epoch += 1;
                 // Where a run of it stopped, picked once it is checked.
-                let journal = c.journal().filter(|j| j.setup == self.doc.setups[si].id);
-                let journal_own = c.journal_own();
+                let (journal, journal_own) = match c.journal_own() {
+                    Some((j, own)) if j.setup == self.doc.setups[si].id => (Some(j), own),
+                    _ => (None, false),
+                };
                 if let Some(old) = &c.run {
                     keep_run_cuts(&mut self.run_cuts, old);
                     keep_pending_cuts(&mut self.run_pending, old);
