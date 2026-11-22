@@ -3255,10 +3255,13 @@ impl Connection {
         {
             self.pi_note = None;
         }
-        if let Err(e) = pending.write(&path) {
-            self.pi_note = Some(format!(
-                "Where a stop after a step would leave this tool run could not be kept: {e}."
-            ));
+        match pending.write(&path) {
+            Ok(()) => crate::run::wrote(&path),
+            Err(e) => {
+                self.pi_note = Some(format!(
+                    "Where a stop after a step would leave this tool run could not be kept: {e}."
+                ))
+            }
         }
         #[cfg(test)]
         if std::mem::take(&mut self.lose_next_job) {
@@ -3311,6 +3314,9 @@ impl Connection {
         let Some(end) = link.tool_run_ends.iter().find(|e| e.id == pending.id) else {
             return;
         };
+        // Kept by this session as it sent the tool run, or by another
+        // (`Run::journal_own`, LIO-586 review).
+        let own = crate::run::own_file(&path);
         let _ = std::fs::remove_file(&path);
         let stopped = end.stopped_after.and_then(|line| {
             let (_, j) = pending.stops.iter().find(|(r, _)| r.contains(&line))?;
@@ -3361,9 +3367,13 @@ impl Connection {
             self.pi_note = Some(format!("Where the Pi stopped could not be kept: {e}."));
             return;
         }
+        // This session's, as the stops it was made from were.
+        if own {
+            crate::run::wrote(&self.journal);
+        }
         self.pi_note = Some(what);
         if let Some(run) = &mut self.run {
-            run.adopt_journal(j);
+            run.adopt_journal(j, own);
         }
     }
 
@@ -6102,11 +6112,15 @@ impl Connection {
         // Followed to its stop: what was kept for not following it is done.
         let _ = std::fs::remove_file(&pending);
         self.z_up = st.up;
-        if let Some(j) = run.journal_of(&st, s.active_wcs, s.work_offset)
-            && let Err(e) = j.write(&self.journal)
-            && let Some((_, message)) = &mut run.outcome
-        {
-            *message += &format!(" Where it stopped could not be kept: {e}.");
+        if let Some(j) = run.journal_of(&st, s.active_wcs, s.work_offset) {
+            match j.write(&self.journal) {
+                Ok(()) => crate::run::wrote(&self.journal),
+                Err(e) => {
+                    if let Some((_, message)) = &mut run.outcome {
+                        *message += &format!(" Where it stopped could not be kept: {e}.");
+                    }
+                }
+            }
         }
         // The start after it is next.
         run.resume_after(st.op, st.last);
@@ -6115,6 +6129,11 @@ impl Connection {
     /// The journal of where a run stopped on this machine, if any.
     pub fn journal(&self) -> Option<crate::run::Journal> {
         crate::run::Journal::read(&self.journal)
+    }
+
+    /// The journal is as this session wrote it (`run::own_file`).
+    pub fn journal_own(&self) -> bool {
+        crate::run::own_file(&self.journal)
     }
 
     /// Keeps where a running tool run is in the journal before the

@@ -2971,11 +2971,11 @@ flood = { pin = 8 }
 
     /// AXIS CAM closed (`a`, disconnected as closing does) and opened again
     /// on the same workspace and project: nothing of its run is left in
-    /// memory, only what it kept on disk; the journals it made are another
-    /// session's.
+    /// memory, only what it kept on disk; the journals it wrote are
+    /// another session's.
     fn reopen(a: App, dir: &std::path::Path) -> App {
         assert!(a.control.is_none(), "disconnect first, as closing does");
-        crate::run::forget_own_journals();
+        crate::run::forget_own_files();
         let mut b = App::from_workspace(dir.join("workspace.json"), None);
         b.replace_document(a.doc.clone(), None);
         b.imported_mesh = a.imported_mesh.clone();
@@ -4961,13 +4961,9 @@ flood = { pin = 8 }
             (0, 0, vec![false, false])
         );
         // Another session's tool run: what this setup's runs cut before is
-        // not known, so every operation is taken as cut (LIO-586 review).
-        let ops: Vec<_> = (run.checked().unwrap().iter())
-            .flat_map(|p| p.indexes.iter().map(|&o| (o, None)))
-            .collect();
+        // not known, so no start goes by the check's stock (LIO-586 review).
         let cut: Vec<_> = run.cut_in_run.iter().map(|c| (c.0, c.1)).collect();
-        assert!(!ops.is_empty());
-        assert_eq!(cut, ops);
+        assert_eq!(cut, [(crate::run::HISTORY_UNKNOWN, None)]);
         assert!(run.outcome.is_none());
         assert!(
             (conn(&a).pi_note.as_ref()).is_some_and(|n| n.contains("tool run 1 of")),

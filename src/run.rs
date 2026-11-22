@@ -525,15 +525,9 @@ pub struct Run {
     /// the check found of one that no longer holds.
     pub resumed: Option<Journal>,
     pub journal_note: Option<String>,
-    /// How many operations the setup had when the run was made: what
-    /// `note_journal_cuts` takes as cut, those the check leaves out
-    /// (disabled, say) too.
-    ops: usize,
-    /// What this setup's runs cut before this run's record began is not
-    /// known: it follows a tool run this session neither sent nor dropped
-    /// (`App::follow`). Once checked, every operation is taken as cut
-    /// (`note_journal_cuts`, LIO-586 review).
-    pub history_unknown: bool,
+    /// `journal` is one this session wrote, unchanged since (`own_file`):
+    /// what its runs cut is in `cut_in_run`. Else another session's.
+    pub journal_own: bool,
     /// The tool run on the Pi this run is to follow once checked, AXIS
     /// CAM having been closed since it was sent (`following`).
     pub follow: Option<Follow>,
@@ -808,24 +802,47 @@ pub fn now() -> u64 {
 }
 
 thread_local! {
-    /// The journals this session made (`Run::journal_of`), on the thread
-    /// that runs the app: one picked up that is not among them is another
-    /// session's, whatever its time, which alone knew what its runs cut
-    /// (`Run::take_journal`, LIO-586 review).
-    static OWN_JOURNALS: std::cell::RefCell<Vec<Journal>> = const { std::cell::RefCell::new(vec![]) };
+    /// The files of journals this session wrote, each with the time it
+    /// was modified as it was written, on the thread that runs the app
+    /// (`wrote`): one read back unchanged since is this session's; any
+    /// other, whatever it holds or when it was written, another session's,
+    /// which alone knew what its runs cut (`Run::take_journal`, LIO-586
+    /// review).
+    static OWN_FILES: std::cell::RefCell<Vec<(std::path::PathBuf, std::time::SystemTime)>> =
+        const { std::cell::RefCell::new(vec![]) };
 }
 
-/// Journal `j` is one this session made (`OWN_JOURNALS`).
-fn own_journal(j: &Journal) -> bool {
-    OWN_JOURNALS.with(|o| o.borrow().contains(j))
+/// The time `path` was last modified.
+fn modified(path: &std::path::Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Tests: AXIS CAM closed, so the journals it made are another session's
-/// to the one opened next.
+/// Notes that this session just wrote `path`: a journal, or the Pi's
+/// stops kept for a tool run (`own_file`).
+pub fn wrote(path: &std::path::Path) {
+    if let Some(t) = modified(path) {
+        OWN_FILES.with(|o| o.borrow_mut().push((path.to_path_buf(), t)));
+    }
+}
+
+/// `path` is as this session wrote it (`wrote`).
+pub fn own_file(path: &std::path::Path) -> bool {
+    modified(path)
+        .is_some_and(|t| OWN_FILES.with(|o| o.borrow().iter().any(|(p, w)| p == path && *w == t)))
+}
+
+/// Tests: AXIS CAM closed, so the files it wrote are another session's to
+/// the one opened next.
 #[cfg(test)]
-pub(crate) fn forget_own_journals() {
-    OWN_JOURNALS.with(|o| o.borrow_mut().clear());
+pub(crate) fn forget_own_files() {
+    OWN_FILES.with(|o| o.borrow_mut().clear());
 }
+
+/// What `Run::cut_in_run` holds for cuts of the setup no session here
+/// knows (`Run::note_history_unknown`): an operation after every start,
+/// which no check simulates, so that no start goes by the check's stock
+/// until New stock loaded, whatever the operations are by then.
+pub(crate) const HISTORY_UNKNOWN: usize = usize::MAX;
 
 /// The stock before an operation of the setup being run, seen from above,
 /// and the shape of its cutter.
@@ -888,7 +905,7 @@ pub struct Carving {
 impl Run {
     pub fn new(doc: &Document, setup: usize, epoch: u64) -> Self {
         let s = &doc.setups[setup];
-        let mut r = Self {
+        Self {
             setup,
             setup_id: s.id.clone(),
             name: s.name().to_string(),
@@ -939,15 +956,12 @@ impl Run {
             journal: None,
             resumed: None,
             journal_note: None,
-            history_unknown: false,
-            ops: 0,
+            journal_own: false,
             follow: None,
             followed: None,
             cut_note: None,
             rows_from_skips: false,
-        };
-        r.ops = s.operations.len();
-        r
+        }
     }
 
     /// The run of `follow`'s setup (index `setup`) as it was when its tool
@@ -1421,10 +1435,6 @@ impl Run {
             Some(f) => self.followed = Some(self.follow_again(f)),
             None => self.take_journal(),
         }
-        if self.history_unknown && self.checked().is_some() {
-            self.history_unknown = false;
-            self.note_journal_cuts();
-        }
     }
 
     /// Where a run of this setup stopped (`journal`), once it is checked:
@@ -1435,13 +1445,12 @@ impl Run {
             return;
         }
         if let Some(j) = self.journal.take() {
-            // Made by another session, it tells of runs of this setup
-            // whose cuts only that session knew, whether or not where it
-            // stopped is picked: every operation is taken as cut. This
-            // session's own journal is in what its runs cut (`App::run_cuts`)
-            // (LIO-586 review).
-            if j.setup == self.setup_id && !own_journal(&j) {
-                self.history_unknown = true;
+            // Another session's, it tells of runs of this setup whose cuts
+            // only that session knew, whether or not where it stopped is
+            // picked. This session's own is in what its runs cut
+            // (`App::run_cuts`) (LIO-586 review).
+            if j.setup == self.setup_id && !std::mem::take(&mut self.journal_own) {
+                self.note_history_unknown();
             }
             // Its steps as they split then: a build that splits them
             // otherwise (a deep drilling's pecks into its holes, LIO-549)
@@ -1450,11 +1459,6 @@ impl Run {
                 .op_steps(j.op)
                 .is_some_and(|s| s.fingerprint == j.fingerprint && s.steps.len() == j.steps);
             if same && j.setup == self.setup_id {
-                // What it cut, before the start is picked, which may drop
-                // the programs for a check of it.
-                if std::mem::take(&mut self.history_unknown) {
-                    self.note_journal_cuts();
-                }
                 self.resume_after(j.op, j.step);
                 self.resumed = Some(j);
             } else {
@@ -1464,38 +1468,27 @@ impl Run {
                 ));
             }
         }
-        if self.history_unknown && self.checked().is_some() {
-            self.history_unknown = false;
-            self.note_journal_cuts();
-        }
     }
 
-    /// What the run that stopped where a journal says cut, as this run's
-    /// (`cut_in_run`), which only the session it ran in kept (LIO-586
-    /// review). The journal says where it last stopped, not what it cut
-    /// before: all of the setup, run before and cut again from an earlier
-    /// step, say. So every operation of the setup is taken as all cut, and
-    /// no start sets Z from the stock the check carves: the work zero is
-    /// kept, or Z set by hand.
-    fn note_journal_cuts(&mut self) {
-        // Every one of the setup's, those the check leaves out too (a
-        // disabled one has no plan print, so no start goes by its stock
-        // until New stock loaded, even enabled again).
-        let checked: Vec<usize> = (self.checked().into_iter().flatten())
-            .flat_map(|p| p.indexes.iter().copied())
-            .collect();
-        let all = checked.iter().max().map_or(0, |&m| m + 1).max(self.ops);
-        for oi in 0..all {
-            self.note_cut(oi, None);
-        }
+    /// Notes that runs of this setup no session here followed cut the
+    /// stock (`HISTORY_UNKNOWN`): another session's journal, or a tool run
+    /// it sent, followed (LIO-586 review). Such a journal says where its
+    /// run last stopped, not what it cut before (all of the setup, cut
+    /// again from an earlier step, or by operations deleted since), so no
+    /// start sets Z from the stock the check carves until New stock
+    /// loaded: the work zero is kept, or Z set by hand.
+    pub fn note_history_unknown(&mut self) {
+        note_cut_in(&mut self.cut_in_run, HISTORY_UNKNOWN, None, None);
     }
 
     /// Where a run of this setup stopped, found while it is open (the Pi
     /// stopped a tool run this computer did not follow): its start is the
     /// step after, now or once it is checked.
-    pub fn adopt_journal(&mut self, j: Journal) {
+    /// `own`: its stops kept as this session wrote them (`own_file`).
+    pub fn adopt_journal(&mut self, j: Journal, own: bool) {
         if self.running.is_none() && j.setup == self.setup_id {
             self.journal = Some(j);
+            self.journal_own = own;
             self.take_journal();
         }
     }
@@ -1559,7 +1552,7 @@ impl Run {
             .find_map(|p| Some((p, p.indexes.iter().position(|&o| o == st.op)?)))?;
         let o = &p.ops[k];
         let steps = self.op_steps(st.op);
-        let j = Journal {
+        Some(Journal {
             project: self.project.clone(),
             setup: self.setup_id.clone(),
             setup_name: self.name.clone(),
@@ -1574,9 +1567,7 @@ impl Run {
             time: now(),
             fingerprint: steps.map_or(0, |s| s.fingerprint),
             why: st.why.clone(),
-        };
-        OWN_JOURNALS.with(|o| o.borrow_mut().push(j.clone()));
-        Some(j)
+        })
     }
 
     /// The picture of the stock operation `op` (its index in the setup)
@@ -7565,8 +7556,7 @@ pub(crate) mod tests {
             journal: None,
             resumed: None,
             journal_note: None,
-            history_unknown: false,
-            ops: 0,
+            journal_own: false,
             follow: None,
             followed: None,
             cut_note: None,
@@ -9606,14 +9596,15 @@ pub(crate) mod tests {
     /// A journal another session wrote, picked up again (LIO-586 review):
     /// it says where its run last stopped, not what it cut before (all of
     /// the setup, then Face cut again from pass 1 and stopped after it,
-    /// say), which only that session knew. So every operation is taken as
-    /// cut, and the start at Face pass 2 sets no Z from the check's stock,
-    /// whatever stopped it (Stop after pass 1, an E-stop in pass 2, the
-    /// Face's tool run done on the Pi), and when its program has changed
-    /// since, so that where it stopped is not picked. A run that follows a
-    /// tool run another session sent knows no more. The journal this
-    /// session wrote is in what its runs cut (`App::run_cuts`): that
-    /// record stands.
+    /// say), which only that session knew. So no start sets Z from the
+    /// check's stock (`HISTORY_UNKNOWN`): not Face pass 2, whatever stopped
+    /// it (Stop after pass 1, an E-stop in pass 2, the Face's tool run done
+    /// on the Pi); not when its program has changed since, so that where it
+    /// stopped is not picked; not with an operation left out of the check
+    /// as it is picked up and enabled again, nor after operations deleted
+    /// and added since. A run that follows a tool run another session sent
+    /// knows no more. The journal this session wrote is in what its runs
+    /// cut (`App::run_cuts`): that record stands.
     #[test]
     fn a_journal_picked_again_keeps_what_its_run_may_have_cut() {
         let dir = tempfile::tempdir().unwrap();
@@ -9623,8 +9614,7 @@ pub(crate) mod tests {
         let (whole, left) = check_steps(&doc, &mesh, 0, &[], &[]);
         let (whole, left) = (Arc::new(whole), Arc::new(left));
         let pass_1 = (left.steps.iter().find(|s| s.op == 0).unwrap().steps[0].z).unwrap();
-        // This session's, as `journal_of` makes it.
-        let own = |op: usize, last: Option<usize>, why: &str| {
+        let journal = |op: usize, last: Option<usize>, why: &str| {
             let mut run = Run::new(&doc, 0, 0);
             run.checked_as(whole.clone(), Some(left.clone()), None);
             let st = Stopped {
@@ -9635,38 +9625,26 @@ pub(crate) mod tests {
             };
             run.journal_of(&st, 0, [0.; 6]).unwrap()
         };
-        // Another session's: none this one made, even of the same second.
-        let journal = |op: usize, last: Option<usize>, why: &str| {
-            let mut j = own(op, last, why);
-            j.tool_label += " ";
-            j
-        };
-        // Picked with the setup, then Face pass 2 picked and checked.
-        let picked = |j: Journal, cuts: Vec<CutInRun>| {
+        // Picked with the setup, this session's (`own`) or another's, with
+        // what this session's runs cut.
+        let picked = |j: Journal, cuts: Vec<CutInRun>, own: bool| {
             let mut run = Run::new(&doc, 0, 0);
-            run.journal = Some(j);
-            run.cut_in_run = cuts;
+            (run.journal, run.journal_own, run.cut_in_run) = (Some(j), own, cuts);
             run.checked_as(whole.clone(), Some(left.clone()), None);
             run
         };
-        let at_pass_2 = |mut run: Run| {
-            if run.start_step != Some((0, 1)) {
-                assert!(run.start_at_step(0, 1));
+        let at_step = |mut run: Run, oi: usize, n: usize| {
+            if run.start_step != Some((oi, n)) {
+                assert!(run.start_at_step(oi, n));
             }
-            let (c, l) = check_steps(&doc, &mesh, 0, &[], &[(0, vec![0])]);
+            let (c, l) = check_steps(&doc, &mesh, 0, &[], &[(oi, (0..n).collect())]);
             run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
-            assert_eq!(run.at_step(), Some((0, 1)));
+            assert_eq!(run.at_step(), Some((oi, n)));
             run
         };
-        let cuts = |run: &Run| {
-            run.cut_in_run
-                .iter()
-                .map(|c| (c.0, c.1))
-                .collect::<Vec<_>>()
-        };
-        let all = [(0, None), (1, None), (2, None)];
+        let unknown = |run: &Run| run.cut_in_run.iter().any(|c| c.0 == HISTORY_UNKNOWN);
         let refused = |run: &Run| {
-            assert_eq!(cuts(run), all);
+            assert!(unknown(run), "{:?}", run.cut_in_run);
             assert_eq!(run.partly().unwrap().cut, [RUN_UNFOLLOWED]);
             assert_eq!(run.touch_off(), None);
             assert_eq!(
@@ -9680,71 +9658,83 @@ pub(crate) mod tests {
             let (at, _) = run.touch_off().unwrap();
             assert!((at[2] - pass_1).abs() < 1e-3, "{at:?} {pass_1}");
         };
+        // Without a journal, Face pass 2 touches off on pass 1's floor and
+        // Drilling hole 2 on the pocket's: it is the journal that tells.
+        let fresh = || {
+            let mut run = Run::new(&doc, 0, 0);
+            run.checked_as(whole.clone(), Some(left.clone()), None);
+            run
+        };
+        on_pass_1(&at_step(fresh(), 0, 1));
+        assert!(at_step(fresh(), 2, 1).touch_off().is_some());
         for j in [
             journal(0, Some(0), "Stop after step"),
             journal(0, Some(0), "an E-stop"),
             journal(2, None, ""),
         ] {
-            let run = picked(j, vec![]);
+            let run = picked(j, vec![], false);
             assert!(run.resumed.is_some());
-            refused(&at_pass_2(run));
+            refused(&at_step(run, 0, 1));
         }
         // Its program changed since (another feed, say): where it stopped
         // is not picked, but what it may have cut is still taken.
         let mut changed = journal(0, Some(0), "Stop after step");
         changed.fingerprint ^= 1;
-        let run = picked(changed, vec![]);
+        let run = picked(changed, vec![], false);
         assert!(run.resumed.is_none() && run.journal_note.is_some());
-        refused(&at_pass_2(run));
+        refused(&at_step(run, 0, 1));
         // The Drilling left out of the check as it is picked up (disabled),
-        // and enabled again: still taken as cut, so its hole 2, which
-        // touches off on the pocket's floor otherwise, sets no Z either.
-        let at_hole_2 = |mut run: Run| {
-            assert!(run.start_at_step(2, 1));
-            let (c, l) = check_steps(&doc, &mesh, 0, &[], &[(2, vec![0])]);
-            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
-            assert_eq!(run.at_step(), Some((2, 1)));
-            run
-        };
-        let mut fresh = Run::new(&doc, 0, 0);
-        fresh.checked_as(whole.clone(), Some(left.clone()), None);
-        assert!(at_hole_2(fresh).touch_off().is_some());
+        // or deleted with the Pocket before and added again: its hole 2
+        // sets no Z either.
         let mut off = doc.clone();
         off.setups[0].operations[2].enabled = false;
-        let (c, l) = check_steps(&off, &mesh, 0, &[], &[]);
-        let mut run = Run::new(&doc, 0, 0);
-        run.journal = Some(journal(0, Some(0), "Stop after step"));
-        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
-        assert!(
-            run.cut_in_run.iter().any(|c| c.0 == 2 && c.1.is_none()),
-            "{:?}",
-            run.cut_in_run
-        );
-        run.checked_as(whole.clone(), Some(left.clone()), None);
-        let run = at_hole_2(run);
-        assert_eq!(run.partly().unwrap().cut, [RUN_UNFOLLOWED]);
-        assert_eq!(run.touch_off(), None);
+        let mut face_only = doc.clone();
+        face_only.setups[0].operations.truncate(1);
+        for edited in [off, face_only] {
+            let (c, l) = check_steps(&edited, &mesh, 0, &[], &[]);
+            let mut run = Run::new(&edited, 0, 0);
+            run.journal = Some(journal(0, Some(0), "Stop after step"));
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            run.checked_as(whole.clone(), Some(left.clone()), None);
+            refused(&at_step(run, 2, 1));
+        }
         // A run following another session's tool run: the same.
-        let mut follows = Run::new(&doc, 0, 0);
-        follows.history_unknown = true;
-        follows.checked_as(whole.clone(), Some(left.clone()), None);
-        assert_eq!(cuts(&follows), all);
-        // Without a journal, the same start touches off on pass 1's floor:
-        // it is the journal that tells of the run.
-        let mut fresh = Run::new(&doc, 0, 0);
-        fresh.checked_as(whole.clone(), Some(left.clone()), None);
-        on_pass_1(&at_pass_2(fresh));
+        let mut follows = fresh();
+        follows.note_history_unknown();
+        refused(&at_step(follows, 0, 1));
         // This session's journal, with what its runs cut (Face pass 1,
-        // given as `App::run_cuts` does): that record stands, even when
-        // another session's runs had none.
-        let mut known = Run::new(&doc, 0, 0);
-        known.checked_as(whole.clone(), Some(left.clone()), None);
+        // given as `App::run_cuts` does): that record stands.
+        let mut known = fresh();
         known.note_cut(0, Some(1));
         let session = known.cut_in_run.clone();
-        let run = picked(own(0, Some(0), "Stop after step"), session.clone());
+        let run = picked(
+            journal(0, Some(0), "Stop after step"),
+            session.clone(),
+            true,
+        );
         assert!(run.resumed.is_some());
         assert_eq!(run.cut_in_run, session);
-        on_pass_1(&at_pass_2(run));
+        on_pass_1(&at_step(run, 0, 1));
+    }
+
+    /// A file is this session's only as it wrote it (`wrote`, LIO-586
+    /// review): written again since, the same bytes or not, by another
+    /// session say, it is not; nor is one it never wrote.
+    #[test]
+    fn a_file_is_this_sessions_only_as_it_wrote_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m-journal.json");
+        assert!(!own_file(&path));
+        std::fs::write(&path, "{}").unwrap();
+        assert!(!own_file(&path));
+        wrote(&path);
+        assert!(own_file(&path));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "{}").unwrap();
+        assert!(!own_file(&path));
+        wrote(&path);
+        forget_own_files();
+        assert!(!own_file(&path));
     }
 
     /// A plan's moves cut with another cutter, or at another A, cut other

@@ -4551,7 +4551,7 @@ impl App {
             // A tool run this session neither sent nor dropped, another
             // session's (AXIS CAM closed and opened again): what this
             // setup's runs cut before it is not known (LIO-586 review).
-            following.history_unknown = true;
+            following.note_history_unknown();
         }
         give_earlier_cuts(&self.run_cuts, &mut following);
         c.run = Some(following);
@@ -8785,12 +8785,13 @@ impl App {
                 self.run_epoch += 1;
                 // Where a run of it stopped, picked once it is checked.
                 let journal = c.journal().filter(|j| j.setup == self.doc.setups[si].id);
+                let journal_own = c.journal_own();
                 if let Some(old) = &c.run {
                     keep_run_cuts(&mut self.run_cuts, old);
                     keep_pending_cuts(&mut self.run_pending, old);
                 }
                 let mut r = run::Run::new(&self.doc, si, self.run_epoch);
-                r.journal = journal;
+                (r.journal, r.journal_own) = (journal, journal_own);
                 // What its runs cut this session, until the operator says
                 // whether the same part is still there (LIO-582 review).
                 if let Some((_, cuts)) = (self.run_cuts.iter()).find(|(id, _)| *id == r.setup_id) {
