@@ -867,36 +867,55 @@ fn read_version(path: &std::path::Path) -> Option<(Vec<u8>, Option<Version>)> {
     Some((data, file.metadata().ok().as_ref().and_then(version)))
 }
 
+/// Tests: what another process does to the file `write_own` just renamed
+/// into place, at each point it looks at it again (0: before it takes its
+/// version from the file it made; 1: before it reads it back).
+#[cfg(test)]
+type Meanwhile = Box<dyn Fn(usize, &std::path::Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static MEANWHILE: std::cell::RefCell<Option<Meanwhile>> = std::cell::RefCell::new(None);
+}
+
 /// Writes `data` to `path` as `storage::write_atomic` does (a new file,
-/// renamed there), and notes the version this session wrote (`read_own`):
-/// that at `path` once renamed, while it is the very file made (its
-/// inode, taken from it as it was written) and holds what was written. One
-/// put there meanwhile, by another session say, is not noted (LIO-586
-/// review).
+/// renamed there), and notes the version this session wrote (`read_own`)
+/// only when nothing else wrote it since (LIO-586 review): the file it
+/// made, renamed there, still has the modified time it had once written
+/// (a rename leaves it; any write changes it), and the file read back at
+/// `path` is that very version, its inode and both times, and holds what
+/// was written. One put there or written meanwhile, by another session
+/// say, is not noted.
 pub fn write_own(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
     use std::io::Write;
     let parent = path.parent().ok_or("Missing parent directory")?;
     std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     let tmp = parent.join(format!(".axis-{}.tmp", uuid::Uuid::new_v4()));
-    let made = (|| {
+    let written = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
         let made = f.metadata()?;
         std::fs::rename(&tmp, path)?;
-        Ok(made)
+        #[cfg(test)]
+        MEANWHILE.with(|m| m.borrow().as_ref().map(|m| m(0, path)));
+        let placed = f.metadata()?;
+        Ok((version(&made), version(&placed)))
     })()
     .map_err(|e: std::io::Error| e.to_string());
-    let made = match made {
-        Ok(m) => version(&m),
+    let (made, placed) = match written {
+        Ok(v) => v,
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
     };
-    if let (Some(made), Some((read, Some(v)))) = (made, read_version(path))
+    #[cfg(test)]
+    MEANWHILE.with(|m| m.borrow().as_ref().map(|m| m(1, path)));
+    if let (Some(made), Some(placed), Some((read, Some(v)))) = (made, placed, read_version(path))
+        && (placed.dev, placed.ino, placed.modified) == (made.dev, made.ino, made.modified)
+        && v == placed
         && read == data
-        && (v.dev, v.ino) == (made.dev, made.ino)
     {
         OWN_FILES.with(|o| o.borrow_mut().push((path.to_path_buf(), v)));
     }
@@ -9827,6 +9846,23 @@ pub(crate) mod tests {
         assert_eq!(own(&path), Some(true));
         forget_own_files();
         assert_eq!(own(&path), Some(false));
+        // Another process writes the same bytes in place just after it is
+        // renamed there, or just before it is read back: not noted.
+        for at in [0, 1] {
+            MEANWHILE.with(|m| {
+                *m.borrow_mut() = Some(Box::new(move |i, p| {
+                    if i == at {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        std::fs::write(p, "{}").unwrap();
+                    }
+                }))
+            });
+            write_own(&path, b"{}").unwrap();
+            MEANWHILE.with(|m| *m.borrow_mut() = None);
+            assert_eq!(own(&path), Some(false), "{at}");
+        }
+        write_own(&path, b"{}").unwrap();
+        assert_eq!(own(&path), Some(true));
     }
 
     /// A plan's moves cut with another cutter, or at another A, cut other
