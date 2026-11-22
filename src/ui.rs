@@ -11505,7 +11505,8 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
     .spacing(6);
     // Set again on the stock only where the check can tell its surface
     // (LIO-586 review).
-    if let Some(why) = c.partway_blocked() {
+    let blocked = c.partway_blocked();
+    if let Some(why) = &blocked {
         two = two.push(
             text(format!(
                 "{why} Zero Z on the stock top and Probe Z are off: {}.",
@@ -11537,8 +11538,13 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
                 (manual && !run.zeroed).then_some(Message::Run(R::KeepZero)),
                 run.zeroed
             ),
+            // Where the stock's surface is not known, the Work zero tab
+            // sets Z by hand only: said so (LIO-586 review).
             small(
-                "Probe the stock again",
+                match blocked {
+                    Some(_) => "Set Z by hand",
+                    None => "Probe the stock again",
+                },
                 Some(Message::ControlTab(ControlTab::WorkZero)),
                 false
             ),

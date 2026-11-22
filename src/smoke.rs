@@ -10173,9 +10173,18 @@ flood = { pin = 8 }
             answer_skips(a, 0);
             assert_eq!(run_of(a).at_step(), Some((0, 1)));
         };
+        let start_tab = |a: &mut App| {
+            let _ = a.update(Message::ControlTab(ControlTab::Start));
+            crate::ui::probe::texts(a.view(), iced::Size::new(1440., 1100.))
+        };
         pass_2(&mut a);
         assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
         assert_eq!(conn(&a).partway_blocked(), None);
+        let texts = start_tab(&mut a);
+        assert!(
+            texts.iter().any(|t| t == "Probe the stock again"),
+            "{texts:?}"
+        );
         let _ = a.update(Message::Run(R::From(0, 0)));
         answer_skips(&mut a, 0);
         cycle_start(&mut a);
@@ -10205,6 +10214,13 @@ flood = { pin = 8 }
                 .any(|p| p.contains("set Z by hand") && p.ends_with(&why)),
             "{:?}",
             problems(&a)
+        );
+        // Its button to the Work zero tab says what is done there now.
+        let texts = start_tab(&mut a);
+        assert!(texts.iter().any(|t| t == "Set Z by hand"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t == "Probe the stock again"),
+            "{texts:?}"
         );
         let _ = a.update(Message::Disconnect);
     }
