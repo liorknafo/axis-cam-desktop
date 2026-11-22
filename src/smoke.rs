@@ -4958,6 +4958,14 @@ flood = { pin = 8 }
             (r.index, r.from, run.done.clone()),
             (0, 0, vec![false, false])
         );
+        // Another session's tool run: what this setup's runs cut before is
+        // not known, so every operation is taken as cut (LIO-586 review).
+        let ops: Vec<_> = (run.checked().unwrap().iter())
+            .flat_map(|p| p.indexes.iter().map(|&o| (o, None)))
+            .collect();
+        let cut: Vec<_> = run.cut_in_run.iter().map(|c| (c.0, c.1)).collect();
+        assert!(!ops.is_empty());
+        assert_eq!(cut, ops);
         assert!(run.outcome.is_none());
         assert!(
             (conn(&a).pi_note.as_ref()).is_some_and(|n| n.contains("tool run 1 of")),

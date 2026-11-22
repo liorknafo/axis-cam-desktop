@@ -2037,6 +2037,9 @@ impl App {
         Self::from_workspace(state_path, smoke_dir)
     }
     fn from_workspace(mut state_path: PathBuf, smoke_dir: Option<PathBuf>) -> Self {
+        // This session begins: journals written before it are another's
+        // (LIO-586 review).
+        run::session_start();
         #[cfg(test)]
         assert_ne!(
             state_path,
@@ -4547,6 +4550,11 @@ impl App {
             (self.run_pending.iter()).find(|p| p.0 == id && (p.1, p.2) == (index, from))
         {
             following.before_follow = Some(p.3.clone());
+        } else {
+            // A tool run this session neither sent nor dropped, another
+            // session's (AXIS CAM closed and opened again): what this
+            // setup's runs cut before it is not known (LIO-586 review).
+            following.history_unknown = true;
         }
         give_earlier_cuts(&self.run_cuts, &mut following);
         c.run = Some(following);
