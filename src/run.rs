@@ -4459,7 +4459,11 @@ pub struct TabletRun {
     pub step_starts: Vec<TabletStepStart>,
     /// For a later tool run, started at its first operation with the tool
     /// runs before taken as cut: its work zero on the stock they left
-    /// (LIO-548). Null for the first tool run, and in a file from before.
+    /// (LIO-548). For the first tool run, the setup's start, its work zero
+    /// on the stock earlier setups left, only where the computer refuses
+    /// the touch-off on the stock top or a probe spot there, an earlier
+    /// setup's cut maybe reaching under them (`tablet_start_zero`,
+    /// LIO-584); null otherwise, and in a file from before.
     #[serde(default)]
     pub zero: Option<TabletZero>,
 }
@@ -4705,6 +4709,9 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
     let mut started = Run::new(doc, si, 0);
     started.checked_as(all.clone(), Some(left), None);
     let orient = crate::orient::Orient::of(&setup.machine);
+    // The setup's start's, on the stock earlier setups left (LIO-584).
+    let inherited = crate::model::get(&setup.p, "stock_source") != "fresh";
+    let mut start_zero = tablet_start_zero(&run, orient, inherited);
     let mut zero = |i: usize, k: usize| {
         started.start_at(i, k);
         tablet_zero(&started, orient)
@@ -4784,7 +4791,7 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
             starts,
             way_out: way_out_line(&p.blocks),
             step_starts,
-            zero: if i > 0 { zero(i, 0) } else { None },
+            zero: if i > 0 { zero(i, 0) } else { start_zero.take() },
         });
     }
     out
@@ -4797,8 +4804,57 @@ fn tablet_zero(run: &Run, orient: crate::orient::Orient) -> Option<TabletZero> {
     if !run.partway() {
         return None;
     }
-    let p = run.checked()?.first()?;
     let partly = run.partly();
+    zero_said(
+        run,
+        orient,
+        partly.as_ref().map_or_else(Vec::new, |x| x.cut.clone()),
+        partly.as_ref().is_some_and(|x| x.top_cut),
+        partly.as_ref().map_or(&[][..], |x| &x.probe_from[..]),
+    )
+}
+
+/// The work zero of `run` from the setup's start (not `Run::partway`) on
+/// the stock earlier setups left, `inherited` saying the setup's stock is
+/// theirs (its `stock_source`), when the computer refuses the touch-off
+/// on the stock top there (`Run::touch_off` None: `INHERITED_UNKNOWN`, or
+/// `STOCK_TOP_CUT`) or a probe spot (`Checked::probe_from`, as
+/// `Connection::probe_spots` has them then), an earlier setup's cut maybe
+/// reaching under them (LIO-584). None otherwise, and always on fresh
+/// stock, which no earlier setup cut (its spots refused for a jaw at most),
+/// and for a zero not on the stock, which no touch-off on its top finds.
+fn tablet_start_zero(
+    run: &Run,
+    orient: crate::orient::Orient,
+    inherited: bool,
+) -> Option<TabletZero> {
+    if run.partway() || !inherited {
+        return None;
+    }
+    let p = run.checked()?.first()?;
+    crate::post::references(&p.origin)?;
+    let refused = run.touch_off().is_none() || p.probe_from.iter().any(|(_, ok)| ok.is_err());
+    if !refused {
+        return None;
+    }
+    // Earlier setups' cuts below the stock top over it, which a touch plate
+    // laid on it may rest over (`Partly::top_cut` of the setup's first
+    // operation, from them alone).
+    let top_cut = p.partly.first().is_some_and(|x| x.top_cut);
+    zero_said(run, orient, vec![], top_cut, &p.probe_from)
+}
+
+/// `TabletZero` of `run` as its Work zero tab says it: the work Z its
+/// touch-off sets, or why none (`Run::partway_blocked`), with `cut`,
+/// `top_cut` and the probe spots `spots` of the stock it starts from.
+fn zero_said(
+    run: &Run,
+    orient: crate::orient::Orient,
+    cut: Vec<String>,
+    top_cut: bool,
+    spots: &[([crate::post::At; 2], Result<(), String>)],
+) -> Option<TabletZero> {
+    let p = run.checked()?.first()?;
     let blocked = run.partway_blocked();
     let set_z = run.touch_off().map(|(_, work)| work[2]);
     Some(TabletZero {
@@ -4810,14 +4866,12 @@ fn tablet_zero(run: &Run, orient: crate::orient::Orient) -> Option<TabletZero> {
                 .is_none()
                 .then(|| crate::post::STOCK_TOP_CUT.to_string())
         }),
-        cut: partly.as_ref().map_or_else(Vec::new, |x| x.cut.clone()),
-        top_cut: partly.as_ref().is_some_and(|x| x.top_cut),
+        cut,
+        top_cut,
         top: (p.stock.max[2] - p.datum[2]) as f64,
         spot: (crate::post::references(&p.origin))
             .map(|refs| crate::control::touch_spot(orient, refs)),
-        probe_from: (partly.as_ref())
-            .map_or(&[][..], |x| &x.probe_from[..])
-            .iter()
+        probe_from: (spots.iter())
             .map(|([x, y], ok)| TabletSpot {
                 x: *x,
                 y: *y,
@@ -9030,6 +9084,63 @@ pub(crate) mod tests {
             .find(|t| (t.x, t.y) == (crate::post::At::Mid, crate::post::At::Mid))
             .unwrap();
         assert_eq!(spot.problem.as_deref(), Some(why.as_str()));
+    }
+
+    /// The small bore's job split in two setups, the second's stock the
+    /// first's (`small_bore_job`, LIO-584): the first bores, the second
+    /// faces. The tablet file's first tool run of the second carries why
+    /// its touch-off cannot set Z, and the probe spots, as the Run panel
+    /// has them from its start; the first setup's, on fresh stock, and the
+    /// second's when nothing was bored under the spot, carry none.
+    #[test]
+    fn the_tablet_file_says_a_setup_start_cannot_touch_off_over_an_earlier_setups_cut() {
+        use crate::post::At;
+        let dir = tempfile::tempdir().unwrap();
+        let (doc, mesh) = small_bore_job(dir.path());
+        let mut split = doc.clone();
+        let mut second = split.setups[0].duplicate("G55");
+        second.operations.remove(0);
+        split.setups[0].operations.truncate(1);
+        split.setups.push(second);
+        split.sync_stock_sources();
+        // As the Run panel has it from the second setup's start.
+        let (programs, left) = check(&split, &mesh, 1);
+        let mut run = Run::new(&split, 1, 0);
+        run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+        assert!(!run.partway() && run.touch_off().is_none());
+        let why = run.partway_blocked().unwrap();
+        assert_eq!(why, INHERITED_UNKNOWN);
+        let p = run.checked().unwrap()[0].clone();
+        let s = tablet_runs(&split, Ok(&mesh), 1);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let zero = s.tool_runs[0].zero.as_ref().unwrap();
+        assert_eq!(
+            (zero.set_z, zero.blocked.as_deref(), zero.cut.is_empty()),
+            (None, Some(why.as_str()), true)
+        );
+        assert_eq!(zero.top, (p.stock.max[2] - p.datum[2]) as f64);
+        assert_eq!(zero.spot.as_deref(), Some("the centre"));
+        assert_eq!(zero.probe_from.len(), p.probe_from.len());
+        for (t, ([x, y], ok)) in zero.probe_from.iter().zip(&p.probe_from) {
+            assert_eq!((t.x, t.y, t.problem.clone()), (*x, *y, ok.clone().err()));
+        }
+        let centre = (zero.probe_from.iter()).find(|t| (t.x, t.y) == (At::Mid, At::Mid));
+        assert!(centre.is_some_and(|t| t.problem.is_some()), "{zero:?}");
+        assert!(zero.probe_from.iter().any(|t| t.problem.is_none()));
+        // The first setup, on fresh stock: none.
+        let s = tablet_runs(&split, Ok(&mesh), 0);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        assert!(s.tool_runs.iter().all(|r| r.zero.is_none()));
+        // Bored nowhere, the second touches off as ever: none either.
+        let mut plain = split.clone();
+        plain.setups[0].operations.clear();
+        let (programs, left) = check(&plain, &mesh, 1);
+        let mut run = Run::new(&plain, 1, 0);
+        run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
+        assert!(run.touch_off().is_some());
+        let s = tablet_runs(&plain, Ok(&mesh), 1);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        assert_eq!(s.tool_runs[0].zero, None);
     }
 
     /// A bore milled from one side leaving a 0.5 mm roof, then the stock
