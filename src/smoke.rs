@@ -9504,6 +9504,10 @@ flood = { pin = 8 }
         let (_, op, _) = run_of(&a).progress(line(&a)).unwrap();
         assert_eq!(op, 1);
         run_until(&mut a, 30.0, "tool run 1 from the Pocket", |r| r.done[0]);
+        // Steps are picked once the machine stands still (LIO-582 review).
+        tick_until(&mut a, 5.0, "Idle after tool run 1", |s| {
+            s.state == Some(uc100::controller::State::Idle)
+        });
         let (ok, message) = run_of(&a).outcome.clone().unwrap();
         assert!(
             ok && message.contains("tool run 1 of 2 from Pocket"),
@@ -9514,10 +9518,444 @@ flood = { pin = 8 }
         assert_eq!(stages(&a, 1), [Next]);
         // Started: the work zero is kept from here, as after any first tool run.
         assert!(!run_of(&a).partway() && work_zero_steps(&a, conn(&a)).is_none());
+        // But the tool run cut the stock: Zero Z on the stock top, Probe Z
+        // and the probe spots go by the stock the check finds before the
+        // Drilling, not the stock top (LIO-582 review).
+        assert!(run_of(&a).on_cut_stock());
+        let partly = run_of(&a).partly().unwrap().into_owned();
+        assert!(partly.top_cut && !partly.cut.is_empty(), "{partly:?}");
+        assert_eq!(conn(&a).touch_off().map(|(at, _)| at[2]), partly.surface);
+        assert_eq!(
+            conn(&a).partway_blocked().is_some(),
+            partly.surface.is_none()
+        );
+        assert!(conn(&a).stock_top().is_err());
+        let spots = conn(&a).probe_spots();
+        let centre = spots.iter().find(|(r, _)| *r == [crate::post::At::Mid; 2]);
+        assert!(centre.is_some_and(|(_, ok)| ok.is_err()), "{spots:?}");
+        let own = conn(&a).edges_setup().map(|(r, _)| r);
+        assert_ne!(own, Ok([crate::post::At::Mid; 2]));
         // The Contour picked again in the tool run done: cut again from it.
         let _ = a.update(Message::Run(R::From(0, 2)));
         assert_eq!(stages(&a, 0), [Done, Done, Next]);
         assert_eq!(stages(&a, 1), [ToCome]);
+        // What the tool run cut after the Contour is in no stock the check
+        // found for it: nothing sets Z or probes (LIO-582 review).
+        assert!(conn(&a).touch_off().is_none() && conn(&a).stock_top().is_err());
+        let why = conn(&a).partway_blocked().unwrap();
+        assert!(
+            why.starts_with("This run's tool runs have cut the stock since"),
+            "{why}"
+        );
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        assert!(conn(&a).edges_setup().is_err());
+        // So with a start at the Pocket's level 2, or the Face's start,
+        // picked again after the tool run cut them: the check takes what is
+        // before the start as cut, not what the run cut since.
+        let none_set = |a: &App| {
+            assert!(conn(a).touch_off().is_none() && conn(a).stock_top().is_err());
+            assert!(conn(a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+            assert!(conn(a).edges_setup().is_err());
+            conn(a).partway_blocked().unwrap()
+        };
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).op_steps(1).is_some_and(|s| s.steps.len() > 1));
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 1)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, 1)));
+        let why = none_set(&a);
+        assert!(
+            why.starts_with("This run's tool runs have cut the stock since"),
+            "{why}"
+        );
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(
+            (run_of(&a).next, run_of(&a).from, run_of(&a).at_step()),
+            (0, 0, None)
+        );
+        none_set(&a);
+        // The setup picked again (Run on the machine): what its run cut is
+        // kept, and until the operator says whether the same part is still
+        // held, nothing sets Z or probes, not at the setup's start, nor at
+        // the Pocket's level 2 (LIO-582 review).
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).stock_unconfirmed && !run_of(&a).cut_in_run.is_empty());
+        assert_eq!((run_of(&a).next, run_of(&a).from), (0, 0));
+        let asks = |a: &App| {
+            let why = none_set(a);
+            assert!(
+                why.contains("press Same part if that part is still held"),
+                "{why}"
+            );
+        };
+        asks(&a);
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 1)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, 1)));
+        asks(&a);
+        // The same part: what its run cut stays the stock's, and the Pocket
+        // was cut whole, so still nothing at its level 2.
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(!run_of(&a).stock_unconfirmed);
+        let why = none_set(&a);
+        assert!(
+            why.starts_with("This run's tool runs have cut the stock since"),
+            "{why}"
+        );
+        // New stock: forgotten, and the start at level 2 goes by the stock
+        // the check carves, as on any new part.
+        let _ = a.update(Message::Run(R::NewStock));
+        assert!(run_of(&a).cut_in_run.is_empty() && !run_of(&a).stock_unconfirmed);
+        let partly = run_of(&a).partly().unwrap().into_owned();
+        assert!(partly.cut != [crate::run::STOCK_UNCONFIRMED], "{partly:?}");
+        assert!(
+            !partly.cut.iter().any(|c| c.contains("runs cut")),
+            "{partly:?}"
+        );
+        // Picked again now, nothing is asked.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(!run_of(&a).stock_unconfirmed && run_of(&a).cut_in_run.is_empty());
+    }
+
+    /// The machine disconnected while tool run 1 cuts the Pocket, the Face
+    /// done (LIO-582 review): connected again and the setup picked, what the
+    /// tool run may have cut, all of it, is kept, so the operator is asked
+    /// whether the same part is held, and on the same part no start before
+    /// what it cut touches off or probes.
+    #[test]
+    fn a_tool_runs_cuts_are_kept_when_the_machine_disconnects_while_it_runs() {
+        use crate::run::{Action as R, Stage};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        cycle_start(&mut a);
+        let stages = |a: &App| run_of(a).stages(0, conn(a).snapshot.current_line);
+        let mut deadline = Deadline::new(30.);
+        while stages(&a) != [Stage::Done, Stage::Cutting, Stage::ToCome] {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot), "{:?}", stages(&a));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(run_of(&a).running.is_some());
+        let _ = a.update(Message::Disconnect);
+        let kept = (a.run_cuts.iter().find(|(id, _)| *id == a.doc.setups[0].id))
+            .map(|(_, c)| c.iter().map(|c| (c.0, c.1)).collect::<Vec<_>>());
+        assert_eq!(kept, Some(vec![(0, None), (1, None), (2, None)]));
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 5., "E-stop after connecting", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 5., "Idle after Reset", |s| {
+            s.state == Some(State::Idle)
+        });
+        let _ = a.update(Message::Machine(crate::control::Action::KeepPosition));
+        tick_until(&mut a, 3., "machine position kept", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).stock_unconfirmed);
+        let none_set = |a: &App| {
+            assert!(conn(a).touch_off().is_none() && conn(a).stock_top().is_err());
+            assert!(conn(a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+            assert!(conn(a).edges_setup().is_err());
+        };
+        none_set(&a);
+        let _ = a.update(Message::Run(R::SamePart));
+        none_set(&a);
+        let why = conn(&a).partway_blocked().unwrap();
+        assert!(
+            why.starts_with("This run's tool runs have cut the stock since"),
+            "{why}"
+        );
+    }
+
+    /// The Pi's tool run, Stop after step armed in the Face's pass 1, goes on
+    /// while this computer disconnects, connects to another machine, and
+    /// back (LIO-582 review). Dropped while it ran, the run counted it as
+    /// cutting all it was to; following that very tool run again starts from
+    /// what was cut before it, and its stop after pass 1 says what it cut, so
+    /// the setup picked again, the same part, touches pass 2 off on pass 1's
+    /// floor.
+    #[test]
+    fn following_the_pi_again_takes_its_outcome_over_the_guess_made_when_it_was_dropped() {
+        follow_the_pi_again(false, false);
+    }
+
+    /// As `following_the_pi_again_takes_its_outcome_over_the_guess_made_when_it_was_dropped`,
+    /// with the Face's feed edited while disconnected: the follow is refused
+    /// (its program changed), and what the run counted the tool run as
+    /// cutting, all of it, is kept, so the setup picked again, the same
+    /// part, sets no Z (LIO-582 review).
+    #[test]
+    fn a_refused_follow_keeps_what_the_tool_run_may_have_cut() {
+        follow_the_pi_again(true, false);
+    }
+
+    /// As `a_refused_follow_keeps_what_the_tool_run_may_have_cut`, then,
+    /// without picking the setup again, the Face made 1 mm shallower and
+    /// run whole from this computer (LIO-582 review): what the refused
+    /// follow kept aside for the Pi's tool run is not that tool run's, and
+    /// the floor the Pi cut to Z−2 stays the run's, so the start at the
+    /// Drilling, on the same part, sets no Z of the shallower Face's.
+    #[test]
+    fn a_tool_run_after_a_refused_follow_does_not_forget_what_it_cut() {
+        follow_the_pi_again(true, true);
+    }
+
+    fn follow_the_pi_again(edit: bool, go_on: bool) {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 3]);
+        let face = &mut a.doc.setups[0].operations[0].p;
+        face.insert("stepdown".into(), "2".into());
+        face.insert("feed".into(), "1000".into());
+        let server = to_pi(&mut a, dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).op_steps(0).unwrap().steps.len(), 2);
+        cycle_start(&mut a);
+        run_until(&mut a, 30., "Face pass 1", |r| {
+            r.step_at(None).is_some_and(|s| s == (0, 0, false))
+        });
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        let mut deadline = Deadline::new(5.);
+        loop {
+            let _ = a.update(Message::Tick);
+            let armed = conn(&a).link.as_ref().is_some_and(|l| {
+                matches!(l.stop_after, uc100_remote::wire::StopAfter::Armed { .. })
+            });
+            if armed {
+                break;
+            }
+            assert!(deadline.within(&conn(&a).snapshot));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let first = conn(&a).machine_id.clone();
+        let mut other = a.doc.machines[0].clone();
+        other.id = "lio582-other".into();
+        other.p.insert("name".into(), "Other simulator".into());
+        other
+            .p
+            .insert("uc100_connection".into(), "Simulated".into());
+        a.doc.machines.push(other);
+        let _ = a.update(Message::Disconnect);
+        let kept = a.run_cuts.iter().find(|(id, _)| *id == a.doc.setups[0].id);
+        assert!(kept.is_some_and(|(_, c)| c.iter().any(|c| c.0 == 0 && c.1.is_none())));
+        let _ = a.update(Message::ControlMachine("lio582-other".into()));
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 5., "the other machine", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::Disconnect);
+        let _ = a.update(Message::ControlMachine(first));
+        if edit {
+            // Another program, the same floor.
+            (a.doc.setups[0].operations[0].p).insert("feed".into(), "900".into());
+        }
+        pi_until(&server, 180., "Face stopped after pass 1", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
+        });
+        let _ = a.update(Message::Connect);
+        if edit {
+            let why = follow_again(&mut a).unwrap_err();
+            assert!(why.contains("changed"), "{why}");
+            if go_on {
+                a.selected = Some(0);
+                let _ = a.update(Message::Edit(Target::Operation, "bottom", "3".into()));
+                let _ = a.update(Message::Run(R::Check));
+                answer_skips(&mut a, 0);
+                let _ = a.update(Message::Run(R::From(0, 0)));
+                assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+                cycle_start(&mut a);
+                assert!(run_of(&a).running.is_some(), "{:?}", problems(&a));
+                run_until(&mut a, 180., "the shallower Face", |r| r.running.is_none());
+                assert!(run_of(&a).outcome.as_ref().is_some_and(|o| o.0));
+            }
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(&mut a, 0);
+            if run_of(&a).programs.is_none() {
+                answer_skips(&mut a, 0);
+            }
+            let _ = a.update(Message::Run(R::SamePart));
+            if go_on {
+                let _ = a.update(Message::Run(R::From(1, 0)));
+            }
+            assert!(
+                conn(&a).touch_off().is_none(),
+                "{:?}",
+                run_of(&a).cut_in_run
+            );
+            assert!(conn(&a).partway_blocked().is_some());
+            let _ = a.update(Message::Disconnect);
+            return;
+        }
+        follow_again(&mut a).unwrap();
+        run_until(&mut a, 10., "the stop's outcome", |r| r.running.is_none());
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        assert!(
+            (run_of(&a).cut_in_run.iter()).all(|c| c.0 != 0 || c.1 == Some(1)),
+            "{:?}",
+            run_of(&a).cut_in_run
+        );
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        let _ = a.update(Message::Run(R::SamePart));
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// The Pi's tool run held in the Face's pass 1 and followed again twice,
+    /// each time after connecting to another machine (LIO-582 review): the
+    /// second drop of the run keeps what was cut before that tool run, not
+    /// the bound the first follow held meanwhile, so once it stops after
+    /// pass 1 the setup picked again, the same part, touches pass 2 off on
+    /// pass 1's floor.
+    #[test]
+    fn following_the_pi_twice_keeps_what_was_cut_before_its_tool_run() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 3]);
+        let face = &mut a.doc.setups[0].operations[0].p;
+        face.insert("stepdown".into(), "2".into());
+        face.insert("feed".into(), "3000".into());
+        let server = to_pi(&mut a, dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        cycle_start(&mut a);
+        run_until(&mut a, 30., "Face pass 1", |r| {
+            r.step_at(None) == Some((0, 0, false))
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        tick_until(&mut a, 10., "the Face held", |s| {
+            s.state == Some(State::Hold)
+        });
+        let first = conn(&a).machine_id.clone();
+        let mut other = a.doc.machines[0].clone();
+        other.id = "lio582-other".into();
+        other.p.insert("name".into(), "Other simulator".into());
+        other
+            .p
+            .insert("uc100_connection".into(), "Simulated".into());
+        a.doc.machines.push(other);
+        for _ in 0..2 {
+            let _ = a.update(Message::Disconnect);
+            let _ = a.update(Message::ControlMachine("lio582-other".into()));
+            let _ = a.update(Message::Connect);
+            tick_until(&mut a, 5., "the other machine", |s| {
+                s.state == Some(State::EStop)
+            });
+            let _ = a.update(Message::Disconnect);
+            let _ = a.update(Message::ControlMachine(first.clone()));
+            let _ = a.update(Message::Connect);
+            follow_again(&mut a).unwrap();
+            tick_until(&mut a, 5., "the held Face followed", |s| {
+                s.state == Some(State::Hold)
+            });
+            assert_eq!(run_of(&a).before_follow, Some(vec![]));
+        }
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        let _ = a.update(Message::Run(R::Resume));
+        run_until(&mut a, 180., "the stop after pass 1", |r| {
+            r.running.is_none()
+        });
+        tick_until(&mut a, 10., "Idle after the stop", |s| {
+            s.state == Some(State::Idle)
+        });
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        let _ = a.update(Message::Run(R::SamePart));
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        let z = conn(&a).touch_off().map(|(_, w)| w[2]);
+        let _ = a.update(Message::Disconnect);
+        drop(server);
+        assert_eq!(z, Some(-2.));
+    }
+
+    /// A run started at the Pocket with the Drilling's first hole taken as
+    /// cut (LIO-582): the Drilling cut the stock the start touches off on,
+    /// which the check does not follow, so Zero Z, Probe Z and the probe
+    /// spots set nothing, each saying so.
+    #[test]
+    fn a_partway_start_with_later_steps_taken_as_cut_sets_no_z() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        assert!(run_of(&a).op_steps(3).is_some_and(|s| s.steps.len() > 1));
+        let _ = a.update(Message::Run(R::Steps(Some(3))));
+        let _ = a.update(Message::Run(R::PickStep(3, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).all_cut(), [(3, vec![0])]);
+        assert_eq!((run_of(&a).next, run_of(&a).from), (0, 1));
+        assert!(run_of(&a).partway());
+        assert!(conn(&a).touch_off().is_none());
+        assert_eq!(
+            conn(&a).partway_blocked().as_deref(),
+            Some(
+                "Operations or steps after the start are taken as cut, and the check does not follow the stock they cut, so it cannot tell the surface where the stock top is touched off."
+            )
+        );
+        let why = conn(&a).edges_setup().unwrap_err();
+        assert!(
+            why.starts_with("Operations or steps after the start are taken as cut, and the check does not follow the stock they cut where a probe finds this work zero."),
+            "{why}"
+        );
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        // From the setup's very start, the Face: not partway, Cycle Start
+        // runs on the setup's work zero, but nothing sets Z or probes where
+        // the Drilling's hole may have cut (LIO-582 review).
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        answer_skips(&mut a, 0);
+        assert_eq!((run_of(&a).next, run_of(&a).from), (0, 0));
+        assert_eq!(run_of(&a).all_cut(), [(3, vec![0])]);
+        assert!(!run_of(&a).partway() && run_of(&a).later_cut());
+        assert!(conn(&a).touch_off().is_none());
+        assert!(conn(&a).stock_top().is_err());
+        let why = conn(&a).edges_setup().unwrap_err();
+        assert!(
+            why.starts_with("Operations or steps after the start"),
+            "{why}"
+        );
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        assert!(
+            !problems(&a).iter().any(|p| p.contains("taken as cut")),
+            "{:?}",
+            problems(&a)
+        );
     }
 
     /// A run started at the Drilling with the work zero on the stock top's

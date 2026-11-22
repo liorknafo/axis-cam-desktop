@@ -29,6 +29,12 @@ pub enum Action {
     /// leaves (`Run::partway`): the one those operations were cut with, or
     /// one set by hand on a surface they left.
     KeepZero,
+    /// The part this setup's runs cut this session is still the one held
+    /// (`Run::stock_unconfirmed`): what they cut stays the stock's.
+    SamePart,
+    /// New stock is held: what this setup's runs cut this session is
+    /// forgotten (`Run::stock_unconfirmed`).
+    NewStock,
     CycleStart,
     Hold,
     Resume,
@@ -277,11 +283,94 @@ pub const PARTWAY_UNKNOWN: &str =
 /// before its start did (`Run::cut_by`).
 const CUT_BY_OPERATIONS: &str = "the operations before the start";
 
-/// What steps taken as cut in the start's operation, the setup's last
-/// operation sent, cut, said as `Partly::cut`: the check knows its stock
-/// only before that operation, none after it (`Run::partly`).
+/// What steps taken as cut in the start's operation cut, said as
+/// `Partly::cut`, when the check did not carve them into the stock
+/// (`Partly::steps`, LIO-582) and has none after their operation, its
+/// setup's last; or carved other steps, the start having moved since
+/// (`Run::partly`).
 pub(crate) const STEPS_UNFOLLOWED: &str =
     "stock cut by the steps taken as cut, which the check does not follow";
+
+/// What operations after a start's, or steps of them, taken as cut cut,
+/// said as `Partly::cut`: the check follows the stock a start touches off
+/// on only through the operations before it and its own (`Run::partly`,
+/// LIO-582).
+pub(crate) const LATER_UNFOLLOWED: &str = "stock the operations or steps after the start, taken as cut, cut, which the check does not follow";
+
+/// Why a probe cannot find a work zero from a spot of a stock
+/// `LATER_UNFOLLOWED` cut.
+pub(crate) const LATER_UNFOLLOWED_WHY: &str = "Operations or steps after the start are taken as cut, and the check does not follow the stock they cut.";
+
+/// What this setup's runs cut earlier this session, said as `Partly::cut`,
+/// while the operator has not said whether the same part is still held
+/// (`Run::stock_unconfirmed`).
+pub(crate) const STOCK_UNCONFIRMED: &str =
+    "stock this setup's runs cut earlier, which may or may not still be held";
+
+/// Why a probe cannot find a work zero from a spot while
+/// `Run::stock_unconfirmed`.
+const STOCK_UNCONFIRMED_WHY: &str = "This setup's runs cut the stock earlier: say under Work zero whether it is the same part or new stock.";
+
+/// Why Zero Z on the stock top and Probe Z cannot set Z while
+/// `Run::stock_unconfirmed`.
+const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier this session: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
+
+/// What other setups' runs cut this session, said as `Partly::cut`, when
+/// the check does not simulate it before this setup as it was cut
+/// (`Run::earlier_unfollowed`).
+pub(crate) const EARLIER_UNFOLLOWED: &str =
+    "stock another setup's run cut this session, which the check does not simulate as it was cut";
+
+/// Why a probe cannot find a work zero from a spot of a stock
+/// `EARLIER_UNFOLLOWED` cut.
+const EARLIER_UNFOLLOWED_WHY: &str = "Another setup's run cut this part this session in a way the check does not follow: an operation disabled or changed since, or its setup deleted or moved after this one.";
+
+/// Why Zero Z on the stock top and Probe Z cannot set Z where
+/// `EARLIER_UNFOLLOWED` cut (`Run::partway_blocked`).
+const EARLIER_UNFOLLOWED_BLOCKED: &str = "Another setup's run cut this part this session in a way the check does not follow (an operation disabled or changed since, or its setup deleted or moved after this one), so it cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero.";
+
+/// What a tool run of a run cut (`Run::cut_in_run`): the operation (index in
+/// the setup), all of it (None) or its steps before the one given, and the
+/// print of the plan and cutter it cut (`OpSteps::cut_print`).
+pub type CutInRun = (usize, Option<usize>, Option<u64>);
+
+/// Notes in `cuts` (`Run::cut_in_run`) that operation `oi` was cut: all of
+/// it (None) or its steps before `steps`, from the plan and cutter `print`.
+fn note_cut_in(cuts: &mut Vec<CutInRun>, oi: usize, steps: Option<usize>, print: Option<u64>) {
+    match cuts.iter_mut().find(|c| c.0 == oi) {
+        Some(c) => {
+            c.1 = match (c.1, steps) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            };
+            // Cut from two plans: neither is all it cut.
+            c.2 = c.2.filter(|&p| print == Some(p));
+        }
+        None => cuts.push((oi, steps, print)),
+    }
+}
+
+/// What this run's own tool runs cut, said as `Partly::cut`, when the
+/// check's stock before the start does not have it: one runs, or one at or
+/// after the start was cut (`Run::partly`, LIO-582 review).
+const RUN_UNFOLLOWED: &str =
+    "stock this run's tool runs cut since, which the check does not follow";
+
+/// Why a probe cannot find a work zero from a spot of a stock
+/// `RUN_UNFOLLOWED` cut.
+const RUN_UNFOLLOWED_WHY: &str = "This run's tool runs have cut the stock since, and the check does not follow what they cut here.";
+
+/// Why Zero Z on the stock top and Probe Z cannot set Z where
+/// `RUN_UNFOLLOWED` cut (`Run::partway_blocked`).
+const RUN_UNFOLLOWED_BLOCKED: &str = "This run's tool runs have cut the stock since, and the check does not follow what they cut, so it cannot tell the surface where the stock top is touched off.";
+
+/// Why Zero Z on the stock top and Probe Z cannot set Z for a run from the
+/// setup's start (`Run::inherited_unknown`).
+const INHERITED_UNKNOWN: &str = "Earlier setups may have cut the stock under the stock top where it is touched off, so the check cannot tell its surface there.";
+
+/// Why Zero Z on the stock top and Probe Z cannot set Z where
+/// `LATER_UNFOLLOWED` cut (`Run::partway_blocked`).
+const LATER_UNFOLLOWED_BLOCKED: &str = "Operations or steps after the start are taken as cut, and the check does not follow the stock they cut, so it cannot tell the surface where the stock top is touched off.";
 
 /// A setup being run on the connected machine, tool run by tool run.
 pub struct Run {
@@ -304,6 +393,34 @@ pub struct Run {
     /// waits for (`partway`).
     pub zeroed: bool,
     pub done: Vec<bool>,
+    /// What this run's tool runs have cut, by operation (index in the
+    /// setup): all of it (None), or its steps before the one given, and
+    /// the print of the plan and cutter it cut (`OpSteps::cut_print`; None when
+    /// the check gave none, or it cut more than one). Kept over the starts
+    /// picked, the edits and the checks, which take what is before a start
+    /// as cut but know nothing of what was cut at or after it, nor of an
+    /// operation since disabled or changed (`Run::partly`, LIO-582 review).
+    pub cut_in_run: Vec<CutInRun>,
+    /// `cut_in_run` came from an earlier pick of this setup this session,
+    /// and the operator has not said whether the same part is still held
+    /// (`Action::SamePart`, `Action::NewStock`): nothing sets Z or probes
+    /// until then (`partly`, LIO-582 review).
+    pub stock_unconfirmed: bool,
+    /// What the other setups cut this session (`App::run_cuts`), by setup
+    /// id: in the part whether those setups come before it, were deleted or
+    /// moved after it since. The check's stock has it only while it
+    /// simulates each such operation, before this setup, as it was cut
+    /// (`earlier_unfollowed`, LIO-582 review).
+    pub earlier_cuts: Vec<(String, Vec<CutInRun>)>,
+    /// The setups `earlier_cuts` was given for: one no longer in it was
+    /// forgotten (New stock loaded).
+    pub earlier_given: Vec<String>,
+    /// A run following on the Pi the tool run its run ran when dropped
+    /// (`App::run_pending`): what was cut before that tool run. Kept only
+    /// once the follow holds (`follow_again`) and until this computer starts
+    /// a tool run, so that only that tool run's outcome starts from this
+    /// instead of `cut_in_run`'s bound of it (LIO-582 review).
+    pub before_follow: Option<Vec<CutInRun>>,
     pub running: Option<Running>,
     /// The work system and X/Y work offset when the first tool run started:
     /// tool changes keep X/Y zero.
@@ -748,6 +865,11 @@ impl Run {
             from: 0,
             zeroed: false,
             done: vec![],
+            cut_in_run: vec![],
+            stock_unconfirmed: false,
+            earlier_cuts: vec![],
+            earlier_given: vec![],
+            before_follow: None,
             running: None,
             xy: None,
             zero: None,
@@ -852,6 +974,9 @@ impl Run {
     /// Cycle Start, while the check finds the program sent. The name it was
     /// sent as, or why it is not followed.
     fn follow_again(&mut self, f: Follow) -> Result<String, String> {
+        // What was cut before the tool run it follows is for that tool
+        // run's outcome only: kept once the follow holds (LIO-582 review).
+        let before = self.before_follow.take();
         let why = not_followed;
         let programs = match self.programs.as_deref() {
             Some(Ok(p)) => p,
@@ -912,6 +1037,7 @@ impl Run {
         (self.done, self.next, self.from) = (done, f.index, f.from);
         (self.xy, self.zero, self.last) = (f.xy, f.zero, f.last);
         (self.running, self.outcome, self.journal) = (Some(running), None, None);
+        self.before_follow = before;
         Ok(f.name)
     }
 
@@ -1424,6 +1550,30 @@ impl Run {
         let unattended = std::mem::take(&mut self.unattended);
         self.stop_after = false;
         let mut message = o.message.clone();
+        // What it cut, for the starts after it (`cut_in_run`): its
+        // operations from where it started, up to a stop.
+        let ran: Vec<usize> = (self.checked().and_then(|c| c.get(r.index)))
+            .map(|p| p.indexes[r.from.min(p.indexes.len())..].to_vec())
+            .unwrap_or_default();
+        let up_to = |op: usize, steps: usize| -> Vec<(usize, Option<usize>)> {
+            (ran.iter().take_while(|&&o| o != op))
+                .map(|&o| (o, None))
+                .chain([(op, Some(steps))])
+                .collect()
+        };
+        let cut: Vec<(usize, Option<usize>)> = if o.ok {
+            ran.iter().map(|&o| (o, None)).collect()
+        } else if o.message.contains(NOT_STARTED) {
+            vec![]
+        } else if let Some((op, s)) = stopping {
+            up_to(op, s + 1)
+        } else if let Some(at) = self.stopped_in("") {
+            // In a step: it may be cut in part.
+            up_to(at.op, at.last.map_or(1, |l| l + 2))
+        } else {
+            ran.iter().map(|&o| (o, None)).collect()
+        };
+
         if o.ok {
             self.finish_carve();
             let Some(r) = &self.running else {
@@ -1461,6 +1611,17 @@ impl Run {
         } else if o.message.contains("E-stop") || o.message.contains("E-STOP") {
             // In a step: it counts as not done.
             self.stopped = self.stopped_in("an E-stop");
+        }
+        // Followed again, what was cut before it is known: its outcome says
+        // the rest (`before_follow`). One never started cut nothing more,
+        // and keeps the bound.
+        if let Some(before) = self.before_follow.take()
+            && !o.message.contains(NOT_STARTED)
+        {
+            self.cut_in_run = before;
+        }
+        for (op, steps) in cut {
+            self.note_cut(op, steps);
         }
         self.outcome = Some((o.ok, message));
         self.running = None;
@@ -2034,6 +2195,8 @@ impl Run {
         if let Some((oi, n)) = self.at_step() {
             name += &format!(" at {}", self.step_label(oi, n));
         }
+        // A tool run this computer starts is not the one a follow was for.
+        self.before_follow = None;
         self.running = Some(Running {
             index: self.next,
             from: self.from,
@@ -2125,6 +2288,113 @@ impl Run {
         self.checked()?.get(r.index)?.from(r.from).ok()
     }
 
+    /// Operations after the start's operation, or steps of them, are taken
+    /// as cut (`Skip::Cut`, `cut_steps`): the stock they cut, which may be
+    /// where the work zero is touched off or probed, is in no stock the
+    /// check found for the start, partway or not, so neither sets it there
+    /// (`touch_off`, `partway_blocked`, `Connection::probe_spots`; LIO-582).
+    pub fn later_cut(&self) -> bool {
+        let Some(start) =
+            (self.checked()).and_then(|c| c.get(self.next)?.indexes.get(self.from).copied())
+        else {
+            return false;
+        };
+        (self.skips.iter()).any(|s| s.1 == Skip::Cut && s.0 > start)
+            || (self.cut_steps.iter()).any(|c| !c.1.is_empty() && c.0 > start)
+    }
+
+    /// The check cannot tell the stock top the setup's first operation
+    /// starts from where the work zero is touched off (`Checked::partly`
+    /// of it, `post::spot_surface`): an earlier setup's cut may reach under
+    /// it there, a bore from the other side, say, which the work-zero
+    /// check's sample points can miss (LIO-582 review). For a run from the
+    /// setup's start; a partway one has its own (`partly`).
+    fn inherited_unknown(&self) -> bool {
+        (self.checked().and_then(|c| c.first()?.partly.first()))
+            .is_some_and(|first| first.surface.is_none())
+    }
+
+    /// Earlier setups cut into the stock top the setup's first operation
+    /// starts from, somewhere over the stock (`Partly::top_cut` of it): a
+    /// touch plate laid on the top may lie in what they cut (LIO-582
+    /// review). For a run from the setup's start.
+    pub fn inherited_top_cut(&self) -> bool {
+        (self.checked().and_then(|c| c.first()?.partly.first())).is_some_and(|first| first.top_cut)
+    }
+
+    /// Notes that a tool run of this run cut operation `oi` (index in the
+    /// setup): all of it (None) or its steps before `steps`, with the plan
+    /// the check has of it now (`cut_in_run`).
+    fn note_cut(&mut self, oi: usize, steps: Option<usize>) {
+        let print = self.op_steps(oi).map(|s| s.cut_print);
+        note_cut_in(&mut self.cut_in_run, oi, steps, print);
+    }
+
+    /// What this run's tool runs have cut so far (`cut_in_run`), a tool
+    /// run that runs now taken as cutting every operation it runs whole,
+    /// as far as it may get: what is kept when the run is dropped while one
+    /// runs, the machine disconnected say, which no outcome then tells
+    /// (LIO-582 review).
+    pub fn cuts_so_far(&self) -> Vec<CutInRun> {
+        let mut cuts = self.cut_in_run.clone();
+        if let Some(r) = &self.running
+            && let Some(p) = self.checked().and_then(|c| c.get(r.index))
+        {
+            for &oi in &p.indexes[r.from.min(p.indexes.len())..] {
+                let print = self.op_steps(oi).map(|s| s.cut_print);
+                note_cut_in(&mut cuts, oi, None, print);
+            }
+        }
+        cuts
+    }
+
+    /// This run's tool runs cut more than the check's stock before the start
+    /// has (`cut_in_run`): an operation after the start's, the start's own
+    /// whole, or steps of it at or after the step it starts at; or one the
+    /// check does not cut as it was cut, disabled or left since, or its plan
+    /// changed (its fingerprint), so its stock lacks what was cut.
+    fn cut_beyond(&self, start: usize) -> bool {
+        let step = self.at_step().map_or(0, |(_, n)| n);
+        let simulated = |op: usize| {
+            (self.checked().into_iter().flatten()).any(|p| p.indexes.contains(&op))
+                || (self.skips.iter()).any(|s| s.0 == op && s.1 == Skip::Cut)
+        };
+        (self.cut_in_run.iter()).any(|&(op, steps, print)| {
+            op > start
+                || op == start && steps.is_none_or(|m| m > step)
+                || !simulated(op)
+                || print.is_none()
+                || self.op_steps(op).map(|s| s.cut_print) != print
+        })
+    }
+
+    /// Another setup's run cut an operation this session (`earlier_cuts`)
+    /// that the check does not simulate before this setup as it was cut:
+    /// disabled, left, its plan or cutter changed, or its setup deleted or
+    /// moved after this one (`Left::earlier`). Its stock lacks what was cut
+    /// (LIO-582 review).
+    pub fn earlier_unfollowed(&self) -> bool {
+        let earlier = self.left.as_ref().map_or(&[][..], |l| &l.earlier[..]);
+        (self.earlier_cuts.iter()).any(|(id, cuts)| {
+            cuts.iter().any(|&(op, _, print)| {
+                !(earlier.iter()).any(|(s, o, p)| s == id && *o == op && Some(*p) == print)
+            })
+        })
+    }
+
+    /// The stock the start begins from is not the setup's own: the run
+    /// starts partway (`partway`), or a tool run of it has started, which
+    /// cut it, or has cut (`cut_in_run`). Zero Z on the stock top, Probe Z and the probe spots go by
+    /// the stock the check finds before the start (`partly`) then; Cycle
+    /// Start waits for the work zero only partway (LIO-582 review).
+    pub fn on_cut_stock(&self) -> bool {
+        self.checked().is_some()
+            && (self.partway()
+                || self.started()
+                || !self.cut_in_run.is_empty()
+                || self.earlier_unfollowed())
+    }
+
     /// The run starts partway through the setup before any of its tool runs
     /// started: at a later tool run or operation than the first, those
     /// before taken as cut, or with steps of its operation taken as cut.
@@ -2153,13 +2423,18 @@ impl Run {
     /// surface the operations before it leave there, when the check knows
     /// it (`partly`), and is None when not (`partway_blocked`).
     pub fn touch_off(&self) -> Option<([f32; 3], [f64; 3])> {
+        if self.later_cut() {
+            return None;
+        }
         let p = self.checked()?.first()?;
         if p.located.is_some_and(|(_, top)| top.is_none()) {
             return None;
         }
         let mut at = crate::post::touch_point(&p.origin, p.stock)?;
-        if self.partway() {
+        if self.on_cut_stock() {
             at[2] = self.partly()?.surface?;
+        } else if self.inherited_unknown() {
+            return None;
         }
         Some((at, std::array::from_fn(|a| (at[a] - p.datum[a]) as f64)))
     }
@@ -2170,8 +2445,11 @@ impl Run {
     /// is touched off. None when it can, or the run starts at the setup's
     /// first operation.
     pub fn partway_blocked(&self) -> Option<String> {
-        if !self.partway() {
-            return None;
+        if self.later_cut() {
+            return Some(LATER_UNFOLLOWED_BLOCKED.into());
+        }
+        if !self.on_cut_stock() {
+            return self.inherited_unknown().then(|| INHERITED_UNKNOWN.into());
         }
         let Some(partly) = self.partly() else {
             return Some(PARTWAY_UNKNOWN.into());
@@ -2184,6 +2462,15 @@ impl Run {
             format!(
                 "The check cannot tell the surface {by} leave where the stock top is touched off."
             )
+        } else if partly.cut == [LATER_UNFOLLOWED] {
+            // Not a part of the stock either (LIO-582).
+            LATER_UNFOLLOWED_BLOCKED.into()
+        } else if partly.cut == [RUN_UNFOLLOWED] {
+            RUN_UNFOLLOWED_BLOCKED.into()
+        } else if partly.cut == [STOCK_UNCONFIRMED] {
+            STOCK_UNCONFIRMED_BLOCKED.into()
+        } else if partly.cut == [EARLIER_UNFOLLOWED] {
+            EARLIER_UNFOLLOWED_BLOCKED.into()
         } else if partly.cut == [STEPS_UNFOLLOWED] {
             // Not a part of the stock: said as the reason it is (LIO-579).
             "The check does not follow the stock cut by the steps taken as cut, so it cannot tell the surface they left where the stock top is touched off.".into()
@@ -2419,34 +2706,106 @@ impl Run {
     /// check did not work it out.
     pub fn partly(&self) -> Option<std::borrow::Cow<'_, Partly>> {
         use std::borrow::Cow;
-        if !self.partway() {
+        if !self.on_cut_stock() {
             return None;
         }
         let programs = self.checked()?;
         let p = programs.get(self.next)?;
         let before = p.partly.get(self.from)?;
+        let start = p.indexes.get(self.from).copied();
+        // Whether the part its runs cut is still held is not said: nothing
+        // sets Z or probes (LIO-582 review).
+        if self.stock_unconfirmed {
+            return Some(Cow::Owned(Partly {
+                cut: vec![STOCK_UNCONFIRMED.into()],
+                surface: None,
+                top_cut: true,
+                probe_from: (before.probe_from.iter())
+                    .map(|(r, _)| (*r, Err(STOCK_UNCONFIRMED_WHY.into())))
+                    .collect(),
+                steps: vec![],
+            }));
+        }
+        // Another setup's run cut an operation the check does not simulate
+        // so before this setup (LIO-582 review).
+        if self.earlier_unfollowed() {
+            return Some(Cow::Owned(Partly {
+                cut: vec![EARLIER_UNFOLLOWED.into()],
+                surface: None,
+                top_cut: true,
+                probe_from: (before.probe_from.iter())
+                    .map(|(r, _)| (*r, Err(EARLIER_UNFOLLOWED_WHY.into())))
+                    .collect(),
+                steps: vec![],
+            }));
+        }
+        // The tool runs this run has cut are the stock's: the check's stock
+        // before the start has them when they are all before it, and not
+        // while one runs or when one cut at or after it, a start picked
+        // again before what was cut (LIO-582 review).
+        if self.running.is_some() || start.is_some_and(|s| self.cut_beyond(s)) {
+            return Some(Cow::Owned(Partly {
+                cut: vec![RUN_UNFOLLOWED.into()],
+                surface: None,
+                top_cut: true,
+                probe_from: (before.probe_from.iter())
+                    .map(|(r, _)| (*r, Err(RUN_UNFOLLOWED_WHY.into())))
+                    .collect(),
+                steps: vec![],
+            }));
+        }
+        // Operations after the start's, or steps of them, taken as cut have
+        // cut the stock it starts from too, which no stock the check found
+        // for it has (`post::partly`): it cannot tell the surface (LIO-582).
+        if self.later_cut() {
+            return Some(Cow::Owned(Partly {
+                cut: vec![LATER_UNFOLLOWED.into()],
+                surface: None,
+                top_cut: true,
+                probe_from: (before.probe_from.iter())
+                    .map(|(r, _)| (*r, Err(LATER_UNFOLLOWED_WHY.into())))
+                    .collect(),
+                steps: vec![],
+            }));
+        }
         // Steps of its operation taken as cut, before a start at a step or
         // skipped, have cut the stock it starts from (LIO-568).
-        let steps_cut = (p.indexes.get(self.from)).is_some_and(|&oi| !self.cut_of(oi).is_empty());
-        if self.at_step().is_none() && !steps_cut {
-            return Some(Cow::Borrowed(before));
-        }
-        // Inside an operation the check does not follow the stock, but it
-        // knows it before the operation and after it (before the next one
-        // sent): a spot neither cut is as it was, a surface the same in both
-        // is that surface. Cut steps only take material away.
-        let after = (programs.iter().flat_map(|p| &p.partly))
-            .skip_while(|p| !std::ptr::eq(*p, before))
-            .nth(1);
-        let unknown = STEPS_UNFOLLOWED;
-        // The stock after the operation says what the operations before
-        // the next one cut; partway by steps of its own alone, they are
-        // the steps taken as cut (LIO-568).
+        let cut = start.map_or_else(Vec::new, |oi| self.cut_of(oi));
+        // Partway by steps of its own alone, what cut the stock is the steps
+        // taken as cut, and the probe spots' reasons say so (LIO-568).
         let by_steps = self.cut_by() != CUT_BY_OPERATIONS;
         let said = |e: &String| match e.strip_prefix("The operations before it ") {
             Some(rest) if by_steps => format!("The steps taken as cut {rest}"),
             _ => e.clone(),
         };
+        // The check carved those very steps into it, or none were: it is the
+        // stock the check found (LIO-582).
+        if before.steps == cut && (!cut.is_empty() || self.at_step().is_none()) {
+            if !by_steps {
+                return Some(Cow::Borrowed(before));
+            }
+            let mut found = before.clone();
+            for (_, ok) in &mut found.probe_from {
+                if let Err(e) = ok {
+                    *e = said(e);
+                }
+            }
+            return Some(Cow::Owned(found));
+        }
+        // Inside an operation the check does not follow the stock, but it
+        // knows it before the operation and after it (before the next one
+        // sent): a spot neither cut is as it was, a surface the same in both
+        // is that surface. Cut steps only take material away. A stock the
+        // check carved other steps into is neither: the start is not the
+        // one checked yet.
+        let after = (programs.iter().flat_map(|p| &p.partly))
+            .skip_while(|p| !std::ptr::eq(*p, before))
+            .nth(1)
+            .filter(|_| before.steps.is_empty());
+        let unknown = STEPS_UNFOLLOWED;
+        // The stock after the operation says what the operations before
+        // the next one cut; partway by steps of its own alone, they are
+        // the steps taken as cut (`said`, LIO-568).
         Some(Cow::Owned(match after {
             Some(after) => Partly {
                 cut: after.cut.clone(),
@@ -2464,6 +2823,7 @@ impl Run {
                         (*r, ok)
                     })
                     .collect(),
+                steps: vec![],
             },
             None => Partly {
                 cut: vec![unknown.into()],
@@ -2472,6 +2832,7 @@ impl Run {
                 probe_from: (before.probe_from.iter())
                     .map(|(r, _)| (*r, Err(format!("The check cannot follow the {unknown}."))))
                     .collect(),
+                steps: vec![],
             },
         }))
     }
@@ -3019,6 +3380,13 @@ pub fn check_steps(
                 // The work zero was set on the stock before them: they were
                 // cut with it, and a start keeps it (LIO-568).
                 sim.before_steps.get_or_insert_with(|| volume.clone());
+                // Which they are, for the work zero of a start at a step
+                // (`Run::partly`, LIO-582).
+                sim.steps_cut = (steps.iter().copied())
+                    .filter(|&s| s < found.steps.len())
+                    .collect();
+                sim.steps_cut.sort_unstable();
+                sim.steps_cut.dedup();
                 let plan = &sim.plan;
                 for m in (steps.iter())
                     .filter_map(|&s| found.steps.get(s))
@@ -3108,6 +3476,11 @@ pub struct OpSteps {
     /// FNV-1a of its plan's moves and its tool (`fingerprint`): a journal of
     /// where a run stopped holds for these steps only (`Journal`).
     pub fingerprint: u64,
+    /// `fingerprint` with what the cutter takes away along the moves: its
+    /// shape and sizes, and the A of each move (`cut_print`). What a run
+    /// cut is the check's only while this is the same (`Run::cut_in_run`,
+    /// LIO-582 review); kept in memory only.
+    pub cut_print: u64,
 }
 
 impl OpSteps {
@@ -3383,9 +3756,32 @@ fn op_steps(doc: &Document, si: usize, sims: &Sims) -> Vec<OpSteps> {
                 hole: op.strategy == crate::model::Strategy::Drill,
                 steps: plan_steps(plan),
                 fingerprint: fingerprint(plan, &op.tool),
+                cut_print: cut_print(plan, &op.tool),
             })
         })
         .collect()
+}
+
+/// `fingerprint` of `plan` and `tool` with what the cutter takes away along
+/// the moves: its shape, radius (and form), flute length, the reach below
+/// its tip and its neck, a lathe plan's rings, and the A each move is at.
+/// A tool saved at another size, or an operation posed at another angle,
+/// cuts other stock along the same moves (LIO-582 review). Not kept on
+/// disk, so its words for the cutter (`Debug`) may change between builds.
+fn cut_print(plan: &crate::simulation::Plan, tool: &str) -> u64 {
+    let mut h = fingerprint(plan, tool);
+    let mut eat = |w: u64| h = (h ^ w).wrapping_mul(0x100000001b3);
+    let cutter = format!(
+        "{:?} {:?} {:?} {:?} {:?} {:?} {:?}",
+        plan.shape, plan.radius, plan.form, plan.flute_length, plan.below, plan.neck, plan.rings
+    );
+    for b in cutter.bytes() {
+        eat(u64::from(b));
+    }
+    for m in &plan.moves {
+        eat(m.a.map_or(u64::MAX, |a| u64::from(a.to_bits())));
+    }
+    h
 }
 
 /// FNV-1a over every bit of `plan`'s moves and the id of `tool`: stable
@@ -3632,6 +4028,7 @@ fn simulated_with(doc: &Document, mesh: &Mesh, si: usize) -> (Sims, Left) {
     let last = doc.setups[si].operations.iter().rposition(|o| o.enabled);
     let mut sims = vec![];
     let mut after = vec![];
+    let mut earlier = vec![];
     if let Some(oi) = last {
         crate::simulation::sequence_with(
             doc,
@@ -3640,6 +4037,10 @@ fn simulated_with(doc: &Document, mesh: &Mesh, si: usize) -> (Sims, Left) {
             |s, oi, r| {
                 if s == si {
                     sims.push((oi, r))
+                } else if let (Ok(sim), Some(setup)) = (&r, doc.setups.get(s))
+                    && let Some(op) = setup.operations.get(oi)
+                {
+                    earlier.push((setup.id.clone(), oi, cut_print(&sim.plan, &op.tool)));
                 }
             },
             |s, oi, v| {
@@ -3680,6 +4081,7 @@ fn simulated_with(doc: &Document, mesh: &Mesh, si: usize) -> (Sims, Left) {
             before: Arc::new(before),
             beneath: vec![],
             steps: vec![],
+            earlier,
         },
     )
 }
@@ -3703,6 +4105,12 @@ pub struct Left {
     /// The steps of each operation that generated (`op_steps`), as found
     /// before any was taken as cut.
     pub steps: Vec<OpSteps>,
+    /// Each operation of the setups before it the check simulated: the
+    /// setup's id, the operation's index in it, and its plan and cutter's
+    /// print (`OpSteps::cut_print`). What earlier setups' runs cut this
+    /// session is the stock's only while this has it (`Run::earlier_cuts`,
+    /// LIO-582 review).
+    pub earlier: Vec<(String, usize, u64)>,
 }
 
 /// How many stocks `op_pictures` meshes at once: each mesher also runs
@@ -6193,31 +6601,48 @@ pub(crate) mod tests {
                 zeros.push((oi, n, zero.clone()));
             }
         }
-        // Pocket's levels and Drilling's holes after the first: each is
-        // touched off at the stock top's centre, on the floor the face left
-        // and the pocket cut. Knowing the stock inside an operation only
-        // before and after it, the check may not tell that floor (LIO-582).
+        // Face's pass 2, Pocket's levels and Drilling's holes after the
+        // first: each is touched off at the stock top's centre, on what the
+        // steps before it left there, as the check carved them (LIO-582).
         assert!(zeros.len() >= 9, "{}", zeros.len());
         for (oi, n, z) in &zeros {
             assert_eq!(z.spot.as_deref(), Some("the centre"), "{oi} {n}");
-            assert!(z.top_cut, "{oi} {n} {z:?}");
-            // Drilling is the last operation: the check has no stock after
-            // it to tell its holes by, and says so in a sentence.
-            if *oi == 2 {
-                assert_eq!(z.cut, [STEPS_UNFOLLOWED], "{n}");
-                assert_eq!(
-                    z.blocked.as_deref(),
-                    Some(
-                        "The check does not follow the stock cut by the steps taken as cut, so it cannot tell the surface they left where the stock top is touched off."
-                    ),
-                    "{n}"
-                );
-            } else {
-                assert!(
-                    z.cut.first().is_some_and(|c| c == "top face"),
-                    "{oi} {n} {z:?}"
-                );
-            }
+            assert!(
+                z.top_cut && z.cut.first().is_some_and(|c| c == "top face"),
+                "{oi} {n} {z:?}"
+            );
+            assert_eq!(z.set_z.is_some(), z.blocked.is_none(), "{oi} {n} {z:?}");
+        }
+        // Below the stock top by as much as the floor is (`TabletZero::top`
+        // is the top's work Z).
+        let below = |z: &TabletZero| z.set_z.map(|s| (z.top - s) as f32);
+        let top = (whole.as_ref().as_ref().unwrap())[0].stock.max[2];
+        let floor = |oi: usize, n: usize| {
+            let s = left.steps.iter().find(|s| s.op == oi).unwrap();
+            top - s.steps[n].z.unwrap()
+        };
+        let near = |a: Option<f32>, b: f32| a.is_some_and(|a| (a - b).abs() < 1e-3);
+        // Face's pass 2 on pass 1's floor.
+        let face = &zeros.iter().find(|z| (z.0, z.1) == (0, 1)).unwrap().2;
+        assert!(near(below(face), floor(0, 0)), "{face:?}");
+        // Drilling's holes on the pocket's floor, which no hole drilled
+        // before cuts there: the floor of its last level.
+        let pocket = left.steps.iter().find(|s| s.op == 1).unwrap().steps.len();
+        let holes: Vec<_> = zeros.iter().filter(|z| z.0 == 2).collect();
+        assert!(holes.len() >= 4, "{}", holes.len());
+        for (_, n, z) in holes {
+            assert!(near(below(z), floor(1, pocket - 1)), "{n} {z:?}");
+        }
+        // Pocket's levels have none: within the end mill's reach of the
+        // centre's spot the pocket leaves stock standing beside the level's
+        // floor, which the tool touched off there may rest on.
+        for (_, n, z) in zeros.iter().filter(|z| z.0 == 1) {
+            assert_eq!(z.set_z, None, "{n}");
+            assert!(
+                z.blocked
+                    .as_deref()
+                    .is_some_and(|b| b.contains("cannot tell"))
+            );
         }
         assert!(zeros.iter().any(|z| z.0 == 2), "{zeros:?}");
         // As runs.json says it.
@@ -6250,6 +6675,7 @@ pub(crate) mod tests {
             surface: None,
             top_cut: true,
             probe_from: vec![],
+            steps: vec![],
         };
         p.partly = vec![cut.clone(), cut];
         let mut run = Run::new(&doc, 0, 0);
@@ -6349,6 +6775,7 @@ pub(crate) mod tests {
                     hole: false,
                     steps: plan_steps(&plan),
                     fingerprint: 0,
+                    cut_print: 0,
                 })
                 .collect();
             for k in 1..3 {
@@ -6902,6 +7329,11 @@ pub(crate) mod tests {
             from: 0,
             zeroed: false,
             done: vec![false],
+            cut_in_run: vec![],
+            stock_unconfirmed: false,
+            earlier_cuts: vec![],
+            earlier_given: vec![],
+            before_follow: None,
             running: Some(Running {
                 index: 0,
                 from: 0,
@@ -8135,7 +8567,8 @@ pub(crate) mod tests {
     /// the zero found and probed as for the whole run. Pass 1 is still in
     /// the stock the run starts from, the top view's and the 3D view's, and
     /// a work zero set on the stock now finds the top cut, whether the run
-    /// starts at Pass 2 or skips Pass 1.
+    /// starts at Pass 2 or skips Pass 1, and touches off on the floor the
+    /// pass taken as cut left (LIO-582).
     #[test]
     fn a_start_at_a_later_pass_of_the_first_operation_keeps_its_work_zero() {
         let dir = tempfile::tempdir().unwrap();
@@ -8216,30 +8649,693 @@ pub(crate) mod tests {
         assert_eq!(second.taken_as_cut(), pass(0));
         assert_eq!(run.taken_as_cut(), pass(1));
         assert_eq!(skipped, started);
-        assert_eq!(later, started);
         assert!(skipped.top_cut && !skipped.cut.is_empty(), "{skipped:?}");
-        assert_eq!(skipped.surface, None);
         let centre = (skipped.probe_from.iter()).find(|(r, _)| *r == p.probe.clone().unwrap());
         assert!(centre.is_some_and(|(_, ok)| ok.is_err()), "{centre:?}");
-        // Zero Z and Probe Z say why they cannot set Z, naming the steps.
+        // What cut it is named as the steps taken as cut, in the probe
+        // spots' reasons too, not operations (LIO-568).
         for r in [&first, &second, &run] {
-            let why = r.partway_blocked().unwrap();
-            assert!(
-                why.starts_with("The steps taken as cut cut the stock's "),
-                "{why}"
-            );
-            assert_eq!(r.touch_off(), None);
             assert_eq!(r.cut_by(), "the steps taken as cut");
-            // Nor do the probe spots' reasons speak of operations.
             for (_, ok) in &r.partly().unwrap().probe_from {
                 let why = ok.as_ref().unwrap_err();
                 assert!(!why.contains("operations"), "{why}");
             }
         }
+        // The touch-off sets Z on the floor the pass taken as cut left
+        // (LIO-582): Pass 1's, or Pass 2's when it is the one taken as cut.
+        let floor = |n: usize| face_steps.steps[n].z.unwrap();
+        assert!(floor(1) < floor(0) && floor(0) < p.stock.max[2] - 0.1);
+        assert_eq!(skipped.surface, Some(floor(0)));
+        assert_eq!(later.surface, Some(floor(1)));
+        assert_eq!((&later.cut, later.top_cut), (&started.cut, started.top_cut));
+        let set_z = |r: &Run| r.touch_off().map(|(_, w)| w[2]);
+        let want = |n: usize| Some((floor(n) - p.datum[2]) as f64);
+        assert_eq!((set_z(&first), set_z(&second)), (want(0), want(0)));
+        assert_eq!((set_z(&run), run.partway_blocked()), (want(1), None));
+        // A check that carved other steps than the run takes as cut is not
+        // the run's yet (its start changed since): no Z from it.
+        let (_, mut stale) = partly(1, true);
+        let (carved, carved_left) = check_steps(&doc, &mesh, 0, &[], &[(0, vec![0])]);
+        stale.checked_as(Arc::new(carved), Some(Arc::new(carved_left)), None);
+        assert_eq!(stale.all_cut(), [(0, vec![1])]);
+        let unknown = stale.partly().unwrap();
+        assert_eq!((unknown.surface, unknown.top_cut), (None, true));
+        assert_eq!(set_z(&stale), None);
+        assert_eq!(unknown.cut, [STEPS_UNFOLLOWED]);
+        assert_eq!(
+            stale.partway_blocked().as_deref(),
+            Some(
+                "The check does not follow the stock cut by the steps taken as cut, so it cannot tell the surface they left where the stock top is touched off."
+            )
+        );
         // Starting at Pass 1, Cycle Start waits for the work zero, kept or
         // set again.
         assert!(!run.zeroed);
         assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
+    }
+
+    /// Steps of an operation after the start's taken as cut (LIO-582
+    /// review): Pocket's level 1 cut the centre Face's pass 2 would touch
+    /// off on, below pass 1's floor, which no stock the check found for the
+    /// start has. The touch-off sets no Z and the probe finds no spot,
+    /// saying why, whether the run starts at a step or at an operation.
+    #[test]
+    fn a_start_with_a_later_operations_steps_taken_as_cut_sets_no_z() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        let (whole, left) = check_steps(&doc, &mesh, 0, &[], &[]);
+        let (whole, left) = (Arc::new(whole), Arc::new(left));
+        let recheck = |run: &mut Run| {
+            let (c, l) = check_steps(&doc, &mesh, 0, &[], &run.all_cut());
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        };
+        let said = "Operations or steps after the start are taken as cut, and the check does not follow the stock they cut, so it cannot tell the surface where the stock top is touched off.";
+        let blocked = |run: &Run| {
+            assert!(run.partway());
+            let partly = run.partly().unwrap();
+            assert_eq!(partly.cut, [LATER_UNFOLLOWED]);
+            assert_eq!((partly.surface, partly.top_cut), (None, true));
+            assert!(!partly.probe_from.is_empty());
+            assert!(
+                (partly.probe_from.iter())
+                    .all(|(_, ok)| ok.as_ref().is_err_and(|e| e == LATER_UNFOLLOWED_WHY))
+            );
+            assert_eq!(run.touch_off(), None);
+            assert_eq!(run.partway_blocked().as_deref(), Some(said));
+        };
+        // At Face's pass 2, Pocket's level 1 taken as cut.
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(whole.clone(), Some(left.clone()), None);
+        run.pick(1, 0, false);
+        assert!(run.skip_steps(true));
+        recheck(&mut run);
+        run.pick(0, 1, false);
+        assert!(run.start_step());
+        recheck(&mut run);
+        assert_eq!(run.all_cut(), [(0, vec![0]), (1, vec![0])]);
+        assert_eq!(run.at_step(), Some((0, 1)));
+        blocked(&run);
+        // At Pocket, Drilling's hole 1 taken as cut.
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(whole.clone(), Some(left.clone()), None);
+        run.start_at(0, 1);
+        run.pick(2, 0, false);
+        assert!(run.skip_steps(true));
+        recheck(&mut run);
+        assert_eq!(
+            (run.next, run.from, run.all_cut()),
+            (0, 1, vec![(2, vec![0])])
+        );
+        blocked(&run);
+        // From the setup's very start, Face's pass 1, with Pocket's level 1
+        // taken as cut, or the whole Pocket skipped as cut: not partway, so
+        // Cycle Start runs on the work zero set for the setup, but the
+        // touch-off sets no Z and Zero Z says why (LIO-582 review).
+        let at_start = |run: &Run| {
+            assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
+            assert!(!run.partway() && run.later_cut());
+            assert_eq!(run.touch_off(), None);
+            assert_eq!(run.partway_blocked().as_deref(), Some(said));
+        };
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(whole.clone(), Some(left.clone()), None);
+        run.pick(1, 0, false);
+        assert!(run.skip_steps(true));
+        recheck(&mut run);
+        at_start(&run);
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(whole.clone(), Some(left.clone()), None);
+        assert!(run.skip(1, Some(Skip::Cut)));
+        let (c, l) = check_steps(&doc, &mesh, 0, &run.skips, &run.all_cut());
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        at_start(&run);
+        // With nothing after it taken as cut, the stock top as ever.
+        assert!(run.skip(1, None));
+        let (c, l) = check_steps(&doc, &mesh, 0, &run.skips, &run.all_cut());
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        assert!(!run.later_cut() && run.touch_off().is_some());
+        assert_eq!(run.partway_blocked(), None);
+        // At Face's pass 2 alone, it has pass 1's floor.
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(whole, Some(left), None);
+        run.pick(0, 1, false);
+        assert!(run.start_step());
+        recheck(&mut run);
+        assert!(run.touch_off().is_some() && run.partway_blocked().is_none());
+    }
+
+    /// A ring 24 mm across and 10 high round a 16 mm bore, written as an
+    /// STL in `dir` and loaded, with a Ø10 and a Ø2 flat end mill (LIO-582
+    /// review): the part a bore through the stock, or opened from the other
+    /// side, is cut in.
+    fn ring(dir: &std::path::Path) -> (std::path::PathBuf, Mesh, [crate::model::Tool; 2]) {
+        let tris =
+            crate::cam::tests::revolved(&[(8., 0.), (12., 0.), (12., 10.), (8., 10.), (8., 0.)]);
+        let path = dir.join("ring.stl");
+        let mut stl = String::from("solid ring\n");
+        for tri in &tris {
+            stl.push_str("facet normal 0 0 0\nouter loop\n");
+            for p in tri {
+                stl.push_str(&format!("vertex {} {} {}\n", p[0], p[1], p[2]));
+            }
+            stl.push_str("endloop\nendfacet\n");
+        }
+        stl.push_str("endsolid ring\n");
+        std::fs::write(&path, stl).unwrap();
+        let mesh = crate::mesh::load(&path).unwrap();
+        let tool = |name: &str, d: &str, n: &str| {
+            let mut t = crate::model::Tool::new(name, "Flat end mill", d);
+            for (k, v) in [("length", "40"), ("stickout", "45"), ("number", n)] {
+                t.p.insert(k.into(), v.into());
+            }
+            t
+        };
+        (
+            path,
+            mesh,
+            [tool("Mill 10", "10", "1"), tool("Mill 2", "2", "2")],
+        )
+    }
+
+    /// The ring's (`ring`) faces at the top of setup `setup`'s stock, up
+    /// (`up`) or down: what its Drill and Face operations cut.
+    fn ring_top(mesh: &Mesh, setup: &crate::model::Setup, up: bool) -> crate::surface::Selection {
+        let placement = crate::stock::Placement::new(mesh, Some(setup));
+        let z = placement.bounds.max[2];
+        let ids: Vec<usize> = (mesh.surfaces.iter().enumerate())
+            .filter(|(_, s)| {
+                (if up {
+                    s.normal[2] > 0.99
+                } else {
+                    s.normal[2] < -0.99
+                }) && (placement.transform(s.center)[2] - z).abs() < 0.01
+            })
+            .map(|(i, _)| i)
+            .collect();
+        assert!(!ids.is_empty());
+        crate::surface::Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids,
+        }
+    }
+
+    /// The ring's bore helically milled through with the Ø10 end mill,
+    /// breaking through by `breakthrough` mm.
+    fn ring_bore(
+        tool: &crate::model::Tool,
+        top: crate::surface::Selection,
+        breakthrough: &str,
+    ) -> crate::model::Operation {
+        let mut bore = crate::model::Operation::new(crate::model::Strategy::Drill, tool.id.clone());
+        bore.geometry.clear();
+        bore.surfaces = Some(top);
+        for (k, v) in [
+            ("cycle", crate::model::HELICAL_MILLING),
+            ("through", "Yes"),
+            ("breakthrough", breakthrough),
+            ("coolant", "Off"),
+            ("stepdown", "2"),
+        ] {
+            bore.p.insert(k.into(), v.into());
+        }
+        bore
+    }
+
+    /// The ring's top faced with `tool` over the stock's silhouette.
+    fn ring_face(
+        tool: &crate::model::Tool,
+        top: crate::surface::Selection,
+    ) -> crate::model::Operation {
+        let mut face = crate::model::Operation::new(crate::model::Strategy::Face, tool.id.clone());
+        face.geometry.clear();
+        face.surfaces = Some(top);
+        for (k, v) in [
+            ("boundary", "Stock silhouette"),
+            ("containment", "Tool outside boundary"),
+            ("allowance", "0"),
+            ("coolant", "Off"),
+        ] {
+            face.p.insert(k.into(), v.into());
+        }
+        face
+    }
+
+    /// A ring setup (`ring`) on the tablet fixture's machine, its stock
+    /// flush with the part but for `top` and `bottom` mm, its work zero
+    /// Stock top center.
+    fn ring_setup(doc: &Document, offset: &str, top: &str, bottom: &str) -> crate::model::Setup {
+        let mut setup = crate::model::Setup::new(doc.setups[0].machine.clone(), offset);
+        for (k, _) in crate::stock::OFFSETS {
+            setup.p.insert(k.into(), "0".into());
+        }
+        setup.p.insert("stock_top".into(), top.into());
+        setup.p.insert("stock_bottom".into(), bottom.into());
+        setup.p.insert("origin".into(), "Stock top center".into());
+        setup
+    }
+
+    /// A bore milled through the stock, then a face with another tool (LIO-582
+    /// review): a start at the face, in the second tool run, finds no floor
+    /// at the stock top's centre, where the bore went through, so neither
+    /// the Run panel nor the tablet file sets a Z there.
+    #[test]
+    fn a_start_after_a_bore_through_the_stock_has_no_floor_to_touch_off_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (mut doc, _) = tablet_fixture(&profile);
+        let (path, mesh, [mill, small]) = ring(dir.path());
+        let mut setup = ring_setup(&doc, "G54", "1", "0");
+        let top = ring_top(&mesh, &setup, true);
+        setup.operations = vec![ring_bore(&mill, top.clone(), "1"), ring_face(&small, top)];
+        doc.active = setup.id.clone();
+        doc.setups = vec![setup];
+        doc.tools = vec![mill, small];
+        if let Some(f) = &mut doc.file {
+            (f.path, f.name, f.format) = (path, "ring.stl".into(), "stl".into());
+        }
+        let (programs, left) = check(&doc, &mesh, 0);
+        let programs = programs.unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(programs.len(), 2);
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(Arc::new(Ok(programs)), Some(Arc::new(left)), None);
+        run.start_at(1, 0);
+        assert!(run.partway());
+        let partly = run.partly().unwrap();
+        assert!(partly.top_cut && !partly.cut.is_empty(), "{partly:?}");
+        assert_eq!(partly.surface, None);
+        assert_eq!(run.touch_off(), None);
+        assert!(run.partway_blocked().is_some());
+        let s = tablet_runs(&doc, Ok(&mesh), 0);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let zero = s.tool_runs[1].zero.as_ref().unwrap();
+        assert_eq!(zero.set_z, None);
+        assert_eq!(zero.blocked, run.partway_blocked());
+    }
+
+    /// A 200 mm disk 10 high with a Ø1 blind bore 2 mm deep at its centre,
+    /// its stock 2.02 mm wider to +X, so the bore lies 1 mm off the stock's
+    /// centre and between the points its centre's probe spot is sampled at,
+    /// on the tablet fixture's machine (in `dir`): the bore milled with a
+    /// Ø0.5 end mill, then the top faced with a Ø10, in two tool runs; work
+    /// zero Stock top center (LIO-582 review).
+    pub(crate) fn small_bore_job(dir: &std::path::Path) -> (Document, Mesh) {
+        let profile = dir.join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (mut doc, _) = tablet_fixture(&profile);
+        let tris = crate::cam::tests::revolved(&[
+            (0., 0.),
+            (100., 0.),
+            (100., 10.),
+            (0.5, 10.),
+            (0.5, 8.),
+            (0., 8.),
+            (0., 0.),
+        ]);
+        let path = dir.join("disk.stl");
+        let mut stl = String::from("solid disk\n");
+        for tri in &tris {
+            stl.push_str("facet normal 0 0 0\nouter loop\n");
+            for p in tri {
+                stl.push_str(&format!("vertex {} {} {}\n", p[0], p[1], p[2]));
+            }
+            stl.push_str("endloop\nendfacet\n");
+        }
+        stl.push_str("endsolid disk\n");
+        std::fs::write(&path, stl).unwrap();
+        let mesh = crate::mesh::load(&path).unwrap();
+        let tool = |name: &str, d: &str, n: &str| {
+            let mut t = crate::model::Tool::new(name, "Flat end mill", d);
+            for (k, v) in [("length", "40"), ("stickout", "45"), ("number", n)] {
+                t.p.insert(k.into(), v.into());
+            }
+            t
+        };
+        let (small, large) = (tool("Mill 0.5", "0.5", "1"), tool("Mill 10", "10", "2"));
+        let mut setup = ring_setup(&doc, "G54", "1", "0");
+        setup.p.insert("stock_right".into(), "2.02".into());
+        let top = ring_top(&mesh, &setup, true);
+        let mut bore = ring_bore(&small, top.clone(), "0");
+        for (k, v) in [("through", "No"), ("allowance", "0"), ("stepdown", "1")] {
+            bore.p.insert(k.into(), v.into());
+        }
+        let mut face = ring_face(&large, top);
+        face.p.insert("stepover".into(), "90".into());
+        setup.operations = vec![bore, face];
+        doc.active = setup.id.clone();
+        doc.setups = vec![setup];
+        doc.tools = vec![small, large];
+        if let Some(f) = &mut doc.file {
+            (f.path, f.name, f.format) = (path, "disk.stl".into(), "stl".into());
+        }
+        (doc, mesh)
+    }
+
+    /// A Ø1 blind bore 2 mm deep, 1 mm off the centre of a 200 mm disk's
+    /// stock, then a face with a Ø10 end mill (LIO-582 review): a start at
+    /// the face, the next tool run, finds the centre's probe spot not
+    /// proven uncut, though no point it is sampled at lies in the bore, so
+    /// neither the Run panel nor the tablet file offers it.
+    #[test]
+    fn a_start_after_a_small_bore_offers_no_probe_spot_over_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (doc, mesh) = small_bore_job(dir.path());
+        let (programs, left) = check(&doc, &mesh, 0);
+        let programs = programs.unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(programs.len(), 2);
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(Arc::new(Ok(programs)), Some(Arc::new(left)), None);
+        run.start_at(1, 0);
+        assert!(run.partway());
+        let partly = run.partly().unwrap();
+        let centre = |spots: &[([crate::post::At; 2], Result<(), String>)]| {
+            let (_, ok) = (spots.iter())
+                .find(|(r, _)| *r == [crate::post::At::Mid; 2])
+                .unwrap();
+            ok.clone()
+        };
+        let why = centre(&partly.probe_from).unwrap_err();
+        assert!(
+            why.contains("may have cut the stock's top face at its centre"),
+            "{why}"
+        );
+        // Not every spot: the corners, far from the bore, stay.
+        assert!((partly.probe_from.iter()).any(|(_, ok)| ok.is_ok()));
+        let s = tablet_runs(&doc, Ok(&mesh), 0);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let zero = s.tool_runs[1].zero.as_ref().unwrap();
+        let spot = (zero.probe_from.iter())
+            .find(|t| (t.x, t.y) == (crate::post::At::Mid, crate::post::At::Mid))
+            .unwrap();
+        assert_eq!(spot.problem.as_deref(), Some(why.as_str()));
+    }
+
+    /// A bore milled from one side leaving a 0.5 mm roof, then the stock
+    /// turned over and the roof faced away (LIO-582 review): the face opens
+    /// the bore from above, so a start at the face's level 2 or at the next
+    /// tool run finds no stock under the floor the face leaves at the
+    /// centre, and neither the Run panel nor the tablet file sets a Z there.
+    #[test]
+    fn a_start_after_opening_a_bore_an_earlier_setup_cut_has_no_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (mut doc, _) = tablet_fixture(&profile);
+        let (path, mesh, [mill, small]) = ring(dir.path());
+        let mut first = ring_setup(&doc, "G54", "1", "1");
+        let top = ring_top(&mesh, &first, true);
+        first.operations = vec![ring_bore(&mill, top, "0.5")];
+        let mut flipped = ring_setup(&doc, "G55", "1", "1");
+        flipped.p.insert("rx".into(), "180".into());
+        let top = ring_top(&mesh, &flipped, false);
+        let mut opening = ring_face(&mill, top.clone());
+        opening.p.insert("stepdown".into(), "0.6".into());
+        flipped.operations = vec![opening, ring_face(&small, top)];
+        doc.active = flipped.id.clone();
+        doc.setups = vec![first, flipped];
+        doc.tools = vec![mill, small];
+        if let Some(f) = &mut doc.file {
+            (f.path, f.name, f.format) = (path, "ring.stl".into(), "stl".into());
+        }
+        let (programs, left) = check(&doc, &mesh, 1);
+        let programs = programs.unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(programs.len(), 2);
+        let (whole, left) = (Arc::new(Ok(programs)), Arc::new(left));
+        // The face opens it at its second level: there is one to start at.
+        let face = left.steps.iter().find(|s| s.op == 0).unwrap();
+        assert!(face.steps.len() >= 2, "{}", face.steps.len());
+        let blocked = |run: &Run| {
+            assert!(run.partway());
+            assert_eq!(run.partly().unwrap().surface, None);
+            assert_eq!(run.touch_off(), None);
+            run.partway_blocked().unwrap()
+        };
+        let mut run = Run::new(&doc, 1, 0);
+        run.checked_as(whole.clone(), Some(left.clone()), None);
+        run.start_at(1, 0);
+        let at_op = blocked(&run);
+        let mut run = Run::new(&doc, 1, 0);
+        run.checked_as(whole, Some(left), None);
+        assert!(run.start_at_step(0, 1));
+        let (c, l) = check_steps(&doc, &mesh, 1, &[], &[(0, vec![0])]);
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        assert_eq!(run.at_step(), Some((0, 1)));
+        let at_step = blocked(&run);
+        let s = tablet_runs(&doc, Ok(&mesh), 1);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let zero = s.tool_runs[1].zero.as_ref().unwrap();
+        assert_eq!((zero.set_z, zero.blocked.as_ref()), (None, Some(&at_op)));
+        let step = (s.tool_runs[0].step_starts.iter())
+            .find(|t| (t.operation, t.step) == (0, 1))
+            .unwrap();
+        let zero = step.zero.as_ref().unwrap();
+        assert_eq!((zero.set_z, zero.blocked.as_ref()), (None, Some(&at_step)));
+    }
+
+    /// What this run's tool runs cut (`cut_in_run`, LIO-582 review): Face
+    /// done and the Pocket stopped after its level 2. The start at level 3,
+    /// where the stop leaves Cycle Start, goes by the stock the check
+    /// carves; one at level 2 or the Pocket's start, before what was cut,
+    /// and the Face's, give no Z; the Drilling's, after it all, does, until
+    /// the Face is disabled or its plan changed.
+    #[test]
+    fn a_start_before_what_the_run_cut_sets_no_z() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        let (whole, left) = check_steps(&doc, &mesh, 0, &[], &[]);
+        let (whole, left) = (Arc::new(whole), Arc::new(left));
+        let at = |oi: usize, n: usize| {
+            let mut run = Run::new(&doc, 0, 0);
+            run.checked_as(whole.clone(), Some(left.clone()), None);
+            run.note_cut(0, None);
+            run.note_cut(1, Some(2));
+            run.note_cut(1, Some(1));
+            let print = |oi: usize| run.op_steps(oi).map(|s| s.cut_print);
+            assert_eq!(
+                run.cut_in_run,
+                [(0, None, print(0)), (1, Some(2), print(1))]
+            );
+            assert!(print(0).is_some() && print(1).is_some());
+            if n > 0 {
+                assert!(run.start_at_step(oi, n));
+                let (c, l) = check_steps(&doc, &mesh, 0, &[], &[(oi, (0..n).collect())]);
+                run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+                assert_eq!(run.at_step(), Some((oi, n)));
+            } else {
+                let i = (run.checked().unwrap().iter())
+                    .position(|p| p.indexes.contains(&oi))
+                    .unwrap();
+                let k = run.checked().unwrap()[i]
+                    .indexes
+                    .iter()
+                    .position(|&o| o == oi);
+                run.start_at(i, k.unwrap());
+            }
+            run
+        };
+        let cut = |run: &Run| run.partly().is_some_and(|p| p.cut == [RUN_UNFOLLOWED]);
+        // The Pocket's levels have no Z on this fixture anyway (stock
+        // beside the floor): what matters is it is the check's stock.
+        assert_eq!(at(1, 2).partly().map(|p| p.steps.clone()), Some(vec![0, 1]));
+        assert!(cut(&at(1, 1)) && at(1, 1).touch_off().is_none());
+        assert!(cut(&at(1, 0)) && cut(&at(0, 0)));
+        assert!(!cut(&at(2, 0)) && at(2, 0).touch_off().is_some());
+        // The Face, cut, then disabled or changed, and the setup checked
+        // again: its stock lacks what the Face cut, so the Drilling's start
+        // gives no Z either (LIO-582 review).
+        let edited = |edit: &dyn Fn(&mut crate::model::Operation)| {
+            let mut run = at(2, 0);
+            let mut doc = doc.clone();
+            edit(&mut doc.setups[0].operations[0]);
+            let (c, l) = check_steps(&doc, &mesh, 0, &[], &[]);
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            assert_eq!(
+                run.checked().unwrap().iter().flat_map(|p| &p.indexes).max(),
+                Some(&2)
+            );
+            run
+        };
+        let off = edited(&|o| o.enabled = false);
+        assert!(cut(&off) && off.touch_off().is_none());
+        let deeper = edited(&|o| {
+            let z = crate::model::get(&o.p, "stepdown")
+                .parse::<f32>()
+                .unwrap_or(2.);
+            o.p.insert("stepdown".into(), (z / 2.).to_string());
+        });
+        assert!(cut(&deeper) && deeper.touch_off().is_none());
+        assert!(!cut(&edited(&|_| {})));
+    }
+
+    /// A plan's moves cut with another cutter, or at another A, cut other
+    /// stock: the journal's fingerprint is the same, the cut print is not
+    /// (LIO-582 review: a drill saved at Ø1 after cutting at Ø8).
+    #[test]
+    fn the_cut_print_follows_the_cutter_and_a() {
+        use crate::simulation::CutterShape;
+        let plan = fixture::plan([0., 0., 15.], &[(Motion::Feed, [0., 0., -5.], 100.)]);
+        let same = |p: &crate::simulation::Plan| {
+            (
+                fingerprint(p, "t1") == fingerprint(&plan, "t1"),
+                cut_print(p, "t1") == cut_print(&plan, "t1"),
+            )
+        };
+        assert_eq!(same(&plan.clone()), (true, true));
+        let mut smaller = plan.clone();
+        smaller.radius /= 8.;
+        assert_eq!(same(&smaller), (true, false));
+        let mut drill = plan.clone();
+        drill.shape = CutterShape::Drill;
+        assert_eq!(same(&drill), (true, false));
+        let mut shorter = plan.clone();
+        shorter.flute_length /= 2.;
+        assert_eq!(same(&shorter), (true, false));
+        let mut turned = plan.clone();
+        turned.moves[0].a = Some(90.);
+        assert_eq!(same(&turned), (true, false));
+        assert_ne!(cut_print(&plan, "t2"), cut_print(&plan, "t1"));
+    }
+
+    /// A Ø8 hole drilled 3 mm from the stock's centre, cut in this run, then
+    /// the drill saved at Ø1 and the setup checked again (LIO-582 review):
+    /// its moves and tool are the same, so the journal's fingerprint is, but
+    /// the check's Ø1 hole is not the one cut, and the start at the face
+    /// that follows gives no Z.
+    #[test]
+    fn a_start_after_a_cut_whose_tool_changed_since_sets_no_z() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (mut doc, _) = tablet_fixture(&profile);
+        let (path, mesh, [mut drill, small]) = ring(dir.path());
+        drill.p.insert("type".into(), "Drill".into());
+        drill.p.insert("diameter".into(), "8".into());
+        let mut setup = ring_setup(&doc, "G54", "1", "0");
+        setup.p.insert("stock_right".into(), "6".into());
+        let top = ring_top(&mesh, &setup, true);
+        let mut bore = ring_bore(&drill, top.clone(), "4");
+        bore.p.insert("cycle".into(), "Drilling".into());
+        setup.operations = vec![bore, ring_face(&small, top)];
+        doc.active = setup.id.clone();
+        doc.setups = vec![setup];
+        doc.tools = vec![drill, small];
+        if let Some(f) = &mut doc.file {
+            (f.path, f.name, f.format) = (path, "ring.stl".into(), "stl".into());
+        }
+        let check_at_face = |doc: &Document, run: &mut Run| {
+            let (c, l) = check(doc, &mesh, 0);
+            assert!(c.is_ok(), "{c:?}");
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            run.start_at(1, 0);
+        };
+        let mut run = Run::new(&doc, 0, 0);
+        check_at_face(&doc, &mut run);
+        run.note_cut(0, None);
+        let print = run.op_steps(0).unwrap().fingerprint;
+        assert!(run.partly().is_some_and(|p| p.cut != [RUN_UNFOLLOWED]));
+        doc.tools[0].p.insert("diameter".into(), "1".into());
+        check_at_face(&doc, &mut run);
+        assert_eq!(run.op_steps(0).unwrap().fingerprint, print);
+        assert!(run.partly().is_some_and(|p| p.cut == [RUN_UNFOLLOWED]));
+        assert!(run.touch_off().is_none());
+        let why = run.partway_blocked().unwrap();
+        assert!(
+            why.starts_with("This run's tool runs have cut the stock since"),
+            "{why}"
+        );
+    }
+
+    /// Setup 1 bores the ring from below, leaving a 0.5 mm roof, cut in a
+    /// run this session; setup 2, flipped, faces the roof away (LIO-582
+    /// review). While setup 1's bore is checked as it was cut, setup 2's
+    /// start at its Face's level 2 sees it; disabled since, or its drill
+    /// changed, setup 2's check no longer has it, and no start of setup 2
+    /// touches off or probes. New stock loaded forgets it, here and in the
+    /// session's record.
+    #[test]
+    fn an_earlier_setups_cut_disabled_since_blocks_a_later_setups_touch_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (mut doc, _) = tablet_fixture(&profile);
+        let (path, mesh, [mill, small]) = ring(dir.path());
+        let mut first = ring_setup(&doc, "G54", "1", "1");
+        let top = ring_top(&mesh, &first, true);
+        first.operations = vec![ring_bore(&mill, top, "0.5")];
+        let mut flipped = ring_setup(&doc, "G55", "1", "1");
+        flipped.p.insert("rx".into(), "180".into());
+        let top = ring_top(&mesh, &flipped, false);
+        let mut opening = ring_face(&mill, top.clone());
+        opening.p.insert("stepdown".into(), "0.6".into());
+        flipped.operations = vec![opening, ring_face(&small, top)];
+        doc.active = flipped.id.clone();
+        doc.setups = vec![first, flipped];
+        doc.tools = vec![mill, small];
+        if let Some(f) = &mut doc.file {
+            (f.path, f.name, f.format) = (path, "ring.stl".into(), "stl".into());
+        }
+        // Setup 1's run cut its bore: its print as the check has it now.
+        let (c, l) = check(&doc, &mesh, 0);
+        let mut one = Run::new(&doc, 0, 0);
+        one.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        one.note_cut(0, None);
+        let session = vec![(doc.setups[0].id.clone(), one.cut_in_run.clone())];
+        let at_level_2 = |doc: &Document| {
+            // The flipped setup, wherever it is now.
+            let si = (doc.setups.iter()).position(|s| s.p.get("rx").is_some_and(|r| r == "180"));
+            let si = si.unwrap();
+            let mut run = Run::new(doc, si, 0);
+            crate::give_earlier_cuts(&session, &mut run);
+            let (c, l) = check(doc, &mesh, si);
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            let level_2 = run.op_steps(0).is_some_and(|s| s.steps.len() >= 2);
+            assert!(level_2 && run.start_at_step(0, 1));
+            let (c, l) = check_steps(doc, &mesh, si, &[], &[(0, vec![0])]);
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            assert_eq!(run.at_step(), Some((0, 1)));
+            run
+        };
+        let unfollowed = |run: &Run| run.partly().is_some_and(|p| p.cut == [EARLIER_UNFOLLOWED]);
+        // As it was cut: setup 2's check has the bore (and blocks the
+        // floor over it, as before).
+        let run = at_level_2(&doc);
+        assert_eq!(run.earlier_cuts, session);
+        assert!(!run.earlier_unfollowed() && !unfollowed(&run));
+        assert!(run.touch_off().is_none());
+        // Disabled since, drilled with a smaller tool, its setup deleted
+        // or moved after the flipped one: not the stock's.
+        let mut off = doc.clone();
+        off.setups[0].operations[0].enabled = false;
+        let mut smaller = doc.clone();
+        smaller.tools[0].p.insert("diameter".into(), "4".into());
+        let mut deleted = doc.clone();
+        deleted.remove_setup(0).unwrap();
+        let mut moved = doc.clone();
+        moved.move_setup(0, 1).unwrap();
+        assert!(moved.setups[1].id == doc.setups[0].id);
+        for edited in [off, smaller, deleted, moved] {
+            let mut run = at_level_2(&edited);
+            assert!(run.earlier_unfollowed() && unfollowed(&run));
+            assert!(run.touch_off().is_none());
+            let why = run.partway_blocked().unwrap();
+            assert!(
+                why.starts_with("Another setup's run cut this part"),
+                "{why}"
+            );
+            // From setup 2's start too.
+            run.start_at(0, 0);
+            assert!(run.on_cut_stock() && unfollowed(&run) && run.touch_off().is_none());
+            // New stock loaded: forgotten, in the session's record too.
+            run.earlier_cuts.clear();
+            let mut kept = session.clone();
+            crate::keep_run_cuts(&mut kept, &run);
+            assert!(kept.is_empty(), "{kept:?}");
+            assert!(!run.earlier_unfollowed());
+        }
     }
 
     /// The journal of where a run stopped (LIO-275) is written and read
@@ -8266,6 +9362,7 @@ pub(crate) mod tests {
                     hole: false,
                     steps: vec![step; 3],
                     fingerprint,
+                    cut_print: fingerprint,
                 }],
                 ..Default::default()
             }
