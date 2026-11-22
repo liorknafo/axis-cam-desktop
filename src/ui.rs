@@ -13180,6 +13180,20 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     });
     let checks = fits_check(c);
     let blocked = c.partway_blocked();
+    // Step 3 says why Z cannot be touched off. A probe that cannot find the
+    // zero at its own spot for the cut that stops it is said there too, not
+    // again on a line of its own (LIO-593): off with no spot under Probe
+    // from left either.
+    let probes = c.config.inputs.probe.is_some() && p.pins.is_none();
+    let same = (probes && blocked.is_some())
+        .then(|| c.cut_probe_blocked())
+        .flatten();
+    let also_off = match (&same, &p.probe) {
+        (Some(_), Ok(refs)) if c.probe_spots().iter().all(|(_, ok)| ok.is_err()) => {
+            Some(crate::control::probe_name(*refs))
+        }
+        _ => None,
+    };
     if let Some(on) = &p.pins {
         steps.truncate(1);
         steps.extend(pin_steps(c, p, on));
@@ -13191,7 +13205,8 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
         }
     } else if let Some(why) = &blocked {
         steps.push(format!(
-            "3. {why} Zero Z on the stock top and Probe Z are off: set Z by hand on a surface whose height you know (Set under Work zero), or from a recorded reference (Set Z from reference)."
+            "3. {why} Zero Z on the stock top and Probe Z are off{}: set Z by hand on a surface whose height you know (Set under Work zero), or from a recorded reference (Set Z from reference).",
+            also_off.map_or_else(String::new, |name| format!(", and so is {name}"))
         ));
     } else if let (true, Some((_, work)), Some(refs)) = (
         run.partway(),
@@ -13245,7 +13260,7 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
             }
         }
     }
-    if c.config.inputs.probe.is_some() && p.pins.is_none() {
+    if probes && also_off.is_none() {
         // On stock that does not conduct the probe touches only the plate:
         // Probe Z sets Z, and X and Y are zeroed by hand.
         let probe_z = |top: f64| {
@@ -13260,6 +13275,12 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
             )
         };
         steps.push(match (c.edges_setup(), c.stock_top()) {
+            // Step 3 sets Z by hand alone, and there is no 4 (LIO-593
+            // review): the probe touches the stock where the check knows it.
+            (Ok((refs, _)), _) if c.sides_blocked().is_none() && blocked.is_some() => format!(
+                "Or, with the plate's lead on the stock and the clip on the tool, {} in the Probe tab sets the work zero, Z too, where it touches the stock.",
+                crate::control::probe_name(refs)
+            ),
             (Ok((refs, _)), _) if c.sides_blocked().is_none() => format!(
                 "With the plate's lead on the stock and the clip on the tool, {} in the Probe tab does 3 and 4.",
                 crate::control::probe_name(refs)
@@ -13268,6 +13289,27 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
                 format!("{} {}", c.sides_blocked().unwrap_or_default(), probe_z(top))
             }
             (Err(why), Ok(top)) => format!("{why} {}", probe_z(top)),
+            // Step 3 says that Probe Z is off, and why (LIO-593): what stops
+            // the setup's probe alone, without the touch plate's Probe Z
+            // `sides_blocked` offers (LIO-593 review).
+            (Ok((refs, _)), Err(_)) if blocked.is_some() => {
+                let name = crate::control::probe_name(refs);
+                match &c.material {
+                    Some((m, _)) => format!(
+                        "{m} does not conduct, so {name} cannot touch the stock either."
+                    ),
+                    None => format!(
+                        "The project has no material: choose a metal one for {name} to touch the stock."
+                    ),
+                }
+            }
+            (Err(_), Err(_)) if same.is_some() => match &p.probe {
+                Ok(refs) => format!(
+                    "{} cannot probe from its own spot for that reason either: pick a spot under Probe from in the Probe tab that a probe can reach.",
+                    crate::control::probe_name(*refs)
+                ),
+                Err(why) => why.clone(),
+            },
             (Err(why), Err(_)) | (Ok(_), Err(why)) => why,
         });
     }
