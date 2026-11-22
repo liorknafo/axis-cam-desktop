@@ -2286,13 +2286,30 @@ impl Run {
                     crate::model::tool_label(first.tool, &first.tool_name)
                 ));
             }
-        } else if self.partway() {
+        } else if self.partway() || self.later_cut() {
+            // Operations or steps after the start taken as cut wait for the
+            // work zero too once a tool run of this run has started: each new
+            // check of them asks again (LIO-583 review).
+            let later = self.later_cut();
             match self.partly() {
-                None => e.push(format!("The check did not work out the stock operation {}, {}, starts from: pick its first operation, or check the setup again.", from + 1, first.name)),
-                Some(_) if !self.zeroed => {
+                None if !later => e.push(format!("The check did not work out the stock operation {}, {}, starts from: pick its first operation, or check the setup again.", from + 1, first.name)),
+                _ if self.zeroed => {}
+                _ => {
                     let oi = p.indexes.get(from).copied();
                     let steps: Vec<usize> = oi.map_or_else(Vec::new, |oi| self.cut_of(oi));
+                    let after: Vec<String> = (self.cut_named().into_iter())
+                        .filter(|c| oi.is_some_and(|o| c.0 > o))
+                        .map(|c| c.1)
+                        .collect();
                     e.push(match (oi, &steps[..]) {
+                        // Nothing sets Z on the stock they left but a hand
+                        // that knows its height, and Keep this work zero
+                        // says so (`later_cut`, LIO-583).
+                        _ if later => format!(
+                            "This run starts at {}, with {} after it taken as cut, and the check cannot tell the surface they left where the work zero is touched off: in the Work zero tab, set Z by hand on a surface whose height you know and press Keep this work zero, or press it if the work zero is still the one they were cut with.",
+                            first.name,
+                            after.join(", ")
+                        ),
                         (Some(oi), [first_step, ..]) => format!(
                             "This run starts at {}, with {} of it taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with.",
                             first.name,
@@ -2302,20 +2319,12 @@ impl Run {
                                 format!("{} of its steps", steps.len())
                             }
                         ),
-                        // Partway only by operations or steps after it taken
-                        // as cut: it starts at the setup's start (LIO-583).
-                        (Some(oi), []) if self.cut_named().iter().all(|c| c.0 > oi) => format!(
-                            "This run starts at {}, with {} after it taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with.",
-                            first.name,
-                            self.taken_as_cut().join(", ")
-                        ),
                         _ => format!(
                             "This run starts at {}, after operations taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with.",
                             first.name
                         ),
                     });
                 }
-                Some(_) => {}
             }
         }
         if !c.idle() {

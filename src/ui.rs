@@ -11844,7 +11844,9 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
             ),
         });
         let stock = stock_question(c, run);
-        if run.partway() {
+        // Asked for by operations or steps after the start taken as cut once
+        // a tool run has started too (LIO-583 review).
+        if run.partway() || run.later_cut() {
             buttons = buttons.push(small(
                 "Keep this work zero",
                 (checked.is_ok() && !run.zeroed && !running).then_some(Message::Run(R::KeepZero)),

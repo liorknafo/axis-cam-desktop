@@ -4042,7 +4042,11 @@ impl Connection {
             // A probe under way sets the work zero for the start it began with.
             R::Next(i) if i < run.done.len() && !self.probing() => run.start_at(i, 0),
             R::From(i, k) if !self.probing() => run.start_at(i, k),
-            R::KeepZero if run.running.is_none() && run.partway() => run.zeroed = true,
+            // Operations or steps after the start taken as cut ask for it once
+            // a tool run has started too (LIO-583 review).
+            R::KeepZero if run.running.is_none() && (run.partway() || run.later_cut()) => {
+                run.zeroed = true
+            }
             // Nothing else ran meanwhile: not while the Pi shows a tool run
             // this computer did not send (LIO-595).
             R::SamePart if run.running.is_none() && self.same_part_refused_for(&run).is_none() => {

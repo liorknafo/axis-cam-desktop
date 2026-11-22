@@ -2806,7 +2806,7 @@ flood = { pin = 8 }
         assert_eq!(run.taken_as_cut(), ["Pocket"]);
         assert_eq!(
             problems(&a),
-            ["This run starts at Face, with Pocket after it taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with."]
+            ["This run starts at Face, with Pocket after it taken as cut, and the check cannot tell the surface they left where the work zero is touched off: in the Work zero tab, set Z by hand on a surface whose height you know and press Keep this work zero, or press it if the work zero is still the one they were cut with."]
         );
         let _ = a.update(Message::Run(R::KeepZero));
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
@@ -2867,6 +2867,26 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::More(Some(3))));
         assert_eq!(run_of(&a).menu, Some(3));
         assert!(skip(&mut a, 3, Some(Cut)));
+        // The Drill taken as cut after a tool run of the run started: not
+        // partway, but Cycle Start waits for the work zero it was drilled
+        // with all the same, kept here (LIO-583 review).
+        let run = run_of(&a);
+        assert!(run.started() && !run.partway() && run.later_cut() && !run.zeroed);
+        let drill = a.doc.setups[0].operations[3].name();
+        let waits = |a: &App| {
+            problems(a).into_iter().find(|p| p.contains("after it taken as cut"))
+        };
+        assert_eq!(
+            waits(&a),
+            Some(format!(
+                "This run starts at {}, with {drill} after it taken as cut, and the check cannot tell the surface they left where the work zero is touched off: in the Work zero tab, set Z by hand on a surface whose height you know and press Keep this work zero, or press it if the work zero is still the one they were cut with.",
+                a.doc.setups[0].operations[0].name()
+            )),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(run_of(&a).zeroed && waits(&a).is_none(), "{:?}", problems(&a));
         a.touch();
         assert!(run_of(&a).skips.is_empty() && run_of(&a).stale);
     }
@@ -11278,7 +11298,7 @@ flood = { pin = 8 }
         assert_eq!(run_of(&a).taken_as_cut(), std::slice::from_ref(&hole));
         let face = &run_of(&a).checked().unwrap()[0].ops[0].name;
         let waits = format!(
-            "This run starts at {face}, with {hole} after it taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with."
+            "This run starts at {face}, with {hole} after it taken as cut, and the check cannot tell the surface they left where the work zero is touched off: in the Work zero tab, set Z by hand on a surface whose height you know and press Keep this work zero, or press it if the work zero is still the one they were cut with."
         );
         assert!(problems(&a).contains(&waits), "{:?}", problems(&a));
         let steps = crate::ui::work_zero_steps(&a, conn(&a)).unwrap().join("\n");
@@ -11294,6 +11314,13 @@ flood = { pin = 8 }
         tick_for(&mut a, 100);
         assert_eq!(conn(&a).snapshot.work_offset, offset);
         assert!(problems(&a).contains(&waits));
+        // Z set by hand is the operator's to vouch for, as for any partway
+        // start: Cycle Start waits on until Keep this work zero says so.
+        let _ = a.update(Message::Machine(crate::control::Action::WorkText(2, "-6".into())));
+        let _ = a.update(Message::Machine(crate::control::Action::WorkSet(2)));
+        tick_for(&mut a, 100);
+        assert!(run_of(&a).touched && !run_of(&a).zeroed);
+        assert!(problems(&a).contains(&waits));
         let _ = a.update(Message::Run(R::KeepZero));
         assert!(run_of(&a).zeroed);
         assert!(
@@ -11308,7 +11335,12 @@ flood = { pin = 8 }
         answer_skips(&mut a, 0);
         assert!(run_of(&a).all_cut().is_empty());
         assert!(!run_of(&a).partway() && conn(&a).touch_off().is_some());
-        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Only the soft limits Z set by hand to -6 above moved are said.
+        assert!(
+            !problems(&a).iter().any(|p| p.contains("taken as cut")),
+            "{:?}",
+            problems(&a)
+        );
     }
 
     /// LIO-593: with operations after the start taken as cut, the Work zero
