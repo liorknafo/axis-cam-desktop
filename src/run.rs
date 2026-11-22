@@ -3100,14 +3100,10 @@ impl Run {
         if self.start_step == start && self.at_step() == start && start.is_some() {
             return false;
         }
-        // The steps it starts after are taken as cut by the start, not
-        // skipped: a skip of them is dropped.
-        for c in &mut self.cut_steps {
-            if c.0 == oi {
-                c.1.retain(|&s| s >= n);
-            }
-        }
-        self.cut_steps.retain(|c| !c.1.is_empty());
+        // The steps it starts after are taken as cut by the start too; a
+        // skip of one is kept all the same, the operator's word that it was
+        // cut, which a start picked elsewhere later must not forget
+        // (LIO-583 review). `step_stages` shows it as before the start.
         // Done in this run, its tool run is cut again from that step.
         let done: Vec<usize> = done.into_iter().filter(|&o| o < oi).collect();
         self.start_step = start;
@@ -3457,8 +3453,9 @@ impl Run {
             (0..os.steps.len()).find(|s| !skipped.contains(s) && start.is_none_or(|n| *s >= n));
         (0..os.steps.len())
             .map(|s| match stage {
-                _ if skipped.contains(&s) => StepStage::Cut,
+                // Before a start at a step, skipped or not (LIO-583 review).
                 _ if start.is_some_and(|n| s < n) => StepStage::Before,
+                _ if skipped.contains(&s) => StepStage::Cut,
                 Stage::Done => StepStage::Done,
                 Stage::Skipped => StepStage::Before,
                 Stage::Cutting => match now {
@@ -9267,6 +9264,23 @@ pub(crate) mod tests {
         assert!(!run.later_cut() && !run.partway() && run.touch_off().is_some());
         assert_eq!(run.partway_blocked(), None);
         assert!(run.taken_as_cut().is_empty());
+        // Pocket's level 1 taken as cut, a start at its level 2, then Face's
+        // Start here: the skip outlives the start at a step, so the run from
+        // the setup's start still has Pocket's level 1 taken as cut and
+        // waits, setting no Z (LIO-583 review).
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(whole.clone(), Some(left.clone()), None);
+        run.pick(1, 0, false);
+        assert!(run.skip_steps(true));
+        recheck(&mut run);
+        assert!(run.start_at_step(1, 1));
+        recheck(&mut run);
+        assert_eq!((run.at_step(), run.all_cut()), (Some((1, 1)), vec![(1, vec![0])]));
+        run.start_at(0, 0);
+        recheck(&mut run);
+        assert_eq!((run.start_step, run.all_cut()), (None, vec![(1, vec![0])]));
+        assert!(run.asks_zero() && !run.zeroed);
+        at_start(&run, &format!("Pocket {pocket}"));
         // At Face's pass 2 alone, it has pass 1's floor.
         let mut run = Run::new(&doc, 0, 0);
         run.checked_as(whole, Some(left), None);

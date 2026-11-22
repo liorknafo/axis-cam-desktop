@@ -2949,14 +2949,16 @@ flood = { pin = 8 }
         );
         assert_eq!((run_of(&a).next, run_of(&a).from), (0, 0));
         // Start at hole 3: the Drill's tool run is next, from there; the
-        // holes before it are taken as cut by the start, the skip of hole 2
-        // with them.
+        // holes before it are taken as cut by the start, hole 2 shown with
+        // them, its skip kept for a start picked elsewhere later (LIO-583
+        // review).
         let _ = a.update(Message::Run(R::PickStep(1, 2)));
         let _ = a.update(Message::Run(R::StartStep));
         answer_skips(&mut a, 0);
         let run = run_of(&a);
         assert_eq!((run.next, run.at_step()), (1, Some((1, 2))));
-        assert!(run.cut_steps.is_empty());
+        assert_eq!(run.cut_steps, [(1, vec![1])]);
+        assert_eq!(run.all_cut(), [(1, vec![0, 1])]);
         assert_eq!(
             run.step_stages(1, Stage::Next, None)[..3],
             [S::Before, S::Before, S::Next]
