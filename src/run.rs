@@ -364,6 +364,11 @@ const RUN_UNFOLLOWED_WHY: &str = "This run's tool runs have cut the stock since,
 /// `RUN_UNFOLLOWED` cut (`Run::partway_blocked`).
 const RUN_UNFOLLOWED_BLOCKED: &str = "This run's tool runs have cut the stock since, and the check does not follow what they cut, so it cannot tell the surface where the stock top is touched off.";
 
+/// What a start at a step whose stock's surface the check cannot tell
+/// (`Run::partway_blocked`) does for its work zero: kept, or Z set by hand
+/// (LIO-586 review).
+pub(crate) const STEP_ZERO_BY_HAND: &str = "keep the work zero they were cut with (Keep it, under Start at a step), or set Z by hand on a surface whose height you know (Set under Work zero)";
+
 /// Why Zero Z on the stock top and Probe Z cannot set Z for a run from the
 /// setup's start (`Run::inherited_unknown`).
 const INHERITED_UNKNOWN: &str = "Earlier setups may have cut the stock under the stock top where it is touched off, so the check cannot tell its surface there.";
@@ -1538,8 +1543,13 @@ impl Run {
     /// job the driver refused ("not started": sent while it re-anchored its
     /// position after a work zero, say) never ran, so the start is undone:
     /// the work zero is not kept from it, and the first tool run's work-zero
-    /// steps stay (#168).
-    pub fn refresh(&mut self, outcome: Option<&uc100::controller::ProgramOutcome>) {
+    /// steps stay (#168). `at`: the machine position the snapshot with the
+    /// outcome gives, where the tool stopped (`reach`).
+    pub fn refresh(
+        &mut self,
+        outcome: Option<&uc100::controller::ProgramOutcome>,
+        at: Option<&[f64; 6]>,
+    ) {
         let (Some(r), Some(o)) = (&self.running, outcome) else {
             return;
         };
@@ -1567,10 +1577,13 @@ impl Run {
             vec![]
         } else if let Some((op, s)) = stopping {
             up_to(op, s + 1)
-        } else if let Some(at) = self.stopped_in("") {
-            // In a step: it may be cut in part.
-            up_to(at.op, at.last.map_or(1, |l| l + 2))
+        } else if let Some(far) = self.reach(at).and_then(|b| self.stopped_on(b, "")) {
+            // In a step: it may be cut in part, up to the furthest step the
+            // tool may have got to (`reach`), not just the one it was last
+            // followed on, which may lag (LIO-586 review).
+            up_to(far.op, far.last.map_or(1, |l| l + 2))
         } else {
+            // Where it stopped is not known: all it ran may be cut.
             ran.iter().map(|&o| (o, None)).collect()
         };
 
@@ -1632,9 +1645,34 @@ impl Run {
     /// tool tip is on (the first until it is found), the last step done of
     /// it being the one before, or that one if its cutting was done.
     pub fn stopped_in(&self, why: &str) -> Option<Stopped> {
+        let block = self.running.as_ref()?.on.map_or(0, |o| o.0);
+        self.stopped_on(block, why)
+    }
+
+    /// The furthest block of the running tool run the tool may be on,
+    /// stopped at machine position `at`: the last, from the one it was
+    /// followed to (`track`), whose move the tip is on. What it was followed
+    /// to may lag: snapshots the app missed while busy, or the one with the
+    /// outcome, which comes before `track` and gives no line once the
+    /// program ended. So the tip's place bounds what it cut (LIO-586
+    /// review). None when it is on none of them, or that one is in no step
+    /// (`mark_step`): where it got is not known.
+    fn reach(&self, at: Option<&[f64; 6]>) -> Option<usize> {
+        let (r, at) = (self.running.as_ref()?, at?);
+        let p = self.checked()?.get(r.index)?;
+        let tip = std::array::from_fn(|k| (at[k] - r.offset[k] + p.datum[k] as f64) as f32);
+        let from = r.on.map_or(0, |o| o.0);
+        let b = (from..r.paths.len())
+            .rev()
+            .find(|&j| r.paths[j].is_some_and(|m| along(m, tip).is_some()))?;
+        self.mark_step(p, r.marks.get(b).copied().flatten()?)?;
+        Some(b)
+    }
+
+    /// `stopped_in` with the tool on block `block` of the running tool run.
+    fn stopped_on(&self, block: usize, why: &str) -> Option<Stopped> {
         let r = self.running.as_ref()?;
         let p = self.checked()?.get(r.index)?;
-        let block = r.on.map_or(0, |o| o.0);
         let (op, s, done) = match r.marks.get(block).copied().flatten() {
             Some(mark) => match self.mark_step(p, mark) {
                 Some(step) => step,
@@ -1922,10 +1960,18 @@ impl Run {
         if let Some((oi, n)) = self.at_step() {
             let step = self.step_label(oi, n);
             if !self.zeroed {
-                e.push(format!(
-                    "This run starts {} at {step}, the steps before it taken as cut: keep the work zero they were cut with (Keep it, under Start at a step), or set it on the stock they left.",
-                    first.name
-                ));
+                // Where the check cannot tell the stock they left, it is
+                // set by hand, and the reason said (LIO-586 review).
+                e.push(match self.partway_blocked() {
+                    Some(why) => format!(
+                        "This run starts {} at {step}, the steps before it taken as cut: {STEP_ZERO_BY_HAND}. {why}",
+                        first.name
+                    ),
+                    None => format!(
+                        "This run starts {} at {step}, the steps before it taken as cut: keep the work zero they were cut with (Keep it, under Start at a step), or set it on the stock they left.",
+                        first.name
+                    ),
+                });
             }
             if !unset.is_empty() {
                 e.push(format!(
@@ -7454,9 +7500,9 @@ pub(crate) mod tests {
             ok,
             message: "m".into(),
         };
-        run.refresh(Some(&o(0, true)));
+        run.refresh(Some(&o(0, true)), None);
         assert!(run.running.is_some());
-        run.refresh(Some(&o(1, true)));
+        run.refresh(Some(&o(1, true)), None);
         assert!(run.running.is_none() && run.done[0] && run.next == 1);
     }
 
@@ -9305,11 +9351,20 @@ pub(crate) mod tests {
         let (pass_1, pass_2) = (face.steps[0].z.unwrap(), face.steps[1].z.unwrap());
         assert!(pass_2 < pass_1 - 0.5, "{pass_1} {pass_2}");
         assert_eq!(whole.as_ref().as_ref().unwrap()[0].indexes, [0, 1]);
-        // Tool run 1 (Face, Pocket) sent from its start, and its outcome:
-        // ended ok, or stopped after a step of the Face (`stopping`).
-        let ran = |ok: bool, stopping: Option<(usize, usize)>| {
+        // Tool run 1 (Face, Pocket) sent from its start, at work offset 0,
+        // and its outcome: ended ok, stopped after a step of the Face
+        // (`stopping`), or stopped in a step (`message`), the tool last
+        // followed on block `on` and standing at machine position `at`.
+        let p = whole.as_ref().as_ref().unwrap()[0].clone();
+        let blocks = p.from(0).unwrap();
+        let ran_at = |ok: bool,
+                      stopping: Option<(usize, usize)>,
+                      message: &str,
+                      on: Option<usize>,
+                      at: Option<[f64; 6]>| {
             let mut run = Run::new(&doc, 0, 0);
             run.checked_as(whole.clone(), Some(left.clone()), None);
+            let marks = run.marks_of(&p, blocks);
             run.running = Some(Running {
                 index: 0,
                 from: 0,
@@ -9321,23 +9376,27 @@ pub(crate) mod tests {
                     last: None,
                     touched: false,
                 },
-                paths: vec![],
+                paths: paths(blocks, [0.; 3]),
                 tip: [0.; 3],
                 start: [0.; 6],
                 print: 0,
                 cut_ops: vec![],
-                on: None,
-                marks: vec![],
+                on: on.map(|b| (b, 0.5)),
+                marks,
             });
             run.stopping = stopping;
-            run.refresh(Some(&uc100::controller::ProgramOutcome {
-                seq: 1,
-                ok,
-                message: "m".into(),
-            }));
+            run.refresh(
+                Some(&uc100::controller::ProgramOutcome {
+                    seq: 1,
+                    ok,
+                    message: message.into(),
+                }),
+                at.as_ref(),
+            );
             assert!(run.running.is_none());
             run
         };
+        let ran = |ok: bool, stopping| ran_at(ok, stopping, "m", None, None);
         // Face pass 2 picked as the start, and the setup checked again
         // with pass 1 taken as cut.
         let at_pass_2 = |mut run: Run| {
@@ -9380,7 +9439,7 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             [(0, None), (1, None)]
         );
-        for run in [at_pass_2(done), at_pass_2(ran(false, Some((0, 1))))] {
+        let refused = |run: Run| {
             let partly = run.partly().unwrap();
             assert_eq!(partly.cut, [RUN_UNFOLLOWED]);
             assert_eq!(partly.surface, None);
@@ -9404,7 +9463,60 @@ pub(crate) mod tests {
                 start.partway_blocked().as_deref(),
                 Some(RUN_UNFOLLOWED_BLOCKED)
             );
-        }
+        };
+        refused(at_pass_2(done));
+        refused(at_pass_2(ran(false, Some((0, 1)))));
+        // Stopped in a step (an E-stop), the tool last followed early in
+        // pass 1: the app may have missed the snapshots that followed it on,
+        // and the one with the outcome has no line (LIO-586 review). What
+        // it cut goes by where the tool stands.
+        let mut plain = Run::new(&doc, 0, 0);
+        plain.checked_as(whole.clone(), Some(left.clone()), None);
+        let marks = plain.marks_of(&p, blocks);
+        let path = paths(blocks, [0.; 3]);
+        let in_pass = |s: usize| -> Vec<usize> {
+            (0..blocks.len())
+                .filter(|&j| {
+                    matches!(
+                        blocks[j],
+                        Block::Move {
+                            kind: Kind::Feed,
+                            ..
+                        }
+                    ) && path[j].is_some()
+                        && marks[j].and_then(|m| plain.mark_step(&p, m)) == Some((0, s, false))
+                })
+                .collect()
+        };
+        let (one, two) = (in_pass(0), in_pass(1));
+        assert!(one.len() > 2 && two.len() > 2, "{one:?} {two:?}");
+        // The machine position at the middle of block `j`'s move.
+        let mid = |j: usize| -> [f64; 6] {
+            let [a, b] = path[j].unwrap();
+            std::array::from_fn(|k| match k {
+                0..3 => ((a[k] + b[k]) / 2. - p.datum[k]) as f64,
+                _ => 0.,
+            })
+        };
+        let e_stop = |at| ran_at(false, None, "E-stop", Some(one[0]), Some(at));
+        let cuts = |run: &Run| {
+            run.cut_in_run
+                .iter()
+                .map(|c| (c.0, c.1))
+                .collect::<Vec<_>>()
+        };
+        // Standing in pass 1: pass 2 not cut, pass 1's floor.
+        let in_1 = e_stop(mid(one[one.len() / 2]));
+        assert_eq!(cuts(&in_1), [(0, Some(1))]);
+        on_pass_1(&at_pass_2(in_1));
+        // Standing in pass 2: cut up to there, so no Z.
+        let in_2 = e_stop(mid(two[two.len() / 2]));
+        assert_eq!(cuts(&in_2), [(0, Some(2))]);
+        refused(at_pass_2(in_2));
+        // On no move: where it got is not known, all it ran may be cut.
+        let lost = e_stop([1e3; 6]);
+        assert_eq!(cuts(&lost), [(0, None), (1, None)]);
+        refused(at_pass_2(lost));
     }
 
     /// A plan's moves cut with another cutter, or at another A, cut other

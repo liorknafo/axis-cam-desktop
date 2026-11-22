@@ -3427,7 +3427,7 @@ impl Connection {
         let outcome = self.run_outcome();
         let remote = self.pi.is_some();
         if let Some(run) = &mut self.run {
-            run.refresh(outcome.as_ref());
+            run.refresh(outcome.as_ref(), Some(&self.snapshot.machine_pos));
             run.carve(&self.snapshot);
             run.track(&self.snapshot);
             // Stop after step: the driver's Stop as the step ends. On the
@@ -7336,7 +7336,10 @@ spindle_max_rpm = 24000
             {
                 c.refresh();
                 if let Some(r) = &mut c.run {
-                    r.refresh(c.snapshot.program_outcome.as_ref());
+                    r.refresh(
+                        c.snapshot.program_outcome.as_ref(),
+                        Some(&c.snapshot.machine_pos),
+                    );
                 }
                 let s = &c.snapshot;
                 for (k, a) in angles.iter().enumerate() {
@@ -7356,7 +7359,10 @@ spindle_max_rpm = 24000
                 s.state == Some(State::Idle)
             });
             if let Some(r) = &mut c.run {
-                r.refresh(c.snapshot.program_outcome.as_ref());
+                r.refresh(
+                    c.snapshot.program_outcome.as_ref(),
+                    Some(&c.snapshot.machine_pos),
+                );
             }
             let run = c.run.as_ref().unwrap();
             assert!(
@@ -7629,7 +7635,10 @@ spindle_max_rpm = 24000
             while !(c.snapshot.program_outcome.as_ref()).is_some_and(|o| o.seq > seq) {
                 c.refresh();
                 if let Some(r) = &mut c.run {
-                    r.refresh(c.snapshot.program_outcome.as_ref());
+                    r.refresh(
+                        c.snapshot.program_outcome.as_ref(),
+                        Some(&c.snapshot.machine_pos),
+                    );
                 }
                 assert!(
                     Instant::now() < cap,
@@ -7853,7 +7862,10 @@ spindle_max_rpm = 24000
         {
             c.refresh();
             if let Some(r) = &mut c.run {
-                r.refresh(c.snapshot.program_outcome.as_ref());
+                r.refresh(
+                    c.snapshot.program_outcome.as_ref(),
+                    Some(&c.snapshot.machine_pos),
+                );
             }
             let s = &c.snapshot;
             for (k, a) in [0., 90., 180., -90.].iter().enumerate() {
@@ -7869,7 +7881,10 @@ spindle_max_rpm = 24000
             s.state == Some(State::Idle)
         });
         if let Some(r) = &mut c.run {
-            r.refresh(c.snapshot.program_outcome.as_ref());
+            r.refresh(
+                c.snapshot.program_outcome.as_ref(),
+                Some(&c.snapshot.machine_pos),
+            );
         }
         let run = c.run.as_ref().unwrap();
         assert!(run.running.is_none() && run.done[0], "{:?}", run.outcome);
@@ -8158,7 +8173,10 @@ spindle_max_rpm = 24000
             while !(c.snapshot.program_outcome.as_ref()).is_some_and(|o| o.seq > seq) {
                 c.refresh();
                 if let Some(r) = &mut c.run {
-                    r.refresh(c.snapshot.program_outcome.as_ref());
+                    r.refresh(
+                        c.snapshot.program_outcome.as_ref(),
+                        Some(&c.snapshot.machine_pos),
+                    );
                 }
                 assert!(
                     Instant::now() < cap,
@@ -8173,7 +8191,10 @@ spindle_max_rpm = 24000
                 s.state == Some(State::Idle)
             });
             if let Some(r) = &mut c.run {
-                r.refresh(c.snapshot.program_outcome.as_ref());
+                r.refresh(
+                    c.snapshot.program_outcome.as_ref(),
+                    Some(&c.snapshot.machine_pos),
+                );
             }
             assert!(c.run.as_ref().unwrap().done[0]);
             let (programs, left) = crate::run::check(&doc, &mesh, 1);
@@ -8481,7 +8502,10 @@ spindle_max_rpm = 24000
         loop {
             c.refresh();
             if let Some(r) = &mut c.run {
-                r.refresh(c.snapshot.program_outcome.as_ref());
+                r.refresh(
+                    c.snapshot.program_outcome.as_ref(),
+                    Some(&c.snapshot.machine_pos),
+                );
             }
             let s = c.snapshot.clone();
             for (k, a) in [0., 90., 180., 270.].iter().enumerate() {
@@ -8520,7 +8544,10 @@ spindle_max_rpm = 24000
             s.state == Some(State::Idle)
         });
         if let Some(r) = &mut c.run {
-            r.refresh(c.snapshot.program_outcome.as_ref());
+            r.refresh(
+                c.snapshot.program_outcome.as_ref(),
+                Some(&c.snapshot.machine_pos),
+            );
         }
         let run = c.run.as_ref().unwrap();
         assert!(run.running.is_none() && run.done[0], "{:?}", run.outcome);
@@ -8592,7 +8619,10 @@ spindle_max_rpm = 24000
         {
             c.refresh();
             if let Some(r) = &mut c.run {
-                r.refresh(c.snapshot.program_outcome.as_ref());
+                r.refresh(
+                    c.snapshot.program_outcome.as_ref(),
+                    Some(&c.snapshot.machine_pos),
+                );
             }
             let s = &c.snapshot;
             for (k, a) in [0., 90., 180., 270.].iter().enumerate() {

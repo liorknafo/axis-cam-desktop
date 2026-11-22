@@ -10030,6 +10030,72 @@ flood = { pin = 8 }
         assert_eq!(z, Some(-2.));
     }
 
+    /// A start at a step of a tool run this run cut to its end, after a real
+    /// Cycle Start (LIO-586): the Face's two passes and the Pocket run to
+    /// their end, then Face pass 2 is picked to cut again. Before the run it
+    /// touches off on pass 1's floor, Z−2; after it, pass 2 has cut there
+    /// too, so nothing sets Z from the stock the check carves, and the Work
+    /// zero tab, the Start at a step tab and the run bar say why.
+    #[test]
+    fn a_step_start_in_a_tool_run_cut_to_its_end_says_why_it_sets_no_z() {
+        use crate::run::Action as R;
+        use crate::ui::ControlTab;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 1, 3]);
+        for (oi, down) in [(0, "2"), (1, "10")] {
+            let p = &mut a.doc.setups[0].operations[oi].p;
+            p.insert("stepdown".into(), down.into());
+            p.insert("feed".into(), "10000".into());
+        }
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let pass_2 = |a: &mut App| {
+            tick_until(a, 5., "Idle", |s| s.state == Some(State::Idle));
+            let _ = a.update(Message::Run(R::Steps(Some(0))));
+            let _ = a.update(Message::Run(R::PickStep(0, 1)));
+            let _ = a.update(Message::Run(R::StartStep));
+            answer_skips(a, 0);
+            assert_eq!(run_of(a).at_step(), Some((0, 1)));
+        };
+        pass_2(&mut a);
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        assert_eq!(conn(&a).partway_blocked(), None);
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        answer_skips(&mut a, 0);
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_some(), "{:?}", problems(&a));
+        run_until(&mut a, 90., "tool run 1", |r| r.running.is_none());
+        assert!(run_of(&a).done[0]);
+        pass_2(&mut a);
+        let why = conn(&a).partway_blocked().unwrap();
+        assert!(
+            why.starts_with("This run's tool runs have cut the stock since"),
+            "{why}"
+        );
+        assert!(conn(&a).touch_off().is_none() && conn(&a).stock_top().is_err());
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        let said = format!(
+            "{why} Zero Z on the stock top and Probe Z are off: {}.",
+            crate::run::STEP_ZERO_BY_HAND
+        );
+        for tab in [ControlTab::WorkZero, ControlTab::Start] {
+            let _ = a.update(Message::ControlTab(tab));
+            let texts = crate::ui::probe::texts(a.view(), iced::Size::new(1440., 1100.));
+            assert!(texts.contains(&said), "{tab:?}: {texts:?}");
+        }
+        assert!(
+            problems(&a)
+                .iter()
+                .any(|p| p.contains("set Z by hand") && p.ends_with(&why)),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// A run started at the Pocket with the Drilling's first hole taken as
     /// cut (LIO-582): the Drilling cut the stock the start touches off on,
     /// which the check does not follow, so Zero Z, Probe Z and the probe
