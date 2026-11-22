@@ -11844,9 +11844,8 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
             ),
         });
         let stock = stock_question(c, run);
-        // Asked for by operations or steps after the start taken as cut once
-        // a tool run has started too (LIO-583 review).
-        if run.partway() || run.later_cut() {
+        // Asked for whenever Cycle Start waits for it (LIO-583 review).
+        if run.asks_zero() {
             buttons = buttons.push(small(
                 "Keep this work zero",
                 (checked.is_ok() && !run.zeroed && !running).then_some(Message::Run(R::KeepZero)),
@@ -11890,7 +11889,9 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
         if let Some(stock) = stock {
             col = col.push(stock);
         }
-        col = col.push(buttons);
+        // Narrow, by touch, the row wraps rather than squeezes a button
+        // (LIO-583 review).
+        col = col.push(buttons.wrap().vertical_spacing(6));
     } else if run.checked().is_some() {
         col = col.push(rule::horizontal(1)).push(muted(
             "The setup's work zero was set on the stock before its first tool run: X and Y stay as they are from here.",
@@ -11912,11 +11913,12 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
                 .size(12)
                 .color(AMBER),
             );
-        } else if run.later_cut() {
-            // Operations or steps after the start taken as cut since: Cycle
-            // Start waits for the work zero they were cut with, kept here
-            // (LIO-583 review).
-            let why = c.partway_blocked().unwrap_or_default();
+        } else if run.asks_zero() {
+            // Operations or steps taken as cut since: Cycle Start waits for
+            // the work zero they were cut with, kept here (LIO-583 review).
+            let why = c.partway_blocked().unwrap_or_else(|| {
+                "Steps of the operation Cycle Start starts at are taken as cut since a tool run of this run started.".into()
+            });
             col = col
                 .push(text(format!(
                     "{why} Set Z by hand on a surface whose height you know (Set above), then press Keep this work zero, or press it if the work zero is still the one they were cut with."

@@ -11547,6 +11547,98 @@ flood = { pin = 8 }
         }
     }
 
+    /// Started and stopped, the start then at the Pocket and its last level
+    /// taken as cut (LIO-583 review): no later operation's, but Cycle Start
+    /// waits for the work zero all the same, kept under Work zero by its
+    /// button, which another check asks for again.
+    #[test]
+    fn a_step_of_the_start_taken_as_cut_after_a_stop_waits_for_the_work_zero() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).op_steps(1).is_some_and(|s| s.steps.len() > 1));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 3.0, "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let last = run_of(&a).op_steps(1).unwrap().steps.len() - 1;
+        let _ = a.update(Message::Run(R::PickStep(1, last)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert_eq!((run.next, run.from), (0, 1));
+        assert!(run.cut_of(1).contains(&last), "{:?}", run.all_cut());
+        assert!(run.started() && !run.later_cut() && run.asks_zero() && !run.zeroed);
+        let waits = |a: &App| problems(a).into_iter().find(|p| p.contains("taken as cut"));
+        assert!(waits(&a).is_some(), "{:?}", problems(&a));
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let window = iced::Size::new(1440., 2400.);
+        let keep = |a: &App| {
+            (crate::ui::probe::clicks(a.view(), window).into_iter())
+                .find(|m| matches!(m, Message::Run(R::KeepZero)))
+        };
+        let _ = a.update(keep(&a).expect("Keep this work zero offered after the Stop"));
+        assert!(run_of(&a).zeroed && waits(&a).is_none(), "{:?}", problems(&a));
+        // Taken back, the next check asks again.
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, last)));
+        let _ = a.update(Message::Run(R::SkipSteps(false)));
+        answer_skips(&mut a, 0);
+        assert!(!run_of(&a).zeroed);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// By touch in a 960 × 552 window (LIO-583 review), the Work zero tab of
+    /// a run from the setup's start with the Pocket's first level taken as
+    /// cut lays Keep this work zero out whole, as wide as in a wide window:
+    /// its row wraps rather than squeezes it.
+    #[test]
+    fn keep_this_work_zero_is_whole_by_touch_in_a_small_window() {
+        use crate::run::Action as R;
+        crate::ui::TOUCH.with(|t| t.set(true));
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).all_cut(), [(1, vec![0])]);
+        assert!(run_of(&a).partway() && run_of(&a).later_cut());
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let keep = |a: &mut App, w: f32, h: f32| {
+            let _ = a.update(Message::Resized(iced::Size::new(w, h)));
+            // Tall enough for the whole tab in sight; the width is the
+            // window's.
+            let window = iced::Size::new(w, 2400.);
+            if let Ok(out) = std::env::var("AXIS_RENDER_DIR") {
+                let path = std::path::Path::new(&out).join(format!("keep-{w}-touch.png"));
+                render_png(a, window, &path);
+            }
+            (crate::ui::probe::placed(a.view(), window).into_iter())
+                .find(|(t, _)| t == "Keep this work zero")
+                .expect("Keep this work zero shown")
+                .1
+        };
+        let wide = keep(&mut a, 1600., 1000.);
+        let small = keep(&mut a, 960., 552.);
+        crate::ui::TOUCH.with(|t| t.set(false));
+        assert!(
+            small.width >= wide.width - 0.5 && small.height >= wide.height - 0.5,
+            "{small:?} of {wide:?}"
+        );
+    }
+
     /// A run started at the Drilling with the work zero on the stock top's
     /// front-left corner, which the Contour cut down in part: the check
     /// cannot tell one surface there, so Zero Z on the stock top and Probe Z

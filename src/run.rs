@@ -2286,10 +2286,10 @@ impl Run {
                     crate::model::tool_label(first.tool, &first.tool_name)
                 ));
             }
-        } else if self.partway() || self.later_cut() {
-            // Operations or steps after the start taken as cut wait for the
-            // work zero too once a tool run of this run has started: each new
-            // check of them asks again (LIO-583 review).
+        } else if self.asks_zero() {
+            // Operations or steps after the start, or of its operation, taken
+            // as cut wait for the work zero too once a tool run of this run
+            // has started: each new check of them asks again (LIO-583 review).
             let later = self.later_cut();
             match self.partly() {
                 None if !later => e.push(format!("The check did not work out the stock operation {}, {}, starts from: pick its first operation, or check the setup again.", from + 1, first.name)),
@@ -2800,6 +2800,21 @@ impl Run {
             || self.cut_steps.iter().any(steps)
             || self.later_cut();
         self.checked().is_some() && (self.at_step().is_some() || !self.started() && early)
+    }
+
+    /// Cycle Start waits for the work zero to be set or kept for the stock
+    /// the run declares (`zeroed`): it starts partway (`partway`), or
+    /// operations or steps after its start's operation are taken as cut
+    /// (`later_cut`), or, once a tool run of it has started, steps of its
+    /// start's operation are, a later step taken as cut after a Stop, say.
+    /// Each new check asks again (LIO-583 review).
+    pub fn asks_zero(&self) -> bool {
+        let start =
+            (self.checked()).and_then(|c| c.get(self.next)?.indexes.get(self.from).copied());
+        self.checked().is_some()
+            && (self.partway()
+                || self.later_cut()
+                || self.started() && start.is_some_and(|oi| !self.cut_of(oi).is_empty()))
     }
 
     /// Where the operator touches off its setup, in plan mm, and the work
