@@ -2037,9 +2037,6 @@ impl App {
         Self::from_workspace(state_path, smoke_dir)
     }
     fn from_workspace(mut state_path: PathBuf, smoke_dir: Option<PathBuf>) -> Self {
-        // This session begins: journals written before it are another's
-        // (LIO-586 review).
-        run::session_start();
         #[cfg(test)]
         assert_ne!(
             state_path,

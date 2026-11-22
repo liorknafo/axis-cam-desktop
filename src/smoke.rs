@@ -2971,9 +2971,11 @@ flood = { pin = 8 }
 
     /// AXIS CAM closed (`a`, disconnected as closing does) and opened again
     /// on the same workspace and project: nothing of its run is left in
-    /// memory, only what it kept on disk.
+    /// memory, only what it kept on disk; the journals it made are another
+    /// session's.
     fn reopen(a: App, dir: &std::path::Path) -> App {
         assert!(a.control.is_none(), "disconnect first, as closing does");
+        crate::run::forget_own_journals();
         let mut b = App::from_workspace(dir.join("workspace.json"), None);
         b.replace_document(a.doc.clone(), None);
         b.imported_mesh = a.imported_mesh.clone();
