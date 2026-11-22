@@ -2799,11 +2799,18 @@ flood = { pin = 8 }
         assert_eq!(sent(&a), [vec![0, 2], vec![3]]);
         let run = run_of(&a);
         assert_eq!(run.stages(0, None), [Next, ToCome]);
-        assert!(
-            !run.partway() && problems(&a).is_empty(),
-            "{:?}",
-            problems(&a)
+        // Taken as cut after the start, the Pocket was cut with a work zero
+        // the stock top it cut away no longer finds: Cycle Start waits for
+        // it, kept or set by hand (LIO-583).
+        assert!(run.partway() && run.later_cut());
+        assert_eq!(run.taken_as_cut(), ["Pocket"]);
+        assert_eq!(
+            problems(&a),
+            ["This run starts at Face, with Pocket after it taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with."]
         );
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let run = run_of(&a);
         let t = run.setup_time().unwrap();
         assert!(
             t < total - pocket / 2.,
@@ -6395,6 +6402,14 @@ flood = { pin = 8 }
         answer_skips(&mut a, 0);
         assert!(skip(&mut a, 1, Some(Cut)) && skip(&mut a, 3, Some(Left)));
         assert_eq!(sent(&a), [vec![0, 2]]);
+        // The Pocket taken as cut after the start: Cycle Start waits for the
+        // work zero it was cut with, kept here (LIO-583).
+        assert!(
+            problems(&a).iter().any(|p| p.contains("with Pocket after it taken as cut")),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Run(R::KeepZero));
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
         cycle_start(&mut a);
         let names: Vec<String> = (run_of(&a).running_blocks().unwrap().iter())
@@ -6439,6 +6454,8 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
         assert!(skip(&mut a, 1, Some(Cut)) && skip(&mut a, 3, Some(Left)));
+        // The work zero the Pocket taken as cut was cut with (LIO-583).
+        let _ = a.update(Message::Run(R::KeepZero));
         let _ = a.update(Message::Run(R::CycleStart));
         run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
         let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
@@ -11234,14 +11251,14 @@ flood = { pin = 8 }
             "{why}"
         );
         assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
-        // From the setup's very start, the Face: not partway, Cycle Start
-        // runs on the setup's work zero, but nothing sets Z or probes where
-        // the Drilling's hole may have cut (LIO-582 review).
+        // From the setup's very start, the Face: partway too, so Cycle Start
+        // waits for the work zero, and nothing sets Z or probes where the
+        // Drilling's hole may have cut (LIO-582 review, LIO-583).
         let _ = a.update(Message::Run(R::From(0, 0)));
         answer_skips(&mut a, 0);
         assert_eq!((run_of(&a).next, run_of(&a).from), (0, 0));
         assert_eq!(run_of(&a).all_cut(), [(3, vec![0])]);
-        assert!(!run_of(&a).partway() && run_of(&a).later_cut());
+        assert!(run_of(&a).partway() && run_of(&a).later_cut());
         assert!(conn(&a).touch_off().is_none());
         assert!(conn(&a).stock_top().is_err());
         let why = conn(&a).edges_setup().unwrap_err();
@@ -11250,11 +11267,48 @@ flood = { pin = 8 }
             "{why}"
         );
         assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        // Cycle Start waits, naming the hole taken as cut after the start,
+        // and so does the Work zero tab, which offers no Zero all: X and Y
+        // stay those the hole was cut with (LIO-583).
+        let hole = format!(
+            "{} {}",
+            run_of(&a).checked().unwrap()[1].ops[0].name,
+            run_of(&a).step_label(3, 0)
+        );
+        assert_eq!(run_of(&a).taken_as_cut(), std::slice::from_ref(&hole));
+        let face = &run_of(&a).checked().unwrap()[0].ops[0].name;
+        let waits = format!(
+            "This run starts at {face}, with {hole} after it taken as cut: set the work zero on the stock they left in the Work zero tab, or press Keep this work zero there if it is still the one they were cut with."
+        );
+        assert!(problems(&a).contains(&waits), "{:?}", problems(&a));
+        let steps = crate::ui::work_zero_steps(&a, conn(&a)).unwrap().join("\n");
+        assert!(
+            steps.contains(&format!("taking {hole} as cut"))
+                && steps.contains("Zero Z on the stock top and Probe Z are off")
+                && !steps.contains("Zero all"),
+            "{steps}"
+        );
+        // Touch off sets nothing; Keep this work zero lets Cycle Start go.
+        let offset = conn(&a).snapshot.work_offset;
+        let _ = a.update(Message::Machine(crate::control::Action::TouchOff));
+        tick_for(&mut a, 100);
+        assert_eq!(conn(&a).snapshot.work_offset, offset);
+        assert!(problems(&a).contains(&waits));
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(run_of(&a).zeroed);
         assert!(
             !problems(&a).iter().any(|p| p.contains("taken as cut")),
             "{:?}",
             problems(&a)
         );
+        // Taken back, the run starts at the setup's own start again.
+        let _ = a.update(Message::Run(R::Steps(Some(3))));
+        let _ = a.update(Message::Run(R::PickStep(3, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(false)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).all_cut().is_empty());
+        assert!(!run_of(&a).partway() && conn(&a).touch_off().is_some());
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
     }
 
     /// LIO-593: with operations after the start taken as cut, the Work zero
