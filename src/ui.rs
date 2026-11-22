@@ -13275,6 +13275,12 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
             )
         };
         steps.push(match (c.edges_setup(), c.stock_top()) {
+            // Step 3 sets Z by hand alone, and there is no 4 (LIO-593
+            // review): the probe touches the stock where the check knows it.
+            (Ok((refs, _)), _) if c.sides_blocked().is_none() && blocked.is_some() => format!(
+                "Or, with the plate's lead on the stock and the clip on the tool, {} in the Probe tab sets the work zero, Z too, where it touches the stock.",
+                crate::control::probe_name(refs)
+            ),
             (Ok((refs, _)), _) if c.sides_blocked().is_none() => format!(
                 "With the plate's lead on the stock and the clip on the tool, {} in the Probe tab does 3 and 4.",
                 crate::control::probe_name(refs)

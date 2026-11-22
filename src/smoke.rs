@@ -10168,7 +10168,8 @@ flood = { pin = 8 }
     /// from that the bore left: step 3 says Probe Z is off, and the probe
     /// line says only what stops the corner probe (no material, or a stock
     /// that does not conduct), never Probe Z on the touch plate or the
-    /// reason again.
+    /// reason again. On a metal it says the setup's probe sets the work
+    /// zero, Z too, not that it "does 3 and 4": there is no step 4 here.
     #[test]
     fn a_blocked_start_with_a_probe_spot_left_offers_no_probe_z() {
         use crate::post::At;
@@ -10215,21 +10216,30 @@ flood = { pin = 8 }
         let name = crate::control::probe_name(spot);
         for (wood, says) in [
             (
-                false,
+                None,
                 format!(
                     "The project has no material: choose a metal one for {name} to touch the stock."
                 ),
             ),
             (
-                true,
+                Some("Wood and composite"),
                 format!("does not conduct, so {name} cannot touch the stock either."),
             ),
+            // A metal: the probe touches the stock, and sets Z with X and
+            // Y, step 3 setting it by hand alone (no 4 to do).
+            (
+                Some("Aluminium"),
+                format!(
+                    "Or, with the plate's lead on the stock and the clip on the tool, {name} in the Probe tab sets the work zero, Z too, where it touches the stock."
+                ),
+            ),
         ] {
-            if wood {
-                material(&mut a, "Wood and composite");
+            if let Some(group) = wood {
+                material(&mut a, group);
                 let _ = a.update(Message::Tick);
             }
-            assert!(conn(&a).sides_blocked().is_some());
+            let metal = wood == Some("Aluminium");
+            assert_eq!(conn(&a).sides_blocked().is_none(), metal, "{wood:?}");
             let steps = crate::ui::work_zero_steps(&a, conn(&a)).unwrap();
             let three = (steps.iter())
                 .find(|t| t.starts_with("3. "))
@@ -10242,7 +10252,7 @@ flood = { pin = 8 }
             );
             assert!(
                 steps.iter().any(|t| t.ends_with(&says)),
-                "{wood}: {steps:#?}"
+                "{wood:?}: {steps:#?}"
             );
             assert_eq!(
                 steps
@@ -10250,13 +10260,13 @@ flood = { pin = 8 }
                     .filter(|t| t.contains(blocked.as_str()))
                     .count(),
                 1,
-                "{wood}: {steps:#?}"
+                "{wood:?}: {steps:#?}"
             );
             assert!(
-                !steps
-                    .iter()
-                    .any(|t| t.contains("touch plate") || t.contains("Probe Z cannot")),
-                "{wood}: {steps:#?}"
+                !steps.iter().any(|t| t.contains("touch plate")
+                    || t.contains("Probe Z cannot")
+                    || t.contains("does 3 and 4")),
+                "{wood:?}: {steps:#?}"
             );
         }
     }
