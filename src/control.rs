@@ -2419,8 +2419,9 @@ struct Held {
 /// uc100-server on a Raspberry Pi across the network.
 enum Driver {
     /// With the commands sent to it, as its `Snapshot::commands` counts
-    /// them: every one but `Shutdown`.
-    Local(Controller, AtomicU64),
+    /// them: every one but `Shutdown`; and those of them that may move the
+    /// machine (`may_move`).
+    Local(Controller, AtomicU64, AtomicU64),
     /// With every message handed to the link so far (`handed`): unlike the
     /// link's own `sent`, never less for one dropped on its way.
     Remote(uc100_remote::RemoteController, AtomicU64),
@@ -2431,9 +2432,12 @@ impl Driver {
     /// Pi cannot take now is dropped, never sent later, with a note.
     fn send(&self, command: Command) -> bool {
         match self {
-            Driver::Local(c, sent) => {
+            Driver::Local(c, sent, moves) => {
                 if !matches!(command, Command::Shutdown) {
                     sent.fetch_add(1, Ordering::SeqCst);
+                }
+                if may_move(&command) {
+                    moves.fetch_add(1, Ordering::SeqCst);
                 }
                 c.send(command);
                 true
@@ -2473,7 +2477,7 @@ impl Driver {
     /// meanwhile (`cycle_pending`).
     fn handed(&self) -> u64 {
         match self {
-            Driver::Local(_, n) | Driver::Remote(_, n) => n.load(Ordering::SeqCst),
+            Driver::Local(_, n, _) | Driver::Remote(_, n) => n.load(Ordering::SeqCst),
         }
     }
 
@@ -2482,7 +2486,7 @@ impl Driver {
     /// on the link's current connection).
     fn snapshot(&self) -> (Snapshot, Option<uc100_remote::client::Ack>) {
         match self {
-            Driver::Local(c, _) => (c.snapshot(), None),
+            Driver::Local(c, _, _) => (c.snapshot(), None),
             Driver::Remote(r, _) => r.acked(),
         }
     }
@@ -2493,10 +2497,42 @@ impl Driver {
     /// before it went.
     fn sent(&self) -> Option<u64> {
         match self {
-            Driver::Local(_, sent) => Some(sent.load(Ordering::SeqCst)),
+            Driver::Local(_, sent, _) => Some(sent.load(Ordering::SeqCst)),
             Driver::Remote(r, _) => r.acked().1.map(|a| a.sent),
         }
     }
+
+    /// The commands sent to the local controller so far that may move the
+    /// machine (`may_move`); None on the Pi, which other computers move too.
+    fn moves(&self) -> Option<u64> {
+        match self {
+            Driver::Local(_, _, moves) => Some(moves.load(Ordering::SeqCst)),
+            Driver::Remote(..) => None,
+        }
+    }
+}
+
+/// Whether `command` may move the machine or change the machine position
+/// it reports: all but those that only stop it, hold it, or set what does
+/// not move (LIO-586 review).
+fn may_move(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Stop
+            | Command::FeedHold
+            | Command::FeedOverride(_)
+            | Command::JogStop
+            | Command::EStop
+            | Command::Spindle { .. }
+            | Command::Coolant { .. }
+            | Command::SetWork { .. }
+            | Command::OverrideLimits(_)
+            | Command::TestOutput { .. }
+            | Command::SimBlock(_)
+            | Command::SimBlocks(_)
+            | Command::SimBars(_)
+            | Command::Shutdown
+    )
 }
 
 /// `ok`, counted in `handed` when true.
@@ -2569,6 +2605,11 @@ pub struct Connection {
     /// down after that it has dropped; never live, it is still connecting
     /// (`pi_lost`, LIO-517).
     pi_was_live: bool,
+    /// The local driver's `moves` when a snapshot last showed the running
+    /// tool run going with every command sent taken: none sent since, the
+    /// machine stands where the tool run left it when its outcome comes
+    /// (`observe`, LIO-586 review).
+    moves_seen: Option<u64>,
     /// The newest of the link's notes, for the status line, and the count
     /// of notes seen.
     pub pi_note: Option<String>,
@@ -2577,7 +2618,7 @@ pub struct Connection {
     /// tool run this run follows (`watch_job`).
     job_missing: Option<Instant>,
     /// The name of the last tool run sent, which the Pi's Stop after step
-    /// names when it fires.
+    /// names when it fires, and the driver's refusal of it (`run_outcome`).
     job_name: Option<String>,
     /// The number the last tool run was sent to the Pi with: the Pi tells
     /// its end by it (`run_outcome`).
@@ -2772,12 +2813,20 @@ struct PiPending {
 
 impl PiPending {
     fn read(path: &Path) -> Option<Self> {
-        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+        Some(Self::read_own(path)?.0)
     }
 
+    /// `read`, and whether it is as this session wrote it
+    /// (`run::read_own`).
+    fn read_own(path: &Path) -> Option<(Self, bool)> {
+        let (data, own) = crate::run::read_own(path)?;
+        Some((serde_json::from_slice(&data).ok()?, own))
+    }
+
+    /// Written as this session's (`run::write_own`).
     fn write(&self, path: &Path) -> Result<(), String> {
         let text = serde_json::to_vec(self).map_err(|e| e.to_string())?;
-        std::fs::write(path, text).map_err(|e| e.to_string())
+        crate::run::write_own(path, &text)
     }
 }
 
@@ -2817,7 +2866,7 @@ impl Connection {
         Ok(Self::with(
             m,
             cfg,
-            Driver::Local(controller, AtomicU64::new(0)),
+            Driver::Local(controller, AtomicU64::new(0), AtomicU64::new(0)),
             Some(nap),
             journal,
         ))
@@ -2879,6 +2928,7 @@ impl Connection {
             pi: None,
             link: None,
             pi_was_live: false,
+            moves_seen: None,
             pi_note: None,
             notes_seen: 0,
             job_missing: None,
@@ -3263,7 +3313,9 @@ impl Connection {
             return;
         }
         let path = self.pi_pending();
-        let Some(pending) = PiPending::read(&path) else {
+        // Kept by this session as it sent the tool run, or by another
+        // (`Run::journal_own`, LIO-586 review).
+        let Some((pending, own)) = PiPending::read_own(&path) else {
             return;
         };
         let Some(end) = link.tool_run_ends.iter().find(|e| e.id == pending.id) else {
@@ -3315,13 +3367,18 @@ impl Connection {
             }
         };
         j.time = crate::run::now();
-        if let Err(e) = j.write(&self.journal) {
+        // This session's, as the stops it was made from were.
+        let written = match own {
+            true => j.write_own(&self.journal),
+            false => j.write(&self.journal),
+        };
+        if let Err(e) = written {
             self.pi_note = Some(format!("Where the Pi stopped could not be kept: {e}."));
             return;
         }
         self.pi_note = Some(what);
         if let Some(run) = &mut self.run {
-            run.adopt_journal(j);
+            run.adopt_journal(j, own);
         }
     }
 
@@ -3426,8 +3483,23 @@ impl Connection {
         self.follow_stop_after();
         let outcome = self.run_outcome();
         let remote = self.pi.is_some();
+        // Where the tool stopped, for what a stop in a step cut (`Run::reach`):
+        // the local driver's position as its outcome comes, the machine
+        // moving only as this computer commands, when it sent nothing that
+        // may move it since a snapshot last showed the tool run going
+        // (`moves_seen`): an MDI the run bar let through as it still showed
+        // the job paused, say. Not the Pi's: its outcome may come long after
+        // the stop, on a reconnect say, the machine moved since by another
+        // computer (LIO-586 review).
+        let moves = self.driver.moves();
+        let quiet = !remote && moves.is_some() && moves == self.moves_seen;
+        let at = quiet.then_some(&self.snapshot.machine_pos);
+        let all_taken = self.shows_all_sent();
         if let Some(run) = &mut self.run {
-            run.refresh(outcome.as_ref());
+            run.refresh(outcome.as_ref(), at);
+            if run.running.is_some() && all_taken {
+                self.moves_seen = moves;
+            }
             run.carve(&self.snapshot);
             run.track(&self.snapshot);
             // Stop after step: the driver's Stop as the step ends. On the
@@ -4073,7 +4145,7 @@ impl Connection {
     /// would be another's).
     fn shows_all_sent(&self) -> bool {
         match &self.driver {
-            Driver::Local(_, sent) => self.snapshot.commands >= sent.load(Ordering::SeqCst),
+            Driver::Local(_, sent, _) => self.snapshot.commands >= sent.load(Ordering::SeqCst),
             Driver::Remote(r, _) => match (&self.ack, r.acked().1) {
                 (Some(then), Some(now)) => then.seq == now.seq && then.applied >= now.sent,
                 _ => false,
@@ -4096,8 +4168,11 @@ impl Connection {
                 .clone()
                 .unwrap_or_else(|| "the link to the Pi is down".into());
             run.not_started(format!("The tool run was not sent ({why}). Nothing moved."));
-        } else if self.pi.is_some() {
-            (self.job_missing, self.job_name) = (None, name);
+        } else {
+            if self.pi.is_some() {
+                self.job_missing = None;
+            }
+            self.job_name = name;
         }
     }
 
@@ -6043,7 +6118,7 @@ impl Connection {
         let _ = std::fs::remove_file(&pending);
         self.z_up = st.up;
         if let Some(j) = run.journal_of(&st, s.active_wcs, s.work_offset)
-            && let Err(e) = j.write(&self.journal)
+            && let Err(e) = j.write_own(&self.journal)
             && let Some((_, message)) = &mut run.outcome
         {
             *message += &format!(" Where it stopped could not be kept: {e}.");
@@ -6055,6 +6130,12 @@ impl Connection {
     /// The journal of where a run stopped on this machine, if any.
     pub fn journal(&self) -> Option<crate::run::Journal> {
         crate::run::Journal::read(&self.journal)
+    }
+
+    /// The journal, and whether it is as this session wrote it
+    /// (`run::read_own`).
+    pub fn journal_own(&self) -> Option<(crate::run::Journal, bool)> {
+        crate::run::Journal::read_own(&self.journal)
     }
 
     /// Keeps where a running tool run is in the journal before the
@@ -6143,10 +6224,20 @@ impl Connection {
     /// The running tool run's outcome. On the Pi, the end the Pi tells of
     /// the tool run sent with `tool_run_id`, never another job's outcome
     /// (of the same name or not); a stop the Pi made after a step is taken
-    /// as that step's first. Otherwise the driver's last.
+    /// as that step's first. Otherwise the driver's last, but for its
+    /// refusal of another job: a Go Z sent as the tool run started, the
+    /// screen still showing the machine idle, is refused while the tool run
+    /// goes on cutting (LIO-586 review).
     fn run_outcome(&mut self) -> Option<uc100::controller::ProgramOutcome> {
         if self.pi.is_none() {
-            return self.snapshot.program_outcome.clone();
+            let o = self.snapshot.program_outcome.clone()?;
+            let ours = |n: &String| o.message.starts_with(&format!("{n}: "));
+            if o.message.contains(crate::run::NOT_STARTED)
+                && !self.job_name.as_ref().is_some_and(ours)
+            {
+                return None;
+            }
+            return Some(o);
         }
         let run = self.run.as_mut().filter(|r| r.running.is_some())?;
         let id = self.tool_run_id?;
@@ -6310,7 +6401,7 @@ impl Connection {
     /// Disconnect: the Pi keeps the UC100 and a running tool run goes on.
     pub fn close(self) {
         match self.driver {
-            Driver::Local(controller, _) => {
+            Driver::Local(controller, _, _) => {
                 controller.send(Command::Disconnect);
                 controller.shutdown();
             }
@@ -7336,7 +7427,10 @@ spindle_max_rpm = 24000
             {
                 c.refresh();
                 if let Some(r) = &mut c.run {
-                    r.refresh(c.snapshot.program_outcome.as_ref());
+                    r.refresh(
+                        c.snapshot.program_outcome.as_ref(),
+                        Some(&c.snapshot.machine_pos),
+                    );
                 }
                 let s = &c.snapshot;
                 for (k, a) in angles.iter().enumerate() {
@@ -7356,7 +7450,10 @@ spindle_max_rpm = 24000
                 s.state == Some(State::Idle)
             });
             if let Some(r) = &mut c.run {
-                r.refresh(c.snapshot.program_outcome.as_ref());
+                r.refresh(
+                    c.snapshot.program_outcome.as_ref(),
+                    Some(&c.snapshot.machine_pos),
+                );
             }
             let run = c.run.as_ref().unwrap();
             assert!(
@@ -7629,7 +7726,10 @@ spindle_max_rpm = 24000
             while !(c.snapshot.program_outcome.as_ref()).is_some_and(|o| o.seq > seq) {
                 c.refresh();
                 if let Some(r) = &mut c.run {
-                    r.refresh(c.snapshot.program_outcome.as_ref());
+                    r.refresh(
+                        c.snapshot.program_outcome.as_ref(),
+                        Some(&c.snapshot.machine_pos),
+                    );
                 }
                 assert!(
                     Instant::now() < cap,
@@ -7853,7 +7953,10 @@ spindle_max_rpm = 24000
         {
             c.refresh();
             if let Some(r) = &mut c.run {
-                r.refresh(c.snapshot.program_outcome.as_ref());
+                r.refresh(
+                    c.snapshot.program_outcome.as_ref(),
+                    Some(&c.snapshot.machine_pos),
+                );
             }
             let s = &c.snapshot;
             for (k, a) in [0., 90., 180., -90.].iter().enumerate() {
@@ -7869,7 +7972,10 @@ spindle_max_rpm = 24000
             s.state == Some(State::Idle)
         });
         if let Some(r) = &mut c.run {
-            r.refresh(c.snapshot.program_outcome.as_ref());
+            r.refresh(
+                c.snapshot.program_outcome.as_ref(),
+                Some(&c.snapshot.machine_pos),
+            );
         }
         let run = c.run.as_ref().unwrap();
         assert!(run.running.is_none() && run.done[0], "{:?}", run.outcome);
@@ -8158,7 +8264,10 @@ spindle_max_rpm = 24000
             while !(c.snapshot.program_outcome.as_ref()).is_some_and(|o| o.seq > seq) {
                 c.refresh();
                 if let Some(r) = &mut c.run {
-                    r.refresh(c.snapshot.program_outcome.as_ref());
+                    r.refresh(
+                        c.snapshot.program_outcome.as_ref(),
+                        Some(&c.snapshot.machine_pos),
+                    );
                 }
                 assert!(
                     Instant::now() < cap,
@@ -8173,7 +8282,10 @@ spindle_max_rpm = 24000
                 s.state == Some(State::Idle)
             });
             if let Some(r) = &mut c.run {
-                r.refresh(c.snapshot.program_outcome.as_ref());
+                r.refresh(
+                    c.snapshot.program_outcome.as_ref(),
+                    Some(&c.snapshot.machine_pos),
+                );
             }
             assert!(c.run.as_ref().unwrap().done[0]);
             let (programs, left) = crate::run::check(&doc, &mesh, 1);
@@ -8481,7 +8593,10 @@ spindle_max_rpm = 24000
         loop {
             c.refresh();
             if let Some(r) = &mut c.run {
-                r.refresh(c.snapshot.program_outcome.as_ref());
+                r.refresh(
+                    c.snapshot.program_outcome.as_ref(),
+                    Some(&c.snapshot.machine_pos),
+                );
             }
             let s = c.snapshot.clone();
             for (k, a) in [0., 90., 180., 270.].iter().enumerate() {
@@ -8520,7 +8635,10 @@ spindle_max_rpm = 24000
             s.state == Some(State::Idle)
         });
         if let Some(r) = &mut c.run {
-            r.refresh(c.snapshot.program_outcome.as_ref());
+            r.refresh(
+                c.snapshot.program_outcome.as_ref(),
+                Some(&c.snapshot.machine_pos),
+            );
         }
         let run = c.run.as_ref().unwrap();
         assert!(run.running.is_none() && run.done[0], "{:?}", run.outcome);
@@ -8592,7 +8710,10 @@ spindle_max_rpm = 24000
         {
             c.refresh();
             if let Some(r) = &mut c.run {
-                r.refresh(c.snapshot.program_outcome.as_ref());
+                r.refresh(
+                    c.snapshot.program_outcome.as_ref(),
+                    Some(&c.snapshot.machine_pos),
+                );
             }
             let s = &c.snapshot;
             for (k, a) in [0., 90., 180., 270.].iter().enumerate() {

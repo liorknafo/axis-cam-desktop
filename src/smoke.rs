@@ -2971,9 +2971,11 @@ flood = { pin = 8 }
 
     /// AXIS CAM closed (`a`, disconnected as closing does) and opened again
     /// on the same workspace and project: nothing of its run is left in
-    /// memory, only what it kept on disk.
+    /// memory, only what it kept on disk; the journals it wrote are
+    /// another session's.
     fn reopen(a: App, dir: &std::path::Path) -> App {
         assert!(a.control.is_none(), "disconnect first, as closing does");
+        crate::run::forget_own_files();
         let mut b = App::from_workspace(dir.join("workspace.json"), None);
         b.replace_document(a.doc.clone(), None);
         b.imported_mesh = a.imported_mesh.clone();
@@ -4958,6 +4960,10 @@ flood = { pin = 8 }
             (r.index, r.from, run.done.clone()),
             (0, 0, vec![false, false])
         );
+        // Another session's tool run: what this setup's runs cut before is
+        // not known, so no start goes by the check's stock (LIO-586 review).
+        let cut: Vec<_> = run.cut_in_run.iter().map(|c| (c.0, c.1)).collect();
+        assert_eq!(cut, [(crate::run::HISTORY_UNKNOWN, None)]);
         assert!(run.outcome.is_none());
         assert!(
             (conn(&a).pi_note.as_ref()).is_some_and(|n| n.contains("tool run 1 of")),
@@ -6022,6 +6028,107 @@ flood = { pin = 8 }
         op.p.insert("feed".into(), "600".into());
     }
 
+    /// An E-stop while a hole is drilled on the Pi (LIO-586 review): where
+    /// the tool stood as the stop's outcome came is not where it stopped,
+    /// the outcome maybe kept for a reconnect and the machine moved since by
+    /// another computer, so all the tool run ran is taken as cut, and a
+    /// start at the hole it stopped in sets no Z from the stock the check
+    /// carves.
+    #[test]
+    fn an_e_stop_mid_step_on_the_pi_takes_all_the_tool_run_ran_as_cut() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _server) = pi_app(dir.path());
+        slow_holes(&mut a);
+        let drill = drilling(&mut a);
+        assert!(drill.steps.len() >= 2);
+        run_until(&mut a, 30.0, "hole 2", |r| {
+            r.step_at(None)
+                .is_some_and(|(oi, s, done)| oi == 1 && s == 1 && !done)
+        });
+        let _ = a.update(Message::MachineEStop);
+        run_until(&mut a, 10.0, "the E-stop", |r| r.running.is_none());
+        let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
+        assert_eq!(cut, [(1, None)]);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        // The start is the hole it stopped in, as after a local E-stop.
+        if run_of(&a).at_step() != Some((1, 1)) {
+            let _ = a.update(Message::Run(R::PickStep(1, 1)));
+            let _ = a.update(Message::Run(R::StartStep));
+            answer_skips(&mut a, 0);
+        }
+        assert_eq!(run_of(&a).at_step(), Some((1, 1)));
+        assert!(conn(&a).touch_off().is_none());
+        let why = conn(&a).partway_blocked().unwrap();
+        assert!(
+            why.starts_with("This run's tool runs have cut the stock since"),
+            "{why}"
+        );
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// An E-stop while a hole is drilled, an MDI sent just before it with
+    /// no snapshot since showing the job going (LIO-586 review): the run
+    /// bar lets one through while it still shows the job paused, and it
+    /// may move the machine once the job has stopped, so where the tool
+    /// stands as the outcome comes is not where it stopped. All the tool
+    /// run ran is taken as cut.
+    #[test]
+    fn a_stop_after_a_command_that_may_move_takes_all_the_tool_run_ran_as_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        slow_holes(&mut a);
+        let drill = drilling(&mut a);
+        assert!(drill.steps.len() >= 2);
+        run_until(&mut a, 30.0, "hole 2", |r| {
+            r.step_at(None)
+                .is_some_and(|(oi, s, done)| oi == 1 && s == 1 && !done)
+        });
+        conn(&a).send(uc100::controller::Command::Mdi("G4 P0".into()));
+        let _ = a.update(Message::MachineEStop);
+        run_until(&mut a, 5.0, "the E-stop", |r| r.running.is_none());
+        let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
+        assert_eq!(cut, [(1, None)]);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// Another job sent as the tool run starts, the screen still showing the
+    /// machine idle (a Go Z, LIO-586 review): the driver refuses it, and its
+    /// refusal is not the tool run's, which goes on and is followed to its
+    /// stop, what it cut kept.
+    #[test]
+    fn another_jobs_refusal_does_not_end_the_tool_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        slow_holes(&mut a);
+        drilling(&mut a);
+        conn(&a).send(uc100::controller::Command::Run {
+            name: "Go Z".into(),
+            lines: std::sync::Arc::new(vec!["G0 Z5".into()]),
+        });
+        tick_until(&mut a, 3.0, "the refusal", |s| {
+            (s.program_outcome.as_ref()).is_some_and(|o| o.message.starts_with("Go Z: not started"))
+        });
+        for _ in 0..5 {
+            let _ = a.update(Message::Tick);
+        }
+        assert!(run_of(&a).running.is_some(), "{:?}", run_of(&a).outcome);
+        run_until(&mut a, 30.0, "hole 2", |r| {
+            r.step_at(None)
+                .is_some_and(|(oi, s, done)| oi == 1 && s == 1 && !done)
+        });
+        let _ = a.update(Message::MachineEStop);
+        run_until(&mut a, 5.0, "the E-stop", |r| r.running.is_none());
+        assert!(
+            run_of(&a).cut_in_run.iter().any(|c| c.0 == 1),
+            "{:?}",
+            run_of(&a).cut_in_run
+        );
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// An E-stop while a hole is drilled (LIO-275): that hole counts as not
     /// done, the journal keeps the one before it, and it is the start, cut
     /// again from its start.
@@ -6041,6 +6148,12 @@ flood = { pin = 8 }
         });
         let _ = a.update(Message::MachineEStop);
         run_until(&mut a, 5.0, "the E-stop", |r| r.running.is_none());
+        // Cut, for the starts after it: holes 1 and 2, by where the tool
+        // stood as the outcome came (LIO-586 review); hole 3 too when it
+        // stood on hole 2's line, which hole 2's last retract goes along
+        // too, after which hole 3 may have begun.
+        let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
+        assert!(matches!(cut[..], [(1, Some(2 | 3))]), "{cut:?}");
         let journal = a.control.as_ref().unwrap().journal().expect("the journal");
         assert_eq!((journal.op, journal.step), (1, Some(0)), "{journal:?}");
         assert!(journal.why.contains("E-stop"), "{}", journal.why);
@@ -10028,6 +10141,88 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
         drop(server);
         assert_eq!(z, Some(-2.));
+    }
+
+    /// A start at a step of a tool run this run cut to its end, after a real
+    /// Cycle Start (LIO-586): the Face's two passes and the Pocket run to
+    /// their end, then Face pass 2 is picked to cut again. Before the run it
+    /// touches off on pass 1's floor, Z−2; after it, pass 2 has cut there
+    /// too, so nothing sets Z from the stock the check carves, and the Work
+    /// zero tab, the Start at a step tab and the run bar say why.
+    #[test]
+    fn a_step_start_in_a_tool_run_cut_to_its_end_says_why_it_sets_no_z() {
+        use crate::run::Action as R;
+        use crate::ui::ControlTab;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 1, 3]);
+        for (oi, down) in [(0, "2"), (1, "10")] {
+            let p = &mut a.doc.setups[0].operations[oi].p;
+            p.insert("stepdown".into(), down.into());
+            p.insert("feed".into(), "10000".into());
+        }
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let pass_2 = |a: &mut App| {
+            tick_until(a, 5., "Idle", |s| s.state == Some(State::Idle));
+            let _ = a.update(Message::Run(R::Steps(Some(0))));
+            let _ = a.update(Message::Run(R::PickStep(0, 1)));
+            let _ = a.update(Message::Run(R::StartStep));
+            answer_skips(a, 0);
+            assert_eq!(run_of(a).at_step(), Some((0, 1)));
+        };
+        let start_tab = |a: &mut App| {
+            let _ = a.update(Message::ControlTab(ControlTab::Start));
+            crate::ui::probe::texts(a.view(), iced::Size::new(1440., 1100.))
+        };
+        pass_2(&mut a);
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        assert_eq!(conn(&a).partway_blocked(), None);
+        let texts = start_tab(&mut a);
+        assert!(
+            texts.iter().any(|t| t == "Probe the stock again"),
+            "{texts:?}"
+        );
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        answer_skips(&mut a, 0);
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_some(), "{:?}", problems(&a));
+        run_until(&mut a, 90., "tool run 1", |r| r.running.is_none());
+        assert!(run_of(&a).done[0]);
+        pass_2(&mut a);
+        let why = conn(&a).partway_blocked().unwrap();
+        assert!(
+            why.starts_with("This run's tool runs have cut the stock since"),
+            "{why}"
+        );
+        assert!(conn(&a).touch_off().is_none() && conn(&a).stock_top().is_err());
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        let said = format!(
+            "{why} Zero Z on the stock top and Probe Z are off: {}.",
+            crate::run::STEP_ZERO_BY_HAND
+        );
+        for tab in [ControlTab::WorkZero, ControlTab::Start] {
+            let _ = a.update(Message::ControlTab(tab));
+            let texts = crate::ui::probe::texts(a.view(), iced::Size::new(1440., 1100.));
+            assert!(texts.contains(&said), "{tab:?}: {texts:?}");
+        }
+        assert!(
+            problems(&a)
+                .iter()
+                .any(|p| p.contains("set Z by hand") && p.ends_with(&why)),
+            "{:?}",
+            problems(&a)
+        );
+        // Its button to the Work zero tab says what is done there now.
+        let texts = start_tab(&mut a);
+        assert!(texts.iter().any(|t| t == "Set Z by hand"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|t| t == "Probe the stock again"),
+            "{texts:?}"
+        );
+        let _ = a.update(Message::Disconnect);
     }
 
     /// A run started at the Pocket with the Drilling's first hole taken as

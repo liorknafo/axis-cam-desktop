@@ -364,6 +364,11 @@ const RUN_UNFOLLOWED_WHY: &str = "This run's tool runs have cut the stock since,
 /// `RUN_UNFOLLOWED` cut (`Run::partway_blocked`).
 const RUN_UNFOLLOWED_BLOCKED: &str = "This run's tool runs have cut the stock since, and the check does not follow what they cut, so it cannot tell the surface where the stock top is touched off.";
 
+/// What a start at a step whose stock's surface the check cannot tell
+/// (`Run::partway_blocked`) does for its work zero: kept, or Z set by hand
+/// (LIO-586 review).
+pub(crate) const STEP_ZERO_BY_HAND: &str = "keep the work zero they were cut with (Keep it, under Start at a step), or set Z by hand on a surface whose height you know (Set under Work zero)";
+
 /// Why Zero Z on the stock top and Probe Z cannot set Z for a run from the
 /// setup's start (`Run::inherited_unknown`).
 const INHERITED_UNKNOWN: &str = "Earlier setups may have cut the stock under the stock top where it is touched off, so the check cannot tell its surface there.";
@@ -520,6 +525,9 @@ pub struct Run {
     /// the check found of one that no longer holds.
     pub resumed: Option<Journal>,
     pub journal_note: Option<String>,
+    /// `journal` is one this session wrote, unchanged since (`read_own`):
+    /// what its runs cut is in `cut_in_run`. Else another session's.
+    pub journal_own: bool,
     /// The tool run on the Pi this run is to follow once checked, AXIS
     /// CAM having been closed since it was sent (`following`).
     pub follow: Option<Follow>,
@@ -764,7 +772,13 @@ pub struct Journal {
 
 impl Journal {
     pub fn read(path: &std::path::Path) -> Option<Self> {
-        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+        Some(Self::read_own(path)?.0)
+    }
+
+    /// `read`, and whether it is as this session wrote it (`read_own`).
+    pub fn read_own(path: &std::path::Path) -> Option<(Self, bool)> {
+        let (data, own) = read_own(path)?;
+        Some((serde_json::from_slice(&data).ok()?, own))
     }
 
     pub fn write(&self, path: &std::path::Path) -> Result<(), String> {
@@ -773,6 +787,13 @@ impl Journal {
         }
         let data = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
         crate::storage::write_atomic(path, &data)
+    }
+
+    /// `write`, as this session's (`write_own`): read back unchanged, it
+    /// is this session's (`read_own`).
+    pub fn write_own(&self, path: &std::path::Path) -> Result<(), String> {
+        let data = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        write_own(path, &data)
     }
 
     /// How long ago it stopped, at `now` (seconds since 1970): "12 min
@@ -792,6 +813,137 @@ impl Journal {
 pub fn now() -> u64 {
     (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)).map_or(0, |d| d.as_secs())
 }
+
+/// One version of a file, as its metadata tells it from any other: on
+/// Unix its device and inode and the times it was modified and changed.
+/// The change time is the system's, set on every write and every time
+/// set, so a copy put back with its modified time (`cp -p`) is not the
+/// version it was copied from. None where it cannot be told (not Unix):
+/// no file is this session's there.
+#[derive(Debug, Clone, PartialEq)]
+struct Version {
+    dev: u64,
+    ino: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+fn version(m: &std::fs::Metadata) -> Option<Version> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Some(Version {
+            dev: m.dev(),
+            ino: m.ino(),
+            modified: (m.mtime(), m.mtime_nsec()),
+            changed: (m.ctime(), m.ctime_nsec()),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = m;
+        None
+    }
+}
+
+thread_local! {
+    /// The versions of the files this session wrote, on the thread that
+    /// runs the app (`write_own`): a journal read back as one of them is this
+    /// session's; any other, whatever it holds or when, another session's,
+    /// which alone knew what its runs cut (`Run::take_journal`, LIO-586
+    /// review).
+    static OWN_FILES: std::cell::RefCell<Vec<(std::path::PathBuf, Version)>> =
+        const { std::cell::RefCell::new(vec![]) };
+}
+
+/// Reads `path` to the end, and the version of the very file read,
+/// taken from it once read, so that one changed meanwhile is not the one
+/// it was before.
+fn read_version(path: &std::path::Path) -> Option<(Vec<u8>, Option<Version>)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut data = vec![];
+    file.read_to_end(&mut data).ok()?;
+    Some((data, file.metadata().ok().as_ref().and_then(version)))
+}
+
+/// Tests: what another process does to the file `write_own` just renamed
+/// into place, at each point it looks at it again (0: before it takes its
+/// version from the file it made; 1: before it reads it back).
+#[cfg(test)]
+type Meanwhile = Box<dyn Fn(usize, &std::path::Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static MEANWHILE: std::cell::RefCell<Option<Meanwhile>> = std::cell::RefCell::new(None);
+}
+
+/// Writes `data` to `path` as `storage::write_atomic` does (a new file,
+/// renamed there), and notes the version this session wrote (`read_own`)
+/// only when nothing else wrote it since (LIO-586 review): the file it
+/// made, renamed there, still has the modified time it had once written
+/// (a rename leaves it; any write changes it), and the file read back at
+/// `path` is that very version, its inode and both times, and holds what
+/// was written. One put there or written meanwhile, by another session
+/// say, is not noted.
+pub fn write_own(path: &std::path::Path, data: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let parent = path.parent().ok_or("Missing parent directory")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let tmp = parent.join(format!(".axis-{}.tmp", uuid::Uuid::new_v4()));
+    let written = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        let made = f.metadata()?;
+        std::fs::rename(&tmp, path)?;
+        #[cfg(test)]
+        MEANWHILE.with(|m| m.borrow().as_ref().map(|m| m(0, path)));
+        let placed = f.metadata()?;
+        Ok((version(&made), version(&placed)))
+    })()
+    .map_err(|e: std::io::Error| e.to_string());
+    let (made, placed) = match written {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    };
+    #[cfg(test)]
+    MEANWHILE.with(|m| m.borrow().as_ref().map(|m| m(1, path)));
+    if let (Some(made), Some(placed), Some((read, Some(v)))) = (made, placed, read_version(path))
+        && (placed.dev, placed.ino, placed.modified) == (made.dev, made.ino, made.modified)
+        && v == placed
+        && read == data
+    {
+        OWN_FILES.with(|o| o.borrow_mut().push((path.to_path_buf(), v)));
+    }
+    Ok(())
+}
+
+/// Reads `path`, and whether what was read is a version this session
+/// wrote (`write_own`): the version of the very file read, taken from it
+/// once read, so that one changed meanwhile is not.
+pub fn read_own(path: &std::path::Path) -> Option<(Vec<u8>, bool)> {
+    let (data, read) = read_version(path)?;
+    let own = read
+        .is_some_and(|v| OWN_FILES.with(|o| o.borrow().iter().any(|(p, w)| p == path && *w == v)));
+    Some((data, own))
+}
+
+/// Tests: AXIS CAM closed, so the files it wrote are another session's to
+/// the one opened next.
+#[cfg(test)]
+pub(crate) fn forget_own_files() {
+    OWN_FILES.with(|o| o.borrow_mut().clear());
+}
+
+/// What `Run::cut_in_run` holds for cuts of the setup no session here
+/// knows (`Run::note_history_unknown`): an operation after every start,
+/// which no check simulates, so that no start goes by the check's stock
+/// until New stock loaded, whatever the operations are by then.
+pub(crate) const HISTORY_UNKNOWN: usize = usize::MAX;
 
 /// The stock before an operation of the setup being run, seen from above,
 /// and the shape of its cutter.
@@ -905,6 +1057,7 @@ impl Run {
             journal: None,
             resumed: None,
             journal_note: None,
+            journal_own: false,
             follow: None,
             followed: None,
             cut_note: None,
@@ -1393,6 +1546,13 @@ impl Run {
             return;
         }
         if let Some(j) = self.journal.take() {
+            // Another session's, it tells of runs of this setup whose cuts
+            // only that session knew, whether or not where it stopped is
+            // picked. This session's own is in what its runs cut
+            // (`App::run_cuts`) (LIO-586 review).
+            if j.setup == self.setup_id && !std::mem::take(&mut self.journal_own) {
+                self.note_history_unknown();
+            }
             // Its steps as they split then: a build that splits them
             // otherwise (a deep drilling's pecks into its holes, LIO-549)
             // numbers them otherwise.
@@ -1411,12 +1571,25 @@ impl Run {
         }
     }
 
+    /// Notes that runs of this setup no session here followed cut the
+    /// stock (`HISTORY_UNKNOWN`): another session's journal, or a tool run
+    /// it sent, followed (LIO-586 review). Such a journal says where its
+    /// run last stopped, not what it cut before (all of the setup, cut
+    /// again from an earlier step, or by operations deleted since), so no
+    /// start sets Z from the stock the check carves until New stock
+    /// loaded: the work zero is kept, or Z set by hand.
+    pub fn note_history_unknown(&mut self) {
+        note_cut_in(&mut self.cut_in_run, HISTORY_UNKNOWN, None, None);
+    }
+
     /// Where a run of this setup stopped, found while it is open (the Pi
     /// stopped a tool run this computer did not follow): its start is the
     /// step after, now or once it is checked.
-    pub fn adopt_journal(&mut self, j: Journal) {
+    /// `own`: its stops kept as this session wrote them (`read_own`).
+    pub fn adopt_journal(&mut self, j: Journal, own: bool) {
         if self.running.is_none() && j.setup == self.setup_id {
             self.journal = Some(j);
+            self.journal_own = own;
             self.take_journal();
         }
     }
@@ -1538,8 +1711,13 @@ impl Run {
     /// job the driver refused ("not started": sent while it re-anchored its
     /// position after a work zero, say) never ran, so the start is undone:
     /// the work zero is not kept from it, and the first tool run's work-zero
-    /// steps stay (#168).
-    pub fn refresh(&mut self, outcome: Option<&uc100::controller::ProgramOutcome>) {
+    /// steps stay (#168). `at`: the machine position the snapshot with the
+    /// outcome gives, where the tool stopped (`reach`).
+    pub fn refresh(
+        &mut self,
+        outcome: Option<&uc100::controller::ProgramOutcome>,
+        at: Option<&[f64; 6]>,
+    ) {
         let (Some(r), Some(o)) = (&self.running, outcome) else {
             return;
         };
@@ -1567,10 +1745,13 @@ impl Run {
             vec![]
         } else if let Some((op, s)) = stopping {
             up_to(op, s + 1)
-        } else if let Some(at) = self.stopped_in("") {
-            // In a step: it may be cut in part.
-            up_to(at.op, at.last.map_or(1, |l| l + 2))
+        } else if let Some(far) = self.reach(at).and_then(|b| self.stopped_on(b, "")) {
+            // In a step: it may be cut in part, up to the furthest step the
+            // tool may have got to (`reach`), not just the one it was last
+            // followed on, which may lag (LIO-586 review).
+            up_to(far.op, far.last.map_or(1, |l| l + 2))
         } else {
+            // Where it stopped is not known: all it ran may be cut.
             ran.iter().map(|&o| (o, None)).collect()
         };
 
@@ -1632,9 +1813,36 @@ impl Run {
     /// tool tip is on (the first until it is found), the last step done of
     /// it being the one before, or that one if its cutting was done.
     pub fn stopped_in(&self, why: &str) -> Option<Stopped> {
+        let block = self.running.as_ref()?.on.map_or(0, |o| o.0);
+        self.stopped_on(block, why)
+    }
+
+    /// The furthest block of the running tool run the tool may be on,
+    /// stopped at machine position `at`: the last, from the one it was
+    /// followed to (`track`), whose move the tip is on. What it was followed
+    /// to may lag: snapshots the app missed while busy, or the one with the
+    /// outcome, which comes before `track` and gives no line once the
+    /// program ended. So the tip's place bounds what it cut (LIO-586
+    /// review). `at` must be where the tool stopped, not where it went since
+    /// (None: not known, as on the Pi). None when it is not known, the tip
+    /// is on none of them, or that one is in no step (`mark_step`): where
+    /// it got is not known.
+    fn reach(&self, at: Option<&[f64; 6]>) -> Option<usize> {
+        let (r, at) = (self.running.as_ref()?, at?);
+        let p = self.checked()?.get(r.index)?;
+        let tip = std::array::from_fn(|k| (at[k] - r.offset[k] + p.datum[k] as f64) as f32);
+        let from = r.on.map_or(0, |o| o.0);
+        let b = (from..r.paths.len())
+            .rev()
+            .find(|&j| r.paths[j].is_some_and(|m| along(m, tip).is_some()))?;
+        self.mark_step(p, r.marks.get(b).copied().flatten()?)?;
+        Some(b)
+    }
+
+    /// `stopped_in` with the tool on block `block` of the running tool run.
+    fn stopped_on(&self, block: usize, why: &str) -> Option<Stopped> {
         let r = self.running.as_ref()?;
         let p = self.checked()?.get(r.index)?;
-        let block = r.on.map_or(0, |o| o.0);
         let (op, s, done) = match r.marks.get(block).copied().flatten() {
             Some(mark) => match self.mark_step(p, mark) {
                 Some(step) => step,
@@ -1922,10 +2130,18 @@ impl Run {
         if let Some((oi, n)) = self.at_step() {
             let step = self.step_label(oi, n);
             if !self.zeroed {
-                e.push(format!(
-                    "This run starts {} at {step}, the steps before it taken as cut: keep the work zero they were cut with (Keep it, under Start at a step), or set it on the stock they left.",
-                    first.name
-                ));
+                // Where the check cannot tell the stock they left, it is
+                // set by hand, and the reason said (LIO-586 review).
+                e.push(match self.partway_blocked() {
+                    Some(why) => format!(
+                        "This run starts {} at {step}, the steps before it taken as cut: {STEP_ZERO_BY_HAND}. {why}",
+                        first.name
+                    ),
+                    None => format!(
+                        "This run starts {} at {step}, the steps before it taken as cut: keep the work zero they were cut with (Keep it, under Start at a step), or set it on the stock they left.",
+                        first.name
+                    ),
+                });
             }
             if !unset.is_empty() {
                 e.push(format!(
@@ -7441,6 +7657,7 @@ pub(crate) mod tests {
             journal: None,
             resumed: None,
             journal_note: None,
+            journal_own: false,
             follow: None,
             followed: None,
             cut_note: None,
@@ -7454,9 +7671,9 @@ pub(crate) mod tests {
             ok,
             message: "m".into(),
         };
-        run.refresh(Some(&o(0, true)));
+        run.refresh(Some(&o(0, true)), None);
         assert!(run.running.is_some());
-        run.refresh(Some(&o(1, true)));
+        run.refresh(Some(&o(1, true)), None);
         assert!(run.running.is_none() && run.done[0] && run.next == 1);
     }
 
@@ -9280,6 +9497,372 @@ pub(crate) mod tests {
         });
         assert!(cut(&deeper) && deeper.touch_off().is_none());
         assert!(!cut(&edited(&|_| {})));
+    }
+
+    /// A start at a step of a tool run this run cut to its end (LIO-586):
+    /// the tablet fixture's Face and Pocket ran to their end (the driver's
+    /// outcome, through `refresh`), then Face pass 2 is picked to cut again.
+    /// The check takes only pass 1 as cut, but pass 2 cut the touch-off spot
+    /// down to its own floor too: Set Z of pass 1's floor there would set
+    /// the work zero as deep too low as pass 2 cuts. So nothing sets Z from
+    /// the check's stock, and Zero Z on the stock top and the probe spots
+    /// say why, as at the tool run's own start. Before any tool run, and
+    /// after one stopped after pass 1, the same start sets pass 1's floor.
+    #[test]
+    fn a_step_start_in_a_tool_run_cut_to_its_end_sets_no_z() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        let (whole, left) = check_steps(&doc, &mesh, 0, &[], &[]);
+        let (whole, left) = (Arc::new(whole), Arc::new(left));
+        // Face's passes go down: pass 2's floor is below pass 1's.
+        let face = left.steps.iter().find(|s| s.op == 0).unwrap();
+        assert!(face.steps.len() >= 2, "{}", face.steps.len());
+        let (pass_1, pass_2) = (face.steps[0].z.unwrap(), face.steps[1].z.unwrap());
+        assert!(pass_2 < pass_1 - 0.5, "{pass_1} {pass_2}");
+        assert_eq!(whole.as_ref().as_ref().unwrap()[0].indexes, [0, 1]);
+        // Tool run 1 (Face, Pocket) sent from its start, at work offset 0,
+        // and its outcome: ended ok, stopped after a step of the Face
+        // (`stopping`), or stopped in a step (`message`), the tool last
+        // followed on block `on` and standing at machine position `at`.
+        let p = whole.as_ref().as_ref().unwrap()[0].clone();
+        let blocks = p.from(0).unwrap();
+        let ran_at = |ok: bool,
+                      stopping: Option<(usize, usize)>,
+                      message: &str,
+                      on: Option<usize>,
+                      at: Option<[f64; 6]>| {
+            let mut run = Run::new(&doc, 0, 0);
+            run.checked_as(whole.clone(), Some(left.clone()), None);
+            let marks = run.marks_of(&p, blocks);
+            run.running = Some(Running {
+                index: 0,
+                from: 0,
+                seq: 0,
+                offset: [0.; 6],
+                before: Before {
+                    xy: None,
+                    zero: None,
+                    last: None,
+                    touched: false,
+                },
+                paths: paths(blocks, [0.; 3]),
+                tip: [0.; 3],
+                start: [0.; 6],
+                print: 0,
+                cut_ops: vec![],
+                on: on.map(|b| (b, 0.5)),
+                marks,
+            });
+            run.stopping = stopping;
+            run.refresh(
+                Some(&uc100::controller::ProgramOutcome {
+                    seq: 1,
+                    ok,
+                    message: message.into(),
+                }),
+                at.as_ref(),
+            );
+            assert!(run.running.is_none());
+            run
+        };
+        let ran = |ok: bool, stopping| ran_at(ok, stopping, "m", None, None);
+        // Face pass 2 picked as the start, and the setup checked again
+        // with pass 1 taken as cut.
+        let at_pass_2 = |mut run: Run| {
+            assert!(run.start_at_step(0, 1));
+            let (c, l) = check_steps(&doc, &mesh, 0, &[], &[(0, vec![0])]);
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            assert_eq!((run.next, run.from, run.at_step()), (0, 0, Some((0, 1))));
+            assert!(run.partway() && run.on_cut_stock());
+            run
+        };
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-3;
+        let on_pass_1 = |run: &Run| {
+            let partly = run.partly().unwrap();
+            assert!(partly.cut != [RUN_UNFOLLOWED], "{:?}", partly.cut);
+            assert!(
+                partly.surface.is_some_and(|z| near(z, pass_1)),
+                "{partly:?}"
+            );
+            let (at, _) = run.touch_off().unwrap();
+            assert!(near(at[2], pass_1), "{at:?}");
+            assert_eq!(run.partway_blocked(), None);
+        };
+        // Before any tool run: pass 1's floor.
+        let mut fresh = Run::new(&doc, 0, 0);
+        fresh.checked_as(whole.clone(), Some(left.clone()), None);
+        on_pass_1(&at_pass_2(fresh));
+        // Stopped after pass 1: pass 2 never cut, pass 1's floor still.
+        let stopped = ran(false, Some((0, 0)));
+        assert_eq!(stopped.cut_in_run.len(), 1);
+        assert_eq!(stopped.cut_in_run[0].1, Some(1));
+        on_pass_1(&at_pass_2(stopped));
+        // Cut to its end, or stopped after pass 2: pass 2 cut there, which
+        // the check's stock before pass 2 does not have.
+        let done = ran(true, None);
+        assert!(done.done[0] && done.next == 1);
+        assert_eq!(
+            done.cut_in_run
+                .iter()
+                .map(|c| (c.0, c.1))
+                .collect::<Vec<_>>(),
+            [(0, None), (1, None)]
+        );
+        let refused = |run: Run| {
+            let partly = run.partly().unwrap();
+            assert_eq!(partly.cut, [RUN_UNFOLLOWED]);
+            assert_eq!(partly.surface, None);
+            assert!(!partly.probe_from.is_empty());
+            assert!(
+                (partly.probe_from.iter())
+                    .all(|(_, ok)| ok.as_ref().is_err_and(|e| e == RUN_UNFOLLOWED_WHY))
+            );
+            assert_eq!(run.touch_off(), None);
+            assert_eq!(
+                run.partway_blocked().as_deref(),
+                Some(RUN_UNFOLLOWED_BLOCKED)
+            );
+            // As at the tool run's own start, picked again.
+            let mut start = run;
+            start.start_at(0, 0);
+            start.checked_as(whole.clone(), Some(left.clone()), None);
+            assert_eq!((start.next, start.from, start.at_step()), (0, 0, None));
+            assert_eq!(start.touch_off(), None);
+            assert_eq!(
+                start.partway_blocked().as_deref(),
+                Some(RUN_UNFOLLOWED_BLOCKED)
+            );
+        };
+        refused(at_pass_2(done));
+        refused(at_pass_2(ran(false, Some((0, 1)))));
+        // Stopped in a step (an E-stop), the tool last followed early in
+        // pass 1: the app may have missed the snapshots that followed it on,
+        // and the one with the outcome has no line (LIO-586 review). What
+        // it cut goes by where the tool stands.
+        let mut plain = Run::new(&doc, 0, 0);
+        plain.checked_as(whole.clone(), Some(left.clone()), None);
+        let marks = plain.marks_of(&p, blocks);
+        let path = paths(blocks, [0.; 3]);
+        let in_pass = |s: usize| -> Vec<usize> {
+            (0..blocks.len())
+                .filter(|&j| {
+                    matches!(
+                        blocks[j],
+                        Block::Move {
+                            kind: Kind::Feed,
+                            ..
+                        }
+                    ) && path[j].is_some()
+                        && marks[j].and_then(|m| plain.mark_step(&p, m)) == Some((0, s, false))
+                })
+                .collect()
+        };
+        let (one, two) = (in_pass(0), in_pass(1));
+        assert!(one.len() > 2 && two.len() > 2, "{one:?} {two:?}");
+        // The machine position at the middle of block `j`'s move.
+        let mid = |j: usize| -> [f64; 6] {
+            let [a, b] = path[j].unwrap();
+            std::array::from_fn(|k| match k {
+                0..3 => ((a[k] + b[k]) / 2. - p.datum[k]) as f64,
+                _ => 0.,
+            })
+        };
+        let e_stop = |at| ran_at(false, None, "E-stop", Some(one[0]), Some(at));
+        let cuts = |run: &Run| {
+            run.cut_in_run
+                .iter()
+                .map(|c| (c.0, c.1))
+                .collect::<Vec<_>>()
+        };
+        // Standing in pass 1: pass 2 not cut, pass 1's floor.
+        let in_1 = e_stop(mid(one[one.len() / 2]));
+        assert_eq!(cuts(&in_1), [(0, Some(1))]);
+        on_pass_1(&at_pass_2(in_1));
+        // Standing in pass 2: cut up to there, so no Z.
+        let in_2 = e_stop(mid(two[two.len() / 2]));
+        assert_eq!(cuts(&in_2), [(0, Some(2))]);
+        refused(at_pass_2(in_2));
+        // On no move, or where it stopped not known (on the Pi): all it
+        // ran may be cut.
+        let lost = e_stop([1e3; 6]);
+        assert_eq!(cuts(&lost), [(0, None), (1, None)]);
+        refused(at_pass_2(lost));
+        let unknown = ran_at(false, None, "E-stop", Some(one[0]), None);
+        assert_eq!(cuts(&unknown), [(0, None), (1, None)]);
+        refused(at_pass_2(unknown));
+    }
+
+    /// A journal another session wrote, picked up again (LIO-586 review):
+    /// it says where its run last stopped, not what it cut before (all of
+    /// the setup, then Face cut again from pass 1 and stopped after it,
+    /// say), which only that session knew. So no start sets Z from the
+    /// check's stock (`HISTORY_UNKNOWN`): not Face pass 2, whatever stopped
+    /// it (Stop after pass 1, an E-stop in pass 2, the Face's tool run done
+    /// on the Pi); not when its program has changed since, so that where it
+    /// stopped is not picked; not with an operation left out of the check
+    /// as it is picked up and enabled again, nor after operations deleted
+    /// and added since. A run that follows a tool run another session sent
+    /// knows no more. The journal this session wrote is in what its runs
+    /// cut (`App::run_cuts`): that record stands.
+    #[test]
+    fn a_journal_picked_again_keeps_what_its_run_may_have_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        let (whole, left) = check_steps(&doc, &mesh, 0, &[], &[]);
+        let (whole, left) = (Arc::new(whole), Arc::new(left));
+        let pass_1 = (left.steps.iter().find(|s| s.op == 0).unwrap().steps[0].z).unwrap();
+        let journal = |op: usize, last: Option<usize>, why: &str| {
+            let mut run = Run::new(&doc, 0, 0);
+            run.checked_as(whole.clone(), Some(left.clone()), None);
+            let st = Stopped {
+                op,
+                last,
+                up: None,
+                why: why.into(),
+            };
+            run.journal_of(&st, 0, [0.; 6]).unwrap()
+        };
+        // Picked with the setup, this session's (`own`) or another's, with
+        // what this session's runs cut.
+        let picked = |j: Journal, cuts: Vec<CutInRun>, own: bool| {
+            let mut run = Run::new(&doc, 0, 0);
+            (run.journal, run.journal_own, run.cut_in_run) = (Some(j), own, cuts);
+            run.checked_as(whole.clone(), Some(left.clone()), None);
+            run
+        };
+        let at_step = |mut run: Run, oi: usize, n: usize| {
+            if run.start_step != Some((oi, n)) {
+                assert!(run.start_at_step(oi, n));
+            }
+            let (c, l) = check_steps(&doc, &mesh, 0, &[], &[(oi, (0..n).collect())]);
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            assert_eq!(run.at_step(), Some((oi, n)));
+            run
+        };
+        let unknown = |run: &Run| run.cut_in_run.iter().any(|c| c.0 == HISTORY_UNKNOWN);
+        let refused = |run: &Run| {
+            assert!(unknown(run), "{:?}", run.cut_in_run);
+            assert_eq!(run.partly().unwrap().cut, [RUN_UNFOLLOWED]);
+            assert_eq!(run.touch_off(), None);
+            assert_eq!(
+                run.partway_blocked().as_deref(),
+                Some(RUN_UNFOLLOWED_BLOCKED)
+            );
+            // Keep this work zero stays.
+            assert!(run.partway() && !run.zeroed);
+        };
+        let on_pass_1 = |run: &Run| {
+            let (at, _) = run.touch_off().unwrap();
+            assert!((at[2] - pass_1).abs() < 1e-3, "{at:?} {pass_1}");
+        };
+        // Without a journal, Face pass 2 touches off on pass 1's floor and
+        // Drilling hole 2 on the pocket's: it is the journal that tells.
+        let fresh = || {
+            let mut run = Run::new(&doc, 0, 0);
+            run.checked_as(whole.clone(), Some(left.clone()), None);
+            run
+        };
+        on_pass_1(&at_step(fresh(), 0, 1));
+        assert!(at_step(fresh(), 2, 1).touch_off().is_some());
+        for j in [
+            journal(0, Some(0), "Stop after step"),
+            journal(0, Some(0), "an E-stop"),
+            journal(2, None, ""),
+        ] {
+            let run = picked(j, vec![], false);
+            assert!(run.resumed.is_some());
+            refused(&at_step(run, 0, 1));
+        }
+        // Its program changed since (another feed, say): where it stopped
+        // is not picked, but what it may have cut is still taken.
+        let mut changed = journal(0, Some(0), "Stop after step");
+        changed.fingerprint ^= 1;
+        let run = picked(changed, vec![], false);
+        assert!(run.resumed.is_none() && run.journal_note.is_some());
+        refused(&at_step(run, 0, 1));
+        // The Drilling left out of the check as it is picked up (disabled),
+        // or deleted with the Pocket before and added again: its hole 2
+        // sets no Z either.
+        let mut off = doc.clone();
+        off.setups[0].operations[2].enabled = false;
+        let mut face_only = doc.clone();
+        face_only.setups[0].operations.truncate(1);
+        for edited in [off, face_only] {
+            let (c, l) = check_steps(&edited, &mesh, 0, &[], &[]);
+            let mut run = Run::new(&edited, 0, 0);
+            run.journal = Some(journal(0, Some(0), "Stop after step"));
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            run.checked_as(whole.clone(), Some(left.clone()), None);
+            refused(&at_step(run, 2, 1));
+        }
+        // A run following another session's tool run: the same.
+        let mut follows = fresh();
+        follows.note_history_unknown();
+        refused(&at_step(follows, 0, 1));
+        // This session's journal, with what its runs cut (Face pass 1,
+        // given as `App::run_cuts` does): that record stands.
+        let mut known = fresh();
+        known.note_cut(0, Some(1));
+        let session = known.cut_in_run.clone();
+        let run = picked(
+            journal(0, Some(0), "Stop after step"),
+            session.clone(),
+            true,
+        );
+        assert!(run.resumed.is_some());
+        assert_eq!(run.cut_in_run, session);
+        on_pass_1(&at_step(run, 0, 1));
+    }
+
+    /// A file is this session's only as it wrote it (`write_own`, LIO-586
+    /// review): written again since, the same bytes or not, by another
+    /// session say, it is not; nor with its modified time put back as it
+    /// was (a copy put back with `cp -p`); nor one it never wrote, nor once
+    /// AXIS CAM is opened again.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_is_this_sessions_only_as_it_wrote_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uc100").join("m-journal.json");
+        let own = |path: &std::path::Path| read_own(path).map(|(_, own)| own);
+        assert_eq!(own(&path), None);
+        crate::storage::write_atomic(&path, b"{}").unwrap();
+        assert_eq!(own(&path), Some(false));
+        write_own(&path, b"{}").unwrap();
+        assert_eq!(own(&path), Some(true));
+        let was = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(own(&path), Some(false));
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(was).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), was);
+        assert_eq!(own(&path), Some(false));
+        write_own(&path, b"{}").unwrap();
+        assert_eq!(own(&path), Some(true));
+        forget_own_files();
+        assert_eq!(own(&path), Some(false));
+        // Another process writes the same bytes in place just after it is
+        // renamed there, or just before it is read back: not noted.
+        for at in [0, 1] {
+            MEANWHILE.with(|m| {
+                *m.borrow_mut() = Some(Box::new(move |i, p| {
+                    if i == at {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        std::fs::write(p, "{}").unwrap();
+                    }
+                }))
+            });
+            write_own(&path, b"{}").unwrap();
+            MEANWHILE.with(|m| *m.borrow_mut() = None);
+            assert_eq!(own(&path), Some(false), "{at}");
+        }
+        write_own(&path, b"{}").unwrap();
+        assert_eq!(own(&path), Some(true));
     }
 
     /// A plan's moves cut with another cutter, or at another A, cut other

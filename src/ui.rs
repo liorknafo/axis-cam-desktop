@@ -11503,6 +11503,19 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
         .size(12)
     ]
     .spacing(6);
+    // Set again on the stock only where the check can tell its surface
+    // (LIO-586 review).
+    let blocked = c.partway_blocked();
+    if let Some(why) = &blocked {
+        two = two.push(
+            text(format!(
+                "{why} Zero Z on the stock top and Probe Z are off: {}.",
+                crate::run::STEP_ZERO_BY_HAND
+            ))
+            .size(12)
+            .color(AMBER),
+        );
+    }
     if let Some(j) = recorded {
         two = two.push(
             text(format!(
@@ -11525,8 +11538,13 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
                 (manual && !run.zeroed).then_some(Message::Run(R::KeepZero)),
                 run.zeroed
             ),
+            // Where the stock's surface is not known, the Work zero tab
+            // sets Z by hand only: said so (LIO-586 review).
             small(
-                "Probe the stock again",
+                match blocked {
+                    Some(_) => "Set Z by hand",
+                    None => "Probe the stock again",
+                },
                 Some(Message::ControlTab(ControlTab::WorkZero)),
                 false
             ),
@@ -11800,6 +11818,19 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
         col = col.push(rule::horizontal(1)).push(muted(
             "The setup's work zero was set on the stock before its first tool run: X and Y stay as they are from here.",
         ));
+        // A start at a step waits for the work zero the steps before it
+        // were cut with, which the check may not be able to find on the
+        // stock this run cut: why, and what to do then (LIO-586 review).
+        if let Some(why) = c.partway_blocked().filter(|_| run.partway()) {
+            col = col.push(
+                text(format!(
+                    "{why} Zero Z on the stock top and Probe Z are off: {}.",
+                    crate::run::STEP_ZERO_BY_HAND
+                ))
+                .size(12)
+                .color(AMBER),
+            );
+        }
     }
     if run.checked().is_some_and(|p| p.len() > 1) {
         col = col
