@@ -868,7 +868,15 @@ pub struct CutHistory {
     /// (`HISTORY_UNKNOWN`), until New stock loaded for it.
     #[serde(default)]
     pub others_unknown: bool,
+    /// The tool runs this computer sent a Pi (`control::sent_tool_runs`),
+    /// the latest `SENT_KEPT`: each kept as cut here before it was sent,
+    /// none ran while it was away (LIO-595), whichever session sent it.
+    #[serde(default)]
+    pub sent: Vec<u64>,
 }
+
+/// How many of the tool runs sent a Pi `CutHistory::sent` keeps.
+pub const SENT_KEPT: usize = 1000;
 
 /// A journal (`Journal`) as the session that kept what its run cut
 /// (`CutHistory::cuts`) wrote it: the setup's, in the machine's journal

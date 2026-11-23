@@ -2976,6 +2976,7 @@ flood = { pin = 8 }
     fn reopen(a: App, dir: &std::path::Path) -> App {
         assert!(a.control.is_none(), "disconnect first, as closing does");
         crate::run::forget_own_files();
+        crate::control::forget_sent_tool_runs();
         let mut b = App::from_workspace(dir.join("workspace.json"), None);
         b.replace_document(a.doc.clone(), None);
         b.imported_mesh = a.imported_mesh.clone();
@@ -10538,6 +10539,62 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
     }
 
+    /// LIO-594 review: on the Pi, a first run of the Face stopped after
+    /// pass 1, then AXIS CAM closed and opened again. The tool runs it sent
+    /// the Pi are kept with what they cut (`CutHistory::sent`), so the Pi
+    /// shows none this computer did not send: "Same part, nothing else
+    /// ran" is offered, and pass 2 touches off on pass 1's floor again.
+    #[test]
+    fn a_pi_run_stopped_after_pass_1_offers_its_floor_after_axis_cam_was_closed() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 3]);
+        let face = &mut a.doc.setups[0].operations[0].p;
+        face.insert("stepdown".into(), "2".into());
+        face.insert("feed".into(), "3000".into());
+        let server = to_pi(&mut a, dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        cycle_start(&mut a);
+        run_until(&mut a, 30., "Face pass 1", |r| {
+            r.step_at(None) == Some((0, 0, false))
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        tick_until(&mut a, 10., "the Face held", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        let _ = a.update(Message::Run(R::Resume));
+        run_until(&mut a, 180., "the stop after pass 1", |r| {
+            r.running.is_none()
+        });
+        tick_until(&mut a, 10., "Idle after the stop", |s| {
+            s.state == Some(State::Idle)
+        });
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        let _ = a.update(Message::Disconnect);
+        let mut b = reopen(a, dir.path());
+        let _ = b.update(Message::Connect);
+        pi_live(&mut b, true, "the Pi live");
+        let _ = b.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut b, 0);
+        if run_of(&b).programs.is_none() {
+            answer_skips(&mut b, 0);
+        }
+        assert_eq!(run_of(&b).at_step(), Some((0, 1)));
+        assert!(run_of(&b).away.as_ref().is_some_and(|w| w.seen.is_none()));
+        assert_eq!(conn(&b).same_part_refused(), None);
+        assert_eq!(conn(&b).touch_off(), None);
+        let _ = b.update(Message::Run(R::SamePart));
+        let z = conn(&b).touch_off().map(|(_, w)| w[2]);
+        let _ = b.update(Message::Disconnect);
+        drop(server);
+        assert_eq!(z, Some(-2.));
+    }
+
     /// The Pi's tool run held in the Face's pass 1 and followed again twice,
     /// each time after connecting to another machine (LIO-582 review): the
     /// second drop of the run keeps what was cut before that tool run, not
@@ -10746,10 +10803,11 @@ flood = { pin = 8 }
         assert!(run_of(&a).running.is_some(), "{:?}", problems(&a));
         // Kept as the tool run starts, as cutting all it runs: AXIS CAM
         // killed now has kept no less than it cut.
+        let setup = a.doc.setups[0].id.clone();
         let kept = || {
             let path = dir.path().join("uc100").join("cuts.json");
             let h = crate::run::CutHistory::read(&path).unwrap().unwrap();
-            let cuts = h.cuts.iter().find(|(id, _)| *id == a.doc.setups[0].id);
+            let cuts = h.cuts.iter().find(|(id, _)| *id == setup);
             (cuts.unwrap().1.iter())
                 .map(|c| (c.0, c.1))
                 .collect::<Vec<_>>()
@@ -10758,6 +10816,11 @@ flood = { pin = 8 }
         run_until(&mut a, 90., "tool run 1", |r| r.running.is_none());
         assert!(run_of(&a).done[0]);
         assert!(conn(&a).journal().is_none());
+        // Removed while AXIS CAM is open (by hand, say): written again
+        // from what it knows at its next update (LIO-594 review).
+        std::fs::remove_file(dir.path().join("uc100").join("cuts.json")).unwrap();
+        let _ = a.update(Message::Tick);
+        assert_eq!(kept(), [(0, None), (1, None)]);
         let _ = a.update(Message::Disconnect);
         let mut b = reopened_at_pass_2(a, dir.path());
         assert!(run_of(&b).stock_unconfirmed);

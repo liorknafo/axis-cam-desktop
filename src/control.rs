@@ -2817,6 +2817,28 @@ pub fn sent_tool_runs() -> Vec<u64> {
     SENT_TOOL_RUNS.with(|s| s.borrow().clone())
 }
 
+/// Takes `ids` as tool runs this computer sent a Pi: kept in what runs cut
+/// (`run::CutHistory::sent`) by an earlier session, or another AXIS CAM on
+/// the same folder, which kept what they may cut before sending them
+/// (LIO-594).
+pub fn remember_sent_tool_runs(ids: &[u64]) {
+    SENT_TOOL_RUNS.with(|s| {
+        let mut s = s.borrow_mut();
+        for id in ids {
+            if !s.contains(id) {
+                s.push(*id);
+            }
+        }
+    });
+}
+
+/// Tests: AXIS CAM closed, so the tool runs it sent are only those kept
+/// on disk (`remember_sent_tool_runs`) to the one opened next.
+#[cfg(test)]
+pub(crate) fn forget_sent_tool_runs() {
+    SENT_TOOL_RUNS.with(|s| s.borrow_mut().clear());
+}
+
 /// Why Same part with nothing else run is refused while the Pi shows a
 /// tool run this computer did not send (`Connection::same_part_refused`).
 pub const RAN_ELSEWHERE: &str =

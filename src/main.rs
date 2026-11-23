@@ -2215,6 +2215,7 @@ impl App {
                 (lost, None)
             }
         };
+        control::remember_sent_tool_runs(&history.sent);
         // Kept from before AXIS CAM was closed, while which anything may
         // have run on the machine, the Pi's tool runs then not known: asked
         // as after a disconnect (LIO-595).
@@ -3977,7 +3978,18 @@ impl App {
     fn sync_cut_history(&mut self) -> bool {
         let theirs = match run::CutHistory::read(&self.cuts_path) {
             Ok(Some(h)) => h,
-            Ok(None) => return false,
+            // Gone since it was read or written (removed by hand, say):
+            // written again from what this one knows (LIO-594 review).
+            Ok(None) => {
+                if self
+                    .cuts_kept
+                    .as_ref()
+                    .is_some_and(|k| *k != Default::default())
+                {
+                    self.cuts_kept = None;
+                }
+                return false;
+            }
             // Unreadable as this one opened: it is replaced as it was.
             Err(_) if self.cuts_kept.is_none() => return false,
             // Unreadable since: what it held is lost.
@@ -4044,6 +4056,7 @@ impl App {
             }
         }
         self.others_unknown |= theirs.others_unknown;
+        control::remember_sent_tool_runs(&theirs.sent);
         self.cuts_kept = Some(theirs);
         grew
     }
@@ -4083,10 +4096,13 @@ impl App {
             };
             keep_cuts_of(&mut cuts, r, self.others_unknown, cut);
         }
+        let sent = control::sent_tool_runs();
+        let sent = sent[sent.len().saturating_sub(run::SENT_KEPT)..].to_vec();
         run::CutHistory {
             cuts,
             journals: self.cut_journals.clone(),
             others_unknown: self.others_unknown,
+            sent,
         }
     }
     /// Writes what setups' runs cut (`cut_history`, `starting`), with what
