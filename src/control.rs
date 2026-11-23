@@ -2822,10 +2822,11 @@ pub fn sent_tool_runs() -> Vec<u64> {
 pub const RAN_ELSEWHERE: &str =
     "The Pi ran a tool run this computer did not send while it was disconnected.";
 
-/// Why Same part with nothing else run is refused when the machine was not
-/// reached through the Pi before the disconnect, and the Pi shows a tool run
+/// Why Same part with nothing else run is refused when the Pi's tool runs
+/// before are not known (not reached through it before the disconnect, or
+/// AXIS CAM closed since, LIO-594), and the Pi shows a tool run
 /// this computer did not send (`Connection::same_part_refused`).
-pub const PI_UNHEARD: &str = "The Pi shows a tool run this computer did not send, and the machine was not reached through the Pi before it was disconnected, so it may have run meanwhile.";
+pub const PI_UNHEARD: &str = "The Pi shows a tool run this computer did not send, and which tool runs the Pi had before is not known here (the machine was not reached through the Pi before it was disconnected, or AXIS CAM was closed since), so it may have run meanwhile.";
 
 /// Why Same part with nothing else run waits on a Pi whose link is not
 /// live yet (`Connection::same_part_refused`).
