@@ -6685,7 +6685,9 @@ impl Connection {
         let mine = u64::from(link.state == uc100_remote::LinkState::Controlling);
         let since = match *seen {
             Some((boot, _)) if boot != now.0 => Some(PiSince::Restarted),
-            Some((_, takes)) if now.1.saturating_sub(takes) > mine => Some(PiSince::OtherTookControl),
+            Some((_, takes)) if now.1.saturating_sub(takes) > mine => {
+                Some(PiSince::OtherTookControl)
+            }
             _ => None,
         };
         *seen = Some(now);

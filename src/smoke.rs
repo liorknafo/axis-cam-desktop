@@ -6351,7 +6351,10 @@ flood = { pin = 8 }
         let z = before.machine_pos[2];
         let lists = |o: &uc100_remote::RemoteController| {
             let l = o.link();
-            (l.tool_run_ends.iter().map(|e| e.id).collect::<Vec<_>>(), l.tool_run_going)
+            (
+                l.tool_run_ends.iter().map(|e| e.id).collect::<Vec<_>>(),
+                l.tool_run_going,
+            )
         };
         let listed = lists(other);
         let sent = match what {
@@ -6412,7 +6415,10 @@ flood = { pin = 8 }
         }
         assert_eq!(run_of(&a).at_step(), Some((0, 1)));
         let z = conn(&a).touch_off().map(|(_, w)| w[2]);
-        assert_eq!(z, None, "{what:?}: Set Z offered from this session's record alone");
+        assert_eq!(
+            z, None,
+            "{what:?}: Set Z offered from this session's record alone"
+        );
         assert!(conn(&a).partway_blocked().is_some());
         assert!(run_of(&a).history_unknown(), "{:?}", run_of(&a).cut_in_run);
         let note = conn(&a).pi_note.clone().unwrap_or_default();
