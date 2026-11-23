@@ -320,11 +320,11 @@ const STOCK_UNCONFIRMED_WHY: &str = "This setup's runs cut the stock earlier: sa
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed`.
-const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier this session: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
+const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier (kept when AXIS CAM is closed): press Same part if that part is still held, or New stock loaded if not, under Work zero.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed` after a disconnect (`Run::away`, LIO-595).
-pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier this session, and the machine was disconnected since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
+pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier, and the machine was disconnected or AXIS CAM closed since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
 
 /// What runs this computer did not follow may have cut, said as
 /// `Partly::cut` (`HISTORY_UNKNOWN` in `Run::cut_in_run`): another
@@ -344,20 +344,201 @@ pub(crate) const HISTORY_UNFOLLOWED_BLOCKED: &str = "Runs this computer did not 
 /// the check does not simulate it before this setup as it was cut
 /// (`Run::earlier_unfollowed`).
 pub(crate) const EARLIER_UNFOLLOWED: &str =
-    "stock another setup's run cut this session, which the check does not simulate as it was cut";
+    "stock another setup's run cut earlier, which the check does not simulate as it was cut";
 
 /// Why a probe cannot find a work zero from a spot of a stock
 /// `EARLIER_UNFOLLOWED` cut.
-const EARLIER_UNFOLLOWED_WHY: &str = "Another setup's run cut this part this session in a way the check does not follow: an operation disabled or changed since, or its setup deleted or moved after this one.";
+const EARLIER_UNFOLLOWED_WHY: &str = "Another setup's run cut this part earlier in a way the check does not follow: an operation disabled or changed since, or its setup deleted or moved after this one.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z where
 /// `EARLIER_UNFOLLOWED` cut (`Run::partway_blocked`).
-const EARLIER_UNFOLLOWED_BLOCKED: &str = "Another setup's run cut this part this session in a way the check does not follow (an operation disabled or changed since, or its setup deleted or moved after this one), so it cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero.";
+const EARLIER_UNFOLLOWED_BLOCKED: &str = "Another setup's run cut this part earlier in a way the check does not follow (an operation disabled or changed since, or its setup deleted or moved after this one), so it cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero.";
 
 /// What a tool run of a run cut (`Run::cut_in_run`): the operation (index in
 /// the setup), all of it (None) or its steps before the one given, and the
 /// print of the plan and cutter it cut (`OpSteps::cut_print`).
 pub type CutInRun = (usize, Option<usize>, Option<u64>);
+
+/// What each setup's runs cut, by setup id (`App::run_cuts`).
+pub type SetupCuts = Vec<(String, Vec<CutInRun>)>;
+
+/// The setup id an unreadable record's unknown cuts are kept under
+/// (`CutStore`): a setup no project has, so each setup takes them as cut
+/// before it in the part (`Run::earlier_cuts`, `earlier_unfollowed`)
+/// until New stock loaded forgets them.
+pub const CUTS_UNREADABLE: &str = "run-cuts-unreadable";
+
+/// What each setup's runs cut, kept on disk (`uc100/run-cuts.json`) so
+/// AXIS CAM closed or crashed and opened again still knows it (LIO-589).
+/// Kept by one AXIS CAM at a time: the first open on this computer owns
+/// it, holding a lock on `run-cuts.lock` while it runs (let go as it ends,
+/// a crash too; the apps one process makes share it). Its only writer, it keeps each record as its app has it,
+/// a stop after a step as exact as in memory. Another AXIS CAM opened
+/// meanwhile owns nothing: it cannot tell what was cut, so Cycle Start is
+/// refused there and nothing sets Z from the stock top (LIO-589 review).
+#[derive(Debug)]
+pub struct CutStore {
+    pub path: std::path::PathBuf,
+    /// The lock held while this AXIS CAM owns the file, or why it does not.
+    owner: Result<Arc<std::fs::File>, String>,
+    /// The file as last written or read.
+    all: SetupCuts,
+}
+
+/// The file `CutStore` keeps.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CutsFile {
+    setups: SetupCuts,
+}
+
+/// Why another AXIS CAM's record keeps this one from cutting.
+pub const CUTS_NOT_OWNED: &str = "Another AXIS CAM open on this computer keeps what the runs cut, so this one cannot tell what the part in the machine has had cut: Cycle Start is off here, and nothing sets Z from the stock top. Close this one and use the other.";
+
+impl CutStore {
+    /// The store at `path`, owned if no other AXIS CAM owns it, and what
+    /// it holds now, with a note to say when that is not known. Unreadable,
+    /// the file is copied aside and the unknown record (`CUTS_UNREADABLE`)
+    /// written over it in one step: until it is, the file stays unreadable,
+    /// so it holds over every opening until New stock loaded. Not owned,
+    /// what was cut is not known either.
+    pub fn open(path: std::path::PathBuf) -> (Self, SetupCuts, Option<String>) {
+        let owner = own(&path);
+        let mut store = Self {
+            path,
+            owner,
+            all: vec![],
+        };
+        if let Err(why) = &store.owner {
+            let note = match why.as_str() {
+                CUTS_NOT_OWNED => why.clone(),
+                _ => format!(
+                    "The file of what the runs cut cannot be used ({why}): Cycle Start is off, and nothing sets Z from the stock top."
+                ),
+            };
+            return (store, unknown_cuts(), Some(note));
+        }
+        let why = match std::fs::read(&store.path) {
+            Ok(data) => match serde_json::from_slice::<CutsFile>(&data) {
+                Ok(f) => {
+                    store.all = f.setups.clone();
+                    return (store, f.setups, None);
+                }
+                Err(e) => e.to_string(),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return (store, vec![], None);
+            }
+            Err(e) => e.to_string(),
+        };
+        let _ = std::fs::copy(&store.path, store.path.with_extension("unreadable.json"));
+        if write_cuts(&store.path, &unknown_cuts()).is_ok() {
+            store.all = unknown_cuts();
+        }
+        let note = format!(
+            "What the runs cut before AXIS CAM was closed could not be read ({why}): no setup sets Z from the stock top until New stock loaded."
+        );
+        (store, unknown_cuts(), Some(note))
+    }
+
+    /// This AXIS CAM owns the file (or why not).
+    pub fn owned(&self) -> Result<(), String> {
+        self.owner.as_ref().map(|_| ()).map_err(Clone::clone)
+    }
+
+    /// Each setup's record as last written or read.
+    pub fn written(&self) -> &SetupCuts {
+        &self.all
+    }
+
+    /// What the file at `path` holds, read as it is (tests).
+    #[cfg(test)]
+    pub fn on_disk(path: &std::path::Path) -> SetupCuts {
+        match std::fs::read(path) {
+            Ok(data) => serde_json::from_slice::<CutsFile>(&data).unwrap().setups,
+            Err(_) => vec![],
+        }
+    }
+
+    /// Puts setup `setup`'s record as `cuts` (none: New stock loaded),
+    /// written at once; refused unless this AXIS CAM owns the file.
+    pub fn put(&mut self, setup: &str, cuts: Option<&[CutInRun]>) -> Result<(), String> {
+        self.owned()?;
+        let mut all = self.all.clone();
+        let now = all
+            .iter()
+            .find(|(id, _)| id == setup)
+            .map(|(_, c)| c.clone());
+        let new = cuts.filter(|c| !c.is_empty()).map(<[CutInRun]>::to_vec);
+        if now == new {
+            return Ok(());
+        }
+        all.retain(|(id, _)| id != setup);
+        if let Some(c) = new {
+            all.push((setup.to_owned(), c));
+            all.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+        write_cuts(&self.path, &all)?;
+        self.all = all;
+        Ok(())
+    }
+}
+
+/// The locks this process holds on the record's file, by its path: one
+/// process is one AXIS CAM, whatever apps it makes (tests make several).
+type Owned = Vec<(std::path::PathBuf, std::sync::Weak<std::fs::File>)>;
+static OWNED: std::sync::Mutex<Owned> = std::sync::Mutex::new(vec![]);
+
+/// The lock on `path`'s `.lock` file, held while this AXIS CAM owns it, or
+/// why it cannot be: another holds it, or it cannot be made.
+fn own(path: &std::path::Path) -> Result<Arc<std::fs::File>, String> {
+    let key = path.with_extension("lock");
+    let mut owned = OWNED.lock().unwrap_or_else(|e| e.into_inner());
+    owned.retain(|(_, w)| w.strong_count() > 0);
+    if let Some(lock) = (owned.iter())
+        .find(|(p, _)| *p == key)
+        .and_then(|(_, w)| w.upgrade())
+    {
+        return Ok(lock);
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&key)
+        .map_err(|e| e.to_string())?;
+    match lock.try_lock() {
+        Ok(()) => {
+            let lock = Arc::new(lock);
+            owned.push((key, Arc::downgrade(&lock)));
+            Ok(lock)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Err(CUTS_NOT_OWNED.into()),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.to_string()),
+    }
+}
+
+/// The record of cuts not known (`CUTS_UNREADABLE`).
+fn unknown_cuts() -> SetupCuts {
+    vec![(CUTS_UNREADABLE.into(), vec![(HISTORY_UNKNOWN, None, None)])]
+}
+
+/// Writes `all` to `path`, or removes the file when nothing is kept.
+fn write_cuts(path: &std::path::Path, all: &SetupCuts) -> Result<(), String> {
+    if all.is_empty() {
+        return match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        };
+    }
+    let file = CutsFile {
+        setups: all.clone(),
+    };
+    let data = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
+    crate::storage::write_atomic(path, &data)
+}
 
 /// Notes in `cuts` (`Run::cut_in_run`) that operation `oi` was cut: all of
 /// it (None) or its steps before `steps`, from the plan and cutter `print`.
@@ -2134,6 +2315,19 @@ impl Run {
         };
         if self.running.is_some() {
             return vec!["A tool run is running.".into()];
+        }
+        // What a tool run cuts is kept before it is sent: not here, where
+        // another AXIS CAM keeps it (LIO-589 review).
+        if let Some(store) = &c.cut_store
+            && let Err(why) = store
+                .lock()
+                .map_err(|_| String::new())
+                .and_then(|s| s.owned())
+        {
+            return vec![match why.is_empty() {
+                true => "The file of what the runs cut cannot be used: Cycle Start is off.".into(),
+                false => why,
+            }];
         }
         if c.press_waits() {
             return vec![match c.pi {
@@ -10097,6 +10291,72 @@ pub(crate) mod tests {
             assert!(kept.is_empty(), "{kept:?}");
             assert!(!run.earlier_unfollowed());
         }
+    }
+
+    /// What the runs cut, kept on disk (LIO-589): owned by one AXIS CAM at
+    /// a time, which keeps each record exactly as its app has it; a second
+    /// opened meanwhile writes nothing and knows nothing cut; let go, the
+    /// next owns it. An unreadable file is kept aside, the unknown record
+    /// written over it, which stays until New stock loaded.
+    #[test]
+    fn the_runs_cuts_on_disk_have_one_owner_and_only_new_stock_takes_one_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uc100").join("run-cuts.json");
+        // Another process's AXIS CAM holds it: not owned here.
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let other = std::fs::File::create(path.with_extension("lock")).unwrap();
+        other.lock().unwrap();
+        let (mut b, cuts, note) = CutStore::open(path.clone());
+        assert_eq!(
+            (cuts, note.as_deref()),
+            (unknown_cuts(), Some(CUTS_NOT_OWNED))
+        );
+        assert_eq!(
+            b.put("s", Some(&[(4, None, None)])),
+            Err(CUTS_NOT_OWNED.into())
+        );
+        assert!(!path.exists());
+        drop((other, b));
+        let (mut a, none, note) = CutStore::open(path.clone());
+        assert!(none.is_empty() && note.is_none() && !path.exists());
+        assert!(a.owned().is_ok());
+        // This process's other apps share it.
+        let (shared, ..) = CutStore::open(path.clone());
+        assert!(shared.owned().is_ok());
+        drop(shared);
+        // Its owner keeps each record as given: a stop after a step narrows
+        // the tool run kept whole as it started.
+        a.put("s", Some(&[(0, None, Some(7))])).unwrap();
+        a.put("s", Some(&[(0, Some(3), Some(7))])).unwrap();
+        a.put("t", Some(&[(1, None, None)])).unwrap();
+        drop(a);
+        let (mut a, all, note) = CutStore::open(path.clone());
+        assert!(note.is_none() && a.owned().is_ok());
+        assert_eq!(
+            all,
+            [
+                ("s".to_string(), vec![(0, Some(3), Some(7))]),
+                ("t".to_string(), vec![(1, None, None)])
+            ]
+        );
+        // New stock loaded.
+        a.put("s", None).unwrap();
+        a.put("t", Some(&[])).unwrap();
+        assert!(!path.exists());
+        drop(a);
+        // Unreadable: kept aside, the unknown record written in its place.
+        std::fs::write(&path, "{").unwrap();
+        let (a, all, note) = CutStore::open(path.clone());
+        assert!(note.unwrap().contains("could not be read"));
+        assert_eq!(all, unknown_cuts());
+        assert_eq!(
+            std::fs::read(path.with_extension("unreadable.json")).unwrap(),
+            b"{"
+        );
+        drop(a);
+        let (_, again, note) = CutStore::open(path.clone());
+        assert!(note.is_none());
+        assert_eq!(again, unknown_cuts());
     }
 
     /// The journal of where a run stopped (LIO-275) is written and read

@@ -2773,6 +2773,11 @@ pub struct Connection {
     /// Where a run stopped on this machine is kept (`run::Journal`): beside
     /// its saved position, one file per machine, the simulator's apart.
     journal: std::path::PathBuf,
+    /// Where what each setup's runs cut is kept (`run::CutStore`, the
+    /// app's): a tool run's cut is written there before it is sent, so
+    /// AXIS CAM crashing as it cuts still knows it (LIO-589). None in
+    /// tests that make a connection alone.
+    pub cut_store: Option<std::sync::Arc<std::sync::Mutex<crate::run::CutStore>>>,
     /// After a Stop after step: the machine Z to lift the tool to once Idle.
     z_up: Option<f64>,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
@@ -2808,18 +2813,16 @@ pub fn sent_tool_runs() -> Vec<u64> {
 
 /// Why Same part with nothing else run is refused while the Pi shows a
 /// tool run this computer did not send (`Connection::same_part_refused`).
-pub const RAN_ELSEWHERE: &str =
-    "The Pi ran a tool run this computer did not send while it was disconnected.";
+pub const RAN_ELSEWHERE: &str = "The Pi ran a tool run this computer did not send while it was disconnected or AXIS CAM closed.";
 
 /// Why Same part with nothing else run is refused when the machine was not
 /// reached through the Pi before the disconnect, and the Pi shows a tool run
 /// this computer did not send (`Connection::same_part_refused`).
-pub const PI_UNHEARD: &str = "The Pi shows a tool run this computer did not send, and the machine was not reached through the Pi before it was disconnected, so it may have run meanwhile.";
+pub const PI_UNHEARD: &str = "The Pi shows a tool run this computer did not send, and which tool runs the Pi had before this computer was disconnected or AXIS CAM closed is not known, so it may have run meanwhile.";
 
 /// Why Same part with nothing else run waits on a Pi whose link is not
 /// live yet (`Connection::same_part_refused`).
-pub const PI_LISTS_PENDING: &str =
-    "Waiting for the Pi to say which tool runs it ran while this computer was disconnected.";
+pub const PI_LISTS_PENDING: &str = "Waiting for the Pi to say which tool runs it ran while this computer was disconnected or AXIS CAM closed.";
 
 /// The stops Stop after step on the Pi can make in the tool run last sent
 /// there, each with the journal of where it leaves the run
@@ -3027,6 +3030,7 @@ impl Connection {
             sim_gauge: None,
             sim_bars_sent: vec![],
             journal,
+            cut_store: None,
             z_up: None,
         };
         c.send_sim_blocks();
@@ -4197,6 +4201,20 @@ impl Connection {
         let Some(job) = run.cycle_start(self, doc) else {
             return;
         };
+        // What it will cut, on disk before anything moves (LIO-589).
+        if let Some(store) = &self.cut_store {
+            let cuts = run.cuts_so_far();
+            let kept = match store.lock() {
+                Ok(mut s) => s.put(&run.setup_id, Some(&cuts)),
+                Err(_) => Err("the store is poisoned".into()),
+            };
+            if let Err(e) = kept {
+                run.not_started(format!(
+                    "The tool run was not sent: what it will cut could not be kept on disk first ({e}), and AXIS CAM closed or crashing would forget it. Nothing moved."
+                ));
+                return;
+            }
+        }
         let name = match &job {
             Command::Job { name, .. } => Some(name.clone()),
             _ => None,
@@ -4590,7 +4608,7 @@ impl Connection {
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::EARLIER_UNFOLLOWED] =>
             {
-                Some("Another setup's run cut this part this session in a way the check does not follow, where a probe finds this work zero.".into())
+                Some("Another setup's run cut this part earlier in a way the check does not follow, where a probe finds this work zero.".into())
             }
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::HISTORY_UNFOLLOWED] =>

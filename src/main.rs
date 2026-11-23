@@ -1624,11 +1624,18 @@ pub struct App {
     /// setup id: kept when its run is dropped (another setup picked, the
     /// machine disconnected) and given back when it is picked again, for the
     /// operator to say whether the same part is still there (LIO-582).
+    /// Kept on disk (`run_cuts_path`) with the current run's, so AXIS CAM
+    /// closed or crashed and opened again remembers them (LIO-589).
     run_cuts: Vec<(String, Vec<run::CutInRun>)>,
     /// The setups of `run_cuts` kept across a disconnect from the machine,
     /// by setup id, until the operator says whether anything else ran on
     /// it meanwhile (`run::Run::away`, LIO-595).
     run_away: Vec<(String, run::Away)>,
+    /// `run_cuts` with the current run's as last written to disk.
+    run_cuts_saved: Vec<(String, Vec<run::CutInRun>)>,
+    /// The file `run_cuts` is kept in, shared with the connection, which
+    /// writes a tool run's cuts before sending it (LIO-589).
+    cut_store: std::sync::Arc<std::sync::Mutex<run::CutStore>>,
     /// For a setup whose run was dropped while a tool run ran: that tool run
     /// (index, and the operation it started at) and what was cut before it.
     /// `run_cuts` counts that tool run as cutting all it was to cut; a
@@ -2166,6 +2173,18 @@ impl App {
         .map(|b| iced::widget::svg::Handle::from_memory(b.to_vec()))
         .collect();
         let generate_inline = smoke_dir.is_some() || cfg!(test);
+        // What each setup's runs cut, kept from before AXIS CAM was closed
+        // (LIO-589).
+        let (cut_store, run_cuts, cuts_note) = run::CutStore::open(run_cuts_path(&state_path));
+        let run_cuts_saved = cut_store.written().clone();
+        let cut_store = std::sync::Arc::new(std::sync::Mutex::new(cut_store));
+        if let Some(note) = cuts_note {
+            status = if status.is_empty() {
+                note
+            } else {
+                format!("{status} {note}")
+            };
+        }
         Self {
             smoke_dir,
             smoke_step: 0,
@@ -2192,8 +2211,16 @@ impl App {
             pi_run: None,
             cnc_over_guide: None,
             run_on_connect: None,
-            run_cuts: vec![],
-            run_away: vec![],
+            run_cuts_saved,
+            // Each kept on disk counts as kept across a disconnect: AXIS
+            // CAM was closed, and anything may have run on the machine
+            // meanwhile, with no list of the Pi's tool runs from before
+            // (LIO-589, LIO-595).
+            run_away: (run_cuts.iter())
+                .map(|(id, _)| (id.clone(), run::Away { seen: None }))
+                .collect(),
+            run_cuts,
+            cut_store,
             run_pending: vec![],
             jog_key: None,
             run_epoch: 0,
@@ -6430,8 +6457,66 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         self.mcp_arrive(&message);
         let task = self.update_turn(message);
+        self.save_run_cuts();
         self.mcp_leave();
         task
+    }
+
+    /// What each setup's runs cut (`run_cuts`), with the current run's so
+    /// far (`run::Run::cuts_so_far`: a tool run running counts as cutting
+    /// all it is to cut), written to disk when it changed: AXIS CAM closed
+    /// or crashed, it is read back when it opens (LIO-589).
+    fn save_run_cuts(&mut self) {
+        // Another AXIS CAM owns the record: what was cut is not known here,
+        // whatever this one's New stock loaded said (LIO-589 review).
+        let owned = (self.cut_store.lock()).is_ok_and(|s| s.owned().is_ok());
+        if !owned
+            && let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut())
+            && !r.cut_in_run.iter().any(|c| c.0 == run::HISTORY_UNKNOWN)
+        {
+            r.note_history_unknown();
+        }
+        let mut cuts = self.run_cuts.clone();
+        if let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref()) {
+            keep_run_cuts(&mut cuts, r);
+        }
+        // Not this one's to keep: said as it opened.
+        if !owned {
+            self.run_cuts_saved = cuts;
+            return;
+        }
+        if cuts == self.run_cuts_saved {
+            return;
+        }
+        let saved = std::mem::take(&mut self.run_cuts_saved);
+        let result = match self.cut_store.lock() {
+            Ok(mut store) => {
+                let changed = (cuts.iter())
+                    .filter(|r| !saved.contains(r))
+                    .map(|(id, c)| (id.as_str(), Some(&c[..])));
+                let gone = (saved.iter())
+                    .filter(|(id, _)| !cuts.iter().any(|(i, _)| i == id))
+                    .map(|(id, _)| (id.as_str(), None));
+                changed.chain(gone).try_for_each(|(id, c)| store.put(id, c))
+            }
+            Err(_) => Err("the store is poisoned".into()),
+        };
+        match result {
+            Ok(()) => self.run_cuts_saved = cuts,
+            Err(e) => {
+                // Tried again after the next message.
+                self.run_cuts_saved = saved;
+                let note = match e.as_str() {
+                    run::CUTS_NOT_OWNED => e,
+                    _ => format!(
+                        "What the runs cut could not be kept on disk ({e}): Cycle Start sends no tool run until it can be."
+                    ),
+                };
+                if self.status != note {
+                    self.status = note;
+                }
+            }
+        }
     }
     fn update_turn(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
@@ -8623,6 +8708,7 @@ impl App {
                 };
                 match opened {
                     Ok(mut c) => {
+                        c.cut_store = Some(self.cut_store.clone());
                         if let Some(kept) = self.pi_run.take() {
                             c.resume_pi_run(kept);
                             // Its cuts were kept across the disconnect:
@@ -11800,6 +11886,12 @@ fn give_away(away: &[(String, run::Away)], run: &mut run::Run) {
         run.away = Some(a.clone());
         run.stock_unconfirmed = true;
     }
+}
+
+/// Where `App::run_cuts` is kept, beside the machines' journals.
+fn run_cuts_path(state_path: &std::path::Path) -> PathBuf {
+    let dir = state_path.parent().unwrap_or(std::path::Path::new("."));
+    dir.join("uc100").join("run-cuts.json")
 }
 
 /// Gives `run` what the other setups cut this session (`App::run_cuts`,

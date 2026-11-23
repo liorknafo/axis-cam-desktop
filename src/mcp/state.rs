@@ -269,6 +269,8 @@ pub const NOT_WORK_STATE: &[(&str, &str)] = &[
     ("run_on_connect", CONTROLLER),
     ("run_cuts", CONTROLLER),
     ("run_away", CONTROLLER),
+    ("run_cuts_saved", CONTROLLER),
+    ("cut_store", CONTROLLER),
     ("run_pending", CONTROLLER),
     ("jog_key", CONTROLLER),
     ("run_epoch", JOB),

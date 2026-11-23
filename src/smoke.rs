@@ -2976,9 +2976,13 @@ flood = { pin = 8 }
     fn reopen(a: App, dir: &std::path::Path) -> App {
         assert!(a.control.is_none(), "disconnect first, as closing does");
         crate::run::forget_own_files();
+        // Closed first: what it held (the record of what the runs cut) is
+        // let go.
+        let (doc, mesh) = (a.doc.clone(), a.imported_mesh.clone());
+        drop(a);
         let mut b = App::from_workspace(dir.join("workspace.json"), None);
-        b.replace_document(a.doc.clone(), None);
-        b.imported_mesh = a.imported_mesh.clone();
+        b.replace_document(doc, None);
+        b.imported_mesh = mesh;
         b.page = Page::Control;
         b
     }
@@ -4962,8 +4966,10 @@ flood = { pin = 8 }
         );
         // Another session's tool run: what this setup's runs cut before is
         // not known, so no start goes by the check's stock (LIO-586 review).
+        // The Facing, kept on disk as cut whole since its Cycle Start, is
+        // there too (LIO-589).
         let cut: Vec<_> = run.cut_in_run.iter().map(|c| (c.0, c.1)).collect();
-        assert_eq!(cut, [(crate::run::HISTORY_UNKNOWN, None)]);
+        assert_eq!(cut, [(0, None), (crate::run::HISTORY_UNKNOWN, None)]);
         assert!(run.outcome.is_none());
         assert!(
             (conn(&a).pi_note.as_ref()).is_some_and(|n| n.contains("tool run 1 of")),
@@ -10690,6 +10696,308 @@ flood = { pin = 8 }
             "{texts:?}"
         );
         let _ = a.update(Message::Disconnect);
+    }
+
+    /// Picks setup 0 to run and answers its check with its steps, as the
+    /// app's does (`answer_skips`): each operation has its cut print.
+    fn pick_checked(a: &mut App) {
+        let _ = a.update(Message::Run(crate::run::Action::Setup(0)));
+        answer_skips(a, 0);
+    }
+
+    /// What the runs cut, as kept on disk for AXIS CAM opened again.
+    fn kept_cuts(a: &App) -> Vec<(String, Vec<crate::run::CutInRun>)> {
+        crate::run::CutStore::on_disk(&crate::run_cuts_path(&a.state_path))
+    }
+
+    /// Nothing sets Z at the start: Zero Z on the stock top, its touch-off
+    /// spot and the probe.
+    fn sets_no_z(a: &App) {
+        assert!(conn(a).stock_top().is_err() && conn(a).touch_off().is_none());
+        assert!(conn(a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+    }
+
+    /// LIO-589: tool run 1 (Face, Pocket, Contour) done on this computer,
+    /// then AXIS CAM closed and opened again. Picked again, the setup has
+    /// what its run cut, as in the session it was cut (LIO-582 review):
+    /// nothing sets Z until the operator says whether the same part is
+    /// held. The same part, tool run 1's start, before what was cut, still
+    /// sets none, while the Drilling's, after it all, goes by the check;
+    /// New stock loaded forgets it, on disk too.
+    #[test]
+    fn a_start_before_what_the_run_cut_sets_no_z_after_axis_cam_opens_again() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        pick_checked(&mut a);
+        assert!(conn(&a).stock_top().is_ok());
+        assert!(kept_cuts(&a).is_empty());
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        let id = a.doc.setups[0].id.clone();
+        let cut = run_of(&a).cut_in_run.clone();
+        assert_eq!(
+            cut.iter().map(|c| (c.0, c.1)).collect::<Vec<_>>(),
+            [(0, None), (1, None), (2, None)]
+        );
+        assert!(cut.iter().all(|c| c.2.is_some()), "{cut:?}");
+        assert_eq!(kept_cuts(&a), [(id.clone(), cut.clone())]);
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        idle(&mut a);
+        pick_checked(&mut a);
+        assert_eq!((run_of(&a).next, run_of(&a).from), (0, 0));
+        assert!(run_of(&a).stock_unconfirmed);
+        assert_eq!(run_of(&a).cut_in_run, cut);
+        // Closed meanwhile: asked too whether anything else ran (LIO-595).
+        assert!(run_of(&a).away.is_some());
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        shows(&a, &[crate::ui::AWAY_ASKED]);
+        sets_no_z(&a);
+        let _ = a.update(Message::Run(R::SamePart));
+        sets_no_z(&a);
+        let why = conn(&a).partway_blocked().unwrap();
+        assert!(
+            why.starts_with("This run's tool runs have cut the stock since"),
+            "{why}"
+        );
+        let unfollowed = |a: &App| {
+            (run_of(a).partly().unwrap().cut.iter()).any(|c| c.contains("this run's tool runs cut"))
+        };
+        let _ = a.update(Message::Run(R::Next(1)));
+        assert!(!unfollowed(&a));
+        let _ = a.update(Message::Run(R::Next(0)));
+        sets_no_z(&a);
+        let _ = a.update(Message::Run(R::NewStock));
+        assert!(conn(&a).stock_top().is_ok());
+        assert!(kept_cuts(&a).is_empty());
+        assert!(!crate::run_cuts_path(&a.state_path).exists());
+    }
+
+    /// LIO-589, from the tablet's LIO-587 review: a setup of one tool run
+    /// (the Face) cut to its end, the setup done. Its start picked again on
+    /// the same part, after AXIS CAM opened again, sets no Z from the stock
+    /// top the Face took down: done does not forget what was cut, only New
+    /// stock loaded does.
+    #[test]
+    fn a_done_setup_picked_again_after_axis_cam_opens_again_sets_no_z_on_the_same_part() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0]);
+        zeroed(&mut a);
+        pick_checked(&mut a);
+        assert!(conn(&a).stock_top().is_ok());
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 30.0, "the Face", |r| r.done[0]);
+        assert_eq!(run_of(&a).next, 1, "the setup done");
+        assert_eq!(kept_cuts(&a).len(), 1);
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        idle(&mut a);
+        pick_checked(&mut a);
+        assert_eq!((run_of(&a).next, run_of(&a).from), (0, 0));
+        sets_no_z(&a);
+        let _ = a.update(Message::Run(R::SamePart));
+        sets_no_z(&a);
+        let _ = a.update(Message::Run(R::NewStock));
+        assert!(conn(&a).stock_top().is_ok());
+    }
+
+    /// LIO-589: AXIS CAM crashes while tool run 1 cuts (nothing kept as it
+    /// closes). What its run cut was kept as Cycle Start started it, tool
+    /// run 1 cutting all it was to cut: opened again, the setup has it.
+    #[test]
+    fn a_tool_run_cutting_as_axis_cam_crashes_counts_as_cut() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        pick_checked(&mut a);
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_some());
+        let id = a.doc.setups[0].id.clone();
+        let kept = kept_cuts(&a);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].0, id);
+        assert_eq!(
+            kept[0].1.iter().map(|c| (c.0, c.1)).collect::<Vec<_>>(),
+            [(0, None), (1, None), (2, None)]
+        );
+        tick_until(&mut a, 3.0, "cutting", |s| s.state == Some(State::Run));
+        // The crash: nothing of the run is kept as it ends.
+        a.control.take().unwrap().close();
+        let mut a = reopen(a, dir.path());
+        idle(&mut a);
+        pick_checked(&mut a);
+        assert_eq!(run_of(&a).cut_in_run, kept[0].1);
+        sets_no_z(&a);
+        let _ = a.update(Message::Run(R::SamePart));
+        sets_no_z(&a);
+    }
+
+    /// LIO-589: the file of what the runs cut cannot be read as AXIS CAM
+    /// opens. It is put aside and said, and what was cut is not known: no
+    /// setup sets Z from the stock top until New stock loaded, over as many
+    /// openings as it takes (review finding), and New stock loaded forgets
+    /// it.
+    #[test]
+    fn an_unreadable_record_of_the_runs_cuts_sets_no_z_until_new_stock() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let a = ops_app(dir.path());
+        let path = crate::run_cuts_path(&a.state_path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{").unwrap();
+        let mut a = reopen(a, dir.path());
+        assert!(
+            a.status.contains("could not be read") && a.status.contains("New stock loaded"),
+            "{}",
+            a.status
+        );
+        assert!(path.with_extension("unreadable.json").exists());
+        assert_eq!(
+            kept_cuts(&a),
+            [(
+                crate::run::CUTS_UNREADABLE.to_string(),
+                vec![(crate::run::HISTORY_UNKNOWN, None, None)]
+            )]
+        );
+        idle(&mut a);
+        zero(&mut a);
+        pick_checked(&mut a);
+        assert!(run_of(&a).earlier_unfollowed());
+        sets_no_z(&a);
+        // Opened again without New stock: still not known.
+        let _ = a.update(Message::Disconnect);
+        let mut a = reopen(a, dir.path());
+        assert!(!a.status.contains("could not be read"), "{}", a.status);
+        idle(&mut a);
+        zero(&mut a);
+        pick_checked(&mut a);
+        assert!(run_of(&a).earlier_unfollowed());
+        sets_no_z(&a);
+        let _ = a.update(Message::Run(R::NewStock));
+        assert!(conn(&a).stock_top().is_ok());
+        assert!(!path.exists());
+    }
+
+    /// LIO-589 review finding: the file of what the runs cut is unreadable
+    /// and the unknown record cannot be written in its place (its folder
+    /// read-only). Opened again, the file is still unreadable, so still
+    /// nothing sets Z from the stock top.
+    #[test]
+    fn an_unreadable_record_that_cannot_be_replaced_stays_unknown_on_the_next_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let a = ops_app(dir.path());
+        let path = crate::run_cuts_path(&a.state_path);
+        let folder = path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(&path, "{").unwrap();
+        // The lock file there already, as any opening made it.
+        std::fs::write(path.with_extension("lock"), "").unwrap();
+        let mode = |m| std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(m));
+        mode(0o555).unwrap();
+        let a = reopen(a, dir.path());
+        assert!(a.status.contains("could not be read"), "{}", a.status);
+        let mut a = reopen(a, dir.path());
+        assert!(a.status.contains("could not be read"), "{}", a.status);
+        assert_eq!(std::fs::read(&path).unwrap(), b"{");
+        mode(0o755).unwrap();
+        idle(&mut a);
+        zero(&mut a);
+        pick_checked(&mut a);
+        assert!(run_of(&a).earlier_unfollowed());
+        sets_no_z(&a);
+    }
+
+    /// LIO-589 review finding, and the user's call: a second AXIS CAM open
+    /// on this computer, the first owning the record of what was cut. It
+    /// says so; it cannot tell what was cut, so nothing sets Z from the
+    /// stock top there, New stock loaded or not, and Cycle Start is refused
+    /// with the reason. The first closed, the next opened owns it.
+    #[test]
+    fn a_second_axis_cam_on_this_computer_neither_starts_nor_sets_z() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let first = ops_app(dir.path());
+        // The first, in another process: its lock on the record.
+        let lock = crate::run_cuts_path(&first.state_path).with_extension("lock");
+        let (doc, mesh) = (first.doc.clone(), first.imported_mesh.clone());
+        drop(first);
+        std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+        let other = std::fs::File::create(&lock).unwrap();
+        other.lock().unwrap();
+        let mut b = App::from_workspace(dir.path().join("workspace.json"), None);
+        b.replace_document(doc, None);
+        b.imported_mesh = mesh;
+        b.page = Page::Control;
+        assert!(
+            b.status.contains(crate::run::CUTS_NOT_OWNED),
+            "{}",
+            b.status
+        );
+        zeroed(&mut b);
+        pick_checked(&mut b);
+        sets_no_z(&b);
+        let _ = b.update(Message::Run(R::NewStock));
+        sets_no_z(&b);
+        assert!(
+            problems(&b).iter().any(|p| p == crate::run::CUTS_NOT_OWNED),
+            "{:?}",
+            problems(&b)
+        );
+        let _ = b.update(Message::Run(R::CycleStart));
+        tick_for(&mut b, 20);
+        assert!(run_of(&b).running.is_none());
+        assert_eq!(
+            conn(&b).snapshot.state,
+            Some(uc100::controller::State::Idle)
+        );
+        assert!(!crate::run_cuts_path(&b.state_path).exists());
+        // The first closed: opened again, this one owns it.
+        drop(other);
+        let _ = b.update(Message::Disconnect);
+        let b = reopen(b, dir.path());
+        assert!(
+            !b.status.contains(crate::run::CUTS_NOT_OWNED),
+            "{}",
+            b.status
+        );
+    }
+
+    /// LIO-589 review finding: what a tool run will cut cannot be written
+    /// to disk. Cycle Start sends nothing, and says why: AXIS CAM closed or
+    /// crashing as it cut would forget it.
+    #[test]
+    fn cycle_start_sends_nothing_when_what_it_cuts_cannot_be_kept() {
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        pick_checked(&mut a);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // The file's place taken by a folder: it cannot be read or written.
+        let path = crate::run_cuts_path(&a.state_path);
+        std::fs::create_dir_all(&path).unwrap();
+        cycle_start(&mut a);
+        tick_for(&mut a, 20);
+        assert!(run_of(&a).running.is_none());
+        assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+        let (ok, why) = run_of(&a).outcome.clone().expect("said");
+        assert!(
+            !ok && why.contains("could not be kept on disk first") && why.contains("Nothing moved"),
+            "{why}"
+        );
+        assert!(!run_of(&a).started());
+        // Put right, it starts.
+        std::fs::remove_dir(&path).unwrap();
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_some());
+        assert_eq!(kept_cuts(&a).len(), 1);
     }
 
     /// A run started at the Pocket with the Drilling's first hole taken as
