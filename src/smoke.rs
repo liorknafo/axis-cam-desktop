@@ -12648,6 +12648,171 @@ flood = { pin = 8 }
         drop(server);
     }
 
+    /// The Pocket's level 1 taken as cut, dropped by a project edit, then
+    /// taken as cut again (LIO-621): the check takes it as cut once more,
+    /// so nothing says it no longer does. What was dropped may not be what
+    /// was taken as cut again, so the words say it may not all be. The
+    /// steps set Z by hand and Keep this work zero, never on the stock top.
+    #[test]
+    fn what_was_dropped_and_taken_as_cut_again_may_not_all_be_taken_as_cut() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let declare = |a: &mut App| {
+            let _ = a.update(Message::Run(R::Steps(Some(1))));
+            let _ = a.update(Message::Run(R::PickStep(1, 0)));
+            let _ = a.update(Message::Run(R::SkipSteps(true)));
+            answer_skips(a, 0);
+        };
+        declare(&mut a);
+        a.doc.title = format!("{} renamed", a.doc.title);
+        a.touch();
+        a.page = Page::Control;
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).all_cut().is_empty() && run_of(&a).declared_lost);
+        declare(&mut a);
+        let run = run_of(&a);
+        assert_eq!(run.all_cut(), [(1, vec![0])]);
+        assert!(run.declared_lost && run.later_cut() && run.partway() && !run.zeroed);
+        assert!(conn(&a).touch_off().is_none() && conn(&a).stock_top().is_err());
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let window = iced::Size::new(1440., 2400.);
+        let said = |a: &App| {
+            let texts = crate::ui::probe::texts(a.view(), window).join("\n");
+            let steps = crate::ui::work_zero_steps(a, conn(a)).unwrap().join("\n");
+            let problems = problems(a).join("\n");
+            format!("{texts}\n{steps}\n{problems}")
+        };
+        let level = run_of(&a).taken_as_cut().join(", ");
+        let face = run_of(&a).checked().unwrap()[0].ops[0].clone();
+        let tool = crate::model::tool_label(face.tool, &face.tool_name);
+        let all = said(&a);
+        for want in [
+            "Operations or steps of this setup were taken as cut before the project changed, and the check may not take all of them as cut now.".to_string(),
+            format!("This run starts at {} (tool run 1), taking {level} as cut: nothing of it is sent. Load {tool}, then set Z by hand on a surface whose height you know and press Keep this work zero.", face.name),
+            "Cycle Start waits until you press Keep this work zero: when it is still the one they were cut with (the stock has not moved since), or after you set Z by hand on a surface whose height you know.".into(),
+            "Zero Z on the stock top and Probe Z are off".into(),
+        ] {
+            assert!(all.contains(&want), "{want}\n---\n{all}");
+        }
+        for not in [
+            "no longer takes them as cut",
+            "no longer taken as cut",
+            "set the work zero on the stock they left",
+            "the work zero is set below",
+        ] {
+            assert!(!all.contains(not), "{not}\n---\n{all}");
+        }
+        // Started after the Pocket, nothing after the start is taken as cut:
+        // what was dropped is said, and the work zero it was cut with is not
+        // offered as kept.
+        let _ = a.update(Message::Run(R::From(0, 2)));
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert!(run.declared_lost && !run.later_cut() && run.partway() && !run.zeroed);
+        assert_eq!(
+            conn(&a).partway_blocked().as_deref(),
+            Some(
+                "Operations or steps of this setup were taken as cut before the project changed, and the check may not take all of them as cut now, so it cannot tell the surface where the stock top is touched off."
+            )
+        );
+        let start = run_of(&a).checked().unwrap()[0].ops[2].clone();
+        let tool = crate::model::tool_label(start.tool, &start.tool_name);
+        let taken = run_of(&a).taken_as_cut();
+        let all = said(&a);
+        for want in [
+            format!("This run starts at {} (tool run 1), taking {} as cut: nothing of {} is sent. Load {tool}, then set Z by hand on a surface whose height you know and press Keep this work zero.", start.name, taken.join(", "), if taken.len() == 1 { "it" } else { "them" }),
+            "Cycle Start waits until you press Keep this work zero: after you set Z by hand on a surface whose height you know.".into(),
+            format!("This run starts at {}, and operations or steps taken as cut before the project changed may not all be taken as cut now, so the check cannot tell the surface they left where the work zero is touched off", start.name),
+        ] {
+            assert!(all.contains(&want), "{want}\n---\n{all}");
+        }
+        for not in [
+            "no longer takes them as cut",
+            "no longer taken as cut",
+            "set the work zero on the stock they left",
+            "the work zero is set below",
+            "still the one they were cut with",
+        ] {
+            assert!(!all.contains(not), "{not}\n---\n{all}");
+        }
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(run_of(&a).zeroed);
+        assert!(
+            !problems(&a)
+                .iter()
+                .any(|p| p.contains("before the project changed")),
+            "{:?}",
+            problems(&a)
+        );
+    }
+
+    /// A run from the setup's start with the Drilling's first hole taken as
+    /// cut (LIO-621): the steps name only what sets Z there, Z by hand and
+    /// Keep this work zero, and once a reference is recorded, Set Z from
+    /// reference, which lets Cycle Start go by itself.
+    #[test]
+    fn the_steps_for_later_cuts_name_only_what_sets_z() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Steps(Some(3))));
+        let _ = a.update(Message::Run(R::PickStep(3, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert_eq!(run.all_cut(), [(3, vec![0])]);
+        assert!(run.later_cut() && run.partway() && !run.declared_lost);
+        assert!(run.reference.is_none() && run.checked().unwrap().len() > 1);
+        let hole = run.taken_as_cut().join(", ");
+        let face = run.checked().unwrap()[0].ops[0].clone();
+        let tool = crate::model::tool_label(face.tool, &face.tool_name);
+        let first = |a: &App| crate::ui::work_zero_steps(a, conn(a)).unwrap()[1..3].join("\n");
+        assert_eq!(
+            first(&a),
+            format!(
+                "This run starts at {} (tool run 1), taking {hole} as cut: nothing of it is sent. Load {tool}, then set Z by hand on a surface whose height you know and press Keep this work zero.\nCycle Start waits until you press Keep this work zero: when it is still the one they were cut with (the stock has not moved since), or after you set Z by hand on a surface whose height you know.",
+                face.name
+            )
+        );
+        // A reference recorded: Set Z from reference is said too, and sets
+        // the work zero Cycle Start waits for.
+        let _ = a.update(Message::Run(R::RecordReference));
+        assert!(run_of(&a).reference.is_some() && !run_of(&a).zeroed);
+        assert_eq!(
+            first(&a),
+            format!(
+                "This run starts at {} (tool run 1), taking {hole} as cut: nothing of it is sent. Load {tool}, then set Z from the recorded reference (Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero.\nCycle Start waits until Z is set from the reference, or until you press Keep this work zero: when it is still the one they were cut with (the stock has not moved since), or after you set Z by hand on a surface whose height you know.",
+                face.name
+            )
+        );
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let window = iced::Size::new(1440., 2400.);
+        assert!(
+            crate::ui::probe::texts(a.view(), window)
+                .iter()
+                .any(|t| t == "Set Z from reference")
+        );
+        assert!(problems(&a).iter().any(|p| p.contains("taken as cut")));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        tick_for(&mut a, 100);
+        assert!(run_of(&a).zeroed);
+        assert!(
+            !problems(&a).iter().any(|p| p.contains("taken as cut")),
+            "{:?}",
+            problems(&a)
+        );
+    }
+
     /// By touch in a 960 × 552 window (LIO-583 review), the Work zero tab of
     /// a run from the setup's start with the Pocket's first level taken as
     /// cut lays Keep this work zero out whole, as wide as in a wide window:
