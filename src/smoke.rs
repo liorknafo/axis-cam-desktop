@@ -10762,8 +10762,10 @@ flood = { pin = 8 }
         let mut b = reopened_at_pass_2(a, dir.path());
         assert!(run_of(&b).stock_unconfirmed);
         assert_eq!(conn(&b).touch_off(), None);
+        // Asked as after a disconnect: anything may have run meanwhile.
+        assert!(run_of(&b).away.is_some());
         let why = conn(&b).partway_blocked().unwrap();
-        assert!(why.contains("Same part"), "{why}");
+        assert_eq!(why, crate::run::STOCK_AWAY_BLOCKED);
         let _ = b.update(Message::Run(R::SamePart));
         assert_eq!(conn(&b).touch_off(), None);
         let why = conn(&b).partway_blocked().unwrap();
@@ -10829,8 +10831,7 @@ flood = { pin = 8 }
         std::fs::remove_file(&path).unwrap();
         let mut e = reopened_at_pass_2(d, dir.path());
         assert!(run_of(&e).resumed.is_none());
-        assert!(run_of(&e).stock_unconfirmed);
-        let _ = e.update(Message::Run(R::SamePart));
+        assert!(run_of(&e).history_unknown());
         assert_eq!(conn(&e).touch_off(), None);
         let _ = e.update(Message::Disconnect);
     }

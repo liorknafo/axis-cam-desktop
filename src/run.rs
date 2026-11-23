@@ -324,7 +324,7 @@ const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed` after a disconnect (`Run::away`, LIO-595).
-pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier this session, and the machine was disconnected since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
+pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier, and the machine was disconnected or AXIS CAM closed since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
 
 /// What runs this computer did not follow may have cut, said as
 /// `Partly::cut` (`HISTORY_UNKNOWN` in `Run::cut_in_run`): another
