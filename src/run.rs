@@ -474,6 +474,13 @@ pub struct Run {
     /// sets Z or probes, and Cycle Start waits for the work zero, until New
     /// stock loaded (`new_stock`, LIO-583 review).
     pub declared_lost: bool,
+    /// Its skips came with a tool run it follows (`following`) that was
+    /// sent before a project edit the session noted (`App::run_declared`
+    /// lost): they say what was sent, by indexes the edit may have changed,
+    /// so the session keeps none of them as taken as cut (`declared`), only
+    /// that something was (`declared_lost`). An edit or New stock loaded,
+    /// which drop them, ends it (LIO-583 review).
+    pub declared_stale: bool,
     /// What the other setups cut this session (`App::run_cuts`), by setup
     /// id: in the part whether those setups come before it, were deleted or
     /// moved after it since. The check's stock has it only while it
@@ -1170,6 +1177,7 @@ impl Run {
             stock_unconfirmed: false,
             away: None,
             declared_lost: false,
+            declared_stale: false,
             earlier_cuts: vec![],
             earlier_given: vec![],
             before_follow: None,
@@ -2844,6 +2852,9 @@ impl Run {
     /// picked again, until New stock loaded (`App::run_declared`, LIO-583
     /// review). Empty when nothing is.
     pub fn declared(&self) -> Declared {
+        if self.declared_stale {
+            return (vec![], vec![]);
+        }
         let skips: Vec<(usize, Skip)> =
             (self.skips.iter()).filter(|s| s.1 == Skip::Cut).copied().collect();
         (skips, self.cut_steps.clone())
@@ -2857,6 +2868,7 @@ impl Run {
     pub fn new_stock(&mut self) -> bool {
         (self.cut_in_run, self.earlier_cuts) = (vec![], vec![]);
         (self.stock_unconfirmed, self.declared_lost) = (false, false);
+        self.declared_stale = false;
         let (skips, steps) = self.declared();
         if skips.is_empty() && steps.is_empty() {
             return false;
@@ -3407,6 +3419,7 @@ impl Run {
         // review).
         let (cut, steps) = self.declared();
         self.declared_lost |= !cut.is_empty() || !steps.is_empty();
+        self.declared_stale = false;
         (self.skips, self.keep, self.menu) = (vec![], None, None);
         (self.cut_steps, self.start_step, self.picked) = (vec![], None, None);
     }
@@ -7902,6 +7915,7 @@ pub(crate) mod tests {
             stock_unconfirmed: false,
             away: None,
             declared_lost: false,
+            declared_stale: false,
             earlier_cuts: vec![],
             earlier_given: vec![],
             before_follow: None,

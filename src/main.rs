@@ -4854,6 +4854,12 @@ impl App {
         let (index, from) = (f.index, f.from);
         let mut following = run::Run::following(&self.doc, si, self.run_epoch, f);
         note_lost_cuts(&mut self.run_cuts, self.others_unknown, &following.setup_id);
+        // Sent before an edit the session noted: its skips say what was
+        // sent, by indexes the edit may have changed, and what was taken as
+        // cut is not known (LIO-583 review).
+        if (self.run_declared.iter()).any(|(id, _, lost)| *id == following.setup_id && *lost) {
+            (following.declared_lost, following.declared_stale) = (true, true);
+        }
         // It follows a tool run cutting the part: the same part (LIO-582).
         if let Some((_, cuts)) = (self.run_cuts.iter()).find(|(id, _)| *id == following.setup_id) {
             following.cut_in_run = cuts.clone();

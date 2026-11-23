@@ -3233,6 +3233,61 @@ flood = { pin = 8 }
         drop(server);
     }
 
+    /// As above, but the run kept for the Pi's tool run is let go meanwhile,
+    /// as connecting to another machine does (LIO-583 review): connected
+    /// back, the run is built anew from the tool run the Pi was sent
+    /// (`Run::following`), with the skips it was sent with. The session
+    /// knows an edit came after them: they are not kept as taken as cut,
+    /// and nothing sets Z, then or once the setup is picked again.
+    #[test]
+    fn a_pi_tool_run_followed_anew_after_an_edit_sets_no_z() {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 1, Some(Skip::Cut)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5.0, "the Face running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10.0, "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        a.doc.title = format!("{} edited", a.doc.title);
+        a.touch();
+        // Let go, as another machine connected meanwhile does.
+        a.pi_run = None;
+        let setup = a.doc.setups[0].id.clone();
+        assert_eq!(a.run_declared, [(setup.clone(), (vec![], vec![]), true)]);
+        let _ = a.update(Message::Connect);
+        follow_again(&mut a).unwrap();
+        let run = run_of(&a);
+        assert_eq!(run.skips, [(1, Skip::Cut)], "followed as sent");
+        assert!(run.declared_lost && run.declared_stale);
+        assert_eq!(run.declared(), (vec![], vec![]));
+        let _ = a.update(Message::Run(R::Resume));
+        run_until(&mut a, 60.0, "tool run 1 done", |r| r.done[0]);
+        assert!(conn(&a).touch_off().is_none());
+        // Picked again: not given back by the old index, and nothing sets Z.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        assert_eq!(a.run_declared, [(setup, (vec![], vec![]), true)]);
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::SamePart));
+        let run = run_of(&a);
+        assert!(run.skips.is_empty() && run.declared_lost, "{:?}", run.skips);
+        assert!(run.asks_zero() && !run.zeroed);
+        assert!(conn(&a).touch_off().is_none() && conn(&a).stock_top().is_err());
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        let _ = a.update(Message::Disconnect);
+        drop(server);
+    }
+
     /// A relay to `target` passing this computer's frames on, one part of a
     /// message in parts every `pace` (a slow link), and noting the snapshot
     /// number each part carries. It stops taking computers once the numbers
