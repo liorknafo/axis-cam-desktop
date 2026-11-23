@@ -17264,6 +17264,58 @@ pub(crate) mod probe {
     ) -> Vec<(Point, Message)> {
         presses_after(page, window, None, area, step)
     }
+    /// `presses` over the whole window every `step` px, after the mouse
+    /// wheel scrolled `down` px over `over` (LIO-583 review): what a press
+    /// reaches once a scrollable there is scrolled, at the window's own size.
+    pub(crate) fn presses_scrolled(
+        page: Element<'_, Message>,
+        window: Size,
+        over: Point,
+        down: f32,
+        step: f32,
+    ) -> Vec<(Point, Message)> {
+        let mut renderer = renderer();
+        let mut ui = UserInterface::build(page, window, Cache::default(), &mut renderer);
+        let wheel = [
+            Event::Mouse(mouse::Event::CursorMoved { position: over }),
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: 0., y: -down },
+            }),
+        ];
+        let _ = ui.update(
+            &wheel,
+            mouse::Cursor::Available(over),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut vec![],
+        );
+        let mut out = vec![];
+        let mut y = 0.;
+        while y < window.height {
+            let mut x = 0.;
+            while x < window.width {
+                let at = Point::new(x, y);
+                let mut messages = vec![];
+                for event in [
+                    mouse::Event::CursorMoved { position: at },
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                ] {
+                    let _ = ui.update(
+                        &[Event::Mouse(event)],
+                        mouse::Cursor::Available(at),
+                        &mut renderer,
+                        &mut clipboard::Null,
+                        &mut messages,
+                    );
+                }
+                out.extend(messages.into_iter().map(|m| (at, m)));
+                x += step;
+            }
+            y += step;
+        }
+        out
+    }
     /// `presses`, after the pointer came to `rest` and stayed there long
     /// enough for a hover card there to open.
     pub(crate) fn presses_after(

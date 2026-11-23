@@ -2807,9 +2807,10 @@ impl Run {
 
     /// The stock the start begins from is not the setup's own: the run
     /// starts partway (`partway`), or a tool run of it has started, which
-    /// cut it, or has cut (`cut_in_run`). Zero Z on the stock top, Probe Z and the probe spots go by
-    /// the stock the check finds before the start (`partly`) then; Cycle
-    /// Start waits for the work zero only partway (LIO-582 review).
+    /// cut it, or has cut (`cut_in_run`). Zero Z on the stock top, Probe Z
+    /// and the probe spots go by the stock the check finds before the start
+    /// (`partly`) then (LIO-582 review). Whether Cycle Start waits for the
+    /// work zero is `asks_zero`'s, not this (LIO-583).
     pub fn on_cut_stock(&self) -> bool {
         self.checked().is_some()
             && (self.partway()

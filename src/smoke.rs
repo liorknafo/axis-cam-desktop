@@ -11908,11 +11908,23 @@ flood = { pin = 8 }
         };
         let wide = keep(&mut a, 1600., 1000.);
         let small = keep(&mut a, 960., 552.);
-        crate::ui::TOUCH.with(|t| t.set(false));
         assert!(
             small.width >= wide.width - 0.5 && small.height >= wide.height - 0.5,
             "{small:?} of {wide:?}"
         );
+        // In the window itself, 960 × 552: the tab scrolled down, a finger
+        // on Keep this work zero presses it (LIO-583 review).
+        let window = iced::Size::new(960., 552.);
+        let _ = a.update(Message::Resized(window));
+        let pressed = (crate::ui::probe::scrollables(a.view(), window).into_iter())
+            .filter(|(_, b)| b.width > 100. && b.height > 100.)
+            .any(|(_, b)| {
+                crate::ui::probe::presses_scrolled(a.view(), window, b.center(), 5000., 8.)
+                    .iter()
+                    .any(|(_, m)| matches!(m, Message::Run(R::KeepZero)))
+            });
+        crate::ui::TOUCH.with(|t| t.set(false));
+        assert!(pressed, "Keep this work zero not pressed at 960 × 552, scrolled");
     }
 
     /// A run started at the Drilling with the work zero on the stock top's
