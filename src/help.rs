@@ -1905,7 +1905,7 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
         ),
         SamePart => (
             "The part held is the part earlier runs cut or took as cut, and nothing else has cut it since: what they cut or took as cut, of every setup, stays the stock's, and the touch-off and probes go by it.",
-            "After a disconnect, or AXIS CAM opened again, it is off while the Pi shows a tool run this computer did not send.",
+            "After a disconnect, or AXIS CAM opened again, it is off while the Pi shows a tool run this computer did not send. And whenever the Pi shows that another computer held control or that the Pi restarted, even within a short link drop, what this computer's runs cut is no longer known, whatever is answered here, until New stock loaded.",
         ),
         OtherRunsMayHaveCut => (
             "The part held is the part earlier runs cut or took as cut, but something else may have cut it while the machine was disconnected or AXIS CAM closed: another computer, or the Pi's own operator. What every setup's runs cut or took as cut is not known any more: no start sets Z or probes from the stock the check carves until New stock loaded: keep the work zero, or set Z by hand on a surface of known height.",

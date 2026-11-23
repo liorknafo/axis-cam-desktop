@@ -1660,6 +1660,11 @@ pub struct App {
     cuts_grew: bool,
     /// The connection's `journal_changes` last seen.
     journal_changes_seen: u64,
+    /// The Pi's start and count of control takes as last heard
+    /// (`control::Connection::pi_control_since`, LIO-597), kept across
+    /// link drops and disconnects: a new start, or a take this computer did
+    /// not make, means something else may have cut the part.
+    pi_control_seen: Option<(u64, u64)>,
     /// For a setup whose run was dropped while a tool run ran: that tool run
     /// (index, and the operation it started at) and what was cut before it.
     /// `run_cuts` counts that tool run as cutting all it was to cut; a
@@ -2282,6 +2287,7 @@ impl App {
             cuts_seen: None,
             cuts_grew: false,
             journal_changes_seen: 0,
+            pi_control_seen: None,
             run_pending: vec![],
             run_declared: history.declared,
             jog_key: None,
@@ -4938,7 +4944,10 @@ impl App {
     /// The Pi shows a tool run this session did not send and has not
     /// answered for (`pi_runs_known`), or another computer in control
     /// (`control::Connection::done_elsewhere`), the link dropped and back
-    /// or not (LIO-596): either may have cut the part. Whatever this
+    /// or not (LIO-596); or, by its start and count of control takes, that
+    /// it restarted or another computer held control since this computer
+    /// last heard (`pi_control_seen`, LIO-597): any of them may have cut
+    /// the part, by a tool run, a plain job or a jog. Whatever this
     /// session's runs cut, of every setup, is unknown from now on
     /// (`run::HISTORY_UNKNOWN`), until New stock loaded, and the Pi's note
     /// says why. Nothing at stake (nothing cut yet, or New stock loaded
@@ -4947,21 +4956,35 @@ impl App {
         let Some(c) = self.control.as_mut() else {
             return;
         };
+        let since = c.pi_control_since(&mut self.pi_control_seen);
         let (runs, holder) = c.done_elsewhere(&self.pi_runs_known);
-        if runs.is_empty() && holder.is_none() {
+        if runs.is_empty() && holder.is_none() && since.is_none() {
             return;
         }
+        let ran = !runs.is_empty();
         self.pi_runs_known.extend(runs);
         if !self.cut_elsewhere() {
             return;
         }
-        let what = match holder {
-            Some(h) => format!("{h} took control of the Pi"),
-            None => "A tool run this computer did not send ran on the Pi".into(),
+        use control::PiSince;
+        let what = match (holder, ran, since) {
+            (Some(h), _, _) => format!("{h} took control of the Pi: it may have cut the part"),
+            (None, true, _) => {
+                "A tool run this computer did not send ran on the Pi: it may have cut the part"
+                    .into()
+            }
+            (None, false, Some(PiSince::Restarted)) => {
+                "The Pi restarted, and no longer shows what ran on it before: that may have cut the part"
+                    .into()
+            }
+            (None, false, _) => {
+                "Another computer held control of the Pi: it may have jogged or run a job into the part"
+                    .into()
+            }
         };
         if let Some(c) = self.control.as_mut() {
             c.pi_note = Some(format!(
-                "{what}: it may have cut the part, so what this computer's runs cut is not known any more. No start sets Z from the stock the check finds until New stock loaded under Work zero; keep the work zero, or set Z by hand."
+                "{what}, so what this computer's runs cut is not known any more. No start sets Z from the stock the check finds until New stock loaded under Work zero; keep the work zero, or set Z by hand."
             ));
         }
     }
@@ -10834,8 +10857,9 @@ impl App {
                         };
                     }
                 }
-                // Something else ran on the Pi, or holds it: what this
-                // session's runs cut is unknown from now on (LIO-596).
+                // Something else ran on the Pi, or holds it, or held it
+                // since, or the Pi restarted: what this session's runs cut
+                // is unknown from now on (LIO-596, LIO-597).
                 self.note_done_elsewhere();
                 let phase_tab = self.phase_tab();
                 // AXIS CAM opened again while the Pi runs the tool run it
