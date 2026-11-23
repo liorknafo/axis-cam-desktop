@@ -1640,6 +1640,10 @@ pub struct App {
     /// written anew.
     cuts_path: PathBuf,
     cuts_kept: Option<run::CutHistory>,
+    /// Whose each setup of `run_cuts` is (`run::CutOwner`, LIO-607): taken
+    /// from the project as long as it has the setup, and kept as it was
+    /// then once it does not (another project opened, the setup deleted).
+    cut_owners: Vec<run::CutOwner>,
     /// When `cuts_kept` last could not be written: tried again a second
     /// later (LIO-594 review).
     cuts_failed: Option<Instant>,
@@ -2249,6 +2253,7 @@ impl App {
             cnc_over_guide: None,
             run_on_connect: None,
             run_cuts: history.cuts,
+            cut_owners: history.owners,
             run_away,
             cut_journals: history.journals,
             others_unknown: history.others_unknown,
@@ -3928,6 +3933,7 @@ impl App {
     /// (`keep_run_cuts`), and the journal the connection last wrote or
     /// removed as this session's.
     fn keep_cut_history(&mut self) {
+        self.note_cut_owners();
         if let Some(c) = &self.control
             && c.journal_changes != self.journal_changes_seen
         {
@@ -3952,6 +3958,27 @@ impl App {
             return;
         }
         let _ = self.write_cut_history(starting);
+    }
+    /// Notes whose each setup with cuts is (`cut_owners`): this project's
+    /// as it is now, another's as it was kept (LIO-607). One whose cuts
+    /// are forgotten is dropped.
+    fn note_cut_owners(&mut self) {
+        let live = (self.control.as_ref())
+            .and_then(|c| c.run.as_ref())
+            .map(|r| r.setup_id.as_str());
+        let cut = |id: &str| live == Some(id) || self.run_cuts.iter().any(|(s, _)| s == id);
+        for si in 0..self.doc.setups.len() {
+            if !cut(&self.doc.setups[si].id) {
+                continue;
+            }
+            let owner = run::CutOwner::of(&self.doc, si);
+            match self.cut_owners.iter_mut().find(|o| o.setup == owner.setup) {
+                Some(o) => *o = owner,
+                None => self.cut_owners.push(owner),
+            }
+        }
+        let owners = std::mem::take(&mut self.cut_owners);
+        self.cut_owners = owners.into_iter().filter(|o| cut(&o.setup)).collect();
     }
     /// Takes in what another AXIS CAM open on the same folder wrote, once
     /// the file changed since it was last looked at: before anything this
@@ -4050,6 +4077,20 @@ impl App {
                 r.zeroed = false;
             }
         }
+        // Whose their setups are, but for this project's, which it says
+        // itself (LIO-607).
+        for o in &theirs.owners {
+            if (self.doc.setups.iter()).any(|s| s.id == o.setup) {
+                continue;
+            }
+            match self.cut_owners.iter_mut().find(|m| m.setup == o.setup) {
+                Some(m) => *m = o.clone(),
+                None => self.cut_owners.push(o.clone()),
+            }
+        }
+        if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
+            give_elsewhere(&self.cut_owners, &self.doc, r);
+        }
         for k in theirs.journals.iter() {
             if !base.journals.contains(k) && !self.cut_journals.contains(k) {
                 self.cut_journals.push(k.clone());
@@ -4098,11 +4139,21 @@ impl App {
         }
         let sent = control::sent_tool_runs();
         let sent = sent[sent.len().saturating_sub(run::SENT_KEPT)..].to_vec();
+        // Whose each setup is: this project's as it is now (LIO-607).
+        let owners = (cuts.iter())
+            .filter_map(
+                |(id, _)| match self.doc.setups.iter().position(|s| s.id == *id) {
+                    Some(si) => Some(run::CutOwner::of(&self.doc, si)),
+                    None => self.cut_owners.iter().find(|o| o.setup == *id).cloned(),
+                },
+            )
+            .collect();
         run::CutHistory {
             cuts,
             journals: self.cut_journals.clone(),
             others_unknown: self.others_unknown,
             sent,
+            owners,
         }
     }
     /// Writes what setups' runs cut (`cut_history`, `starting`), with what
@@ -4855,6 +4906,7 @@ impl App {
             following.note_history_unknown();
         }
         give_earlier_cuts(&self.run_cuts, &mut following);
+        give_elsewhere(&self.cut_owners, &self.doc, &mut following);
         // Kept across a disconnect: was anything else run meanwhile?
         give_away(&self.run_away, &mut following);
         c.run = Some(following);
@@ -9133,6 +9185,7 @@ impl App {
                     r.note_history_unknown();
                 }
                 give_earlier_cuts(&self.run_cuts, &mut r);
+                give_elsewhere(&self.cut_owners, &self.doc, &mut r);
                 give_away(&self.run_away, &mut r);
                 c.run = Some(r);
                 // A spot picked to probe from was for the setup before.
@@ -12237,6 +12290,20 @@ fn give_earlier_cuts(cuts: &[(String, Vec<run::CutInRun>)], run: &mut run::Run) 
         .cloned()
         .collect();
     run.earlier_given = run.earlier_cuts.iter().map(|(id, _)| id.clone()).collect();
+}
+
+/// Gives `run` whose the setups of its `earlier_cuts` that are another
+/// project's are (`owners`, `App::cut_owners`; `run::Run::earlier_elsewhere`),
+/// so that their cuts are said as that project's (LIO-607). One `doc` has,
+/// or one deleted from it, is this project's; one with no owner kept, of a
+/// project not known.
+fn give_elsewhere(owners: &[run::CutOwner], doc: &Document, run: &mut run::Run) {
+    run.earlier_elsewhere = (run.earlier_cuts.iter())
+        .filter(|(id, _)| !doc.setups.iter().any(|s| s.id == *id))
+        .filter_map(|(id, _)| owners.iter().find(|o| o.setup == *id))
+        .filter(|o| o.project != doc.project_id)
+        .cloned()
+        .collect();
 }
 
 /// Notes in `pending` (`App::run_pending`) the tool run `run` runs as it is

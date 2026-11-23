@@ -457,6 +457,9 @@ pub struct Run {
     /// The setups `earlier_cuts` was given for: one no longer in it was
     /// forgotten (New stock loaded).
     pub earlier_given: Vec<String>,
+    /// Of the setups of `earlier_cuts`, those of another project, whose
+    /// (`CutOwner`, LIO-607): their cuts are said as that project's.
+    pub earlier_elsewhere: Vec<CutOwner>,
     /// A run following on the Pi the tool run its run ran when dropped
     /// (`App::run_pending`): what was cut before that tool run. Kept only
     /// once the follow holds (`follow_again`) and until this computer starts
@@ -873,6 +876,37 @@ pub struct CutHistory {
     /// none ran while it was away (LIO-595), whichever session sent it.
     #[serde(default)]
     pub sent: Vec<u64>,
+    /// Whose each setup in `cuts` is (`CutOwner`), so that another
+    /// project's cuts are said to be so (LIO-607). A setup with none, kept
+    /// by an AXIS CAM before it, is said as any setup the check does not
+    /// follow.
+    #[serde(default)]
+    pub owners: Vec<CutOwner>,
+}
+
+/// The project and names of a setup whose runs cut (`CutHistory::owners`),
+/// as they were when its cuts were last kept (LIO-607).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CutOwner {
+    pub setup: String,
+    /// The project's identity (`Document::project_id`) and title.
+    pub project: String,
+    pub title: String,
+    /// The names of the setup's operations, by index.
+    pub ops: Vec<String>,
+}
+
+impl CutOwner {
+    /// Setup `si` of `doc`'s.
+    pub fn of(doc: &Document, si: usize) -> Self {
+        let s = &doc.setups[si];
+        Self {
+            setup: s.id.clone(),
+            project: doc.project_id.clone(),
+            title: doc.title.clone(),
+            ops: s.operations.iter().map(|o| o.name().to_string()).collect(),
+        }
+    }
 }
 
 /// How many of the tool runs sent a Pi `CutHistory::sent` keeps.
@@ -1145,6 +1179,7 @@ impl Run {
             away: None,
             earlier_cuts: vec![],
             earlier_given: vec![],
+            earlier_elsewhere: vec![],
             before_follow: None,
             running: None,
             xy: None,
@@ -2738,12 +2773,112 @@ impl Run {
     /// moved after this one (`Left::earlier`). Its stock lacks what was cut
     /// (LIO-582 review).
     pub fn earlier_unfollowed(&self) -> bool {
+        self.unfollowed_earlier().next().is_some()
+    }
+
+    /// The setups of `earlier_cuts` whose cuts the check does not follow
+    /// (`earlier_unfollowed`), with those cuts.
+    fn unfollowed_earlier(&self) -> impl Iterator<Item = &(String, Vec<CutInRun>)> {
         let earlier = self.left.as_ref().map_or(&[][..], |l| &l.earlier[..]);
-        (self.earlier_cuts.iter()).any(|(id, cuts)| {
+        (self.earlier_cuts.iter()).filter(move |(id, cuts)| {
             cuts.iter().any(|&(op, _, print)| {
                 !(earlier.iter()).any(|(s, o, p)| s == id && *o == op && Some(*p) == print)
             })
         })
+    }
+
+    /// What another project's runs cut that the check does not follow
+    /// (`earlier_unfollowed`, `earlier_elsewhere`), said (LIO-607): None
+    /// when none did. With whether a setup of this project's, or one whose
+    /// project is not known, cut what it does not follow too.
+    fn earlier_elsewhere_said(&self) -> Option<(String, bool)> {
+        let mut projects: Vec<(&str, &str, Vec<&str>)> = vec![];
+        let mut own = false;
+        for (id, cuts) in self.unfollowed_earlier() {
+            let Some(o) = self.earlier_elsewhere.iter().find(|o| o.setup == *id) else {
+                own = true;
+                continue;
+            };
+            let i = match projects.iter().position(|p| p.0 == o.project) {
+                Some(i) => i,
+                None => {
+                    projects.push((&o.project, &o.title, vec![]));
+                    projects.len() - 1
+                }
+            };
+            for &(op, _, _) in cuts {
+                if let Some(name) = o.ops.get(op).filter(|n| !n.is_empty())
+                    && !projects[i].2.contains(&name.as_str())
+                {
+                    projects[i].2.push(name);
+                }
+            }
+        }
+        if projects.is_empty() {
+            return None;
+        }
+        let which = (projects.iter())
+            .map(|(_, title, ops)| match (title.trim(), ops.is_empty()) {
+                ("", true) => "one with no name".to_string(),
+                ("", false) => format!("one with no name: {}", crate::post::listed(ops)),
+                (t, true) => format!("\"{t}\""),
+                (t, false) => format!("\"{t}\": {}", crate::post::listed(ops)),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let whose = match projects.len() {
+            1 => "another project's runs",
+            _ => "other projects' runs",
+        };
+        Some((
+            format!(
+                "{whose} cut stock on this machine earlier ({which}), cuts this project's check does not have"
+            ),
+            own,
+        ))
+    }
+
+    /// Why the stock is not the check's where another setup's or another
+    /// project's run cut it (`earlier_unfollowed`), the start of a sentence
+    /// (LIO-607): None when only this project's setups did, said as
+    /// `EARLIER_UNFOLLOWED_WHY` is.
+    fn earlier_elsewhere_cause(&self) -> Option<String> {
+        let (said, own) = self.earlier_elsewhere_said()?;
+        Some(match own {
+            true => format!(
+                "Another setup's run cut this part earlier in a way the check does not follow, and {said}"
+            ),
+            false => format!("{}{}", said[..1].to_uppercase(), &said[1..]),
+        })
+    }
+
+    /// What the Work zero tab says of the cuts the check does not follow
+    /// (`earlier_unfollowed`), with New stock loaded.
+    pub fn earlier_unfollowed_note(&self) -> String {
+        match self.earlier_elsewhere_cause() {
+            Some(cause) => format!("{cause}."),
+            None => "Another setup's run cut this part in a way the check does not follow.".into(),
+        }
+    }
+
+    /// Why a probe cannot find a work zero from a spot of a stock
+    /// `EARLIER_UNFOLLOWED` cut.
+    fn earlier_unfollowed_why(&self) -> String {
+        match self.earlier_elsewhere_cause() {
+            Some(cause) => format!("{cause}."),
+            None => EARLIER_UNFOLLOWED_WHY.into(),
+        }
+    }
+
+    /// Why a probe cannot find this work zero where `EARLIER_UNFOLLOWED`
+    /// cut (`Connection::cut_probe_blocked`).
+    pub fn earlier_unfollowed_probe(&self) -> String {
+        match self.earlier_elsewhere_cause() {
+            Some(cause) => format!(
+                "{cause}, so the check cannot tell the stock where a probe finds this work zero."
+            ),
+            None => "Another setup's run cut this part earlier in a way the check does not follow, where a probe finds this work zero.".into(),
+        }
     }
 
     /// The stock the start begins from is not the setup's own: the run
@@ -2838,7 +2973,12 @@ impl Run {
         } else if partly.cut == [HISTORY_UNFOLLOWED] {
             HISTORY_UNFOLLOWED_BLOCKED.into()
         } else if partly.cut == [EARLIER_UNFOLLOWED] {
-            EARLIER_UNFOLLOWED_BLOCKED.into()
+            match self.earlier_elsewhere_cause() {
+                Some(cause) => format!(
+                    "{cause}, so the check cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero."
+                ),
+                None => EARLIER_UNFOLLOWED_BLOCKED.into(),
+            }
         } else if partly.cut == [STEPS_UNFOLLOWED] {
             // Not a part of the stock: said as the reason it is (LIO-579).
             "The check does not follow the stock cut by the steps taken as cut, so it cannot tell the surface they left where the stock top is touched off.".into()
@@ -3102,7 +3242,7 @@ impl Run {
                 surface: None,
                 top_cut: true,
                 probe_from: (before.probe_from.iter())
-                    .map(|(r, _)| (*r, Err(EARLIER_UNFOLLOWED_WHY.into())))
+                    .map(|(r, _)| (*r, Err(self.earlier_unfollowed_why())))
                     .collect(),
                 steps: vec![],
             }));
@@ -7770,6 +7910,7 @@ pub(crate) mod tests {
             away: None,
             earlier_cuts: vec![],
             earlier_given: vec![],
+            earlier_elsewhere: vec![],
             before_follow: None,
             running: Some(Running {
                 index: 0,
@@ -10109,6 +10250,71 @@ pub(crate) mod tests {
             why.starts_with("This run's tool runs have cut the stock since"),
             "{why}"
         );
+    }
+
+    /// LIO-607: another project's setups' cuts, kept with whose they are
+    /// (`CutOwner`), are said as that project's, its name and the
+    /// operations cut; a setup deleted from this project, or one kept with
+    /// no owner (an older AXIS CAM's), as any setup the check does not
+    /// follow.
+    #[test]
+    fn another_projects_cuts_are_said_as_its() {
+        let doc = crate::post::fixture::job().0;
+        let mut other = doc.clone();
+        other.project_id = crate::id();
+        other.title = "Bracket".into();
+        for s in &mut other.setups {
+            s.id = crate::id();
+        }
+        let mut third = other.clone();
+        third.project_id = crate::id();
+        third.title = "Lid".into();
+        third.setups[0].id = crate::id();
+        let (a, b) = (CutOwner::of(&other, 0), CutOwner::of(&third, 0));
+        let (face, pocket) = (a.ops[0].clone(), a.ops[1].clone());
+        // Of this project, but deleted since.
+        let mut gone = CutOwner::of(&doc, 0);
+        gone.setup = crate::id();
+        let owners = [a.clone(), b.clone(), gone.clone()];
+        let note = |cuts: &[(&str, &[usize])]| {
+            let mut run = Run::new(&doc, 0, 0);
+            run.earlier_cuts = (cuts.iter())
+                .map(|(id, ops)| {
+                    (
+                        id.to_string(),
+                        ops.iter().map(|&o| (o, None, None)).collect(),
+                    )
+                })
+                .collect();
+            crate::give_elsewhere(&owners, &doc, &mut run);
+            run.earlier_unfollowed_note()
+        };
+        assert_eq!(
+            note(&[(&a.setup, &[0, 1, 0, HISTORY_UNKNOWN])]),
+            format!(
+                "Another project's runs cut stock on this machine earlier (\"Bracket\": {face} and {pocket}), cuts this project's check does not have."
+            )
+        );
+        assert_eq!(
+            note(&[(&a.setup, &[1]), (&b.setup, &[0])]),
+            format!(
+                "Other projects' runs cut stock on this machine earlier (\"Bracket\": {pocket}; \"Lid\": {face}), cuts this project's check does not have."
+            )
+        );
+        let generic = "Another setup's run cut this part in a way the check does not follow.";
+        assert_eq!(note(&[(&gone.setup, &[0])]), generic);
+        assert_eq!(note(&[("kept-with-no-owner", &[0])]), generic);
+        assert_eq!(
+            note(&[(&gone.setup, &[0]), (&a.setup, &[0])]),
+            format!(
+                "Another setup's run cut this part earlier in a way the check does not follow, and another project's runs cut stock on this machine earlier (\"Bracket\": {face}), cuts this project's check does not have."
+            )
+        );
+        // A history kept before owners were kept still reads.
+        let old =
+            r#"{"cuts":[["s",[[0,null,null]]]],"journals":[],"others_unknown":false,"sent":[]}"#;
+        let h: CutHistory = serde_json::from_str(old).unwrap();
+        assert!(h.owners.is_empty() && h.cuts.len() == 1);
     }
 
     /// Setup 1 bores the ring from below, leaving a 0.5 mm roof, cut in a

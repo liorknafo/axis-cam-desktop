@@ -11106,6 +11106,71 @@ flood = { pin = 8 }
         let _ = b.update(Message::Disconnect);
     }
 
+    /// LIO-607: project A's Face and Pocket run, and another project, B,
+    /// is opened, its first setup picked: in the same session, and again
+    /// once AXIS CAM is closed and opened again. A's cuts may be on the
+    /// stock held (B continues A's part, say), so nothing sets Z from B's
+    /// stock until the operator says new stock is held; but the question
+    /// says they are another project's, A's, and which operations cut.
+    #[test]
+    fn another_projects_cuts_are_asked_for_as_another_projects() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = two_pass_app(dir.path());
+        a.doc.title = "Project A".into();
+        let first = a.doc.clone();
+        let face = first.setups[0].operations[0].name().to_string();
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        cycle_start(&mut a);
+        run_until(&mut a, 90., "tool run 1", |r| r.running.is_none());
+        // Project B: another project, with setups of its own, opened in
+        // the same session.
+        let mut doc = first.clone();
+        doc.project_id = crate::id();
+        doc.title = "Project B".into();
+        for s in &mut doc.setups {
+            s.id = crate::id();
+        }
+        doc.active = doc.setups[0].id.clone();
+        let mesh = a.imported_mesh.clone();
+        a.replace_document(doc, None);
+        a.imported_mesh = mesh;
+        a.page = Page::Control;
+        let said = format!(
+            "Another project's runs cut stock on this machine earlier (\"Project A\": {face}"
+        );
+        let asked = |b: &mut App| {
+            let _ = b.update(Message::Run(R::Setup(0)));
+            answer_skips(b, 0);
+            assert!(run_of(b).earlier_unfollowed());
+            assert_eq!(conn(b).touch_off(), None);
+            let why = conn(b).partway_blocked().unwrap_or_default();
+            assert!(why.starts_with(&said), "{why}");
+            assert!(run_of(b).earlier_unfollowed_note().starts_with(&said));
+        };
+        asked(&mut a);
+        let _ = a.update(Message::Disconnect);
+        // Kept with whose they are, A's setup no longer in the project.
+        let path = dir.path().join("uc100").join("cuts.json");
+        let h = crate::run::CutHistory::read(&path).unwrap().unwrap();
+        let owner = h.owners.iter().find(|o| o.setup == first.setups[0].id);
+        assert_eq!(owner, Some(&crate::run::CutOwner::of(&first, 0)));
+        // AXIS CAM closed and opened again on project B.
+        let mut b = reopen(a, dir.path());
+        zeroed(&mut b);
+        asked(&mut b);
+        let _ = b.update(Message::Run(R::NewStock));
+        assert!(conn(&b).touch_off().is_some());
+        let _ = b.update(Message::Tick);
+        // New stock loaded forgets A's cuts, and whose they were.
+        let h = crate::run::CutHistory::read(&path).unwrap().unwrap();
+        assert!(!h.cuts.iter().any(|(id, _)| *id == first.setups[0].id));
+        assert!(!h.owners.iter().any(|o| o.setup == first.setups[0].id));
+        let _ = b.update(Message::Disconnect);
+    }
+
     /// LIO-594 review: what runs cut, kept on disk, becomes unreadable while
     /// a run is picked: what it held is lost, so the run asks again whether
     /// the same part is held, sets no Z from the check's stock, and is no
