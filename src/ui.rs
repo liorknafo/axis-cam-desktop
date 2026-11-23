@@ -11630,7 +11630,13 @@ fn stock_question<'a>(
     // buttons keep their room (LIO-582 review).
     let stock = (run.stock_unconfirmed && run.away.is_none()).then(|| {
         column![
-            text("This setup's runs cut a part earlier. Is it still the one held?").size(12),
+            text(if run.cut_in_run.is_empty() {
+                // Only taken as cut (LIO-583 review).
+                "Operations or steps of this setup were taken as cut this session. Is it still the same part?"
+            } else {
+                "This setup's runs cut a part earlier. Is it still the one held?"
+            })
+            .size(12),
             row![
                 small(
                     "Same part",

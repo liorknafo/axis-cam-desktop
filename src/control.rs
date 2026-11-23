@@ -4056,10 +4056,10 @@ impl Connection {
                 run.stock_unconfirmed = false;
                 run.away = None;
             }
+            // What was taken as cut goes too, the setup checked again
+            // without it (LIO-583 review).
             R::NewStock if run.running.is_none() => {
-                run.cut_in_run.clear();
-                run.earlier_cuts.clear();
-                run.stock_unconfirmed = false;
+                run.new_stock();
                 run.away = None;
             }
             R::More(oi) => {
@@ -4649,7 +4649,7 @@ impl Connection {
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::STOCK_UNCONFIRMED] =>
             {
-                Some("This setup's runs cut the stock earlier: say under Work zero whether it is the same part or new stock before a probe finds this work zero.".into())
+                Some("This setup's runs cut the stock earlier, or took operations or steps of it as cut: say under Work zero whether it is the same part or new stock before a probe finds this work zero.".into())
             }
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::STEPS_UNFOLLOWED] =>

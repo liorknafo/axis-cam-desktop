@@ -90,6 +90,10 @@ pub enum Action {
     StopAfterStep,
 }
 
+/// What a run took as cut (`Run::declared`): its operations skipped as cut
+/// and its steps skipped, by operation (index in the setup).
+pub type Declared = (Vec<(usize, Skip)>, Vec<(usize, Vec<usize>)>);
+
 /// How a run skips an operation of its setup (`Run::skips`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Skip {
@@ -312,15 +316,15 @@ pub(crate) const LATER_UNFOLLOWED_WHY: &str = "Operations or steps after the sta
 /// while the operator has not said whether the same part is still held
 /// (`Run::stock_unconfirmed`).
 pub(crate) const STOCK_UNCONFIRMED: &str =
-    "stock this setup's runs cut earlier, which may or may not still be held";
+    "stock this setup's runs cut, or took as cut, earlier, which may or may not still be held";
 
 /// Why a probe cannot find a work zero from a spot while
 /// `Run::stock_unconfirmed`.
-const STOCK_UNCONFIRMED_WHY: &str = "This setup's runs cut the stock earlier: say under Work zero whether it is the same part or new stock.";
+const STOCK_UNCONFIRMED_WHY: &str = "This setup's runs cut the stock earlier, or took operations or steps of it as cut: say under Work zero whether it is the same part or new stock.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed`.
-const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
+const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier, or took operations or steps of it as cut: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed` after a disconnect (`Run::away`, LIO-595).
@@ -438,7 +442,9 @@ pub struct Run {
     pub cut_in_run: Vec<CutInRun>,
     /// `cut_in_run` came from an earlier pick of this setup, this session
     /// or before AXIS CAM was last closed (`CutHistory`, LIO-594), or
-    /// tells of runs whose cuts are not known (`HISTORY_UNKNOWN`), and the
+    /// tells of runs whose cuts are not known (`HISTORY_UNKNOWN`), or what
+    /// was taken as cut came from an earlier pick this session (`declared`,
+    /// LIO-583 review), and the
     /// operator has not said whether the same part is still held
     /// (`Action::SamePart`, `Action::NewStock`): nothing sets Z or probes
     /// until then (`partly`, LIO-582 review).
@@ -2800,6 +2806,38 @@ impl Run {
             || self.cut_steps.iter().any(steps)
             || self.later_cut();
         self.checked().is_some() && (self.at_step().is_some() || !self.started() && early)
+    }
+
+    /// What the operator took as cut in this run: the operations skipped as
+    /// cut (`Skip::Cut`) and the steps skipped (`cut_steps`), kept by the
+    /// session when the run is dropped and given back when its setup is
+    /// picked again, until New stock loaded (`App::run_declared`, LIO-583
+    /// review). Empty when nothing is.
+    pub fn declared(&self) -> Declared {
+        let skips: Vec<(usize, Skip)> =
+            (self.skips.iter()).filter(|s| s.1 == Skip::Cut).copied().collect();
+        (skips, self.cut_steps.clone())
+    }
+
+    /// New stock loaded: what this setup's runs and the other setups' cut
+    /// this session is forgotten, and so is what the operator took as cut
+    /// (`declared`), the setup to be checked again without it. Whether it
+    /// changed what was taken as cut, and the setup is checked again,
+    /// keeping where Cycle Start starts (`recheck`).
+    pub fn new_stock(&mut self) -> bool {
+        (self.cut_in_run, self.earlier_cuts) = (vec![], vec![]);
+        self.stock_unconfirmed = false;
+        let (skips, steps) = self.declared();
+        if skips.is_empty() && steps.is_empty() {
+            return false;
+        }
+        if let Some(programs) = self.checked() {
+            self.keep = Some(self.progress_kept(programs));
+        }
+        self.skips.retain(|s| s.1 != Skip::Cut);
+        self.cut_steps.clear();
+        (self.recheck, self.picked, self.carving) = (true, None, None);
+        true
     }
 
     /// Cycle Start waits for the work zero to be set or kept for the stock

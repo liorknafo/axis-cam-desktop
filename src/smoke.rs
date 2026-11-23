@@ -11597,6 +11597,77 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
     }
 
+    /// The Pocket's level 1 taken as cut, then the setup picked again (Run
+    /// on the machine, LIO-583 review): what was taken as cut comes back
+    /// with it, and until the operator says whether the same part is still
+    /// held nothing sets Z or probes and Cycle Start waits. Same part keeps
+    /// it; New stock loaded forgets it, the setup checked again without it,
+    /// and a pick after that asks nothing.
+    #[test]
+    fn what_was_taken_as_cut_comes_back_when_the_setup_is_picked_again() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 3, Some(crate::run::Skip::Cut)));
+        let declared = run_of(&a).declared();
+        assert_eq!(declared, (vec![(3, crate::run::Skip::Cut)], vec![(1, vec![0])]));
+        let refused = |a: &App| {
+            assert!(run_of(a).asks_zero() && !run_of(a).zeroed);
+            assert!(conn(a).touch_off().is_none() && conn(a).stock_top().is_err());
+            assert!(conn(a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+            assert!(
+                problems(a).iter().any(|p| p.contains("after it taken as cut")),
+                "{:?}",
+                problems(a)
+            );
+        };
+        refused(&a);
+        // Picked again: the same declarations, and the question.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).declared(), declared);
+        assert_eq!(run_of(&a).all_cut(), [(1, vec![0])]);
+        assert!(run_of(&a).stock_unconfirmed);
+        refused(&a);
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let window = iced::Size::new(1440., 2400.);
+        let texts = crate::ui::probe::texts(a.view(), window).join("\n");
+        assert!(
+            texts.contains("Operations or steps of this setup were taken as cut this session. Is it still the same part?"),
+            "{texts}"
+        );
+        // The same part: still taken as cut, still waiting.
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(!run_of(&a).stock_unconfirmed);
+        assert_eq!(run_of(&a).declared(), declared);
+        refused(&a);
+        // Picked again once more: back again.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).declared(), declared);
+        // New stock loaded: forgotten, and checked again without it.
+        let _ = a.update(Message::Run(R::NewStock));
+        assert!(run_of(&a).declared() == (vec![], vec![]) && run_of(&a).recheck);
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert!(run.all_cut().is_empty() && run.skips.is_empty() && !run.stock_unconfirmed);
+        assert!(!run.asks_zero() && conn(&a).touch_off().is_some());
+        assert_eq!(sent(&a), [vec![0, 1, 2], vec![3]]);
+        // Picked again now, nothing is asked nor taken as cut.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).declared() == (vec![], vec![]) && !run_of(&a).stock_unconfirmed);
+    }
+
     /// By touch in a 960 × 552 window (LIO-583 review), the Work zero tab of
     /// a run from the setup's start with the Pocket's first level taken as
     /// cut lays Keep this work zero out whole, as wide as in a wide window:
