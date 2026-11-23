@@ -11613,6 +11613,119 @@ fn work_zero_note(o: crate::orient::Orient) -> String {
         o.end(0, true)
     )
 }
+/// The Work zero tab's question of whether the part a setup's runs cut is
+/// still held (`run::Run::stock_unconfirmed`), and after a disconnect
+/// whether anything else ran meanwhile (`run::Run::away`, LIO-595); or
+/// New stock loaded alone when another setup's cuts are not followed. It
+/// shows whether or not the run has started: a run kept across a
+/// disconnect has.
+fn stock_question<'a>(
+    c: &'a crate::control::Connection,
+    run: &'a crate::run::Run,
+) -> Option<iced::widget::Column<'a, Message>> {
+    use crate::run::Action as R;
+    let running = run.running.is_some();
+    // This setup's runs cut a part earlier this session: is it still
+    // the one held? Asked on a row of its own, so the work zero's
+    // buttons keep their room (LIO-582 review).
+    let stock = (run.stock_unconfirmed && run.away.is_none()).then(|| {
+        column![
+            text("This setup's runs cut a part this session. Is it still the one held?").size(12),
+            row![
+                small(
+                    "Same part",
+                    (!running).then_some(Message::Run(R::SamePart)),
+                    false,
+                ),
+                small(
+                    "New stock loaded",
+                    (!running).then_some(Message::Run(R::NewStock)),
+                    false,
+                ),
+            ]
+            .spacing(6),
+        ]
+        .spacing(4)
+    });
+    // Kept across a disconnect, while which anything may have run on
+    // the machine: asked too, and Same part with nothing else run is
+    // off while the Pi shows a tool run this computer did not send
+    // (LIO-595).
+    let stock = stock.or_else(|| {
+        (run.stock_unconfirmed && run.away.is_some()).then(|| {
+            let refused = c.same_part_refused();
+            // Why Same part with nothing else run is off, said above the
+            // answers so it shows with them in a short window (LIO-595
+            // review).
+            let mut col = column![text(AWAY_ASKED).size(12)].spacing(4);
+            if let Some(why) = refused {
+                col = col.push(text(why).size(12).color(AMBER));
+            }
+            col.push(
+                row![
+                    small(
+                        "Same part, nothing else ran",
+                        (!running && refused.is_none()).then_some(Message::Run(R::SamePart)),
+                        false,
+                    ),
+                    small(
+                        "Same part, other runs may have cut it",
+                        (!running).then_some(Message::Run(R::OtherRunsMayHaveCut)),
+                        false,
+                    ),
+                    small(
+                        "New stock loaded",
+                        (!running).then_some(Message::Run(R::NewStock)),
+                        false,
+                    ),
+                ]
+                .spacing(6)
+                .wrap()
+                .vertical_spacing(6),
+            )
+        })
+    });
+    // Runs this computer did not follow may have cut it: only new stock
+    // clears them (LIO-586 review, LIO-595).
+    let stock = stock.or_else(|| {
+        run.history_unknown().then(|| {
+            column![
+                text(HISTORY_ASKED).size(12),
+                small(
+                    "New stock loaded",
+                    (!running).then_some(Message::Run(R::NewStock)),
+                    false,
+                ),
+            ]
+            .spacing(4)
+        })
+    });
+    // Another setup's cuts the check does not follow: only new stock
+    // clears them (LIO-582 review).
+    stock.or_else(|| {
+        run.earlier_unfollowed().then(|| {
+            column![
+                text("Another setup's run cut this part in a way the check does not follow.")
+                    .size(12),
+                small(
+                    "New stock loaded",
+                    (!running).then_some(Message::Run(R::NewStock)),
+                    false,
+                ),
+            ]
+            .spacing(4)
+        })
+    })
+}
+
+/// What the Work zero tab asks of a setup whose runs cut a part before a
+/// disconnect from the machine (`run::Run::away`, LIO-595).
+pub const AWAY_ASKED: &str = "This setup's runs cut a part this session, and the machine was disconnected since. Is it still the one held, and did anything else run on the machine meanwhile?";
+
+/// Said with New stock loaded on the Work zero tab while runs this
+/// computer did not follow may have cut the part (`run::Run::history_unknown`).
+pub const HISTORY_ASKED: &str = "Runs this computer did not follow may have cut this part, so nothing sets Z from the stock the check carves until new stock is loaded.";
+
 fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
     let fit = Fit::of(app);
     use crate::control::Action;
@@ -11730,45 +11843,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
                 false,
             ),
         });
-        // This setup's runs cut a part earlier this session: is it still
-        // the one held? Asked on a row of its own, so the work zero's
-        // buttons keep their room (LIO-582 review).
-        let stock = run.stock_unconfirmed.then(|| {
-            column![
-                text("This setup's runs cut a part this session. Is it still the one held?")
-                    .size(12),
-                row![
-                    small(
-                        "Same part",
-                        (!running).then_some(Message::Run(R::SamePart)),
-                        false,
-                    ),
-                    small(
-                        "New stock loaded",
-                        (!running).then_some(Message::Run(R::NewStock)),
-                        false,
-                    ),
-                ]
-                .spacing(6),
-            ]
-            .spacing(4)
-        });
-        // Another setup's cuts the check does not follow: only new stock
-        // clears them (LIO-582 review).
-        let stock = stock.or_else(|| {
-            run.earlier_unfollowed().then(|| {
-                column![
-                    text("Another setup's run cut this part in a way the check does not follow.")
-                        .size(12),
-                    small(
-                        "New stock loaded",
-                        (!running).then_some(Message::Run(R::NewStock)),
-                        false,
-                    ),
-                ]
-                .spacing(4)
-            })
-        });
+        let stock = stock_question(c, run);
         if run.partway() {
             buttons = buttons.push(small(
                 "Keep this work zero",
@@ -11818,6 +11893,11 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
         col = col.push(rule::horizontal(1)).push(muted(
             "The setup's work zero was set on the stock before its first tool run: X and Y stay as they are from here.",
         ));
+        // Asked here too: a run kept across a disconnect has started
+        // (LIO-595).
+        if let Some(stock) = stock_question(c, run) {
+            col = col.push(stock);
+        }
         // A start at a step waits for the work zero the steps before it
         // were cut with, which the check may not be able to find on the
         // stock this run cut: why, and what to do then (LIO-586 review).

@@ -474,6 +474,7 @@ pub fn run_action(a: &run::Action) -> Class {
         | run::Action::From(..)
         | run::Action::KeepZero
         | run::Action::SamePart
+        | run::Action::OtherRunsMayHaveCut
         | run::Action::NewStock
         | run::Action::CycleStart
         | run::Action::Resume

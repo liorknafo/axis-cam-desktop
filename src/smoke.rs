@@ -5089,6 +5089,41 @@ flood = { pin = 8 }
         assert!(run_of(&a).programs.is_none() && problems(&a).len() == 1);
         answer_skips(&mut a, 0);
         assert_eq!(run_of(&a).at_step(), Some((1, hole)));
+        if !closed {
+            // The run kept across the disconnect, and the Pi shows the
+            // Laptop's tool run: the operator is asked, and Same part with
+            // nothing else run is refused (LIO-595).
+            use crate::run::Action as R;
+            assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+            assert_eq!(
+                conn(&a).same_part_refused(),
+                Some(crate::control::RAN_ELSEWHERE)
+            );
+            assert!(conn(&a).touch_off().is_none());
+            let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+            let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+            shows(&a, &[crate::ui::AWAY_ASKED, crate::control::RAN_ELSEWHERE]);
+            let clicks = crate::ui::probe::clicks(a.view(), iced::Size::new(1440., 900.));
+            assert!(
+                !clicks
+                    .iter()
+                    .any(|m| matches!(m, Message::Run(R::SamePart)))
+            );
+            assert!(
+                clicks
+                    .iter()
+                    .any(|m| matches!(m, Message::Run(R::OtherRunsMayHaveCut)))
+            );
+            let _ = a.update(Message::Run(R::SamePart));
+            assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+            let _ = a.update(Message::Run(R::OtherRunsMayHaveCut));
+            assert!(!run_of(&a).stock_unconfirmed && run_of(&a).history_unknown());
+            assert!(conn(&a).touch_off().is_none());
+            assert_eq!(
+                conn(&a).partway_blocked().as_deref(),
+                Some(crate::run::HISTORY_UNFOLLOWED_BLOCKED)
+            );
+        }
         other.shutdown();
     }
 
@@ -9925,6 +9960,438 @@ flood = { pin = 8 }
             why.starts_with("This run's tool runs have cut the stock since"),
             "{why}"
         );
+    }
+
+    /// The Face stopped after pass 1, then the machine disconnected
+    /// (LIO-595). While away, another computer may have cut pass 2 to Z−4:
+    /// nothing of that reaches this one. Connected again and the setup
+    /// picked, the operator is asked whether anything else ran meanwhile:
+    /// with nothing else run, pass 2 touches off on pass 1's floor (Z−2);
+    /// with other runs that may have cut it, no start sets Z or probes
+    /// until New stock loaded. Picked again with no disconnect between,
+    /// only whether it is the same part is asked.
+    #[test]
+    fn same_part_after_a_disconnect_asks_whether_anything_else_ran() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 3]);
+        let face = &mut a.doc.setups[0].operations[0].p;
+        face.insert("stepdown".into(), "2".into());
+        face.insert("feed".into(), "6000".into());
+        let journal = stop_after(&mut a, 0, 0);
+        assert_eq!((journal.op, journal.step), (0, Some(0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        // This session's own record, nothing else could have cut: pass 2
+        // touches off on pass 1's floor.
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        // The setup picked again, and checked.
+        let pick = |a: &mut App| {
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(a, 0);
+            if run_of(a).programs.is_none() {
+                answer_skips(a, 0);
+            }
+            assert!(run_of(a).programs.is_some());
+        };
+        let reconnect = |a: &mut App| {
+            let _ = a.update(Message::Disconnect);
+            let _ = a.update(Message::Connect);
+            tick_until(a, 5., "E-stop after connecting", |s| {
+                s.state == Some(State::EStop)
+            });
+            let _ = a.update(Message::MachineReset);
+            tick_until(a, 5., "Idle after Reset", |s| s.state == Some(State::Idle));
+            let _ = a.update(Message::Machine(crate::control::Action::KeepPosition));
+            tick_until(a, 3., "machine position kept", |s| {
+                s.referenced[..3].iter().all(|r| *r)
+            });
+            pick(a);
+            let r = run_of(a);
+            assert_eq!(
+                r.at_step(),
+                Some((0, 1)),
+                "next {} from {} journal {:?} note {:?} resumed {:?}",
+                r.next,
+                r.from,
+                r.journal.as_ref().map(|j| (j.op, j.step)),
+                r.journal_note,
+                r.resumed.as_ref().map(|j| (j.op, j.step))
+            );
+        };
+        // The answers the Work zero tab offers.
+        let offered = |a: &mut App| {
+            let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+            let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+            let clicks = crate::ui::probe::clicks(a.view(), iced::Size::new(1440., 900.));
+            let mut said: Vec<&str> = vec![];
+            for m in &clicks {
+                let name = match m {
+                    Message::Run(R::SamePart) => "same",
+                    Message::Run(R::OtherRunsMayHaveCut) => "other",
+                    Message::Run(R::NewStock) => "new",
+                    _ => continue,
+                };
+                if !said.contains(&name) {
+                    said.push(name);
+                }
+            }
+            said
+        };
+        let none_set = |a: &App| {
+            assert!(conn(a).touch_off().is_none() && conn(a).stock_top().is_err());
+            assert!(conn(a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+            conn(a).partway_blocked().unwrap()
+        };
+        // With `$AXIS_RENDER_DIR` set, the Work zero tab is drawn there at
+        // each state, at 1440 × 900, 1120 × 690 and the least window.
+        let render = std::env::var("AXIS_RENDER_DIR")
+            .ok()
+            .map(std::path::PathBuf::from);
+        let shot = |a: &mut App, name: &str| {
+            let Some(out) = &render else {
+                return;
+            };
+            let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+            for size in [
+                iced::Size::new(1440., 900.),
+                iced::Size::new(1120., 690.),
+                crate::MIN_WINDOW,
+            ] {
+                let _ = a.update(Message::Resized(size));
+                let dir = out.join(format!("{}x{}", size.width, size.height));
+                std::fs::create_dir_all(&dir).unwrap();
+                render_png(a, size, &dir.join(format!("{name}.png")));
+            }
+        };
+        // Away, then nothing else ran: the record holds.
+        reconnect(&mut a);
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+        assert_eq!(conn(&a).same_part_refused(), None);
+        assert_eq!(none_set(&a), crate::run::STOCK_AWAY_BLOCKED);
+        assert_eq!(offered(&mut a), ["same", "other", "new"]);
+        shows(&a, &[crate::ui::AWAY_ASKED]);
+        shot(&mut a, "1-away-asked");
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(!run_of(&a).stock_unconfirmed && run_of(&a).away.is_none());
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        // Picked again, no disconnect between: answered already for the
+        // time away, so only whether it is the same part is asked.
+        pick(&mut a);
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_none());
+        assert_eq!(offered(&mut a), ["same", "new"]);
+        let _ = a.update(Message::Run(R::SamePart));
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        // Away again, and other runs may have cut it: no start sets Z or
+        // probes from the check's stock, whatever is picked.
+        reconnect(&mut a);
+        assert!(run_of(&a).away.is_some());
+        let _ = a.update(Message::Run(R::OtherRunsMayHaveCut));
+        assert!(!run_of(&a).stock_unconfirmed && run_of(&a).history_unknown());
+        assert_eq!(none_set(&a), crate::run::HISTORY_UNFOLLOWED_BLOCKED);
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let said = page_texts(&a);
+        assert!(
+            said.iter()
+                .any(|t| t.contains(crate::run::HISTORY_UNFOLLOWED_BLOCKED)),
+            "{said:?}"
+        );
+        // New stock loaded is offered, the one thing that clears it.
+        shows(&a, &[crate::ui::HISTORY_ASKED]);
+        shot(&mut a, "2-other-runs-may-have-cut");
+        let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+        let clicks = crate::ui::probe::clicks(a.view(), iced::Size::new(1440., 900.));
+        assert!(
+            clicks
+                .iter()
+                .any(|m| matches!(m, Message::Run(R::NewStock)))
+        );
+        // It stays unknown when the setup is picked again and called the
+        // same part.
+        pick(&mut a);
+        assert!(run_of(&a).away.is_none());
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(run_of(&a).history_unknown());
+        assert_eq!(none_set(&a), crate::run::HISTORY_UNFOLLOWED_BLOCKED);
+        // New stock: the start at pass 2 goes by the stock the check
+        // carves, pass 1 taken as cut.
+        let _ = a.update(Message::Run(R::NewStock));
+        assert!(!run_of(&a).history_unknown());
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+    }
+
+    /// Connected again to the Pi after a disconnect, but its link not live
+    /// yet (its lists of tool runs not heard on this connection): Same part
+    /// with nothing else run is refused and says it waits for them, so an
+    /// answer given before the Pi has told what ran meanwhile does not
+    /// clear the question (LIO-595 review). Once live, with nothing else
+    /// run, it is taken.
+    #[test]
+    fn same_part_after_a_disconnect_waits_for_the_pis_tool_runs() {
+        same_part_waits_for_the_pi(false);
+    }
+
+    /// As `same_part_after_a_disconnect_waits_for_the_pis_tool_runs`, with
+    /// another computer's tool run on the Pi while this one was away
+    /// (LIO-595 review): once the link is live and its lists are heard,
+    /// Same part with nothing else run stays refused, and the other
+    /// answer leaves no start setting Z from the check's stock.
+    #[test]
+    fn same_part_after_a_disconnect_is_refused_once_the_pi_shows_another_tool_run() {
+        same_part_waits_for_the_pi(true);
+    }
+
+    fn same_part_waits_for_the_pi(foreign: bool) {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        cycle_start(&mut a);
+        tick_until(&mut a, 10.0, "running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Stop));
+        run_until(&mut a, 20.0, "the stop", |r| r.running.is_none());
+        tick_until(&mut a, 10.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(!run_of(&a).cut_in_run.is_empty());
+        let _ = a.update(Message::Disconnect);
+        // Another computer: a short move in the air, as its tool run.
+        let other = foreign.then(|| {
+            use uc100::controller::Command;
+            use uc100::gcode::{Action as Do, Located};
+            let code = uc100_remote::data::Data {
+                dir: dir.path().join("pi"),
+            }
+            .new_code()
+            .unwrap();
+            let addr = server.addr().to_string();
+            let token = uc100_remote::RemoteController::pair(&addr, &code, "Laptop").unwrap();
+            let other = uc100_remote::RemoteController::watch(&addr, token);
+            other.take_control();
+            let mut deadline = Deadline::new(5.);
+            while other.link().state != uc100_remote::LinkState::Controlling {
+                assert!(deadline.within(&other.snapshot()), "no control");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let mut up = server.snapshot().unwrap().machine_pos;
+            up[2] += 1.0;
+            let job = Command::Job {
+                name: "Laptop".into(),
+                actions: std::sync::Arc::new(vec![Located {
+                    line: 1,
+                    action: Do::Move {
+                        target: up,
+                        feed: None,
+                    },
+                }]),
+            };
+            let mut deadline = Deadline::new(5.);
+            let made_from = loop {
+                let (snapshot, ack) = other.acked();
+                if let Some(a) = ack.filter(|a| a.applied >= a.sent) {
+                    break a.seq;
+                }
+                assert!(deadline.within(&snapshot), "the other's ack");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            assert!(other.send_tool_run(99595, job, vec![], None, made_from));
+            let mut deadline = Deadline::new(10.);
+            while !other.link().tool_run_ends.iter().any(|e| e.id == 99595) {
+                assert!(deadline.within(&other.snapshot()), "the other's end");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other.release_control();
+            other
+        });
+        // Connected, the setup picked and checked and answered before the
+        // first Tick: the connection has no link yet, and it waits too
+        // (LIO-595 review).
+        let _ = a.update(Message::Connect);
+        assert!(conn(&a).pi.is_some() && conn(&a).link.is_none());
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert!(run_of(&a).away.is_some());
+        assert_eq!(
+            conn(&a).same_part_refused(),
+            Some(crate::control::PI_LISTS_PENDING)
+        );
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+        let _ = a.update(Message::Disconnect);
+        let gate = pi_through_a_gate(&mut a, &server);
+        assert!(conn(&a).link.as_ref().is_some_and(|l| !l.live));
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+        assert_eq!(
+            conn(&a).same_part_refused(),
+            Some(crate::control::PI_LISTS_PENDING)
+        );
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+        let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        shows(
+            &a,
+            &[crate::ui::AWAY_ASKED, crate::control::PI_LISTS_PENDING],
+        );
+        let clicks = crate::ui::probe::clicks(a.view(), iced::Size::new(1440., 900.));
+        assert!(
+            !clicks
+                .iter()
+                .any(|m| matches!(m, Message::Run(R::SamePart)))
+        );
+        gate.set_open(true);
+        pi_live(&mut a, true, "the link live");
+        if let Some(other) = other {
+            // The Laptop's tool run shows: refused for good.
+            assert_eq!(
+                conn(&a).same_part_refused(),
+                Some(crate::control::RAN_ELSEWHERE)
+            );
+            let _ = a.update(Message::Run(R::SamePart));
+            assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+            let _ = a.update(Message::Run(R::OtherRunsMayHaveCut));
+            assert!(!run_of(&a).stock_unconfirmed && run_of(&a).history_unknown());
+            assert!(conn(&a).touch_off().is_none() && conn(&a).stock_top().is_err());
+            assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+            other.shutdown();
+            return;
+        }
+        // Live: nothing else ran, so it is taken.
+        assert_eq!(conn(&a).same_part_refused(), None);
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(!run_of(&a).stock_unconfirmed && run_of(&a).away.is_none());
+    }
+
+    /// The Face stopped after pass 1 on the machine reached directly, then
+    /// disconnected, and the same machine reached through a Pi from then
+    /// on, where another computer ran a tool run meanwhile (LIO-595
+    /// review). This computer has no list of the Pi's tool runs from before
+    /// the disconnect, so any it did not send may have run meanwhile: Same
+    /// part with nothing else run is refused, and the start at pass 2 sets
+    /// no Z from this computer's record.
+    #[test]
+    fn same_part_after_a_disconnect_is_refused_on_a_pi_not_heard_from_before() {
+        use crate::run::Action as R;
+        use uc100::controller::Command;
+        use uc100::gcode::{Action as Do, Located};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 3]);
+        let face = &mut a.doc.setups[0].operations[0].p;
+        face.insert("stepdown".into(), "2".into());
+        face.insert("feed".into(), "6000".into());
+        let journal = stop_after(&mut a, 0, 0);
+        assert_eq!((journal.op, journal.step), (0, Some(0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        let _ = a.update(Message::Disconnect);
+        let server = to_pi(&mut a, dir.path());
+        // Through the Pi once, which starts its controller, and away again:
+        // the entry kept at the first disconnect still has no Pi list.
+        zeroed(&mut a);
+        let _ = a.update(Message::Disconnect);
+        // Another computer runs a tool run on the Pi.
+        let code = uc100_remote::data::Data {
+            dir: dir.path().join("pi"),
+        }
+        .new_code()
+        .unwrap();
+        let addr = server.addr().to_string();
+        let token = uc100_remote::RemoteController::pair(&addr, &code, "Laptop").unwrap();
+        let other = uc100_remote::RemoteController::watch(&addr, token);
+        other.take_control();
+        let mut deadline = Deadline::new(10.);
+        while other.link().state != uc100_remote::LinkState::Controlling {
+            assert!(deadline.within(&other.snapshot()), "no control");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut up = server.snapshot().unwrap().machine_pos;
+        up[2] += 1.0;
+        let job = Command::Job {
+            name: "Laptop".into(),
+            actions: std::sync::Arc::new(vec![Located {
+                line: 1,
+                action: Do::Move {
+                    target: up,
+                    feed: None,
+                },
+            }]),
+        };
+        let mut deadline = Deadline::new(10.);
+        let made_from = loop {
+            let (snapshot, ack) = other.acked();
+            if let Some(a) = ack.filter(|a| a.applied >= a.sent) {
+                break a.seq;
+            }
+            assert!(deadline.within(&snapshot), "the other's ack");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(other.send_tool_run(99595, job, vec![], None, made_from));
+        let mut deadline = Deadline::new(10.);
+        while !other.link().tool_run_ends.iter().any(|e| e.id == 99595) {
+            assert!(deadline.within(&other.snapshot()), "the other's end");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        other.shutdown();
+        let _ = a.update(Message::Connect);
+        pi_live(&mut a, true, "the Pi live");
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        // Face pass 2 picked, as in the issue: the journal here is the
+        // Pi's, not the one kept for the machine reached directly.
+        let _ = a.update(Message::Run(R::Steps(Some(0))));
+        let _ = a.update(Message::Run(R::PickStep(0, 1)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        assert!(run_of(&a).away.as_ref().is_some_and(|w| w.seen.is_none()));
+        assert_eq!(
+            conn(&a).same_part_refused(),
+            Some(crate::control::PI_UNHEARD)
+        );
+        let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        shows(&a, &[crate::ui::AWAY_ASKED, crate::control::PI_UNHEARD]);
+        // With `$AXIS_RENDER_DIR` set, the Work zero tab is drawn there.
+        if let Ok(out) = std::env::var("AXIS_RENDER_DIR") {
+            for size in [iced::Size::new(1440., 900.), crate::MIN_WINDOW] {
+                let _ = a.update(Message::Resized(size));
+                let dir =
+                    std::path::Path::new(&out).join(format!("{}x{}", size.width, size.height));
+                std::fs::create_dir_all(&dir).unwrap();
+                render_png(&a, size, &dir.join("3-pi-unheard-refused.png"));
+            }
+            let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+        }
+        let clicks = crate::ui::probe::clicks(a.view(), iced::Size::new(1440., 900.));
+        assert!(
+            !clicks
+                .iter()
+                .any(|m| matches!(m, Message::Run(R::SamePart)))
+        );
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+        assert!(conn(&a).touch_off().is_none());
+        let _ = a.update(Message::Run(R::OtherRunsMayHaveCut));
+        assert!(run_of(&a).history_unknown() && conn(&a).touch_off().is_none());
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
     }
 
     /// The Pi's tool run, Stop after step armed in the Face's pass 1, goes on

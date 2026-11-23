@@ -2781,7 +2781,7 @@ pub struct Connection {
 }
 
 /// A number for a tool run sent to the Pi, its own among this computer's
-/// and others'.
+/// and others', kept among those this session sent (`sent_tool_runs`).
 fn tool_run_id() -> u64 {
     use std::hash::{BuildHasher, Hasher};
     let mut h = std::collections::hash_map::RandomState::new().build_hasher();
@@ -2790,8 +2790,36 @@ fn tool_run_id() -> u64 {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos()),
     );
-    h.finish()
+    let id = h.finish();
+    SENT_TOOL_RUNS.with(|s| s.borrow_mut().push(id));
+    id
 }
+
+thread_local! {
+    /// The numbers of the tool runs this session sent a Pi (`tool_run_id`).
+    static SENT_TOOL_RUNS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(vec![]) };
+}
+
+/// The numbers of the tool runs this session sent a Pi: none of them ran
+/// while it was away (`Connection::same_part_refused`, LIO-595).
+pub fn sent_tool_runs() -> Vec<u64> {
+    SENT_TOOL_RUNS.with(|s| s.borrow().clone())
+}
+
+/// Why Same part with nothing else run is refused while the Pi shows a
+/// tool run this computer did not send (`Connection::same_part_refused`).
+pub const RAN_ELSEWHERE: &str =
+    "The Pi ran a tool run this computer did not send while it was disconnected.";
+
+/// Why Same part with nothing else run is refused when the machine was not
+/// reached through the Pi before the disconnect, and the Pi shows a tool run
+/// this computer did not send (`Connection::same_part_refused`).
+pub const PI_UNHEARD: &str = "The Pi shows a tool run this computer did not send, and the machine was not reached through the Pi before it was disconnected, so it may have run meanwhile.";
+
+/// Why Same part with nothing else run waits on a Pi whose link is not
+/// live yet (`Connection::same_part_refused`).
+pub const PI_LISTS_PENDING: &str =
+    "Waiting for the Pi to say which tool runs it ran while this computer was disconnected.";
 
 /// The stops Stop after step on the Pi can make in the tool run last sent
 /// there, each with the journal of where it leaves the run
@@ -3976,11 +4004,22 @@ impl Connection {
             R::Next(i) if i < run.done.len() && !self.probing() => run.start_at(i, 0),
             R::From(i, k) if !self.probing() => run.start_at(i, k),
             R::KeepZero if run.running.is_none() && run.partway() => run.zeroed = true,
-            R::SamePart if run.running.is_none() => run.stock_unconfirmed = false,
+            // Nothing else ran meanwhile: not while the Pi shows a tool run
+            // this computer did not send (LIO-595).
+            R::SamePart if run.running.is_none() && self.same_part_refused_for(&run).is_none() => {
+                run.stock_unconfirmed = false;
+                run.away = None;
+            }
+            R::OtherRunsMayHaveCut if run.running.is_none() && run.away.is_some() => {
+                run.note_history_unknown();
+                run.stock_unconfirmed = false;
+                run.away = None;
+            }
             R::NewStock if run.running.is_none() => {
                 run.cut_in_run.clear();
                 run.earlier_cuts.clear();
                 run.stock_unconfirmed = false;
+                run.away = None;
             }
             R::More(oi) => {
                 run.menu = oi.filter(|_| self.manual() && run.running.is_none() && !self.probing())
@@ -4552,6 +4591,11 @@ impl Connection {
                 if p.probe.is_ok() && partly.cut == [crate::run::EARLIER_UNFOLLOWED] =>
             {
                 Some("Another setup's run cut this part this session in a way the check does not follow, where a probe finds this work zero.".into())
+            }
+            Some((Some(partly), _))
+                if p.probe.is_ok() && partly.cut == [crate::run::HISTORY_UNFOLLOWED] =>
+            {
+                Some("Runs this computer did not follow may have cut the stock where a probe finds this work zero.".into())
             }
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::STOCK_UNCONFIRMED] =>
@@ -6125,6 +6169,58 @@ impl Connection {
         }
         // The start after it is next.
         run.resume_after(st.op, st.last);
+    }
+
+    /// Why the run's Same part with nothing else run (`run::Action::SamePart`)
+    /// is refused after a disconnect (`run::Run::away`, LIO-595): the Pi
+    /// shows a tool run that ran while this computer was away, one it had
+    /// not when the machine was disconnected nor this computer sent since
+    /// (`RAN_ELSEWHERE`), or any it did not send when the machine was not
+    /// reached through the Pi then (`PI_UNHEARD`); or the Pi's link is not live yet, so its lists of
+    /// tool runs are not heard on this connection (`PI_LISTS_PENDING`).
+    pub fn same_part_refused(&self) -> Option<&'static str> {
+        self.run
+            .as_ref()
+            .and_then(|r| self.same_part_refused_for(r))
+    }
+
+    fn same_part_refused_for(&self, run: &crate::run::Run) -> Option<&'static str> {
+        let away = run.away.as_ref()?;
+        self.pi.as_ref()?;
+        // The server sends its lists before it says who controls the
+        // machine, which a live link has heard; before the first refresh
+        // of a Pi connection there is no link (LIO-595 review).
+        let Some(link) = self.link.as_ref().filter(|l| l.live) else {
+            return Some(PI_LISTS_PENDING);
+        };
+        // Without the Pi's tool runs from before the disconnect (the machine
+        // was not reached through the Pi then), any this computer did not
+        // send may have run meanwhile (LIO-595 review).
+        let seen = away.seen.as_deref().unwrap_or(&[]);
+        let sent = sent_tool_runs();
+        let other = (link.tool_run_ends.iter().map(|e| e.id))
+            .chain(link.tool_run_going.iter().copied())
+            .any(|id| !seen.contains(&id) && !sent.contains(&id));
+        other.then_some(match away.seen {
+            Some(_) => RAN_ELSEWHERE,
+            None => PI_UNHEARD,
+        })
+    }
+
+    /// The tool runs the Pi has, going or ended, as far as this computer
+    /// heard (`run::Away::seen`): none before its link's first refresh, so
+    /// that every tool run this computer did not send counts as run while
+    /// it was away. None when it is not a Pi.
+    pub fn pi_tool_runs(&self) -> Option<Vec<u64>> {
+        self.pi.as_ref()?;
+        let Some(link) = self.link.as_ref() else {
+            return Some(vec![]);
+        };
+        Some(
+            (link.tool_run_ends.iter().map(|e| e.id))
+                .chain(link.tool_run_going.iter().copied())
+                .collect(),
+        )
     }
 
     /// The journal of where a run stopped on this machine, if any.
