@@ -375,6 +375,18 @@ fn note_cut_in(cuts: &mut Vec<CutInRun>, oi: usize, steps: Option<usize>, print:
     }
 }
 
+/// Notes in a record of what runs cut (`Run::cut_in_run`, `App::run_cuts`)
+/// that something else may have cut the part since (`HISTORY_UNKNOWN`,
+/// LIO-596). An empty record says nothing was cut and stays so. True when
+/// it was not already unknown.
+pub(crate) fn note_unknown(cuts: &mut Vec<CutInRun>) -> bool {
+    if cuts.is_empty() || cuts.iter().any(|c| c.0 == HISTORY_UNKNOWN) {
+        return false;
+    }
+    note_cut_in(cuts, HISTORY_UNKNOWN, None, None);
+    true
+}
+
 /// What this run's own tool runs cut, said as `Partly::cut`, when the
 /// check's stock before the start does not have it: one runs, or one at or
 /// after the start was cut (`Run::partly`, LIO-582 review).
@@ -1624,9 +1636,36 @@ impl Run {
         note_cut_in(&mut self.cut_in_run, HISTORY_UNKNOWN, None, None);
     }
 
-    /// What this setup's runs cut is unknown (`note_history_unknown`).
+    /// What this setup's runs cut is unknown (`note_history_unknown`), or
+    /// what another setup's did that this one has (`earlier_cuts`, LIO-596).
     pub fn history_unknown(&self) -> bool {
-        self.cut_in_run.iter().any(|c| c.0 == HISTORY_UNKNOWN)
+        (self.cut_in_run.iter()).any(|c| c.0 == HISTORY_UNKNOWN)
+            || (self.earlier_cuts.iter()).any(|(_, cuts)| cuts.iter().any(|c| c.0 == HISTORY_UNKNOWN))
+    }
+
+    /// Something else may have cut the part: the Pi showed a tool run this
+    /// computer did not send, or another computer in control (LIO-596), or
+    /// the operator said other runs may have cut it after a disconnect
+    /// (`Action::OtherRunsMayHaveCut`, LIO-595). What this setup's runs
+    /// cut, a tool run of its running included (`cuts_so_far`), what the
+    /// other setups' did (`earlier_cuts`), and what was cut before a tool
+    /// run it follows (`before_follow`) are unknown from now on
+    /// (`HISTORY_UNKNOWN`), until New stock loaded. True when any of them
+    /// was not already.
+    pub fn note_cut_elsewhere(&mut self) -> bool {
+        let own = !self.cuts_so_far().is_empty()
+            && !(self.cut_in_run.iter()).any(|c| c.0 == HISTORY_UNKNOWN);
+        if own {
+            self.note_history_unknown();
+        }
+        let mut marked = own;
+        for (_, cuts) in &mut self.earlier_cuts {
+            marked |= note_unknown(cuts);
+        }
+        if let Some(cuts) = &mut self.before_follow {
+            marked |= note_unknown(cuts);
+        }
+        marked
     }
 
     /// Where a run of this setup stopped, found while it is open (the Pi
@@ -2993,6 +3032,21 @@ impl Run {
                 steps: vec![],
             }));
         }
+        // Runs this computer did not follow may have cut it: another
+        // session's, anything that ran while it was disconnected, or that
+        // the Pi showed since: this setup's or another's record (LIO-586
+        // review, LIO-595, LIO-596).
+        if self.history_unknown() {
+            return Some(Cow::Owned(Partly {
+                cut: vec![HISTORY_UNFOLLOWED.into()],
+                surface: None,
+                top_cut: true,
+                probe_from: (before.probe_from.iter())
+                    .map(|(r, _)| (*r, Err(HISTORY_UNFOLLOWED_WHY.into())))
+                    .collect(),
+                steps: vec![],
+            }));
+        }
         // Another setup's run cut an operation the check does not simulate
         // so before this setup (LIO-582 review).
         if self.earlier_unfollowed() {
@@ -3002,20 +3056,6 @@ impl Run {
                 top_cut: true,
                 probe_from: (before.probe_from.iter())
                     .map(|(r, _)| (*r, Err(EARLIER_UNFOLLOWED_WHY.into())))
-                    .collect(),
-                steps: vec![],
-            }));
-        }
-        // Runs this computer did not follow may have cut it: another
-        // session's, or anything that ran while it was disconnected
-        // (LIO-586 review, LIO-595).
-        if self.history_unknown() {
-            return Some(Cow::Owned(Partly {
-                cut: vec![HISTORY_UNFOLLOWED.into()],
-                surface: None,
-                top_cut: true,
-                probe_from: (before.probe_from.iter())
-                    .map(|(r, _)| (*r, Err(HISTORY_UNFOLLOWED_WHY.into())))
                     .collect(),
                 steps: vec![],
             }));
@@ -10045,12 +10085,12 @@ pub(crate) mod tests {
         one.checked_as(Arc::new(c), Some(Arc::new(l)), None);
         one.note_cut(0, None);
         let session = vec![(doc.setups[0].id.clone(), one.cut_in_run.clone())];
-        let at_level_2 = |doc: &Document| {
+        let at_level_2_of = |doc: &Document, session: &[(String, Vec<CutInRun>)]| {
             // The flipped setup, wherever it is now.
             let si = (doc.setups.iter()).position(|s| s.p.get("rx").is_some_and(|r| r == "180"));
             let si = si.unwrap();
             let mut run = Run::new(doc, si, 0);
-            crate::give_earlier_cuts(&session, &mut run);
+            crate::give_earlier_cuts(session, &mut run);
             let (c, l) = check(doc, &mesh, si);
             run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
             let level_2 = run.op_steps(0).is_some_and(|s| s.steps.len() >= 2);
@@ -10060,6 +10100,7 @@ pub(crate) mod tests {
             assert_eq!(run.at_step(), Some((0, 1)));
             run
         };
+        let at_level_2 = |doc: &Document| at_level_2_of(doc, &session);
         let unfollowed = |run: &Run| run.partly().is_some_and(|p| p.cut == [EARLIER_UNFOLLOWED]);
         // As it was cut: setup 2's check has the bore (and blocks the
         // floor over it, as before).
@@ -10097,6 +10138,45 @@ pub(crate) mod tests {
             assert!(kept.is_empty(), "{kept:?}");
             assert!(!run.earlier_unfollowed());
         }
+        // Something else may have cut the part since (LIO-596): setup 1's
+        // record, as setup 2 has it, is unknown, and nothing of setup 2's
+        // own is.
+        let mut run = at_level_2(&doc);
+        assert!(run.note_cut_elsewhere(), "{:?}", run.earlier_cuts);
+        assert!(!run.note_cut_elsewhere(), "noted once");
+        assert!(run.cut_in_run.is_empty(), "{:?}", run.cut_in_run);
+        let unknown = |run: &Run| run.partly().is_some_and(|p| p.cut == [HISTORY_UNFOLLOWED]);
+        let said = |run: &Run| {
+            let why = run.partway_blocked().unwrap();
+            assert!(why.starts_with("Runs this computer did not follow"), "{why}");
+        };
+        assert!(run.history_unknown() && unknown(&run) && run.touch_off().is_none());
+        said(&run);
+        // So is it in the session's record (`App::run_cuts`): a run of
+        // setup 2 made anew has it so, from its start too.
+        let mut marked = session.clone();
+        assert!(note_unknown(&mut marked[0].1) && !note_unknown(&mut marked[0].1));
+        let mut run = at_level_2_of(&doc, &marked);
+        assert!(run.history_unknown() && unknown(&run) && run.touch_off().is_none());
+        said(&run);
+        run.start_at(0, 0);
+        assert!(run.on_cut_stock() && unknown(&run) && run.touch_off().is_none());
+        // An empty record says nothing was cut, and stays so.
+        assert!(!note_unknown(&mut vec![]));
+        // Kept across a disconnect, setup 1's record is asked about when
+        // setup 2 is picked, though setup 2's runs cut nothing: the answer
+        // is said of the part (LIO-596).
+        let away = vec![(doc.setups[0].id.clone(), Away { seen: Some(vec![7]) })];
+        let mut run = Run::new(&doc, 1, 0);
+        crate::give_earlier_cuts(&session, &mut run);
+        crate::give_away(&away, &mut run);
+        assert!(run.stock_unconfirmed);
+        assert_eq!(run.away, Some(Away { seen: Some(vec![7]) }));
+        // Nothing of setup 1's kept: nothing to ask.
+        let mut run = Run::new(&doc, 1, 0);
+        crate::give_earlier_cuts(&[], &mut run);
+        crate::give_away(&away, &mut run);
+        assert!(!run.stock_unconfirmed && run.away.is_none());
     }
 
     /// The journal of where a run stopped (LIO-275) is written and read

@@ -1629,6 +1629,10 @@ pub struct App {
     /// by setup id, until the operator says whether anything else ran on
     /// it meanwhile (`run::Run::away`, LIO-595).
     run_away: Vec<(String, run::Away)>,
+    /// The tool runs the Pi showed that this session did not send and has
+    /// answered for (`App::note_done_elsewhere`, LIO-596): seen while
+    /// nothing it cut was at stake, or taken as cutting the part already.
+    pi_runs_known: Vec<u64>,
     /// For a setup whose run was dropped while a tool run ran: that tool run
     /// (index, and the operation it started at) and what was cut before it.
     /// `run_cuts` counts that tool run as cutting all it was to cut; a
@@ -2194,6 +2198,7 @@ impl App {
             run_on_connect: None,
             run_cuts: vec![],
             run_away: vec![],
+            pi_runs_known: vec![],
             run_pending: vec![],
             jog_key: None,
             run_epoch: 0,
@@ -4504,6 +4509,66 @@ impl App {
                 .and_then(|c| c.run.as_ref())
                 .is_some_and(|r| r.left.is_some())
     }
+
+    /// The Pi shows a tool run this session did not send and has not
+    /// answered for (`pi_runs_known`), or another computer in control
+    /// (`control::Connection::done_elsewhere`), the link dropped and back
+    /// or not (LIO-596): either may have cut the part. Whatever this
+    /// session's runs cut, of every setup, is unknown from now on
+    /// (`run::HISTORY_UNKNOWN`), until New stock loaded, and the Pi's note
+    /// says why. Nothing at stake (nothing cut yet, or New stock loaded
+    /// since), nothing changes.
+    fn note_done_elsewhere(&mut self) {
+        let Some(c) = self.control.as_mut() else {
+            return;
+        };
+        let (runs, holder) = c.done_elsewhere(&self.pi_runs_known);
+        if runs.is_empty() && holder.is_none() {
+            return;
+        }
+        self.pi_runs_known.extend(runs);
+        if !self.cut_elsewhere() {
+            return;
+        }
+        let what = match holder {
+            Some(h) => format!("{h} took control of the Pi"),
+            None => "A tool run this computer did not send ran on the Pi".into(),
+        };
+        if let Some(c) = self.control.as_mut() {
+            c.pi_note = Some(format!(
+                "{what}: it may have cut the part, so what this computer's runs cut is not known any more. No start sets Z from the stock the check finds until New stock loaded under Work zero; keep the work zero, or set Z by hand."
+            ));
+        }
+    }
+
+    /// Something else may have cut the part (LIO-596): the record of what
+    /// every setup's runs cut this session (`run_cuts`, `run_pending`, and
+    /// the run's) is unknown from now on. True when any was not already.
+    fn cut_elsewhere(&mut self) -> bool {
+        let mut marked = false;
+        for (_, cuts) in &mut self.run_cuts {
+            marked |= run::note_unknown(cuts);
+        }
+        for p in &mut self.run_pending {
+            marked |= run::note_unknown(&mut p.3);
+        }
+        if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
+            marked |= r.note_cut_elsewhere();
+        }
+        marked
+    }
+
+    /// The run's operator said, after a disconnect, whether the part is
+    /// still the one held and whether anything else ran (`action`): it is
+    /// said of the part, so of every setup's record kept across it, not
+    /// asked again for each (LIO-596).
+    fn answered_away(&mut self, action: &run::Action) {
+        if matches!(action, run::Action::OtherRunsMayHaveCut) {
+            self.cut_elsewhere();
+        }
+        self.run_away.clear();
+    }
+
     /// While the machine moves (`locked`), the setup being run is only marked
     /// to be checked: the Tick checks it once the machine stops, so that the
     /// simulation of the job never competes with the driver feeding it
@@ -8922,7 +8987,13 @@ impl App {
                     return Task::none();
                 }
                 if let Some(c) = &mut self.control {
-                    c.run_act(action, &self.doc);
+                    let away = c.run.as_ref().is_some_and(|r| r.away.is_some());
+                    c.run_act(action.clone(), &self.doc);
+                    // Said for the part after a disconnect: it answers for
+                    // every setup's record (LIO-596).
+                    if away && c.run.as_ref().is_some_and(|r| r.away.is_none()) {
+                        self.answered_away(&action);
+                    }
                 }
             }
             Message::RunChecked(epoch, programs) => {
@@ -10158,6 +10229,9 @@ impl App {
                         };
                     }
                 }
+                // Something else ran on the Pi, or holds it: what this
+                // session's runs cut is unknown from now on (LIO-596).
+                self.note_done_elsewhere();
                 let phase_tab = self.phase_tab();
                 // AXIS CAM opened again while the Pi runs the tool run it
                 // sent before: its run, built anew, follows it, once the
@@ -11792,11 +11866,19 @@ fn mark_away(
 
 /// Gives `run` its setup's entry of `away` (`App::run_away`): its cuts were
 /// kept across a disconnect, so the operator is asked whether it is the
-/// same part and whether anything else ran meanwhile (LIO-595).
+/// same part and whether anything else ran meanwhile (LIO-595). So is it
+/// when it has none, but has another setup's kept so (`earlier_cuts`),
+/// which the answer covers too (LIO-596); given after them.
 fn give_away(away: &[(String, run::Away)], run: &mut run::Run) {
-    if let Some((_, a)) = away.iter().find(|(id, _)| *id == run.setup_id)
-        && !run.cuts_so_far().is_empty()
-    {
+    let own = (away.iter())
+        .find(|(id, _)| *id == run.setup_id)
+        .filter(|_| !run.cuts_so_far().is_empty());
+    let earlier = || {
+        away.iter().find(|(id, _)| {
+            (run.earlier_cuts.iter()).any(|(e, cuts)| e == id && !cuts.is_empty())
+        })
+    };
+    if let Some((_, a)) = own.or_else(earlier) {
         run.away = Some(a.clone());
         run.stock_unconfirmed = true;
     }
