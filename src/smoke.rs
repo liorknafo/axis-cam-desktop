@@ -5324,6 +5324,100 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
     }
 
+    /// This computer follows again its first tool run, the Face held in
+    /// pass 1, nothing cut before it (LIO-596 review). The link drops,
+    /// another computer takes control, and it stops the Face after pass 1:
+    /// the record is unknown while it holds control, and stays so once the
+    /// followed tool run's outcome comes, the setup picked again and called
+    /// the same part. No Set Z on pass 1's floor until New stock loaded.
+    #[test]
+    fn a_followed_tool_runs_outcome_keeps_the_record_unknown_after_another_computer_held_control() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 3]);
+        let face = &mut a.doc.setups[0].operations[0].p;
+        face.insert("stepdown".into(), "2".into());
+        face.insert("feed".into(), "3000".into());
+        let server = to_pi(&mut a, dir.path());
+        let relay = Relay::to(server.addr());
+        let _ = a.update(Message::PiAddress(relay.addr.to_string()));
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        cycle_start(&mut a);
+        run_until(&mut a, 30., "Face pass 1", |r| {
+            r.step_at(None) == Some((0, 0, false))
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        tick_until(&mut a, 10., "the Face held", |s| {
+            s.state == Some(State::Hold)
+        });
+        // Dropped while it runs, and followed again: nothing cut before it.
+        let first = conn(&a).machine_id.clone();
+        let mut sim = a.doc.machines[0].clone();
+        sim.id = "lio596-other".into();
+        sim.p.insert("name".into(), "Other simulator".into());
+        sim.p.insert("uc100_connection".into(), "Simulated".into());
+        a.doc.machines.push(sim);
+        let _ = a.update(Message::Disconnect);
+        let _ = a.update(Message::ControlMachine("lio596-other".into()));
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 5., "the other machine", |s| {
+            s.state == Some(State::EStop)
+        });
+        let _ = a.update(Message::Disconnect);
+        let _ = a.update(Message::ControlMachine(first));
+        let _ = a.update(Message::Connect);
+        follow_again(&mut a).unwrap();
+        tick_until(&mut a, 5., "the held Face followed", |s| {
+            s.state == Some(State::Hold)
+        });
+        assert_eq!(run_of(&a).before_follow.as_deref(), Some(&[][..]));
+        // Another computer takes control while the link is down.
+        drop_the_link(&mut a, &relay);
+        let other = another_computer_in_control(dir.path(), &server);
+        link_back(&mut a, &relay, false);
+        assert!(run_of(&a).history_unknown(), "{:?}", run_of(&a).cut_in_run);
+        // It stops the Face after pass 1 and gives control up.
+        assert!(other.stop_after(run_of(&a).stop_ranges()));
+        let mut deadline = Deadline::new(5.);
+        while !matches!(
+            other.link().stop_after,
+            uc100_remote::wire::StopAfter::Armed { .. }
+        ) {
+            assert!(deadline.within(&other.snapshot()));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        other.send(uc100::controller::Command::Resume);
+        pi_until(&server, 180., "the Face stopped after pass 1", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| !o.ok)
+        });
+        other.shutdown();
+        let _ = a.update(Message::Disconnect);
+        let _ = a.update(Message::Connect);
+        run_until(&mut a, 10., "the stop after pass 1", |r| r.running.is_none());
+        tick_until(&mut a, 10., "Idle after the stop", |s| {
+            s.state == Some(State::Idle)
+        });
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        assert!(run_of(&a).history_unknown(), "{:?}", run_of(&a).cut_in_run);
+        // Picked again, the same part: still no Set Z from the record.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        if run_of(&a).stock_unconfirmed {
+            let _ = a.update(Message::Run(R::SamePart));
+        }
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        assert!(run_of(&a).history_unknown(), "{:?}", run_of(&a).cut_in_run);
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), None);
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// The link drops long enough for the Pi to free control, and comes back
     /// with nothing else run: this computer takes control again, its own
     /// older connection perhaps still holding it for a moment. The record

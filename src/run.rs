@@ -380,7 +380,14 @@ fn note_cut_in(cuts: &mut Vec<CutInRun>, oi: usize, steps: Option<usize>, print:
 /// LIO-596). An empty record says nothing was cut and stays so. True when
 /// it was not already unknown.
 pub(crate) fn note_unknown(cuts: &mut Vec<CutInRun>) -> bool {
-    if cuts.is_empty() || cuts.iter().any(|c| c.0 == HISTORY_UNKNOWN) {
+    !cuts.is_empty() && note_unknown_before(cuts)
+}
+
+/// As `note_unknown`, for what was cut before a tool run that runs or ran
+/// (`Run::before_follow`, `App::run_pending`), empty or not: that tool run
+/// cuts the part, and its outcome starts from this (LIO-596 review).
+pub(crate) fn note_unknown_before(cuts: &mut Vec<CutInRun>) -> bool {
+    if cuts.iter().any(|c| c.0 == HISTORY_UNKNOWN) {
         return false;
     }
     note_cut_in(cuts, HISTORY_UNKNOWN, None, None);
@@ -1663,7 +1670,7 @@ impl Run {
             marked |= note_unknown(cuts);
         }
         if let Some(cuts) = &mut self.before_follow {
-            marked |= note_unknown(cuts);
+            marked |= note_unknown_before(cuts);
         }
         marked
     }
@@ -1885,7 +1892,14 @@ impl Run {
         if let Some(before) = self.before_follow.take()
             && !o.message.contains(NOT_STARTED)
         {
+            // Unknown stays unknown: something else may have cut the part
+            // since, which no outcome of this computer's tells (LIO-596
+            // review).
+            let unknown = self.cut_in_run.iter().any(|c| c.0 == HISTORY_UNKNOWN);
             self.cut_in_run = before;
+            if unknown {
+                self.note_history_unknown();
+            }
         }
         for (op, steps) in cut {
             self.note_cut(op, steps);

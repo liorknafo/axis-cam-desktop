@@ -4550,7 +4550,7 @@ impl App {
             marked |= run::note_unknown(cuts);
         }
         for p in &mut self.run_pending {
-            marked |= run::note_unknown(&mut p.3);
+            marked |= run::note_unknown_before(&mut p.3);
         }
         if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
             marked |= r.note_cut_elsewhere();
