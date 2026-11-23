@@ -2856,8 +2856,10 @@ impl Run {
         if self.declared_stale {
             return (vec![], vec![]);
         }
-        let skips: Vec<(usize, Skip)> =
-            (self.skips.iter()).filter(|s| s.1 == Skip::Cut).copied().collect();
+        let skips: Vec<(usize, Skip)> = (self.skips.iter())
+            .filter(|s| s.1 == Skip::Cut)
+            .copied()
+            .collect();
         (skips, self.cut_steps.clone())
     }
 
@@ -3021,7 +3023,11 @@ impl Run {
         let mut ops: Vec<usize> = (programs[..self.next].iter())
             .flat_map(|p| p.indexes.iter().copied())
             .chain(p.indexes[..self.from.min(p.indexes.len())].iter().copied())
-            .chain((self.skips.iter()).filter(|s| s.1 == Skip::Cut).map(|s| s.0))
+            .chain(
+                (self.skips.iter())
+                    .filter(|s| s.1 == Skip::Cut)
+                    .map(|s| s.0),
+            )
             .collect();
         ops.sort_unstable();
         ops.dedup();
@@ -9380,7 +9386,10 @@ pub(crate) mod tests {
         recheck(&mut run);
         assert!(run.start_at_step(1, 1));
         recheck(&mut run);
-        assert_eq!((run.at_step(), run.all_cut()), (Some((1, 1)), vec![(1, vec![0])]));
+        assert_eq!(
+            (run.at_step(), run.all_cut()),
+            (Some((1, 1)), vec![(1, vec![0])])
+        );
         run.start_at(0, 0);
         recheck(&mut run);
         assert_eq!((run.start_step, run.all_cut()), (None, vec![(1, vec![0])]));

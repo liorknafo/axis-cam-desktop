@@ -2806,7 +2806,9 @@ flood = { pin = 8 }
         assert_eq!(run.taken_as_cut(), ["Pocket"]);
         assert_eq!(
             problems(&a),
-            ["This run starts at Face, with Pocket after it taken as cut, and the check cannot tell the surface they left where the work zero is touched off: in the Work zero tab, set Z by hand on a surface whose height you know and press Keep this work zero, or press it if the work zero is still the one they were cut with."]
+            [
+                "This run starts at Face, with Pocket after it taken as cut, and the check cannot tell the surface they left where the work zero is touched off: in the Work zero tab, set Z by hand on a surface whose height you know and press Keep this work zero, or press it if the work zero is still the one they were cut with."
+            ]
         );
         let _ = a.update(Message::Run(R::KeepZero));
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
@@ -2874,7 +2876,9 @@ flood = { pin = 8 }
         assert!(run.started() && !run.partway() && run.later_cut() && !run.zeroed);
         let drill = a.doc.setups[0].operations[3].name();
         let waits = |a: &App| {
-            problems(a).into_iter().find(|p| p.contains("after it taken as cut"))
+            problems(a)
+                .into_iter()
+                .find(|p| p.contains("after it taken as cut"))
         };
         assert_eq!(
             waits(&a),
@@ -2901,11 +2905,19 @@ flood = { pin = 8 }
                 .find(|m| matches!(m, Message::Run(R::KeepZero)))
         };
         let _ = a.update(keep(&a).expect("Keep this work zero offered after the Stop"));
-        assert!(run_of(&a).zeroed && waits(&a).is_none(), "{:?}", problems(&a));
+        assert!(
+            run_of(&a).zeroed && waits(&a).is_none(),
+            "{:?}",
+            problems(&a)
+        );
         assert!(keep(&a).is_none(), "kept: the button is off");
         // Another declared after it asks again.
         assert!(skip(&mut a, 2, Some(Cut)));
-        assert!(!run_of(&a).zeroed && waits(&a).is_some(), "{:?}", problems(&a));
+        assert!(
+            !run_of(&a).zeroed && waits(&a).is_some(),
+            "{:?}",
+            problems(&a)
+        );
         assert!(keep(&a).is_some());
         a.touch();
         assert!(run_of(&a).skips.is_empty() && run_of(&a).stale);
@@ -6550,7 +6562,9 @@ flood = { pin = 8 }
         // The Pocket taken as cut after the start: Cycle Start waits for the
         // work zero it was cut with, kept here (LIO-583).
         assert!(
-            problems(&a).iter().any(|p| p.contains("with Pocket after it taken as cut")),
+            problems(&a)
+                .iter()
+                .any(|p| p.contains("with Pocket after it taken as cut")),
             "{:?}",
             problems(&a)
         );
@@ -11441,7 +11455,10 @@ flood = { pin = 8 }
         assert!(problems(&a).contains(&waits));
         // Z set by hand is the operator's to vouch for, as for any partway
         // start: Cycle Start waits on until Keep this work zero says so.
-        let _ = a.update(Message::Machine(crate::control::Action::WorkText(2, "-6".into())));
+        let _ = a.update(Message::Machine(crate::control::Action::WorkText(
+            2,
+            "-6".into(),
+        )));
         let _ = a.update(Message::Machine(crate::control::Action::WorkSet(2)));
         tick_for(&mut a, 100);
         assert!(run_of(&a).touched && !run_of(&a).zeroed);
@@ -11690,7 +11707,11 @@ flood = { pin = 8 }
                 .find(|m| matches!(m, Message::Run(R::KeepZero)))
         };
         let _ = a.update(keep(&a).expect("Keep this work zero offered after the Stop"));
-        assert!(run_of(&a).zeroed && waits(&a).is_none(), "{:?}", problems(&a));
+        assert!(
+            run_of(&a).zeroed && waits(&a).is_none(),
+            "{:?}",
+            problems(&a)
+        );
         // Taken back, the next check asks again.
         let _ = a.update(Message::Run(R::Steps(Some(1))));
         let _ = a.update(Message::Run(R::PickStep(1, last)));
@@ -11720,13 +11741,18 @@ flood = { pin = 8 }
         answer_skips(&mut a, 0);
         assert!(skip(&mut a, 3, Some(crate::run::Skip::Cut)));
         let declared = run_of(&a).declared();
-        assert_eq!(declared, (vec![(3, crate::run::Skip::Cut)], vec![(1, vec![0])]));
+        assert_eq!(
+            declared,
+            (vec![(3, crate::run::Skip::Cut)], vec![(1, vec![0])])
+        );
         let refused = |a: &App| {
             assert!(run_of(a).asks_zero() && !run_of(a).zeroed);
             assert!(conn(a).touch_off().is_none() && conn(a).stock_top().is_err());
             assert!(conn(a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
             assert!(
-                problems(a).iter().any(|p| p.contains("after it taken as cut")),
+                problems(a)
+                    .iter()
+                    .any(|p| p.contains("after it taken as cut")),
                 "{:?}",
                 problems(a)
             );
@@ -11817,13 +11843,15 @@ flood = { pin = 8 }
         let window = iced::Size::new(1440., 2400.);
         let texts = crate::ui::probe::texts(a.view(), window).join("\n");
         assert!(
-            texts.contains("Operations or steps of this setup were taken as cut before the project changed")
-                && !texts.contains("taking  as cut"),
+            texts.contains(
+                "Operations or steps of this setup were taken as cut before the project changed"
+            ) && !texts.contains("taking  as cut"),
             "{texts}"
         );
         let steps = crate::ui::work_zero_steps(&a, conn(&a)).unwrap().join("\n");
         assert!(
-            steps.contains("Zero Z on the stock top and Probe Z are off") && !steps.contains("Zero all"),
+            steps.contains("Zero Z on the stock top and Probe Z are off")
+                && !steps.contains("Zero all"),
             "{steps}"
         );
         // Picked again: still so, and the question asked.
@@ -11837,7 +11865,9 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::KeepZero));
         assert!(run_of(&a).zeroed);
         assert!(
-            !problems(&a).iter().any(|p| p.contains("before the project changed")),
+            !problems(&a)
+                .iter()
+                .any(|p| p.contains("before the project changed")),
             "{:?}",
             problems(&a)
         );
@@ -11862,7 +11892,10 @@ flood = { pin = 8 }
         assert!(a.control.is_none());
         a.doc.title = format!("{} again", a.doc.title);
         a.touch();
-        assert_eq!(a.run_declared, [(a.doc.setups[0].id.clone(), (vec![], vec![]), true)]);
+        assert_eq!(
+            a.run_declared,
+            [(a.doc.setups[0].id.clone(), (vec![], vec![]), true)]
+        );
         zeroed(&mut a);
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
@@ -11933,8 +11966,14 @@ flood = { pin = 8 }
         };
         let (before, after) = (presses(&a, 0.), presses(&a, 5000.));
         crate::ui::TOUCH.with(|t| t.set(false));
-        assert!(!before, "Keep this work zero pressed at 960 × 552 unscrolled: not below the fold");
-        assert!(after, "Keep this work zero not pressed at 960 × 552, scrolled");
+        assert!(
+            !before,
+            "Keep this work zero pressed at 960 × 552 unscrolled: not below the fold"
+        );
+        assert!(
+            after,
+            "Keep this work zero not pressed at 960 × 552, scrolled"
+        );
     }
 
     /// A run started at the Drilling with the work zero on the stock top's
