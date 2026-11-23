@@ -312,19 +312,19 @@ pub(crate) const LATER_UNFOLLOWED_WHY: &str = "Operations or steps after the sta
 /// while the operator has not said whether the same part is still held
 /// (`Run::stock_unconfirmed`).
 pub(crate) const STOCK_UNCONFIRMED: &str =
-    "stock this setup's runs cut earlier, which may or may not still be held";
+    "stock runs this session cut earlier, which may or may not still be held";
 
 /// Why a probe cannot find a work zero from a spot while
 /// `Run::stock_unconfirmed`.
-const STOCK_UNCONFIRMED_WHY: &str = "This setup's runs cut the stock earlier: say under Work zero whether it is the same part or new stock.";
+const STOCK_UNCONFIRMED_WHY: &str = "Runs this session cut the stock earlier: say under Work zero whether it is the same part or new stock.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed`.
-const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier this session: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
+const STOCK_UNCONFIRMED_BLOCKED: &str = "Runs this session cut the stock earlier: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed` after a disconnect (`Run::away`, LIO-595).
-pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier this session, and the machine was disconnected since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
+pub(crate) const STOCK_AWAY_BLOCKED: &str = "Runs this session cut the stock earlier, and the machine was disconnected since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile. The answer covers every setup.";
 
 /// What runs this computer did not follow may have cut, said as
 /// `Partly::cut` (`HISTORY_UNKNOWN` in `Run::cut_in_run`): another
@@ -1661,7 +1661,8 @@ impl Run {
     /// (`HISTORY_UNKNOWN`), until New stock loaded. True when any of them
     /// was not already.
     pub fn note_cut_elsewhere(&mut self) -> bool {
-        let own = !self.cuts_so_far().is_empty()
+        // A tool run running cuts, its check in or not (LIO-596 review).
+        let own = (self.running.is_some() || !self.cuts_so_far().is_empty())
             && !(self.cut_in_run.iter()).any(|c| c.0 == HISTORY_UNKNOWN);
         if own {
             self.note_history_unknown();
@@ -2701,7 +2702,10 @@ impl Run {
 
     /// The stock the start begins from is not the setup's own: the run
     /// starts partway (`partway`), or a tool run of it has started, which
-    /// cut it, or has cut (`cut_in_run`). Zero Z on the stock top, Probe Z and the probe spots go by
+    /// cut it, or has cut (`cut_in_run`); or whether the part runs cut is
+    /// still held is not said yet (`stock_unconfirmed`), its own runs' or
+    /// only other setups' (`earlier_cuts`) kept across a disconnect
+    /// (LIO-596 review). Zero Z on the stock top, Probe Z and the probe spots go by
     /// the stock the check finds before the start (`partly`) then; Cycle
     /// Start waits for the work zero only partway (LIO-582 review).
     pub fn on_cut_stock(&self) -> bool {
@@ -2709,7 +2713,8 @@ impl Run {
             && (self.partway()
                 || self.started()
                 || !self.cut_in_run.is_empty()
-                || self.earlier_unfollowed())
+                || self.earlier_unfollowed()
+                || self.stock_unconfirmed)
     }
 
     /// The run starts partway through the setup before any of its tool runs
@@ -10192,6 +10197,11 @@ pub(crate) mod tests {
         )];
         let mut run = Run::new(&doc, 1, 0);
         crate::give_earlier_cuts(&session, &mut run);
+        let (c, l) = check(&doc, &mesh, 1);
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        // Before the disconnect, its start touches off on the stock the
+        // check carves with setup 1's cuts.
+        assert!(run.touch_off().is_some() && run.partway_blocked().is_none());
         crate::give_away(&away, &mut run);
         assert!(run.stock_unconfirmed);
         assert_eq!(
@@ -10200,6 +10210,13 @@ pub(crate) mod tests {
                 seen: Some(vec![7])
             })
         );
+        // Until answered, nothing sets Z from the stock the check carves:
+        // the part may not be the one held, or cut since (Fable review).
+        assert!(run.touch_off().is_none());
+        assert_eq!(run.partway_blocked().as_deref(), Some(STOCK_AWAY_BLOCKED));
+        // Same part, nothing else ran: as before.
+        (run.stock_unconfirmed, run.away) = (false, None);
+        assert!(run.touch_off().is_some() && run.partway_blocked().is_none());
         // Nothing of setup 1's kept: nothing to ask.
         let mut run = Run::new(&doc, 1, 0);
         crate::give_earlier_cuts(&[], &mut run);

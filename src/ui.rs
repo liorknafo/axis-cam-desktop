@@ -11720,7 +11720,7 @@ fn stock_question<'a>(
 
 /// What the Work zero tab asks of a setup whose runs cut a part before a
 /// disconnect from the machine (`run::Run::away`, LIO-595).
-pub const AWAY_ASKED: &str = "This setup's runs cut a part this session, and the machine was disconnected since. Is it still the one held, and did anything else run on the machine meanwhile?";
+pub const AWAY_ASKED: &str = "Runs this session cut a part, and the machine was disconnected since. Is it still the one held, and did anything else run on the machine meanwhile? The answer covers every setup.";
 
 /// Said with New stock loaded on the Work zero tab while runs this
 /// computer did not follow may have cut the part (`run::Run::history_unknown`).
