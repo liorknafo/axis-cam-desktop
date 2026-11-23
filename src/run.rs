@@ -30,8 +30,15 @@ pub enum Action {
     /// one set by hand on a surface they left.
     KeepZero,
     /// The part this setup's runs cut this session is still the one held
-    /// (`Run::stock_unconfirmed`): what they cut stays the stock's.
+    /// (`Run::stock_unconfirmed`), and nothing else has cut it since: what
+    /// they cut stays the stock's. Refused after a disconnect while the Pi
+    /// shows a tool run this computer did not send (`Run::away`, LIO-595).
     SamePart,
+    /// The part this setup's runs cut this session is still the one held,
+    /// but after a disconnect (`Run::away`) something else may have cut it
+    /// meanwhile: what this setup's runs cut is unknown
+    /// (`Run::note_history_unknown`) until New stock loaded (LIO-595).
+    OtherRunsMayHaveCut,
     /// New stock is held: what this setup's runs cut this session is
     /// forgotten (`Run::stock_unconfirmed`).
     NewStock,
@@ -315,6 +322,24 @@ const STOCK_UNCONFIRMED_WHY: &str = "This setup's runs cut the stock earlier: sa
 /// `Run::stock_unconfirmed`.
 const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier this session: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
 
+/// Why Zero Z on the stock top and Probe Z cannot set Z while
+/// `Run::stock_unconfirmed` after a disconnect (`Run::away`, LIO-595).
+pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier this session, and the machine was disconnected since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
+
+/// What runs this computer did not follow may have cut, said as
+/// `Partly::cut` (`HISTORY_UNKNOWN` in `Run::cut_in_run`): another
+/// session's, or anything that ran on the machine while it was
+/// disconnected (LIO-586 review, LIO-595).
+pub(crate) const HISTORY_UNFOLLOWED: &str = "stock runs this computer did not follow may have cut";
+
+/// Why a probe cannot find a work zero from a spot of a stock
+/// `HISTORY_UNFOLLOWED` cut.
+pub(crate) const HISTORY_UNFOLLOWED_WHY: &str = "Runs this computer did not follow may have cut the stock, and the check does not know what they cut here.";
+
+/// Why Zero Z on the stock top and Probe Z cannot set Z where
+/// `HISTORY_UNFOLLOWED` cut (`Run::partway_blocked`).
+pub(crate) const HISTORY_UNFOLLOWED_BLOCKED: &str = "Runs this computer did not follow may have cut the stock, so the check cannot tell the surface where the stock top is touched off.";
+
 /// What other setups' runs cut this session, said as `Partly::cut`, when
 /// the check does not simulate it before this setup as it was cut
 /// (`Run::earlier_unfollowed`).
@@ -411,6 +436,11 @@ pub struct Run {
     /// (`Action::SamePart`, `Action::NewStock`): nothing sets Z or probes
     /// until then (`partly`, LIO-582 review).
     pub stock_unconfirmed: bool,
+    /// `cut_in_run` was kept across a disconnect from the machine, while
+    /// which anything may have run on it (LIO-595): the operator is asked
+    /// too whether something else ran meanwhile (`Action::SamePart`,
+    /// `Action::OtherRunsMayHaveCut`). Cleared once answered.
+    pub away: Option<Away>,
     /// What the other setups cut this session (`App::run_cuts`), by setup
     /// id: in the part whether those setups come before it, were deleted or
     /// moved after it since. The check's stock has it only while it
@@ -945,6 +975,17 @@ pub(crate) fn forget_own_files() {
 /// until New stock loaded, whatever the operations are by then.
 pub(crate) const HISTORY_UNKNOWN: usize = usize::MAX;
 
+/// A setup's cuts kept across a disconnect from the machine (`Run::away`,
+/// `App::run_away`, LIO-595).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Away {
+    /// The tool runs the Pi had, going or ended, when the machine was first
+    /// disconnected since, with those this computer sent since: one it
+    /// shows that is neither ran while this computer was away
+    /// (`control::Connection::ran_elsewhere`). None when it was not a Pi.
+    pub seen: Option<Vec<u64>>,
+}
+
 /// The stock before an operation of the setup being run, seen from above,
 /// and the shape of its cutter.
 #[derive(Debug, Clone)]
@@ -1019,6 +1060,7 @@ impl Run {
             done: vec![],
             cut_in_run: vec![],
             stock_unconfirmed: false,
+            away: None,
             earlier_cuts: vec![],
             earlier_given: vec![],
             before_follow: None,
@@ -1580,6 +1622,11 @@ impl Run {
     /// loaded: the work zero is kept, or Z set by hand.
     pub fn note_history_unknown(&mut self) {
         note_cut_in(&mut self.cut_in_run, HISTORY_UNKNOWN, None, None);
+    }
+
+    /// What this setup's runs cut is unknown (`note_history_unknown`).
+    pub fn history_unknown(&self) -> bool {
+        self.cut_in_run.iter().any(|c| c.0 == HISTORY_UNKNOWN)
     }
 
     /// Where a run of this setup stopped, found while it is open (the Pi
@@ -2683,8 +2730,12 @@ impl Run {
             LATER_UNFOLLOWED_BLOCKED.into()
         } else if partly.cut == [RUN_UNFOLLOWED] {
             RUN_UNFOLLOWED_BLOCKED.into()
+        } else if partly.cut == [STOCK_UNCONFIRMED] && self.away.is_some() {
+            STOCK_AWAY_BLOCKED.into()
         } else if partly.cut == [STOCK_UNCONFIRMED] {
             STOCK_UNCONFIRMED_BLOCKED.into()
+        } else if partly.cut == [HISTORY_UNFOLLOWED] {
+            HISTORY_UNFOLLOWED_BLOCKED.into()
         } else if partly.cut == [EARLIER_UNFOLLOWED] {
             EARLIER_UNFOLLOWED_BLOCKED.into()
         } else if partly.cut == [STEPS_UNFOLLOWED] {
@@ -2951,6 +3002,20 @@ impl Run {
                 top_cut: true,
                 probe_from: (before.probe_from.iter())
                     .map(|(r, _)| (*r, Err(EARLIER_UNFOLLOWED_WHY.into())))
+                    .collect(),
+                steps: vec![],
+            }));
+        }
+        // Runs this computer did not follow may have cut it: another
+        // session's, or anything that ran while it was disconnected
+        // (LIO-586 review, LIO-595).
+        if self.history_unknown() {
+            return Some(Cow::Owned(Partly {
+                cut: vec![HISTORY_UNFOLLOWED.into()],
+                surface: None,
+                top_cut: true,
+                probe_from: (before.probe_from.iter())
+                    .map(|(r, _)| (*r, Err(HISTORY_UNFOLLOWED_WHY.into())))
                     .collect(),
                 steps: vec![],
             }));
@@ -7601,6 +7666,7 @@ pub(crate) mod tests {
             done: vec![false],
             cut_in_run: vec![],
             stock_unconfirmed: false,
+            away: None,
             earlier_cuts: vec![],
             earlier_given: vec![],
             before_follow: None,
@@ -9746,11 +9812,12 @@ pub(crate) mod tests {
         let unknown = |run: &Run| run.cut_in_run.iter().any(|c| c.0 == HISTORY_UNKNOWN);
         let refused = |run: &Run| {
             assert!(unknown(run), "{:?}", run.cut_in_run);
-            assert_eq!(run.partly().unwrap().cut, [RUN_UNFOLLOWED]);
+            // Said as runs this computer did not follow (LIO-595).
+            assert_eq!(run.partly().unwrap().cut, [HISTORY_UNFOLLOWED]);
             assert_eq!(run.touch_off(), None);
             assert_eq!(
                 run.partway_blocked().as_deref(),
-                Some(RUN_UNFOLLOWED_BLOCKED)
+                Some(HISTORY_UNFOLLOWED_BLOCKED)
             );
             // Keep this work zero stays.
             assert!(run.partway() && !run.zeroed);

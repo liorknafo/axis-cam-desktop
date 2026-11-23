@@ -268,6 +268,7 @@ pub const NOT_WORK_STATE: &[(&str, &str)] = &[
     ("cnc_over_guide", VIEW),
     ("run_on_connect", CONTROLLER),
     ("run_cuts", CONTROLLER),
+    ("run_away", CONTROLLER),
     ("run_pending", CONTROLLER),
     ("jog_key", CONTROLLER),
     ("run_epoch", JOB),
