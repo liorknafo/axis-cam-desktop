@@ -2476,6 +2476,10 @@ impl App {
         // app is open (LIO-459); not from a test's or smoke run's workspace.
         if app.smoke_dir.is_none() && app.state_path == storage::state_path() {
             let path = app.state_path.clone();
+            // What setups' runs cut, as loaded (LIO-594), before a tablet
+            // can ask: the first update publishes it only later (LIO-590
+            // review).
+            tablet::set_session_cuts(&path, app.session_cuts());
             std::thread::spawn(move || tablet::serve(path, computer_name(), true));
             return (app, firewall(tablet::firewall_problem));
         }
@@ -6749,7 +6753,31 @@ impl App {
         self.mcp_arrive(&message);
         let task = self.update_turn(message);
         self.mcp_leave();
+        // The tablets this computer shares projects with are sent tablet
+        // files made with what this session cut (LIO-590).
+        tablet::set_session_cuts(&self.state_path, self.session_cuts());
         task
+    }
+    /// What each setup's runs cut (`run_cuts`), the run picked now's
+    /// included as far as a tool run it runs may get, as `cut_history`
+    /// keeps them, whether what runs cut was lost (`others_unknown`), and
+    /// the setups whose operations or steps were taken as cut
+    /// (`run_declared`): what the tablet file's work zeros go by
+    /// (`run::tablet_runs`, LIO-590).
+    pub(crate) fn session_cuts(&self) -> run::Session {
+        let mut cuts = self.run_cuts.clone();
+        if let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref()) {
+            keep_run_cuts(&mut cuts, r, self.others_unknown);
+        }
+        let mut declared = self.run_declared.clone();
+        if let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref()) {
+            keep_declared(&mut declared, r);
+        }
+        run::Session {
+            cuts,
+            lost: self.others_unknown,
+            declared: declared.into_iter().map(|(id, ..)| id).collect(),
+        }
     }
     fn update_turn(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
@@ -9149,12 +9177,7 @@ impl App {
                 // last closed (LIO-594), until the operator says whether
                 // the same part is still there (LIO-582 review).
                 note_lost_cuts(&mut self.run_cuts, self.others_unknown, &id);
-                if let Some((_, cuts)) = (self.run_cuts.iter()).find(|(s, _)| *s == id)
-                    && !cuts.is_empty()
-                {
-                    r.cut_in_run = cuts.clone();
-                    r.stock_unconfirmed = true;
-                }
+                r.picked_in(&self.run_cuts, self.others_unknown);
                 if journal_gone {
                     r.note_history_unknown();
                 }
@@ -9169,7 +9192,6 @@ impl App {
                     (r.declared_lost, r.stock_unconfirmed) = (*lost, true);
                 }
                 let skipped = !r.skips.is_empty();
-                give_earlier_cuts(&self.run_cuts, &mut r);
                 give_away(&self.run_away, &mut r);
                 c.run = Some(r);
                 // A spot picked to probe from was for the setup before.
@@ -9691,6 +9713,7 @@ impl App {
                 self.save_busy = true;
                 self.record_picks();
                 let doc = self.doc.clone();
+                let session = self.session_cuts();
                 let dialog = rfd::AsyncFileDialog::new()
                     .set_title("Save for the shop tablet")
                     .add_filter("AXIS tablet file", &[bundle::EXTENSION])
@@ -9704,7 +9727,7 @@ impl App {
                         let path = dialog.save_file().await?.path().to_path_buf();
                         Some(
                             tokio::task::spawn_blocking(move || {
-                                bundle::write(&path, &doc).map(|()| path)
+                                bundle::write(&path, &doc, &session).map(|()| path)
                             })
                             .await
                             .unwrap_or_else(|e| Err(e.to_string())),
