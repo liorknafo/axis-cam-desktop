@@ -11654,8 +11654,14 @@ fn stock_question<'a>(
     let stock = stock.or_else(|| {
         (run.stock_unconfirmed && run.away.is_some()).then(|| {
             let refused = c.same_part_refused();
-            let mut col = column![
-                text(AWAY_ASKED).size(12),
+            // Why Same part with nothing else run is off, said above the
+            // answers so it shows with them in a short window (LIO-595
+            // review).
+            let mut col = column![text(AWAY_ASKED).size(12)].spacing(4);
+            if let Some(why) = refused {
+                col = col.push(text(why).size(12).color(AMBER));
+            }
+            col.push(
                 row![
                     small(
                         "Same part, nothing else ran",
@@ -11676,12 +11682,7 @@ fn stock_question<'a>(
                 .spacing(6)
                 .wrap()
                 .vertical_spacing(6),
-            ]
-            .spacing(4);
-            if let Some(why) = refused {
-                col = col.push(text(why).size(12));
-            }
-            col
+            )
         })
     });
     // Runs this computer did not follow may have cut it: only new stock

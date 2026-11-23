@@ -10369,6 +10369,17 @@ flood = { pin = 8 }
         let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
         let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
         shows(&a, &[crate::ui::AWAY_ASKED, crate::control::PI_UNHEARD]);
+        // With `$AXIS_RENDER_DIR` set, the Work zero tab is drawn there.
+        if let Ok(out) = std::env::var("AXIS_RENDER_DIR") {
+            for size in [iced::Size::new(1440., 900.), crate::MIN_WINDOW] {
+                let _ = a.update(Message::Resized(size));
+                let dir =
+                    std::path::Path::new(&out).join(format!("{}x{}", size.width, size.height));
+                std::fs::create_dir_all(&dir).unwrap();
+                render_png(&a, size, &dir.join("3-pi-unheard-refused.png"));
+            }
+            let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+        }
         let clicks = crate::ui::probe::clicks(a.view(), iced::Size::new(1440., 900.));
         assert!(
             !clicks
