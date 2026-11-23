@@ -344,6 +344,19 @@ pub(crate) const HISTORY_UNFOLLOWED_WHY: &str = "Runs this computer did not foll
 /// `HISTORY_UNFOLLOWED` cut (`Run::partway_blocked`).
 pub(crate) const HISTORY_UNFOLLOWED_BLOCKED: &str = "Runs this computer did not follow may have cut the stock, so the check cannot tell the surface where the stock top is touched off.";
 
+/// What was taken as cut before the project changed, said as `Partly::cut`
+/// (`Run::declared_lost`, LIO-583 review).
+pub(crate) const DECLARED_LOST: &str =
+    "stock taken as cut before the project changed, which the check no longer takes as cut";
+
+/// Why a probe cannot find a work zero from a spot while
+/// `Run::declared_lost`.
+pub(crate) const DECLARED_LOST_WHY: &str = "Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut.";
+
+/// Why Zero Z on the stock top and Probe Z cannot set Z while
+/// `Run::declared_lost`.
+const DECLARED_LOST_BLOCKED: &str = "Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut, so it cannot tell the surface where the stock top is touched off.";
+
 /// What other setups' runs cut this session, said as `Partly::cut`, when
 /// the check does not simulate it before this setup as it was cut
 /// (`Run::earlier_unfollowed`).
@@ -454,6 +467,13 @@ pub struct Run {
     /// too whether something else ran meanwhile (`Action::SamePart`,
     /// `Action::OtherRunsMayHaveCut`). Cleared once answered.
     pub away: Option<Away>,
+    /// Operations or steps were taken as cut (`declared`) and dropped since:
+    /// by a project edit (`unskip`), or a check that refused them
+    /// (`checked_as`). The check no longer takes their material as cut, so
+    /// it cannot tell the surface the stock top is touched off on: nothing
+    /// sets Z or probes, and Cycle Start waits for the work zero, until New
+    /// stock loaded (`new_stock`, LIO-583 review).
+    pub declared_lost: bool,
     /// What the other setups cut this session (`App::run_cuts`), by setup
     /// id: in the part whether those setups come before it, were deleted or
     /// moved after it since. The check's stock has it only while it
@@ -1149,6 +1169,7 @@ impl Run {
             cut_in_run: vec![],
             stock_unconfirmed: false,
             away: None,
+            declared_lost: false,
             earlier_cuts: vec![],
             earlier_given: vec![],
             before_follow: None,
@@ -1589,6 +1610,8 @@ impl Run {
                 why.join(" ")
             ));
             (self.start_step, self.resumed, self.picked) = (None, None, None);
+            // Its steps taken as cut go: their material is not the check's.
+            self.declared_lost |= !self.cut_steps.is_empty();
             self.cut_steps.clear();
             (self.programs, self.recheck) = (None, true);
             // Checked otherwise, it is not the program sent.
@@ -2308,6 +2331,12 @@ impl Run {
                         .map(|c| c.1)
                         .collect();
                     e.push(match (oi, &steps[..]) {
+                        // Dropped by an edit: only a hand, or new stock,
+                        // knows the surface (LIO-583 review).
+                        _ if self.declared_lost && !later => format!(
+                            "This run starts at {}, and operations or steps taken as cut before the project changed are no longer taken as cut, so the check cannot tell the surface they left where the work zero is touched off: in the Work zero tab, set Z by hand on a surface whose height you know and press Keep this work zero, or press New stock loaded if the stock is new.",
+                            first.name
+                        ),
                         // Nothing sets Z on the stock they left but a hand
                         // that knows its height, and Keep this work zero
                         // says so (`later_cut`, LIO-583).
@@ -2804,7 +2833,8 @@ impl Run {
         let early = (self.next, self.from) != (0, 0)
             || self.skips.iter().any(cut)
             || self.cut_steps.iter().any(steps)
-            || self.later_cut();
+            || self.later_cut()
+            || self.declared_lost;
         self.checked().is_some() && (self.at_step().is_some() || !self.started() && early)
     }
 
@@ -2826,7 +2856,7 @@ impl Run {
     /// keeping where Cycle Start starts (`recheck`).
     pub fn new_stock(&mut self) -> bool {
         (self.cut_in_run, self.earlier_cuts) = (vec![], vec![]);
-        self.stock_unconfirmed = false;
+        (self.stock_unconfirmed, self.declared_lost) = (false, false);
         let (skips, steps) = self.declared();
         if skips.is_empty() && steps.is_empty() {
             return false;
@@ -2852,6 +2882,7 @@ impl Run {
         self.checked().is_some()
             && (self.partway()
                 || self.later_cut()
+                || self.declared_lost
                 || self.started() && start.is_some_and(|oi| !self.cut_of(oi).is_empty()))
     }
 
@@ -2862,7 +2893,7 @@ impl Run {
     /// surface the operations before it leave there, when the check knows
     /// it (`partly`), and is None when not (`partway_blocked`).
     pub fn touch_off(&self) -> Option<([f32; 3], [f64; 3])> {
-        if self.later_cut() {
+        if self.later_cut() || self.declared_lost {
             return None;
         }
         let p = self.checked()?.first()?;
@@ -2886,6 +2917,9 @@ impl Run {
     pub fn partway_blocked(&self) -> Option<String> {
         if self.later_cut() {
             return Some(LATER_UNFOLLOWED_BLOCKED.into());
+        }
+        if self.declared_lost {
+            return Some(DECLARED_LOST_BLOCKED.into());
         }
         if !self.on_cut_stock() {
             return self.inherited_unknown().then(|| INHERITED_UNKNOWN.into());
@@ -3217,6 +3251,19 @@ impl Run {
                 steps: vec![],
             }));
         }
+        // What was taken as cut and dropped since is in no stock the check
+        // found (LIO-583 review).
+        if self.declared_lost {
+            return Some(Cow::Owned(Partly {
+                cut: vec![DECLARED_LOST.into()],
+                surface: None,
+                top_cut: true,
+                probe_from: (before.probe_from.iter())
+                    .map(|(r, _)| (*r, Err(DECLARED_LOST_WHY.into())))
+                    .collect(),
+                steps: vec![],
+            }));
+        }
         // Operations after the start's, or steps of them, taken as cut have
         // cut the stock it starts from too, which no stock the check found
         // for it has (`post::partly`): it cannot tell the surface (LIO-582).
@@ -3356,6 +3403,10 @@ impl Run {
     /// Skips nothing any more, without asking for a check: the project
     /// changed, and the setup is checked again anyway.
     pub fn unskip(&mut self) {
+        // What was taken as cut is still cut in the stock held (LIO-583
+        // review).
+        let (cut, steps) = self.declared();
+        self.declared_lost |= !cut.is_empty() || !steps.is_empty();
         (self.skips, self.keep, self.menu) = (vec![], None, None);
         (self.cut_steps, self.start_step, self.picked) = (vec![], None, None);
     }
@@ -7850,6 +7901,7 @@ pub(crate) mod tests {
             cut_in_run: vec![],
             stock_unconfirmed: false,
             away: None,
+            declared_lost: false,
             earlier_cuts: vec![],
             earlier_given: vec![],
             before_follow: None,

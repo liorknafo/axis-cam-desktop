@@ -11668,6 +11668,86 @@ flood = { pin = 8 }
         assert!(run_of(&a).declared() == (vec![], vec![]) && !run_of(&a).stock_unconfirmed);
     }
 
+    /// The Pocket's level 1 taken as cut, then the project edited (LIO-583
+    /// review): the edit drops it from the run, as it drops every skip, but
+    /// its material is still gone from the stock held, so after the check
+    /// nothing sets Z or probes and Cycle Start waits; picked again, the
+    /// same; Keep this work zero lets Cycle Start go; New stock loaded
+    /// clears it.
+    #[test]
+    fn what_was_taken_as_cut_and_dropped_by_an_edit_still_sets_no_z() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).all_cut(), [(1, vec![0])]);
+        // The project edited, and checked again once the edits pause.
+        a.doc.title = format!("{} renamed", a.doc.title);
+        a.touch();
+        a.page = Page::Control;
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        let refused = |a: &App| {
+            let run = run_of(a);
+            assert!(run.all_cut().is_empty() && run.declared_lost);
+            assert!(run.partway() && run.asks_zero() && !run.zeroed);
+            assert!(conn(a).touch_off().is_none() && conn(a).stock_top().is_err());
+            assert!(conn(a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+            assert!(conn(a).edges_setup().is_err());
+            assert!(
+                problems(a)
+                    .iter()
+                    .any(|p| p.contains("taken as cut before the project changed")),
+                "{:?}",
+                problems(a)
+            );
+        };
+        refused(&a);
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let window = iced::Size::new(1440., 2400.);
+        let texts = crate::ui::probe::texts(a.view(), window).join("\n");
+        assert!(
+            texts.contains("Operations or steps of this setup were taken as cut before the project changed")
+                && !texts.contains("taking  as cut"),
+            "{texts}"
+        );
+        let steps = crate::ui::work_zero_steps(&a, conn(&a)).unwrap().join("\n");
+        assert!(
+            steps.contains("Zero Z on the stock top and Probe Z are off") && !steps.contains("Zero all"),
+            "{steps}"
+        );
+        // Picked again: still so, and the question asked.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        refused(&a);
+        let _ = a.update(Message::Run(R::SamePart));
+        refused(&a);
+        // Keep this work zero, the Z set by hand on the floor: Cycle Start
+        // goes.
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(run_of(&a).zeroed);
+        assert!(
+            !problems(&a).iter().any(|p| p.contains("before the project changed")),
+            "{:?}",
+            problems(&a)
+        );
+        // New stock loaded: as any new part.
+        let _ = a.update(Message::Run(R::NewStock));
+        let run = run_of(&a);
+        assert!(!run.declared_lost && !run.partway() && !run.asks_zero());
+        assert!(conn(&a).touch_off().is_some());
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(!run_of(&a).declared_lost && !run_of(&a).stock_unconfirmed);
+    }
+
     /// By touch in a 960 × 552 window (LIO-583 review), the Work zero tab of
     /// a run from the setup's start with the Pocket's first level taken as
     /// cut lays Keep this work zero out whole, as wide as in a wide window:

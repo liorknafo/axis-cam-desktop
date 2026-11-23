@@ -1662,7 +1662,7 @@ pub struct App {
     /// `run_cuts` is, and given back when it is picked again, for the
     /// operator to say whether the same part is still there; New stock
     /// loaded forgets it (LIO-583 review).
-    run_declared: Vec<(String, run::Declared)>,
+    run_declared: Vec<(String, run::Declared, bool)>,
     /// The jog key down on the Control page (axis, negative).
     pub jog_key: Option<(usize, bool)>,
     /// Counts the checks of setups to run, so a late answer is ignored.
@@ -9146,11 +9146,11 @@ impl App {
                 // operator says whether the same part is still there: the
                 // stock top may be cut where Z is touched off (LIO-583
                 // review).
-                if let Some((_, (skips, steps))) =
-                    (self.run_declared.iter()).find(|(id, _)| *id == r.setup_id)
+                if let Some((_, (skips, steps), lost)) =
+                    (self.run_declared.iter()).find(|(id, ..)| *id == r.setup_id)
                 {
                     (r.skips, r.cut_steps) = (skips.clone(), steps.clone());
-                    r.stock_unconfirmed = true;
+                    (r.declared_lost, r.stock_unconfirmed) = (*lost, true);
                 }
                 let skipped = !r.skips.is_empty();
                 give_earlier_cuts(&self.run_cuts, &mut r);
@@ -12267,12 +12267,13 @@ fn journal_known(
 
 /// Keeps what the operator took as cut in `run` (`run::Run::declared`)
 /// under its setup in `declared` (`App::run_declared`), or forgets it there
-/// once nothing is (New stock loaded, or each skip undone).
-fn keep_declared(declared: &mut Vec<(String, run::Declared)>, run: &run::Run) {
-    declared.retain(|(id, _)| *id != run.setup_id);
+/// once nothing is (New stock loaded, or each skip undone), with whether
+/// some of it was dropped by a project edit (`run::Run::declared_lost`).
+fn keep_declared(declared: &mut Vec<(String, run::Declared, bool)>, run: &run::Run) {
+    declared.retain(|(id, ..)| *id != run.setup_id);
     let now = run.declared();
-    if !now.0.is_empty() || !now.1.is_empty() {
-        declared.push((run.setup_id.clone(), now));
+    if !now.0.is_empty() || !now.1.is_empty() || run.declared_lost {
+        declared.push((run.setup_id.clone(), now, run.declared_lost));
     }
 }
 

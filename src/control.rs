@@ -4634,6 +4634,11 @@ impl Connection {
             .map(|r| (r.partly(), r.cut_by()))
         {
             _ if later && p.probe.is_ok() => Some("Operations or steps after the start are taken as cut, and the check does not follow the stock they cut where a probe finds this work zero.".into()),
+            Some((Some(partly), _))
+                if p.probe.is_ok() && partly.cut == [crate::run::DECLARED_LOST] =>
+            {
+                Some("Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut where a probe finds this work zero.".into())
+            }
             Some((None, _)) => Some(crate::run::PARTWAY_UNKNOWN.to_string()),
             // Not a part of the stock: the reason the check cannot tell it.
             Some((Some(partly), _))
@@ -4673,11 +4678,17 @@ impl Connection {
         let (Some(run), Ok(p)) = (&self.run, self.run_program()) else {
             return vec![];
         };
-        if run.later_cut() {
+        if run.later_cut() || run.declared_lost {
             // What operations or steps after the start, taken as cut, cut is
-            // in no stock the check found (LIO-582).
+            // in no stock the check found (LIO-582), nor what was taken as
+            // cut and dropped since (LIO-583 review).
+            let why = if run.later_cut() {
+                crate::run::LATER_UNFOLLOWED_WHY
+            } else {
+                crate::run::DECLARED_LOST_WHY
+            };
             (p.probe_from.iter())
-                .map(|(r, _)| (*r, Err(crate::run::LATER_UNFOLLOWED_WHY.to_string())))
+                .map(|(r, _)| (*r, Err(why.to_string())))
                 .collect()
         } else if run.on_cut_stock() {
             run.partly().map_or_else(Vec::new, |x| x.probe_from.clone())

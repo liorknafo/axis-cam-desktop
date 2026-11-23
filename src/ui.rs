@@ -11708,10 +11708,26 @@ fn stock_question<'a>(
     });
     // Another setup's cuts the check does not follow: only new stock
     // clears them (LIO-582 review).
-    stock.or_else(|| {
+    let stock = stock.or_else(|| {
         run.earlier_unfollowed().then(|| {
             column![
                 text("Another setup's run cut this part in a way the check does not follow.")
+                    .size(12),
+                small(
+                    "New stock loaded",
+                    (!running).then_some(Message::Run(R::NewStock)),
+                    false,
+                ),
+            ]
+            .spacing(4)
+        })
+    });
+    // What was taken as cut and dropped by a project edit: only new stock
+    // clears it (LIO-583 review).
+    stock.or_else(|| {
+        run.declared_lost.then(|| {
+            column![
+                text("Operations or steps of this setup were taken as cut before the project changed.")
                     .size(12),
                 small(
                     "New stock loaded",
@@ -13483,6 +13499,22 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
     };
     let o = &p.ops[run.from.min(p.ops.len() - 1)];
     let skipped = run.taken_as_cut();
+    // Partway only by what was taken as cut and dropped since: nothing it
+    // takes as cut to name (LIO-583 review).
+    if skipped.is_empty() && run.declared_lost {
+        return vec![
+            format!(
+                "This run starts at {} (tool run {}). Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut: set Z by hand on a surface whose height you know, or press New stock loaded below if the stock is new.",
+                o.name,
+                run.next + 1
+            ),
+            if run.zeroed {
+                "The work zero is set for this start.".into()
+            } else {
+                "Cycle Start waits until you press Keep this work zero, or New stock loaded.".into()
+            },
+        ];
+    }
     let mut steps = vec![format!(
         "This run starts at {} (tool run {}), taking {} as cut: nothing of {} is sent. Load {} and set the work zero on the stock they left.",
         o.name,
