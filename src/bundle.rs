@@ -113,6 +113,13 @@ pub fn pack_with(
 pub struct Runs {
     pub format: u32,
     pub setups: Vec<crate::run::TabletSetup>,
+    /// Every setup of the project by id, in order, on whatever machine
+    /// (LIO-610): "Setup N" is a setup's place in it, as the computer counts
+    /// it, where `setups` holds only the UC100 ones. Added without a new
+    /// `format`, as a tablet that does not know it reads the file as before
+    /// (`Runs.plan` in axis-shop's `runs.ts`); none in a file from before.
+    #[serde(default)]
+    pub plan: Vec<String>,
 }
 
 pub fn runs(doc: &Document, mesh: Result<&crate::mesh::Mesh, &str>) -> Runs {
@@ -120,7 +127,12 @@ pub fn runs(doc: &Document, mesh: Result<&crate::mesh::Mesh, &str>) -> Runs {
         .filter(|&si| crate::model::get(&doc.setups[si].machine.p, "controller") == "UC100")
         .map(|si| crate::run::tablet_runs(doc, mesh, si))
         .collect();
-    Runs { format: 1, setups }
+    let plan = doc.setups.iter().map(|s| s.id.clone()).collect();
+    Runs {
+        format: 1,
+        setups,
+        plan,
+    }
 }
 
 /// The part, for the runs and the steps worked out for the tablet; not
@@ -329,6 +341,39 @@ mod tests {
         assert_eq!(file_name(Path::new(r"C:\x\..\b.stl")).unwrap(), "b.stl");
         assert!(file_name(Path::new("part/..")).is_err());
         assert!(open(&tablet.path().join("tablet.axis.json"), tablet.path()).is_err());
+    }
+
+    /// The tablet file lists every setup of the project by id, in order,
+    /// whatever machine it is on (LIO-610): with Setup 1 on a lathe and
+    /// Setups 2 and 3 on a UC100, the tablet counts the third "Setup 3" as
+    /// the computer does, not "Setup 2" from the UC100 setups alone.
+    #[test]
+    fn the_tablet_file_lists_every_setup_whatever_its_machine() {
+        let mut doc = Document::sample();
+        let mut uc100 = doc.setups[0].machine.clone();
+        uc100.p.insert("controller".into(), "UC100".into());
+        let lathe = crate::model::Setup::new(crate::lathe::defaults(), "G54");
+        let second = crate::model::Setup::new(uc100.clone(), "G54");
+        let third = crate::model::Setup::new(uc100, "G55");
+        doc.setups = vec![lathe, second, third];
+        let ids: Vec<String> = doc.setups.iter().map(|s| s.id.clone()).collect();
+        let bytes = pack_with(&doc, Err("no part")).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut json = vec![];
+        (zip.by_name(RUNS).unwrap().read_to_end(&mut json)).unwrap();
+        // As the tablet reads it (`Runs.plan?: string[]`): an array of the
+        // setup ids under `plan`, the format unchanged.
+        let raw: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(raw["plan"], serde_json::json!(ids));
+        assert_eq!(raw["format"], 1);
+        let runs: Runs = serde_json::from_slice(&json).unwrap();
+        assert_eq!(runs.plan, ids);
+        let on_uc100: Vec<&str> = runs.setups.iter().map(|s| s.setup_id.as_str()).collect();
+        assert_eq!(on_uc100, [&ids[1], &ids[2]]);
+        assert!(!on_uc100.contains(&ids[0].as_str()));
+        // A tablet file from before it still reads, with no plan.
+        let older: Runs = serde_json::from_str(r#"{"format":1,"setups":[]}"#).unwrap();
+        assert!(older.plan.is_empty() && older.setups.is_empty());
     }
 
     /// The tablet file carries the hand setups' Steps screens and every
