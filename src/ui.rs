@@ -11625,12 +11625,12 @@ fn stock_question<'a>(
 ) -> Option<iced::widget::Column<'a, Message>> {
     use crate::run::Action as R;
     let running = run.running.is_some();
-    // This setup's runs cut a part earlier this session: is it still
-    // the one held? Asked on a row of its own, so the work zero's
+    // This setup's runs cut a part earlier, this session or before AXIS
+    // CAM was last closed (LIO-594): is it still the one held? Asked on a row of its own, so the work zero's
     // buttons keep their room (LIO-582 review).
     let stock = (run.stock_unconfirmed && run.away.is_none()).then(|| {
         column![
-            text("This setup's runs cut a part this session. Is it still the one held?").size(12),
+            text("This setup's runs cut a part earlier. Is it still the one held?").size(12),
             row![
                 small(
                     "Same part",
@@ -11720,7 +11720,7 @@ fn stock_question<'a>(
 
 /// What the Work zero tab asks of a setup whose runs cut a part before a
 /// disconnect from the machine (`run::Run::away`, LIO-595).
-pub const AWAY_ASKED: &str = "This setup's runs cut a part this session, and the machine was disconnected since. Is it still the one held, and did anything else run on the machine meanwhile?";
+pub const AWAY_ASKED: &str = "This setup's runs cut a part earlier, and the machine was disconnected or AXIS CAM closed since. Is it still the one held, and did anything else run on the machine meanwhile?";
 
 /// Said with New stock loaded on the Work zero tab while runs this
 /// computer did not follow may have cut the part (`run::Run::history_unknown`).

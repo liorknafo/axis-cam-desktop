@@ -308,7 +308,7 @@ pub(crate) const LATER_UNFOLLOWED: &str = "stock the operations or steps after t
 /// `LATER_UNFOLLOWED` cut.
 pub(crate) const LATER_UNFOLLOWED_WHY: &str = "Operations or steps after the start are taken as cut, and the check does not follow the stock they cut.";
 
-/// What this setup's runs cut earlier this session, said as `Partly::cut`,
+/// What this setup's runs cut earlier, said as `Partly::cut`,
 /// while the operator has not said whether the same part is still held
 /// (`Run::stock_unconfirmed`).
 pub(crate) const STOCK_UNCONFIRMED: &str =
@@ -320,11 +320,11 @@ const STOCK_UNCONFIRMED_WHY: &str = "This setup's runs cut the stock earlier: sa
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed`.
-const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier this session: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
+const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed` after a disconnect (`Run::away`, LIO-595).
-pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier this session, and the machine was disconnected since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
+pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier, and the machine was disconnected or AXIS CAM closed since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
 
 /// What runs this computer did not follow may have cut, said as
 /// `Partly::cut` (`HISTORY_UNKNOWN` in `Run::cut_in_run`): another
@@ -344,15 +344,15 @@ pub(crate) const HISTORY_UNFOLLOWED_BLOCKED: &str = "Runs this computer did not 
 /// the check does not simulate it before this setup as it was cut
 /// (`Run::earlier_unfollowed`).
 pub(crate) const EARLIER_UNFOLLOWED: &str =
-    "stock another setup's run cut this session, which the check does not simulate as it was cut";
+    "stock another setup's run cut earlier, which the check does not simulate as it was cut";
 
 /// Why a probe cannot find a work zero from a spot of a stock
 /// `EARLIER_UNFOLLOWED` cut.
-const EARLIER_UNFOLLOWED_WHY: &str = "Another setup's run cut this part this session in a way the check does not follow: an operation disabled or changed since, or its setup deleted or moved after this one.";
+const EARLIER_UNFOLLOWED_WHY: &str = "Another setup's run cut this part earlier in a way the check does not follow: an operation disabled or changed since, its setup deleted or moved after this one, or a setup this project does not have.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z where
 /// `EARLIER_UNFOLLOWED` cut (`Run::partway_blocked`).
-const EARLIER_UNFOLLOWED_BLOCKED: &str = "Another setup's run cut this part this session in a way the check does not follow (an operation disabled or changed since, or its setup deleted or moved after this one), so it cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero.";
+const EARLIER_UNFOLLOWED_BLOCKED: &str = "Another setup's run cut this part earlier in a way the check does not follow (an operation disabled or changed since, its setup deleted or moved after this one, or a setup this project does not have), so it cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero.";
 
 /// What a tool run of a run cut (`Run::cut_in_run`): the operation (index in
 /// the setup), all of it (None) or its steps before the one given, and the
@@ -361,7 +361,12 @@ pub type CutInRun = (usize, Option<usize>, Option<u64>);
 
 /// Notes in `cuts` (`Run::cut_in_run`) that operation `oi` was cut: all of
 /// it (None) or its steps before `steps`, from the plan and cutter `print`.
-fn note_cut_in(cuts: &mut Vec<CutInRun>, oi: usize, steps: Option<usize>, print: Option<u64>) {
+pub(crate) fn note_cut_in(
+    cuts: &mut Vec<CutInRun>,
+    oi: usize,
+    steps: Option<usize>,
+    print: Option<u64>,
+) {
     match cuts.iter_mut().find(|c| c.0 == oi) {
         Some(c) => {
             c.1 = match (c.1, steps) {
@@ -431,8 +436,10 @@ pub struct Run {
     /// as cut but know nothing of what was cut at or after it, nor of an
     /// operation since disabled or changed (`Run::partly`, LIO-582 review).
     pub cut_in_run: Vec<CutInRun>,
-    /// `cut_in_run` came from an earlier pick of this setup this session,
-    /// and the operator has not said whether the same part is still held
+    /// `cut_in_run` came from an earlier pick of this setup, this session
+    /// or before AXIS CAM was last closed (`CutHistory`, LIO-594), or
+    /// tells of runs whose cuts are not known (`HISTORY_UNKNOWN`), and the
+    /// operator has not said whether the same part is still held
     /// (`Action::SamePart`, `Action::NewStock`): nothing sets Z or probes
     /// until then (`partly`, LIO-582 review).
     pub stock_unconfirmed: bool,
@@ -837,6 +844,81 @@ impl Journal {
             _ => format!("{} days ago", s / 86400),
         }
     }
+}
+
+/// What each setup's runs cut, kept on disk beside the machines' journals
+/// (`uc100/cuts.json`, `App::run_cuts`), so that it survives closing AXIS
+/// CAM (LIO-594): a setup picked again in a new session takes it as this
+/// session's, and asks whether the same part is still held
+/// (`Run::stock_unconfirmed`). Written as it changes: a tool run as it
+/// starts counts as cutting all it runs (`Run::cuts_so_far`), so a session
+/// that ends mid-run, AXIS CAM killed say, has kept no less than it cut.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CutHistory {
+    /// By setup id, what its runs cut (`Run::cut_in_run`). Kept empty for
+    /// a setup whose runs cut nothing since New stock loaded only while
+    /// `others_unknown`.
+    pub cuts: Vec<(String, Vec<CutInRun>)>,
+    /// The journals of where runs stopped as the sessions that kept `cuts`
+    /// wrote them (`KeptJournal`).
+    #[serde(default)]
+    pub journals: Vec<KeptJournal>,
+    /// What runs cut was lost (this file could not be read): a setup with
+    /// no entry in `cuts` was cut by runs no session here knows of
+    /// (`HISTORY_UNKNOWN`), until New stock loaded for it.
+    #[serde(default)]
+    pub others_unknown: bool,
+    /// The tool runs this computer sent a Pi (`control::sent_tool_runs`),
+    /// the latest `SENT_KEPT`: each kept as cut here before it was sent,
+    /// none ran while it was away (LIO-595), whichever session sent it.
+    #[serde(default)]
+    pub sent: Vec<u64>,
+}
+
+/// How many of the tool runs sent a Pi `CutHistory::sent` keeps.
+pub const SENT_KEPT: usize = 1000;
+
+/// A journal (`Journal`) as the session that kept what its run cut
+/// (`CutHistory::cuts`) wrote it: the setup's, in the machine's journal
+/// file named `file` (`Connection::journal_name`), its very text. Read back
+/// as it is, it tells of runs that history has; any other journal there,
+/// or none where this one was, of runs it may not have (another session's
+/// that kept none, an older AXIS CAM's), whose cuts are not known
+/// (`App::journal_known`).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct KeptJournal {
+    pub setup: String,
+    pub file: String,
+    pub text: String,
+}
+
+impl CutHistory {
+    /// The history kept at `path`: Ok(None) when there is none yet, Err
+    /// when there is one that cannot be read.
+    pub fn read(path: &std::path::Path) -> Result<Option<Self>, String> {
+        match std::fs::read(path) {
+            Ok(data) => serde_json::from_slice(&data)
+                .map(Some)
+                .map_err(|e| e.to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    pub fn write(&self, path: &std::path::Path) -> Result<(), String> {
+        #[cfg(test)]
+        if FAIL_CUT_WRITES.with(|f| f.get()) {
+            return Err("a write refused for the test".into());
+        }
+        let data = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
+        crate::storage::write_atomic(path, &data)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: `CutHistory::write` fails.
+    pub(crate) static FAIL_CUT_WRITES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Seconds since 1970, now.
@@ -2599,11 +2681,30 @@ impl Run {
     /// runs, the machine disconnected say, which no outcome then tells
     /// (LIO-582 review).
     pub fn cuts_so_far(&self) -> Vec<CutInRun> {
+        match &self.running {
+            Some(r) => self.cuts_with(r.index, r.from),
+            None => self.cut_in_run.clone(),
+        }
+    }
+
+    /// `cuts_so_far` once Cycle Start starts the next tool run
+    /// (`next`, `from`): what is kept on disk before it is sent (LIO-594
+    /// review).
+    pub fn cuts_if_started(&self) -> Vec<CutInRun> {
+        let mut cuts = self.cuts_so_far();
+        let started = self.cuts_with(self.next, self.from);
+        for (oi, steps, print) in started {
+            note_cut_in(&mut cuts, oi, steps, print);
+        }
+        cuts
+    }
+
+    /// `cut_in_run` and tool run `index` from its operation `from` on, all
+    /// of each.
+    fn cuts_with(&self, index: usize, from: usize) -> Vec<CutInRun> {
         let mut cuts = self.cut_in_run.clone();
-        if let Some(r) = &self.running
-            && let Some(p) = self.checked().and_then(|c| c.get(r.index))
-        {
-            for &oi in &p.indexes[r.from.min(p.indexes.len())..] {
+        if let Some(p) = self.checked().and_then(|c| c.get(index)) {
+            for &oi in &p.indexes[from.min(p.indexes.len())..] {
                 let print = self.op_steps(oi).map(|s| s.cut_print);
                 note_cut_in(&mut cuts, oi, None, print);
             }
@@ -10093,7 +10194,7 @@ pub(crate) mod tests {
             // New stock loaded: forgotten, in the session's record too.
             run.earlier_cuts.clear();
             let mut kept = session.clone();
-            crate::keep_run_cuts(&mut kept, &run);
+            crate::keep_run_cuts(&mut kept, &run, false);
             assert!(kept.is_empty(), "{kept:?}");
             assert!(!run.earlier_unfollowed());
         }
