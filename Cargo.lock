@@ -5794,7 +5794,7 @@ dependencies = [
 [[package]]
 name = "uc100-remote"
 version = "0.1.0"
-source = "git+https://github.com/liorknafo/uc100-server.git?rev=00d74fd9d45ce59e34be292d8cf6a612caec0bc2#00d74fd9d45ce59e34be292d8cf6a612caec0bc2"
+source = "git+https://github.com/liorknafo/uc100-server.git?rev=185fa8f1d8b04fb1c2c881947c9d2ef545f5f71a#185fa8f1d8b04fb1c2c881947c9d2ef545f5f71a"
 dependencies = [
  "clap",
  "env_logger",
