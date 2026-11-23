@@ -5138,6 +5138,213 @@ flood = { pin = 8 }
         another_computers_tool_run_after_this_ones_stop(false);
     }
 
+    /// Another computer paired with the Pi of `server` (its data in `dir`),
+    /// in control: as the Pi's operator's laptop is.
+    fn another_computer_in_control(
+        dir: &std::path::Path,
+        server: &uc100_remote::Server,
+    ) -> uc100_remote::RemoteController {
+        let code = uc100_remote::data::Data {
+            dir: dir.join("pi"),
+        }
+        .new_code()
+        .unwrap();
+        let addr = server.addr().to_string();
+        let token = uc100_remote::RemoteController::pair(&addr, &code, "Laptop").unwrap();
+        let other = uc100_remote::RemoteController::watch(&addr, token);
+        other.take_control();
+        let mut deadline = Deadline::new(10.);
+        while other.link().state != uc100_remote::LinkState::Controlling {
+            assert!(deadline.within(&other.snapshot()), "no control");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        other
+    }
+
+    /// `other`, in control, runs a tool run numbered `id` on the Pi of
+    /// `server`: a short move in the air, as far as this test goes; on a
+    /// part, a pass that cuts deeper. Returns once it ended.
+    fn another_computers_tool_run(
+        other: &uc100_remote::RemoteController,
+        server: &uc100_remote::Server,
+        id: u64,
+    ) {
+        use uc100::controller::Command;
+        use uc100::gcode::{Action as Do, Located};
+        let mut up = server.snapshot().unwrap().machine_pos;
+        up[2] += 1.0;
+        let job = Command::Job {
+            name: "Laptop's pass".into(),
+            actions: std::sync::Arc::new(vec![Located {
+                line: 1,
+                action: Do::Move {
+                    target: up,
+                    feed: None,
+                },
+            }]),
+        };
+        let mut deadline = Deadline::new(5.);
+        let made_from = loop {
+            let (snapshot, ack) = other.acked();
+            if let Some(a) = ack.filter(|a| a.applied >= a.sent) {
+                break a.seq;
+            }
+            assert!(deadline.within(&snapshot), "the other's ack");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(other.send_tool_run(id, job, vec![], None, made_from));
+        let mut deadline = Deadline::new(10.);
+        while !other.link().tool_run_ends.iter().any(|e| e.id == id) {
+            assert!(deadline.within(&other.snapshot()), "the other's end");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The Face, 2 mm a pass, stopped on the Pi after pass 1, this computer
+    /// linked to the Pi through a relay the test can cut: pass 2 starts on
+    /// the floor pass 1 left, Z−2, which this session's record knows
+    /// (LIO-596).
+    fn face_stopped_on_the_pi_after_pass_1(
+        dir: &std::path::Path,
+    ) -> (App, uc100_remote::Server, Relay) {
+        let mut a = run_app_of(dir, &fast_z_slow(), &[0, 3]);
+        let face = &mut a.doc.setups[0].operations[0].p;
+        face.insert("stepdown".into(), "2".into());
+        face.insert("feed".into(), "6000".into());
+        let server = to_pi(&mut a, dir);
+        let relay = Relay::to(server.addr());
+        // Connected again through the relay (`stop_after`'s `zeroed`).
+        let _ = a.update(Message::PiAddress(relay.addr.to_string()));
+        let journal = stop_after(&mut a, 0, 0);
+        assert_eq!((journal.op, journal.step), (0, Some(0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        (a, server, relay)
+    }
+
+    /// Cuts the relay of `face_stopped_on_the_pi_after_pass_1` until this
+    /// computer's link is down, long enough for the Pi to free its control.
+    fn drop_the_link(a: &mut App, relay: &Relay) {
+        relay.set_cut(true);
+        pi_live(a, false, "the link down");
+        // The Pi frees control once it has not heard from this computer
+        // for its silence time.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while std::time::Instant::now() < end {
+            let _ = a.update(Message::Tick);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Ticks until this computer's link to the Pi is back and it is in
+    /// control (`control`), or watching another computer in control.
+    fn link_back(a: &mut App, relay: &Relay, control: bool) {
+        relay.set_cut(false);
+        pi_live(a, true, "the link back");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while conn(a).in_control() != control || conn(a).watching() == control {
+            let _ = a.update(Message::Tick);
+            assert!(
+                std::time::Instant::now() < end,
+                "timed out waiting for control {control}: {:?}",
+                conn(a).link.as_ref().map(|l| &l.state)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = a.update(Message::Tick);
+    }
+
+    /// The Face stopped after pass 1 on the Pi, the link drops, and another
+    /// computer takes control and runs a tool run (LIO-596). On the part it
+    /// may cut pass 2 to Z−4. The link back, no Disconnect having happened,
+    /// the start at pass 2 must not set Z on pass 1's floor from this
+    /// session's record: it is unknown, and the run says why.
+    #[test]
+    fn a_tool_run_another_computer_ran_while_the_pi_link_was_down_makes_the_cut_record_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server, relay) = face_stopped_on_the_pi_after_pass_1(dir.path());
+        drop_the_link(&mut a, &relay);
+        let other = another_computer_in_control(dir.path(), &server);
+        another_computers_tool_run(&other, &server, 99);
+        other.shutdown();
+        link_back(&mut a, &relay, true);
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        let z = conn(&a).touch_off().map(|(_, w)| w[2]);
+        assert_eq!(z, None, "Set Z offered from this session's record alone");
+        assert!(conn(&a).partway_blocked().is_some());
+        let unknown = |r: &crate::run::Run| {
+            (r.cut_in_run.iter()).any(|c| c.0 == crate::run::HISTORY_UNKNOWN)
+        };
+        assert!(unknown(run_of(&a)), "{:?}", run_of(&a).cut_in_run);
+        let note = conn(&a).pi_note.clone().unwrap_or_default();
+        assert!(note.contains("did not send"), "{note}");
+        // Kept so: the setup picked again, the same part.
+        let _ = a.update(Message::Run(crate::run::Action::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        if run_of(&a).stock_unconfirmed {
+            let _ = a.update(Message::Run(crate::run::Action::SamePart));
+        }
+        assert!(unknown(run_of(&a)), "{:?}", run_of(&a).cut_in_run);
+        assert!(conn(&a).touch_off().is_none());
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// As above, but the other computer, having taken control while the
+    /// link was down, still holds it when the link is back: this computer
+    /// watches it, and whatever it does from now on, the record is unknown
+    /// at once, before any tool run of the other's shows (LIO-596).
+    #[test]
+    fn another_computer_in_control_when_the_pi_link_is_back_makes_the_cut_record_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server, relay) = face_stopped_on_the_pi_after_pass_1(dir.path());
+        drop_the_link(&mut a, &relay);
+        let other = another_computer_in_control(dir.path(), &server);
+        link_back(&mut a, &relay, false);
+        assert!(conn(&a).touch_off().is_none(), "{:?}", run_of(&a).cut_in_run);
+        assert!(
+            (run_of(&a).cut_in_run.iter()).any(|c| c.0 == crate::run::HISTORY_UNKNOWN),
+            "{:?}",
+            run_of(&a).cut_in_run
+        );
+        // The other gives control up and this computer takes it back:
+        // still unknown.
+        other.shutdown();
+        let _ = a.update(Message::PiTakeControl);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !conn(&a).in_control() {
+            let _ = a.update(Message::Tick);
+            assert!(std::time::Instant::now() < end, "control back");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(conn(&a).touch_off().is_none(), "{:?}", run_of(&a).cut_in_run);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// The link drops long enough for the Pi to free control, and comes back
+    /// with nothing else run: this computer takes control again, its own
+    /// older connection perhaps still holding it for a moment. The record
+    /// stays this session's own, and pass 2 still touches off on pass 1's
+    /// floor (LIO-596: no evidence, no loss).
+    #[test]
+    fn a_pi_link_drop_with_nothing_else_run_keeps_the_cut_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _server, relay) = face_stopped_on_the_pi_after_pass_1(dir.path());
+        drop_the_link(&mut a, &relay);
+        link_back(&mut a, &relay, true);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < end {
+            let _ = a.update(Message::Tick);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// A tool run lost on the way to the Pi (the link failed as it
     /// crossed): it never runs and no outcome comes, so after a few seconds
     /// with the link live it is put back, nothing having moved, and Cycle
@@ -10392,6 +10599,71 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::OtherRunsMayHaveCut));
         assert!(run_of(&a).history_unknown() && conn(&a).touch_off().is_none());
         assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+    }
+
+    /// The Face stopped after pass 1, and another setup's runs cut too this
+    /// session, then the machine disconnected (LIO-596). The answer to
+    /// whether anything else ran, given once the Face's setup is picked, is
+    /// said of the part: of the other setup's record too, not asked again
+    /// for it. Nothing else ran: both kept. Other runs may have cut it:
+    /// both unknown.
+    #[test]
+    fn one_answer_after_a_disconnect_covers_every_setups_record() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 3]);
+        let face = &mut a.doc.setups[0].operations[0].p;
+        face.insert("stepdown".into(), "2".into());
+        face.insert("feed".into(), "6000".into());
+        stop_after(&mut a, 0, 0);
+        answer_skips(&mut a, 0);
+        // Another setup's runs cut its first operation whole this session.
+        let other = "lio596-other".to_string();
+        let cut: Vec<crate::run::CutInRun> = vec![(0, None, Some(1))];
+        a.run_cuts.push((other.clone(), cut.clone()));
+        let reconnect = |a: &mut App| {
+            let _ = a.update(Message::Disconnect);
+            assert!(a.run_away.iter().any(|(id, _)| *id == other), "{:?}", a.run_away);
+            let _ = a.update(Message::Connect);
+            tick_until(a, 5., "E-stop after connecting", |s| {
+                s.state == Some(State::EStop)
+            });
+            let _ = a.update(Message::MachineReset);
+            tick_until(a, 5., "Idle after Reset", |s| {
+                s.state == Some(State::Idle)
+            });
+            let _ = a.update(Message::Machine(crate::control::Action::KeepPosition));
+            tick_until(a, 3., "machine position kept", |s| {
+                s.referenced[..3].iter().all(|r| *r)
+            });
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(a, 0);
+            if run_of(a).programs.is_none() {
+                answer_skips(a, 0);
+            }
+            assert!(run_of(a).away.is_some());
+        };
+        let others = |a: &App| {
+            (a.run_cuts.iter()).find(|(id, _)| *id == other).map(|(_, c)| c.clone())
+        };
+        reconnect(&mut a);
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(a.run_away.is_empty(), "{:?}", a.run_away);
+        assert_eq!(others(&a), Some(cut.clone()));
+        assert!(!run_of(&a).history_unknown());
+        reconnect(&mut a);
+        let _ = a.update(Message::Run(R::OtherRunsMayHaveCut));
+        assert!(a.run_away.is_empty(), "{:?}", a.run_away);
+        let others = others(&a).unwrap();
+        assert!(others.iter().any(|c| c.0 == crate::run::HISTORY_UNKNOWN), "{others:?}");
+        let run = run_of(&a);
+        assert!(
+            (run.earlier_cuts.iter()).any(|(id, c)| *id == other
+                && c.iter().any(|c| c.0 == crate::run::HISTORY_UNKNOWN)),
+            "{:?}",
+            run.earlier_cuts
+        );
     }
 
     /// The Pi's tool run, Stop after step armed in the Face's pass 1, goes on
