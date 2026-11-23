@@ -5273,9 +5273,8 @@ flood = { pin = 8 }
         let z = conn(&a).touch_off().map(|(_, w)| w[2]);
         assert_eq!(z, None, "Set Z offered from this session's record alone");
         assert!(conn(&a).partway_blocked().is_some());
-        let unknown = |r: &crate::run::Run| {
-            (r.cut_in_run.iter()).any(|c| c.0 == crate::run::HISTORY_UNKNOWN)
-        };
+        let unknown =
+            |r: &crate::run::Run| (r.cut_in_run.iter()).any(|c| c.0 == crate::run::HISTORY_UNKNOWN);
         assert!(unknown(run_of(&a)), "{:?}", run_of(&a).cut_in_run);
         let note = conn(&a).pi_note.clone().unwrap_or_default();
         assert!(note.contains("did not send"), "{note}");
@@ -5304,7 +5303,11 @@ flood = { pin = 8 }
         drop_the_link(&mut a, &relay);
         let other = another_computer_in_control(dir.path(), &server);
         link_back(&mut a, &relay, false);
-        assert!(conn(&a).touch_off().is_none(), "{:?}", run_of(&a).cut_in_run);
+        assert!(
+            conn(&a).touch_off().is_none(),
+            "{:?}",
+            run_of(&a).cut_in_run
+        );
         assert!(
             (run_of(&a).cut_in_run.iter()).any(|c| c.0 == crate::run::HISTORY_UNKNOWN),
             "{:?}",
@@ -5320,7 +5323,11 @@ flood = { pin = 8 }
             assert!(std::time::Instant::now() < end, "control back");
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(conn(&a).touch_off().is_none(), "{:?}", run_of(&a).cut_in_run);
+        assert!(
+            conn(&a).touch_off().is_none(),
+            "{:?}",
+            run_of(&a).cut_in_run
+        );
         let _ = a.update(Message::Disconnect);
     }
 
@@ -5396,7 +5403,9 @@ flood = { pin = 8 }
         other.shutdown();
         let _ = a.update(Message::Disconnect);
         let _ = a.update(Message::Connect);
-        run_until(&mut a, 10., "the stop after pass 1", |r| r.running.is_none());
+        run_until(&mut a, 10., "the stop after pass 1", |r| {
+            r.running.is_none()
+        });
         tick_until(&mut a, 10., "Idle after the stop", |s| {
             s.state == Some(State::Idle)
         });
@@ -10718,15 +10727,17 @@ flood = { pin = 8 }
         a.run_cuts.push((other.clone(), cut.clone()));
         let reconnect = |a: &mut App| {
             let _ = a.update(Message::Disconnect);
-            assert!(a.run_away.iter().any(|(id, _)| *id == other), "{:?}", a.run_away);
+            assert!(
+                a.run_away.iter().any(|(id, _)| *id == other),
+                "{:?}",
+                a.run_away
+            );
             let _ = a.update(Message::Connect);
             tick_until(a, 5., "E-stop after connecting", |s| {
                 s.state == Some(State::EStop)
             });
             let _ = a.update(Message::MachineReset);
-            tick_until(a, 5., "Idle after Reset", |s| {
-                s.state == Some(State::Idle)
-            });
+            tick_until(a, 5., "Idle after Reset", |s| s.state == Some(State::Idle));
             let _ = a.update(Message::Machine(crate::control::Action::KeepPosition));
             tick_until(a, 3., "machine position kept", |s| {
                 s.referenced[..3].iter().all(|r| *r)
@@ -10739,7 +10750,9 @@ flood = { pin = 8 }
             assert!(run_of(a).away.is_some());
         };
         let others = |a: &App| {
-            (a.run_cuts.iter()).find(|(id, _)| *id == other).map(|(_, c)| c.clone())
+            (a.run_cuts.iter())
+                .find(|(id, _)| *id == other)
+                .map(|(_, c)| c.clone())
         };
         reconnect(&mut a);
         let _ = a.update(Message::Run(R::SamePart));
@@ -10750,7 +10763,10 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::OtherRunsMayHaveCut));
         assert!(a.run_away.is_empty(), "{:?}", a.run_away);
         let others = others(&a).unwrap();
-        assert!(others.iter().any(|c| c.0 == crate::run::HISTORY_UNKNOWN), "{others:?}");
+        assert!(
+            others.iter().any(|c| c.0 == crate::run::HISTORY_UNKNOWN),
+            "{others:?}"
+        );
         let run = run_of(&a);
         assert!(
             (run.earlier_cuts.iter()).any(|(id, c)| *id == other

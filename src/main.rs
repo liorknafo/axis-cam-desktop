@@ -11874,9 +11874,8 @@ fn give_away(away: &[(String, run::Away)], run: &mut run::Run) {
         .find(|(id, _)| *id == run.setup_id)
         .filter(|_| !run.cuts_so_far().is_empty());
     let earlier = || {
-        away.iter().find(|(id, _)| {
-            (run.earlier_cuts.iter()).any(|(e, cuts)| e == id && !cuts.is_empty())
-        })
+        away.iter()
+            .find(|(id, _)| (run.earlier_cuts.iter()).any(|(e, cuts)| e == id && !cuts.is_empty()))
     };
     if let Some((_, a)) = own.or_else(earlier) {
         run.away = Some(a.clone());

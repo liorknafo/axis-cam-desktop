@@ -1647,7 +1647,8 @@ impl Run {
     /// what another setup's did that this one has (`earlier_cuts`, LIO-596).
     pub fn history_unknown(&self) -> bool {
         (self.cut_in_run.iter()).any(|c| c.0 == HISTORY_UNKNOWN)
-            || (self.earlier_cuts.iter()).any(|(_, cuts)| cuts.iter().any(|c| c.0 == HISTORY_UNKNOWN))
+            || (self.earlier_cuts.iter())
+                .any(|(_, cuts)| cuts.iter().any(|c| c.0 == HISTORY_UNKNOWN))
     }
 
     /// Something else may have cut the part: the Pi showed a tool run this
@@ -10162,7 +10163,10 @@ pub(crate) mod tests {
         let unknown = |run: &Run| run.partly().is_some_and(|p| p.cut == [HISTORY_UNFOLLOWED]);
         let said = |run: &Run| {
             let why = run.partway_blocked().unwrap();
-            assert!(why.starts_with("Runs this computer did not follow"), "{why}");
+            assert!(
+                why.starts_with("Runs this computer did not follow"),
+                "{why}"
+            );
         };
         assert!(run.history_unknown() && unknown(&run) && run.touch_off().is_none());
         said(&run);
@@ -10180,12 +10184,22 @@ pub(crate) mod tests {
         // Kept across a disconnect, setup 1's record is asked about when
         // setup 2 is picked, though setup 2's runs cut nothing: the answer
         // is said of the part (LIO-596).
-        let away = vec![(doc.setups[0].id.clone(), Away { seen: Some(vec![7]) })];
+        let away = vec![(
+            doc.setups[0].id.clone(),
+            Away {
+                seen: Some(vec![7]),
+            },
+        )];
         let mut run = Run::new(&doc, 1, 0);
         crate::give_earlier_cuts(&session, &mut run);
         crate::give_away(&away, &mut run);
         assert!(run.stock_unconfirmed);
-        assert_eq!(run.away, Some(Away { seen: Some(vec![7]) }));
+        assert_eq!(
+            run.away,
+            Some(Away {
+                seen: Some(vec![7])
+            })
+        );
         // Nothing of setup 1's kept: nothing to ask.
         let mut run = Run::new(&doc, 1, 0);
         crate::give_earlier_cuts(&[], &mut run);

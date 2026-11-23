@@ -6250,7 +6250,9 @@ impl Connection {
         runs.sort_unstable();
         runs.dedup();
         let holder = match &link.state {
-            uc100_remote::LinkState::Watching { holder: Some(h) } if link.name.as_ref() != Some(h) => {
+            uc100_remote::LinkState::Watching { holder: Some(h) }
+                if link.name.as_ref() != Some(h) =>
+            {
                 Some(h.clone())
             }
             _ => None,
