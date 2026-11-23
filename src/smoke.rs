@@ -10207,6 +10207,24 @@ flood = { pin = 8 }
             other.release_control();
             other
         });
+        // Connected, the setup picked and checked and answered before the
+        // first Tick: the connection has no link yet, and it waits too
+        // (LIO-595 review).
+        let _ = a.update(Message::Connect);
+        assert!(conn(&a).pi.is_some() && conn(&a).link.is_none());
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert!(run_of(&a).away.is_some());
+        assert_eq!(
+            conn(&a).same_part_refused(),
+            Some(crate::control::PI_LISTS_PENDING)
+        );
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+        let _ = a.update(Message::Disconnect);
         let gate = pi_through_a_gate(&mut a, &server);
         assert!(conn(&a).link.as_ref().is_some_and(|l| !l.live));
         let _ = a.update(Message::Run(R::Setup(0)));

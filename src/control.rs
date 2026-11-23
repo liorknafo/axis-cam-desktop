@@ -6179,14 +6179,16 @@ impl Connection {
     }
 
     fn same_part_refused_for(&self, run: &crate::run::Run) -> Option<&'static str> {
-        let (Some(away), Some(link)) = (&run.away, &self.link) else {
+        let away = run.away.as_ref()?;
+        if self.pi.is_none() {
             return None;
-        };
-        // The server sends its lists before it says who controls the
-        // machine, which a live link has heard.
-        if !link.live {
-            return Some(PI_LISTS_PENDING);
         }
+        // The server sends its lists before it says who controls the
+        // machine, which a live link has heard; before the first refresh
+        // of a Pi connection there is no link (LIO-595 review).
+        let Some(link) = self.link.as_ref().filter(|l| l.live) else {
+            return Some(PI_LISTS_PENDING);
+        };
         let seen = away.seen.as_ref()?;
         let sent = sent_tool_runs();
         (link.tool_run_ends.iter().map(|e| e.id))
@@ -6196,9 +6198,14 @@ impl Connection {
     }
 
     /// The tool runs the Pi has, going or ended, as far as this computer
-    /// heard (`run::Away::seen`); None when it is not a Pi.
+    /// heard (`run::Away::seen`): none before its link's first refresh, so
+    /// that every tool run this computer did not send counts as run while
+    /// it was away. None when it is not a Pi.
     pub fn pi_tool_runs(&self) -> Option<Vec<u64>> {
-        let link = self.link.as_ref()?;
+        self.pi.as_ref()?;
+        let Some(link) = self.link.as_ref() else {
+            return Some(vec![]);
+        };
         Some(
             (link.tool_run_ends.iter().map(|e| e.id))
                 .chain(link.tool_run_going.iter().copied())
