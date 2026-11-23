@@ -1629,6 +1629,28 @@ pub struct App {
     /// by setup id, until the operator says whether anything else ran on
     /// it meanwhile (`run::Run::away`, LIO-595).
     run_away: Vec<(String, run::Away)>,
+    /// The journals of where runs stopped as this session, or the one
+    /// that kept `run_cuts` before it, wrote them (`run::KeptJournal`,
+    /// LIO-594).
+    cut_journals: Vec<run::KeptJournal>,
+    /// What runs cut was lost (`run::CutHistory::others_unknown`).
+    others_unknown: bool,
+    /// Where `run_cuts` is kept (`run::CutHistory`), and what was last
+    /// written or read there; None after it could not be read, so it is
+    /// written anew.
+    cuts_path: PathBuf,
+    cuts_kept: Option<run::CutHistory>,
+    /// When `cuts_kept` last could not be written: tried again a second
+    /// later (LIO-594 review).
+    cuts_failed: Option<Instant>,
+    /// The file's modified time and length when last looked at: changed,
+    /// another AXIS CAM wrote it (`refresh_cut_history`).
+    cuts_seen: Option<(Option<std::time::SystemTime>, u64)>,
+    /// What another AXIS CAM kept, taken in as this update began, says it
+    /// cut the run's setup since: a Cycle Start pressed now sends nothing.
+    cuts_grew: bool,
+    /// The connection's `journal_changes` last seen.
+    journal_changes_seen: u64,
     /// For a setup whose run was dropped while a tool run ran: that tool run
     /// (index, and the operation it started at) and what was cut before it.
     /// `run_cuts` counts that tool run as cutting all it was to cut; a
@@ -2166,6 +2188,39 @@ impl App {
         .map(|b| iced::widget::svg::Handle::from_memory(b.to_vec()))
         .collect();
         let generate_inline = smoke_dir.is_some() || cfg!(test);
+        // What setups' runs cut before AXIS CAM was last closed (LIO-594).
+        let cuts_path = cut_history_path(&state_path);
+        let (history, cuts_kept) = match run::CutHistory::read(&cuts_path) {
+            Ok(h) => {
+                let h = h.unwrap_or_default();
+                (h.clone(), Some(h))
+            }
+            Err(e) => {
+                // A copy is kept to look at; the file itself stays until what
+                // replaces it, every history unknown, is written over it
+                // (`keep_cut_history`), so a failed write leaves it unknown
+                // when opened again (LIO-594 review).
+                let aside = cuts_path.with_file_name(format!("cuts-unreadable-{}.json", id()));
+                let kept = match std::fs::copy(&cuts_path, &aside) {
+                    Ok(_) => format!(" A copy is kept as {}.", aside.display()),
+                    Err(_) => String::new(),
+                };
+                status += &format!(
+                    " What the runs cut before AXIS CAM was last closed could not be read ({e}), so a setup picked to run asks for New stock loaded before anything sets Z from its stock.{kept}"
+                );
+                let lost = run::CutHistory {
+                    others_unknown: true,
+                    ..Default::default()
+                };
+                (lost, None)
+            }
+        };
+        // Kept from before AXIS CAM was closed, while which anything may
+        // have run on the machine, the Pi's tool runs then not known: asked
+        // as after a disconnect (LIO-595).
+        let run_away = (history.cuts.iter())
+            .map(|(id, _)| (id.clone(), run::Away { seen: None }))
+            .collect();
         Self {
             smoke_dir,
             smoke_step: 0,
@@ -2192,8 +2247,16 @@ impl App {
             pi_run: None,
             cnc_over_guide: None,
             run_on_connect: None,
-            run_cuts: vec![],
-            run_away: vec![],
+            run_cuts: history.cuts,
+            run_away,
+            cut_journals: history.journals,
+            others_unknown: history.others_unknown,
+            cuts_path,
+            cuts_kept,
+            cuts_failed: None,
+            cuts_seen: None,
+            cuts_grew: false,
+            journal_changes_seen: 0,
             run_pending: vec![],
             jog_key: None,
             run_epoch: 0,
@@ -3859,12 +3922,224 @@ impl App {
         }
         Task::none()
     }
+    /// Keeps what setups' runs cut on disk (`run::CutHistory`, LIO-594)
+    /// as it changes: `run_cuts`, the run's as far as its tool run may get
+    /// (`keep_run_cuts`), and the journal the connection last wrote or
+    /// removed as this session's.
+    fn keep_cut_history(&mut self) {
+        if let Some(c) = &self.control
+            && c.journal_changes != self.journal_changes_seen
+        {
+            self.journal_changes_seen = c.journal_changes;
+            let file = c.journal_name();
+            self.cut_journals.retain(|k| k.file != file);
+            if let Some((j, text, true)) = c.journal_text() {
+                self.cut_journals.push(run::KeptJournal {
+                    setup: j.setup,
+                    file,
+                    text,
+                });
+            }
+        }
+        // While a Cycle Start press waits, what it may send is kept as
+        // cut: what the press kept stays (LIO-594 review).
+        let starting = self.control.as_ref().is_some_and(|c| c.press_waits());
+        let history = self.cut_history(starting);
+        if self.cuts_kept.as_ref() == Some(&history)
+            || (self.cuts_failed).is_some_and(|t| t.elapsed() < Duration::from_secs(1))
+        {
+            return;
+        }
+        let _ = self.write_cut_history(starting);
+    }
+    /// Takes in what another AXIS CAM open on the same folder wrote, once
+    /// the file changed since it was last looked at: before anything this
+    /// update does sets Z from the stock (LIO-594 review).
+    fn refresh_cut_history(&mut self) {
+        let seen = std::fs::metadata(&self.cuts_path)
+            .ok()
+            .map(|m| (m.modified().ok(), m.len()));
+        self.cuts_grew = false;
+        if seen != self.cuts_seen {
+            self.cuts_seen = seen;
+            self.cuts_grew = self.sync_cut_history();
+        }
+    }
+    /// Takes in what another AXIS CAM open on the same folder kept since
+    /// this one last read or wrote it (`cuts_kept`), so that writing over
+    /// it loses nothing, and a setup picked here knows it (LIO-594
+    /// review). Each setup's cuts it changed are added to this one's, as
+    /// is each journal it kept, and `others_unknown`: what it forgot (New
+    /// stock loaded there) stays known here, the safe side. A run of a
+    /// setup it cut, no tool run running, asks again whether the same part
+    /// is held, and a work zero set for its start before is set again or
+    /// kept anew. Whether that run's cuts grew.
+    fn sync_cut_history(&mut self) -> bool {
+        let theirs = match run::CutHistory::read(&self.cuts_path) {
+            Ok(Some(h)) => h,
+            Ok(None) => return false,
+            // Unreadable as this one opened: it is replaced as it was.
+            Err(_) if self.cuts_kept.is_none() => return false,
+            // Unreadable since: what it held is lost.
+            Err(_) => return self.note_history_lost(),
+        };
+        if self.cuts_kept.as_ref() == Some(&theirs) {
+            return false;
+        }
+        let mut grew = theirs.others_unknown && !self.others_unknown && self.note_history_lost();
+        let base = self.cuts_kept.take().unwrap_or_default();
+        let mut live = self.control.as_mut().and_then(|c| c.run.as_mut());
+        let mut earlier = false;
+        for (id, cuts) in &theirs.cuts {
+            let before = base.cuts.iter().find(|(s, _)| s == id).map(|(_, c)| c);
+            if before == Some(cuts) || cuts.is_empty() {
+                continue;
+            }
+            let add = |into: &mut Vec<run::CutInRun>| {
+                for &(oi, steps, print) in cuts {
+                    run::note_cut_in(into, oi, steps, print);
+                }
+            };
+            match self.run_cuts.iter_mut().find(|(s, _)| s == id) {
+                Some((_, mine)) => add(mine),
+                None => self.run_cuts.push((id.clone(), cuts.clone())),
+            }
+            match live.as_deref_mut() {
+                Some(r) if r.setup_id == *id => {
+                    let before = r.cut_in_run.clone();
+                    add(&mut r.cut_in_run);
+                    if r.cut_in_run != before {
+                        grew = true;
+                        if r.running.is_none() {
+                            r.stock_unconfirmed = true;
+                            r.zeroed = false;
+                        }
+                    }
+                }
+                // Another setup's: in the part the run cuts, which the
+                // check has only while it simulates them as they were cut
+                // (`Run::earlier_unfollowed`).
+                Some(r) => {
+                    match r.earlier_cuts.iter_mut().find(|(s, _)| s == id) {
+                        Some((_, mine)) => add(mine),
+                        None => r.earlier_cuts.push((id.clone(), cuts.clone())),
+                    }
+                    if !r.earlier_given.contains(id) {
+                        r.earlier_given.push(id.clone());
+                    }
+                    earlier = true;
+                }
+                None => {}
+            }
+        }
+        if let Some(r) = live.filter(|r| earlier && r.earlier_unfollowed()) {
+            grew = true;
+            if r.running.is_none() {
+                r.zeroed = false;
+            }
+        }
+        for k in theirs.journals.iter() {
+            if !base.journals.contains(k) && !self.cut_journals.contains(k) {
+                self.cut_journals.push(k.clone());
+            }
+        }
+        self.others_unknown |= theirs.others_unknown;
+        self.cuts_kept = Some(theirs);
+        grew
+    }
+    /// What runs cut, kept on disk, was lost (the file unreadable since,
+    /// or another AXIS CAM found it so): every setup's cuts are unknown
+    /// from here on (`others_unknown`, `run::HISTORY_UNKNOWN`), the run's
+    /// too, which, no tool run running, asks again whether the same part is
+    /// held and is no longer zeroed for its start (LIO-594 review).
+    /// Whether that is new.
+    fn note_history_lost(&mut self) -> bool {
+        self.others_unknown = true;
+        for (_, cuts) in &mut self.run_cuts {
+            run::note_cut_in(cuts, run::HISTORY_UNKNOWN, None, None);
+        }
+        let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) else {
+            return false;
+        };
+        if r.cut_in_run.iter().any(|c| c.0 == run::HISTORY_UNKNOWN) {
+            return false;
+        }
+        r.note_history_unknown();
+        if r.running.is_none() {
+            r.stock_unconfirmed = true;
+            r.zeroed = false;
+        }
+        true
+    }
+    /// What setups' runs cut, as kept on disk (`run::CutHistory`): the
+    /// run's as far as its tool run may get, or, `starting`, as far as the
+    /// tool run Cycle Start starts may get (`Run::cuts_if_started`).
+    fn cut_history(&self, starting: bool) -> run::CutHistory {
+        let mut cuts = self.run_cuts.clone();
+        if let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref()) {
+            let cut = match starting {
+                true => r.cuts_if_started(),
+                false => r.cuts_so_far(),
+            };
+            keep_cuts_of(&mut cuts, r, self.others_unknown, cut);
+        }
+        run::CutHistory {
+            cuts,
+            journals: self.cut_journals.clone(),
+            others_unknown: self.others_unknown,
+        }
+    }
+    /// Writes what setups' runs cut (`cut_history`, `starting`), with what
+    /// another AXIS CAM on the same folder kept taken in first
+    /// (`sync_cut_history`), the file locked meanwhile. One that cannot be
+    /// written is not taken as kept: tried again a second later, and said
+    /// once.
+    fn write_cut_history(&mut self, starting: bool) -> Result<(), String> {
+        let lock = self.cuts_path.with_extension("lock");
+        let written = (|| {
+            if let Some(dir) = lock.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock)
+                .map_err(|e| e.to_string())?;
+            file.lock().map_err(|e| e.to_string())?;
+            if self.sync_cut_history() && starting {
+                return Err(CUT_ELSEWHERE.into());
+            }
+            let history = self.cut_history(starting);
+            if self.cuts_kept.as_ref() != Some(&history) {
+                history.write(&self.cuts_path)?;
+            }
+            Ok(history)
+        })();
+        match written {
+            Ok(history) => {
+                self.cuts_kept = Some(history);
+                self.cuts_failed = None;
+                Ok(())
+            }
+            Err(e) if e == CUT_ELSEWHERE => Err(e),
+            Err(e) => {
+                if self.cuts_failed.is_none() {
+                    self.status = format!(
+                        "What the runs cut could not be kept on disk ({e}): Cycle Start sends nothing until it is. Tried again each second."
+                    );
+                }
+                self.cuts_failed = Some(Instant::now());
+                Err(e)
+            }
+        }
+    }
     /// Disables the machine and stops its controller, if connected.
     pub fn disconnect_machine(&mut self) {
         self.switch_machine = None;
         if let Some(mut c) = self.control.take() {
             if let Some(old) = &c.run {
-                keep_run_cuts(&mut self.run_cuts, old);
+                keep_run_cuts(&mut self.run_cuts, old, self.others_unknown);
                 keep_pending_cuts(&mut self.run_pending, old);
                 keep_away(&mut self.run_away, old);
             }
@@ -4514,6 +4789,7 @@ impl App {
     /// check does not wait for the machine to stand still: the Pi drives
     /// it, not this computer.
     fn follow_pi_run(&mut self, f: run::Follow) -> Task<Message> {
+        self.sync_cut_history();
         let Some(c) = self.control.as_mut() else {
             return Task::none();
         };
@@ -4536,12 +4812,13 @@ impl App {
         self.run_epoch += 1;
         let skipped = !f.skips.is_empty();
         if let Some(old) = &c.run {
-            keep_run_cuts(&mut self.run_cuts, old);
+            keep_run_cuts(&mut self.run_cuts, old, self.others_unknown);
             keep_pending_cuts(&mut self.run_pending, old);
             keep_away(&mut self.run_away, old);
         }
         let (index, from) = (f.index, f.from);
         let mut following = run::Run::following(&self.doc, si, self.run_epoch, f);
+        note_lost_cuts(&mut self.run_cuts, self.others_unknown, &following.setup_id);
         // It follows a tool run cutting the part: the same part (LIO-582).
         if let Some((_, cuts)) = (self.run_cuts.iter()).find(|(id, _)| *id == following.setup_id) {
             following.cut_in_run = cuts.clone();
@@ -6458,6 +6735,7 @@ impl App {
             })
         })
         .flatten();
+        self.refresh_cut_history();
         let task = match fault::guard(|| self.handle(message)) {
             Ok(task) => task,
             Err(fault) => {
@@ -6465,6 +6743,7 @@ impl App {
                 Task::none()
             }
         };
+        self.keep_cut_history();
         // A problem the status line still reports, which an edit that says
         // nothing of its own has put right, is cleared (LIO-396).
         if self.status == before {
@@ -8623,6 +8902,8 @@ impl App {
                 };
                 match opened {
                     Ok(mut c) => {
+                        self.journal_changes_seen = c.journal_changes;
+                        c.keep_cuts = true;
                         if let Some(kept) = self.pi_run.take() {
                             c.resume_pi_run(kept);
                             // Its cuts were kept across the disconnect:
@@ -8786,6 +9067,11 @@ impl App {
                 }
             }
             Message::Run(run::Action::Setup(si)) => {
+                // What another AXIS CAM open on this folder kept since
+                // (LIO-594 review).
+                if self.control.is_some() {
+                    self.sync_cut_history();
+                }
                 let Some(c) = &mut self.control else {
                     return Task::none();
                 };
@@ -8799,22 +9085,36 @@ impl App {
                 }
                 self.run_epoch += 1;
                 // Where a run of it stopped, picked once it is checked.
-                let (journal, journal_own) = match c.journal_own() {
-                    Some((j, own)) if j.setup == self.doc.setups[si].id => (Some(j), own),
-                    _ => (None, false),
-                };
+                let id = self.doc.setups[si].id.clone();
+                let (journal, journal_own, journal_gone) =
+                    journal_known(&self.cut_journals, c, &id);
+                // A journal kept for it there that is gone or written over
+                // tells nothing more: what it left unknown is in its cuts
+                // from here on (`HISTORY_UNKNOWN`), until New stock loaded.
+                if !journal_own {
+                    let file = c.journal_name();
+                    self.cut_journals
+                        .retain(|k| !(k.setup == id && k.file == file));
+                }
                 if let Some(old) = &c.run {
-                    keep_run_cuts(&mut self.run_cuts, old);
+                    keep_run_cuts(&mut self.run_cuts, old, self.others_unknown);
                     keep_pending_cuts(&mut self.run_pending, old);
                     keep_away(&mut self.run_away, old);
                 }
                 let mut r = run::Run::new(&self.doc, si, self.run_epoch);
                 (r.journal, r.journal_own) = (journal, journal_own);
-                // What its runs cut this session, until the operator says
-                // whether the same part is still there (LIO-582 review).
-                if let Some((_, cuts)) = (self.run_cuts.iter()).find(|(id, _)| *id == r.setup_id) {
+                // What its runs cut, this session or before AXIS CAM was
+                // last closed (LIO-594), until the operator says whether
+                // the same part is still there (LIO-582 review).
+                note_lost_cuts(&mut self.run_cuts, self.others_unknown, &id);
+                if let Some((_, cuts)) = (self.run_cuts.iter()).find(|(s, _)| *s == id)
+                    && !cuts.is_empty()
+                {
                     r.cut_in_run = cuts.clone();
                     r.stock_unconfirmed = true;
+                }
+                if journal_gone {
+                    r.note_history_unknown();
                 }
                 give_earlier_cuts(&self.run_cuts, &mut r);
                 give_away(&self.run_away, &mut r);
@@ -8921,8 +9221,52 @@ impl App {
                 if matches!(action, run::Action::CycleStart) && self.planning_busy().is_some() {
                     return Task::none();
                 }
+                // What the tool run may cut is kept on disk before it is
+                // sent: AXIS CAM killed while it runs knows it when opened
+                // again (LIO-594 review).
+                if matches!(action, run::Action::CycleStart)
+                    && let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref())
+                    && r.running.is_none()
+                {
+                    let kept_for = (r.setup_id.clone(), r.next, r.from);
+                    let kept = match self.cuts_grew {
+                        true => Err(CUT_ELSEWHERE.to_string()),
+                        false => self.write_cut_history(true),
+                    };
+                    if let Some(c) = &mut self.control {
+                        c.cuts_kept_for = kept.is_ok().then_some(kept_for);
+                    }
+                    if let Err(e) = kept {
+                        self.status = match e == CUT_ELSEWHERE {
+                            true => format!("Cycle Start sent nothing: {e}."),
+                            false => format!(
+                                "Cycle Start sent nothing: what the tool run may cut could not be kept on disk first ({e})."
+                            ),
+                        };
+                        return Task::none();
+                    }
+                }
                 if let Some(c) = &mut self.control {
+                    let new_stock = matches!(action, run::Action::NewStock)
+                        && (c.run.as_ref()).is_some_and(|r| r.running.is_none());
                     c.run_act(action, &self.doc);
+                    // New stock loaded: what runs cut before is forgotten,
+                    // and with it what a journal of theirs no session kept
+                    // left unknown. The journal there now is known from
+                    // here on, its run's cuts this session's (LIO-594).
+                    if new_stock
+                        && let Some(r) = &c.run
+                        && let Some((j, text, _)) = c.journal_text()
+                        && j.setup == r.setup_id
+                    {
+                        let file = c.journal_name();
+                        self.cut_journals.retain(|k| k.file != file);
+                        self.cut_journals.push(run::KeptJournal {
+                            setup: j.setup,
+                            file,
+                            text,
+                        });
+                    }
                 }
             }
             Message::RunChecked(epoch, programs) => {
@@ -11744,14 +12088,34 @@ fn computer_name() -> String {
 /// Keeps what `run` cut this session under its setup in `cuts` (`App::run_cuts`),
 /// a tool run it runs now as far as it may get (`Run::cuts_so_far`), or
 /// forgets it there once nothing is (new stock loaded).
-fn keep_run_cuts(cuts: &mut Vec<(String, Vec<run::CutInRun>)>, run: &run::Run) {
+/// `keep_empty` (`App::others_unknown`): a setup whose runs cut nothing
+/// since New stock loaded keeps its entry, empty, which tells it from one
+/// whose cuts were lost (LIO-594).
+fn keep_run_cuts(cuts: &mut Vec<(String, Vec<run::CutInRun>)>, run: &run::Run, keep_empty: bool) {
+    keep_cuts_of(cuts, run, keep_empty, run.cuts_so_far());
+}
+
+/// `keep_run_cuts`, `run` having cut `cut`.
+fn keep_cuts_of(
+    cuts: &mut Vec<(String, Vec<run::CutInRun>)>,
+    run: &run::Run,
+    keep_empty: bool,
+    cut: Vec<run::CutInRun>,
+) {
     // Earlier setups' it forgot (New stock loaded) are forgotten here too.
-    cuts.retain(|(id, _)| {
-        !run.earlier_given.contains(id) || run.earlier_cuts.iter().any(|(e, _)| e == id)
-    });
+    if keep_empty {
+        for (id, c) in cuts.iter_mut() {
+            if run.earlier_given.contains(id) && !run.earlier_cuts.iter().any(|(e, _)| e == id) {
+                c.clear();
+            }
+        }
+    } else {
+        cuts.retain(|(id, _)| {
+            !run.earlier_given.contains(id) || run.earlier_cuts.iter().any(|(e, _)| e == id)
+        });
+    }
     cuts.retain(|(id, _)| *id != run.setup_id);
-    let cut = run.cuts_so_far();
-    if !cut.is_empty() {
+    if keep_empty || !cut.is_empty() {
         cuts.push((run.setup_id.clone(), cut));
     }
 }
@@ -11799,6 +12163,51 @@ fn give_away(away: &[(String, run::Away)], run: &mut run::Run) {
     {
         run.away = Some(a.clone());
         run.stock_unconfirmed = true;
+    }
+}
+
+/// Why Cycle Start sent nothing: what another AXIS CAM open on the same
+/// folder kept, taken in as it was pressed, says it cut the run's setup
+/// since (`App::sync_cut_history`, LIO-594 review).
+const CUT_ELSEWHERE: &str = "another AXIS CAM open on this folder cut this setup since. Say under Work zero whether the same part is held, and set the work zero again";
+
+/// Where what setups' runs cut is kept (`run::CutHistory`), beside the
+/// machines' journals (LIO-594).
+fn cut_history_path(state_path: &std::path::Path) -> PathBuf {
+    let dir = state_path.parent().unwrap_or(std::path::Path::new("."));
+    dir.join("uc100").join("cuts.json")
+}
+
+/// What runs cut was lost (`App::others_unknown`): setup `id`, with no
+/// entry in `cuts` (`App::run_cuts`), was cut by runs no session here
+/// knows of (`run::HISTORY_UNKNOWN`), until New stock loaded for it.
+fn note_lost_cuts(cuts: &mut Vec<(String, Vec<run::CutInRun>)>, lost: bool, id: &str) {
+    if lost && !cuts.iter().any(|(s, _)| s == id) {
+        cuts.push((id.to_owned(), vec![(run::HISTORY_UNKNOWN, None, None)]));
+    }
+}
+
+/// The journal of where a run of setup `id` stopped on `c`'s machine, if
+/// any, whether its run's cuts are known, and whether a journal kept for
+/// it there is gone (LIO-594). Known: as this session wrote it
+/// (`run::read_own`), or as the session that kept what its runs cut wrote
+/// it (`kept`, `run::KeptJournal`), its very text. Gone: the journal kept
+/// for it in that file is no longer there, removed or written over by a
+/// session that kept none of what it cut, an older AXIS CAM's say, so what
+/// its runs cut since is not known either.
+fn journal_known(
+    kept: &[run::KeptJournal],
+    c: &control::Connection,
+    id: &str,
+) -> (Option<run::Journal>, bool, bool) {
+    let file = c.journal_name();
+    let mut kept = (kept.iter()).filter(|k| k.setup == id && k.file == file);
+    match c.journal_text() {
+        Some((j, text, own)) if j.setup == id => {
+            let known = own || kept.any(|k| k.text == text);
+            (Some(j), known, false)
+        }
+        _ => (None, false, kept.next().is_some()),
     }
 }
 

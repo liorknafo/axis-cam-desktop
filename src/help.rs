@@ -1904,15 +1904,15 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
             "Before the setup's first Cycle Start, set the work zero on the stock the operations before it leave, or keep it: Cycle Start waits for that.",
         ),
         SamePart => (
-            "The part this setup's runs cut earlier this session is still held, and nothing else has cut it since: what they cut stays the stock's, and the touch-off and probes go by it.",
-            "After a disconnect, it is off while the Pi shows a tool run this computer did not send.",
+            "The part this setup's runs cut earlier is still held, and nothing else has cut it since: what they cut stays the stock's, and the touch-off and probes go by it.",
+            "After a disconnect, or AXIS CAM opened again, it is off while the Pi shows a tool run this computer did not send.",
         ),
         OtherRunsMayHaveCut => (
-            "The part this setup's runs cut earlier this session is still held, but something else may have cut it while the machine was disconnected: another computer, or the Pi's own operator. No start sets Z or probes from the stock the check carves until New stock loaded: keep the work zero, or set Z by hand on a surface of known height.",
+            "The part this setup's runs cut earlier is still held, but something else may have cut it while the machine was disconnected or AXIS CAM closed: another computer, or the Pi's own operator. No start sets Z or probes from the stock the check carves until New stock loaded: keep the work zero, or set Z by hand on a surface of known height.",
             "",
         ),
         NewStock => (
-            "New stock is held: what this setup's runs cut earlier this session is forgotten, and the work zero is found on the new stock.",
+            "New stock is held: what this setup's runs cut earlier is forgotten, and the work zero is found on the new stock.",
             "",
         ),
         KeepZero => (
