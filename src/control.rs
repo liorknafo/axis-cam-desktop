@@ -2551,6 +2551,14 @@ pub struct PiRun {
     job_name: Option<String>,
     tool_run_id: Option<u64>,
 }
+impl PiRun {
+    /// Its run, kept for the link to come back: a project edit meanwhile
+    /// reaches it as it reaches the run picked (`App::run_follows_project`,
+    /// LIO-583 review).
+    pub fn run_mut(&mut self) -> &mut crate::run::Run {
+        &mut self.run
+    }
+}
 
 /// How long the Pi, the link live, may show neither having nor having
 /// ended a tool run sent to it before it is taken as lost on the way.

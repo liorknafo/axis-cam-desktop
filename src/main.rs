@@ -3593,6 +3593,15 @@ impl App {
             run.follow(&self.doc);
             run.unskip();
         }
+        // So is the run of a tool run left running on the Pi while this
+        // computer was disconnected, which connecting again follows: what
+        // it took as cut is dropped, and noted so (LIO-583 review).
+        if let Some(kept) = self.pi_run.as_mut() {
+            let run = kept.run_mut();
+            run.stale = true;
+            run.follow(&self.doc);
+            run.unskip();
+        }
         lose_declared(&mut self.run_declared);
     }
     fn touch(&mut self) {

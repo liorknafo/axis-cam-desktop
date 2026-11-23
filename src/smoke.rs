@@ -3185,6 +3185,54 @@ flood = { pin = 8 }
         );
     }
 
+    /// The Drill taken as cut, the Face sent to the Pi, this computer
+    /// disconnected while it runs and the project edited meanwhile (LIO-583
+    /// review): the run kept for the Pi's tool run drops what it took as
+    /// cut and notes it, as the run picked does, so connected again, and the
+    /// setup picked again once the Face is done, nothing sets Z or probes
+    /// until Keep this work zero or New stock loaded.
+    #[test]
+    fn an_edit_while_the_pi_runs_disconnected_drops_what_was_taken_as_cut() {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 1, Some(Skip::Cut)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5.0, "the Face running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Disconnect);
+        assert!(a.control.is_none() && a.pi_run.is_some(), "{}", a.status);
+        a.doc.title = format!("{} edited", a.doc.title);
+        a.touch();
+        let kept = a.pi_run.as_mut().unwrap().run_mut();
+        assert!(kept.skips.is_empty() && kept.declared_lost);
+        pi_until(&server, 60.0, "the Face's end", |s| {
+            s.state == Some(State::Idle) && s.program_outcome.as_ref().is_some_and(|o| o.ok)
+        });
+        let _ = a.update(Message::Connect);
+        run_until(&mut a, 10.0, "tool run 1 done", |r| r.done[0]);
+        assert!(run_of(&a).declared_lost);
+        // Picked again: what was taken as cut is not given back by its old
+        // index, and nothing sets Z.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::SamePart));
+        let run = run_of(&a);
+        assert!(run.skips.is_empty() && run.declared_lost, "{:?}", run.skips);
+        assert!(run.asks_zero() && !run.zeroed);
+        assert!(conn(&a).touch_off().is_none() && conn(&a).stock_top().is_err());
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        let _ = a.update(Message::Disconnect);
+        drop(server);
+    }
+
     /// A relay to `target` passing this computer's frames on, one part of a
     /// message in parts every `pace` (a slow link), and noting the snapshot
     /// number each part carries. It stops taking computers once the numbers
