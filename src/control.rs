@@ -2811,6 +2811,11 @@ pub fn sent_tool_runs() -> Vec<u64> {
 pub const RAN_ELSEWHERE: &str =
     "The Pi ran a tool run this computer did not send while it was disconnected.";
 
+/// Why Same part with nothing else run is refused when the machine was not
+/// reached through the Pi before the disconnect, and the Pi shows a tool run
+/// this computer did not send (`Connection::same_part_refused`).
+pub const PI_UNHEARD: &str = "The Pi shows a tool run this computer did not send, and the machine was not reached through the Pi before it was disconnected, so it may have run meanwhile.";
+
 /// Why Same part with nothing else run waits on a Pi whose link is not
 /// live yet (`Connection::same_part_refused`).
 pub const PI_LISTS_PENDING: &str =
@@ -6170,7 +6175,8 @@ impl Connection {
     /// is refused after a disconnect (`run::Run::away`, LIO-595): the Pi
     /// shows a tool run that ran while this computer was away, one it had
     /// not when the machine was disconnected nor this computer sent since
-    /// (`RAN_ELSEWHERE`); or the Pi's link is not live yet, so its lists of
+    /// (`RAN_ELSEWHERE`), or any it did not send when the machine was not
+    /// reached through the Pi then (`PI_UNHEARD`); or the Pi's link is not live yet, so its lists of
     /// tool runs are not heard on this connection (`PI_LISTS_PENDING`).
     pub fn same_part_refused(&self) -> Option<&'static str> {
         self.run
@@ -6189,12 +6195,18 @@ impl Connection {
         let Some(link) = self.link.as_ref().filter(|l| l.live) else {
             return Some(PI_LISTS_PENDING);
         };
-        let seen = away.seen.as_ref()?;
+        // Without the Pi's tool runs from before the disconnect (the machine
+        // was not reached through the Pi then), any this computer did not
+        // send may have run meanwhile (LIO-595 review).
+        let seen = away.seen.as_deref().unwrap_or(&[]);
         let sent = sent_tool_runs();
-        (link.tool_run_ends.iter().map(|e| e.id))
+        let other = (link.tool_run_ends.iter().map(|e| e.id))
             .chain(link.tool_run_going.iter().copied())
-            .any(|id| !seen.contains(&id) && !sent.contains(&id))
-            .then_some(RAN_ELSEWHERE)
+            .any(|id| !seen.contains(&id) && !sent.contains(&id));
+        other.then_some(match away.seen {
+            Some(_) => RAN_ELSEWHERE,
+            None => PI_UNHEARD,
+        })
     }
 
     /// The tool runs the Pi has, going or ended, as far as this computer

@@ -10274,6 +10274,115 @@ flood = { pin = 8 }
         assert!(!run_of(&a).stock_unconfirmed && run_of(&a).away.is_none());
     }
 
+    /// The Face stopped after pass 1 on the machine reached directly, then
+    /// disconnected, and the same machine reached through a Pi from then
+    /// on, where another computer ran a tool run meanwhile (LIO-595
+    /// review). This computer has no list of the Pi's tool runs from before
+    /// the disconnect, so any it did not send may have run meanwhile: Same
+    /// part with nothing else run is refused, and the start at pass 2 sets
+    /// no Z from this computer's record.
+    #[test]
+    fn same_part_after_a_disconnect_is_refused_on_a_pi_not_heard_from_before() {
+        use crate::run::Action as R;
+        use uc100::controller::Command;
+        use uc100::gcode::{Action as Do, Located};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 3]);
+        let face = &mut a.doc.setups[0].operations[0].p;
+        face.insert("stepdown".into(), "2".into());
+        face.insert("feed".into(), "6000".into());
+        let journal = stop_after(&mut a, 0, 0);
+        assert_eq!((journal.op, journal.step), (0, Some(0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        let _ = a.update(Message::Disconnect);
+        let server = to_pi(&mut a, dir.path());
+        // Through the Pi once, which starts its controller, and away again:
+        // the entry kept at the first disconnect still has no Pi list.
+        zeroed(&mut a);
+        let _ = a.update(Message::Disconnect);
+        // Another computer runs a tool run on the Pi.
+        let code = uc100_remote::data::Data {
+            dir: dir.path().join("pi"),
+        }
+        .new_code()
+        .unwrap();
+        let addr = server.addr().to_string();
+        let token = uc100_remote::RemoteController::pair(&addr, &code, "Laptop").unwrap();
+        let other = uc100_remote::RemoteController::watch(&addr, token);
+        other.take_control();
+        let mut deadline = Deadline::new(10.);
+        while other.link().state != uc100_remote::LinkState::Controlling {
+            assert!(deadline.within(&other.snapshot()), "no control");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut up = server.snapshot().unwrap().machine_pos;
+        up[2] += 1.0;
+        let job = Command::Job {
+            name: "Laptop".into(),
+            actions: std::sync::Arc::new(vec![Located {
+                line: 1,
+                action: Do::Move {
+                    target: up,
+                    feed: None,
+                },
+            }]),
+        };
+        let mut deadline = Deadline::new(10.);
+        let made_from = loop {
+            let (snapshot, ack) = other.acked();
+            if let Some(a) = ack.filter(|a| a.applied >= a.sent) {
+                break a.seq;
+            }
+            assert!(deadline.within(&snapshot), "the other's ack");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(other.send_tool_run(99595, job, vec![], None, made_from));
+        let mut deadline = Deadline::new(10.);
+        while !other.link().tool_run_ends.iter().any(|e| e.id == 99595) {
+            assert!(deadline.within(&other.snapshot()), "the other's end");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        other.shutdown();
+        let _ = a.update(Message::Connect);
+        pi_live(&mut a, true, "the Pi live");
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        // Face pass 2 picked, as in the issue: the journal here is the
+        // Pi's, not the one kept for the machine reached directly.
+        let _ = a.update(Message::Run(R::Steps(Some(0))));
+        let _ = a.update(Message::Run(R::PickStep(0, 1)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        assert!(run_of(&a).away.as_ref().is_some_and(|w| w.seen.is_none()));
+        assert_eq!(
+            conn(&a).same_part_refused(),
+            Some(crate::control::PI_UNHEARD)
+        );
+        let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        shows(&a, &[crate::ui::AWAY_ASKED, crate::control::PI_UNHEARD]);
+        let clicks = crate::ui::probe::clicks(a.view(), iced::Size::new(1440., 900.));
+        assert!(
+            !clicks
+                .iter()
+                .any(|m| matches!(m, Message::Run(R::SamePart)))
+        );
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+        assert!(conn(&a).touch_off().is_none());
+        let _ = a.update(Message::Run(R::OtherRunsMayHaveCut));
+        assert!(run_of(&a).history_unknown() && conn(&a).touch_off().is_none());
+        assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+    }
+
     /// The Pi's tool run, Stop after step armed in the Face's pass 1, goes on
     /// while this computer disconnects, connects to another machine, and
     /// back (LIO-582 review). Dropped while it ran, the run counted it as
