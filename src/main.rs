@@ -10808,6 +10808,13 @@ impl App {
                 }
                 if let Some(c) = &mut self.control {
                     c.refresh();
+                }
+                // Something else ran on the Pi, or holds it, or held it
+                // since, or the Pi restarted: what this session's runs cut
+                // is unknown from now on (LIO-596, LIO-597). Before a
+                // Cycle Start press waiting goes, on the snapshot just read.
+                self.note_done_elsewhere();
+                if let Some(c) = &mut self.control {
                     // A Cycle Start press waiting for the machine to show
                     // what was sent before it (LIO-562).
                     c.cycle_pending(&self.doc);
@@ -10872,10 +10879,6 @@ impl App {
                         };
                     }
                 }
-                // Something else ran on the Pi, or holds it, or held it
-                // since, or the Pi restarted: what this session's runs cut
-                // is unknown from now on (LIO-596, LIO-597).
-                self.note_done_elsewhere();
                 let phase_tab = self.phase_tab();
                 // AXIS CAM opened again while the Pi runs the tool run it
                 // sent before: its run, built anew, follows it, once the
