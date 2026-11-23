@@ -6186,9 +6186,7 @@ impl Connection {
 
     fn same_part_refused_for(&self, run: &crate::run::Run) -> Option<&'static str> {
         let away = run.away.as_ref()?;
-        if self.pi.is_none() {
-            return None;
-        }
+        self.pi.as_ref()?;
         // The server sends its lists before it says who controls the
         // machine, which a live link has heard; before the first refresh
         // of a Pi connection there is no link (LIO-595 review).
