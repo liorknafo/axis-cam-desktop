@@ -11746,6 +11746,26 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
         assert!(!run_of(&a).declared_lost && !run_of(&a).stock_unconfirmed);
+        // Taken as cut again, then the machine disconnected, the project
+        // edited meanwhile and the setup picked once connected again
+        // (LIO-583 review): what the session kept of it is not given back
+        // by its old indexes, but as dropped, and the same holds.
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).all_cut(), [(1, vec![0])]);
+        let _ = a.update(Message::Disconnect);
+        assert!(a.control.is_none());
+        a.doc.title = format!("{} again", a.doc.title);
+        a.touch();
+        assert_eq!(a.run_declared, [(a.doc.setups[0].id.clone(), (vec![], vec![]), true)]);
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).stock_unconfirmed);
+        let _ = a.update(Message::Run(R::SamePart));
+        refused(&a);
     }
 
     /// By touch in a 960 × 552 window (LIO-583 review), the Work zero tab of

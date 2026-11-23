@@ -3593,6 +3593,7 @@ impl App {
             run.follow(&self.doc);
             run.unskip();
         }
+        lose_declared(&mut self.run_declared);
     }
     fn touch(&mut self) {
         // A refused face's note belongs to the click before an edit (LIO-408).
@@ -12274,6 +12275,17 @@ fn keep_declared(declared: &mut Vec<(String, run::Declared, bool)>, run: &run::R
     let now = run.declared();
     if !now.0.is_empty() || !now.1.is_empty() || run.declared_lost {
         declared.push((run.setup_id.clone(), now, run.declared_lost));
+    }
+}
+
+/// The project changed: what each setup kept in `declared` took as cut is
+/// no longer taken as cut, its operations named by an index that may now
+/// name others or cut otherwise, but its material is still gone from the
+/// stock held (`run::Run::declared_lost`, LIO-583 review).
+fn lose_declared(declared: &mut [(String, run::Declared, bool)]) {
+    for (_, (skips, steps), lost) in declared {
+        *lost |= !skips.is_empty() || !steps.is_empty();
+        (*skips, *steps) = (vec![], vec![]);
     }
 }
 
