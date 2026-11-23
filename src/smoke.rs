@@ -11912,19 +11912,29 @@ flood = { pin = 8 }
             small.width >= wide.width - 0.5 && small.height >= wide.height - 0.5,
             "{small:?} of {wide:?}"
         );
-        // In the window itself, 960 × 552: the tab scrolled down, a finger
-        // on Keep this work zero presses it (LIO-583 review).
+        // In the window itself, 960 × 552: below the fold, a finger on Keep
+        // this work zero presses it only once the tab is scrolled down by
+        // the wheel (LIO-583 review). The presses keep off the scrollbars,
+        // whose presses would scroll the tab too.
         let window = iced::Size::new(960., 552.);
         let _ = a.update(Message::Resized(window));
-        let pressed = (crate::ui::probe::scrollables(a.view(), window).into_iter())
-            .filter(|(_, b)| b.width > 100. && b.height > 100.)
-            .any(|(_, b)| {
-                crate::ui::probe::presses_scrolled(a.view(), window, b.center(), 5000., 8.)
-                    .iter()
-                    .any(|(_, m)| matches!(m, Message::Run(R::KeepZero)))
-            });
+        let presses = |a: &App, down: f32| {
+            (crate::ui::probe::scrollables(a.view(), window).into_iter())
+                .filter(|(_, b)| b.width > 100. && b.height > 100.)
+                .any(|(_, b)| {
+                    let area = iced::Rectangle {
+                        width: b.width - crate::ui::SCROLLBAR_GUTTER,
+                        ..b
+                    };
+                    crate::ui::probe::presses_scrolled(a.view(), window, b.center(), down, area, 8.)
+                        .iter()
+                        .any(|(_, m)| matches!(m, Message::Run(R::KeepZero)))
+                })
+        };
+        let (before, after) = (presses(&a, 0.), presses(&a, 5000.));
         crate::ui::TOUCH.with(|t| t.set(false));
-        assert!(pressed, "Keep this work zero not pressed at 960 × 552, scrolled");
+        assert!(!before, "Keep this work zero pressed at 960 × 552 unscrolled: not below the fold");
+        assert!(after, "Keep this work zero not pressed at 960 × 552, scrolled");
     }
 
     /// A run started at the Drilling with the work zero on the stock top's

@@ -17264,14 +17264,16 @@ pub(crate) mod probe {
     ) -> Vec<(Point, Message)> {
         presses_after(page, window, None, area, step)
     }
-    /// `presses` over the whole window every `step` px, after the mouse
-    /// wheel scrolled `down` px over `over` (LIO-583 review): what a press
-    /// reaches once a scrollable there is scrolled, at the window's own size.
+    /// `presses` over `area` every `step` px, after the mouse wheel
+    /// scrolled `down` px (none: 0) over `over` (LIO-583 review): what a
+    /// press reaches once a scrollable there is scrolled, at the window's
+    /// own size. Keep `area` off the scrollbars, whose presses scroll too.
     pub(crate) fn presses_scrolled(
         page: Element<'_, Message>,
         window: Size,
         over: Point,
         down: f32,
+        area: iced::Rectangle,
         step: f32,
     ) -> Vec<(Point, Message)> {
         let mut renderer = renderer();
@@ -17290,10 +17292,10 @@ pub(crate) mod probe {
             &mut vec![],
         );
         let mut out = vec![];
-        let mut y = 0.;
-        while y < window.height {
-            let mut x = 0.;
-            while x < window.width {
+        let mut y = area.y;
+        while y < area.y + area.height {
+            let mut x = area.x;
+            while x < area.x + area.width {
                 let at = Point::new(x, y);
                 let mut messages = vec![];
                 for event in [
