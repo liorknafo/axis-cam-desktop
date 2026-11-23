@@ -5095,11 +5095,14 @@ flood = { pin = 8 }
             // nothing else run is refused (LIO-595).
             use crate::run::Action as R;
             assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
-            assert!(conn(&a).ran_elsewhere());
+            assert_eq!(
+                conn(&a).same_part_refused(),
+                Some(crate::control::RAN_ELSEWHERE)
+            );
             assert!(conn(&a).touch_off().is_none());
             let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
             let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
-            shows(&a, &[crate::ui::AWAY_ASKED, crate::ui::RAN_ELSEWHERE]);
+            shows(&a, &[crate::ui::AWAY_ASKED, crate::control::RAN_ELSEWHERE]);
             let clicks = crate::ui::probe::clicks(a.view(), iced::Size::new(1440., 900.));
             assert!(
                 !clicks
@@ -10065,7 +10068,7 @@ flood = { pin = 8 }
         // Away, then nothing else ran: the record holds.
         reconnect(&mut a);
         assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
-        assert!(!conn(&a).ran_elsewhere());
+        assert_eq!(conn(&a).same_part_refused(), None);
         assert_eq!(none_set(&a), crate::run::STOCK_AWAY_BLOCKED);
         assert_eq!(offered(&mut a), ["same", "other", "new"]);
         shows(&a, &[crate::ui::AWAY_ASKED]);
@@ -10116,6 +10119,141 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::NewStock));
         assert!(!run_of(&a).history_unknown());
         assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+    }
+
+    /// Connected again to the Pi after a disconnect, but its link not live
+    /// yet (its lists of tool runs not heard on this connection): Same part
+    /// with nothing else run is refused and says it waits for them, so an
+    /// answer given before the Pi has told what ran meanwhile does not
+    /// clear the question (LIO-595 review). Once live, with nothing else
+    /// run, it is taken.
+    #[test]
+    fn same_part_after_a_disconnect_waits_for_the_pis_tool_runs() {
+        same_part_waits_for_the_pi(false);
+    }
+
+    /// As `same_part_after_a_disconnect_waits_for_the_pis_tool_runs`, with
+    /// another computer's tool run on the Pi while this one was away
+    /// (LIO-595 review): once the link is live and its lists are heard,
+    /// Same part with nothing else run stays refused, and the other
+    /// answer leaves no start setting Z from the check's stock.
+    #[test]
+    fn same_part_after_a_disconnect_is_refused_once_the_pi_shows_another_tool_run() {
+        same_part_waits_for_the_pi(true);
+    }
+
+    fn same_part_waits_for_the_pi(foreign: bool) {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        cycle_start(&mut a);
+        tick_until(&mut a, 10.0, "running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Stop));
+        run_until(&mut a, 20.0, "the stop", |r| r.running.is_none());
+        tick_until(&mut a, 10.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(!run_of(&a).cut_in_run.is_empty());
+        let _ = a.update(Message::Disconnect);
+        // Another computer: a short move in the air, as its tool run.
+        let other = foreign.then(|| {
+            use uc100::controller::Command;
+            use uc100::gcode::{Action as Do, Located};
+            let code = uc100_remote::data::Data {
+                dir: dir.path().join("pi"),
+            }
+            .new_code()
+            .unwrap();
+            let addr = server.addr().to_string();
+            let token = uc100_remote::RemoteController::pair(&addr, &code, "Laptop").unwrap();
+            let other = uc100_remote::RemoteController::watch(&addr, token);
+            other.take_control();
+            let mut deadline = Deadline::new(5.);
+            while other.link().state != uc100_remote::LinkState::Controlling {
+                assert!(deadline.within(&other.snapshot()), "no control");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let mut up = server.snapshot().unwrap().machine_pos;
+            up[2] += 1.0;
+            let job = Command::Job {
+                name: "Laptop".into(),
+                actions: std::sync::Arc::new(vec![Located {
+                    line: 1,
+                    action: Do::Move {
+                        target: up,
+                        feed: None,
+                    },
+                }]),
+            };
+            let mut deadline = Deadline::new(5.);
+            let made_from = loop {
+                let (snapshot, ack) = other.acked();
+                if let Some(a) = ack.filter(|a| a.applied >= a.sent) {
+                    break a.seq;
+                }
+                assert!(deadline.within(&snapshot), "the other's ack");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            assert!(other.send_tool_run(99595, job, vec![], None, made_from));
+            let mut deadline = Deadline::new(10.);
+            while !other.link().tool_run_ends.iter().any(|e| e.id == 99595) {
+                assert!(deadline.within(&other.snapshot()), "the other's end");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            other.release_control();
+            other
+        });
+        let gate = pi_through_a_gate(&mut a, &server);
+        assert!(conn(&a).link.as_ref().is_some_and(|l| !l.live));
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+        assert_eq!(
+            conn(&a).same_part_refused(),
+            Some(crate::control::PI_LISTS_PENDING)
+        );
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+        let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        shows(
+            &a,
+            &[crate::ui::AWAY_ASKED, crate::control::PI_LISTS_PENDING],
+        );
+        let clicks = crate::ui::probe::clicks(a.view(), iced::Size::new(1440., 900.));
+        assert!(
+            !clicks
+                .iter()
+                .any(|m| matches!(m, Message::Run(R::SamePart)))
+        );
+        gate.set_open(true);
+        pi_live(&mut a, true, "the link live");
+        if let Some(other) = other {
+            // The Laptop's tool run shows: refused for good.
+            assert_eq!(
+                conn(&a).same_part_refused(),
+                Some(crate::control::RAN_ELSEWHERE)
+            );
+            let _ = a.update(Message::Run(R::SamePart));
+            assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_some());
+            let _ = a.update(Message::Run(R::OtherRunsMayHaveCut));
+            assert!(!run_of(&a).stock_unconfirmed && run_of(&a).history_unknown());
+            assert!(conn(&a).touch_off().is_none() && conn(&a).stock_top().is_err());
+            assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+            other.shutdown();
+            return;
+        }
+        // Live: nothing else ran, so it is taken.
+        assert_eq!(conn(&a).same_part_refused(), None);
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(!run_of(&a).stock_unconfirmed && run_of(&a).away.is_none());
     }
 
     /// The Pi's tool run, Stop after step armed in the Face's pass 1, goes on

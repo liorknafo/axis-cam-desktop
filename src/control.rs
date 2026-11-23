@@ -2801,10 +2801,20 @@ thread_local! {
 }
 
 /// The numbers of the tool runs this session sent a Pi: none of them ran
-/// while it was away (`Connection::ran_elsewhere`, LIO-595).
+/// while it was away (`Connection::same_part_refused`, LIO-595).
 pub fn sent_tool_runs() -> Vec<u64> {
     SENT_TOOL_RUNS.with(|s| s.borrow().clone())
 }
+
+/// Why Same part with nothing else run is refused while the Pi shows a
+/// tool run this computer did not send (`Connection::same_part_refused`).
+pub const RAN_ELSEWHERE: &str =
+    "The Pi ran a tool run this computer did not send while it was disconnected.";
+
+/// Why Same part with nothing else run waits on a Pi whose link is not
+/// live yet (`Connection::same_part_refused`).
+pub const PI_LISTS_PENDING: &str =
+    "Waiting for the Pi to say which tool runs it ran while this computer was disconnected.";
 
 /// The stops Stop after step on the Pi can make in the tool run last sent
 /// there, each with the journal of where it leaves the run
@@ -3991,7 +4001,7 @@ impl Connection {
             R::KeepZero if run.running.is_none() && run.partway() => run.zeroed = true,
             // Nothing else ran meanwhile: not while the Pi shows a tool run
             // this computer did not send (LIO-595).
-            R::SamePart if run.running.is_none() && !self.ran_elsewhere_for(&run) => {
+            R::SamePart if run.running.is_none() && self.same_part_refused_for(&run).is_none() => {
                 run.stock_unconfirmed = false;
                 run.away = None;
             }
@@ -6156,24 +6166,33 @@ impl Connection {
         run.resume_after(st.op, st.last);
     }
 
-    /// The run's setup was cut before a disconnect (`run::Run::away`), and
-    /// the Pi shows a tool run that ran while this computer was away: one
-    /// it had not when the machine was disconnected, nor this computer sent
-    /// since (LIO-595). The run's Same part (nothing else ran) is refused.
-    pub fn ran_elsewhere(&self) -> bool {
-        self.run.as_ref().is_some_and(|r| self.ran_elsewhere_for(r))
+    /// Why the run's Same part with nothing else run (`run::Action::SamePart`)
+    /// is refused after a disconnect (`run::Run::away`, LIO-595): the Pi
+    /// shows a tool run that ran while this computer was away, one it had
+    /// not when the machine was disconnected nor this computer sent since
+    /// (`RAN_ELSEWHERE`); or the Pi's link is not live yet, so its lists of
+    /// tool runs are not heard on this connection (`PI_LISTS_PENDING`).
+    pub fn same_part_refused(&self) -> Option<&'static str> {
+        self.run
+            .as_ref()
+            .and_then(|r| self.same_part_refused_for(r))
     }
 
-    fn ran_elsewhere_for(&self, run: &crate::run::Run) -> bool {
-        let (Some(seen), Some(link)) =
-            (run.away.as_ref().and_then(|a| a.seen.as_ref()), &self.link)
-        else {
-            return false;
+    fn same_part_refused_for(&self, run: &crate::run::Run) -> Option<&'static str> {
+        let (Some(away), Some(link)) = (&run.away, &self.link) else {
+            return None;
         };
+        // The server sends its lists before it says who controls the
+        // machine, which a live link has heard.
+        if !link.live {
+            return Some(PI_LISTS_PENDING);
+        }
+        let seen = away.seen.as_ref()?;
         let sent = sent_tool_runs();
         (link.tool_run_ends.iter().map(|e| e.id))
             .chain(link.tool_run_going.iter().copied())
             .any(|id| !seen.contains(&id) && !sent.contains(&id))
+            .then_some(RAN_ELSEWHERE)
     }
 
     /// The tool runs the Pi has, going or ended, as far as this computer

@@ -11653,13 +11653,13 @@ fn stock_question<'a>(
     // (LIO-595).
     let stock = stock.or_else(|| {
         (run.stock_unconfirmed && run.away.is_some()).then(|| {
-            let elsewhere = c.ran_elsewhere();
+            let refused = c.same_part_refused();
             let mut col = column![
                 text(AWAY_ASKED).size(12),
                 row![
                     small(
                         "Same part, nothing else ran",
-                        (!running && !elsewhere).then_some(Message::Run(R::SamePart)),
+                        (!running && refused.is_none()).then_some(Message::Run(R::SamePart)),
                         false,
                     ),
                     small(
@@ -11678,8 +11678,8 @@ fn stock_question<'a>(
                 .vertical_spacing(6),
             ]
             .spacing(4);
-            if elsewhere {
-                col = col.push(text(RAN_ELSEWHERE).size(12));
+            if let Some(why) = refused {
+                col = col.push(text(why).size(12));
             }
             col
         })
@@ -11724,11 +11724,6 @@ pub const AWAY_ASKED: &str = "This setup's runs cut a part this session, and the
 /// Said with New stock loaded on the Work zero tab while runs this
 /// computer did not follow may have cut the part (`run::Run::history_unknown`).
 pub const HISTORY_ASKED: &str = "Runs this computer did not follow may have cut this part, so nothing sets Z from the stock the check carves until new stock is loaded.";
-
-/// Said under `AWAY_ASKED` when the Pi shows a tool run this computer did
-/// not send (`control::Connection::ran_elsewhere`).
-pub const RAN_ELSEWHERE: &str =
-    "The Pi ran a tool run this computer did not send while it was disconnected.";
 
 fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a, Message> {
     let fit = Fit::of(app);

@@ -982,7 +982,7 @@ pub struct Away {
     /// The tool runs the Pi had, going or ended, when the machine was first
     /// disconnected since, with those this computer sent since: one it
     /// shows that is neither ran while this computer was away
-    /// (`control::Connection::ran_elsewhere`). None when it was not a Pi.
+    /// (`control::Connection::same_part_refused`). None when it was not a Pi.
     pub seen: Option<Vec<u64>>,
 }
 
