@@ -29,18 +29,20 @@ pub enum Action {
     /// leaves (`Run::partway`): the one those operations were cut with, or
     /// one set by hand on a surface they left.
     KeepZero,
-    /// The part this setup's runs cut this session is still the one held
-    /// (`Run::stock_unconfirmed`), and nothing else has cut it since: what
-    /// they cut stays the stock's. Refused after a disconnect while the Pi
-    /// shows a tool run this computer did not send (`Run::away`, LIO-595).
+    /// The part this setup's runs cut, or took as cut, this session is
+    /// still the one held (`Run::stock_unconfirmed`), and nothing else has
+    /// cut it since: what they cut stays the stock's. Refused after a
+    /// disconnect while the Pi shows a tool run this computer did not send
+    /// (`Run::away`, LIO-595).
     SamePart,
-    /// The part this setup's runs cut this session is still the one held,
-    /// but after a disconnect (`Run::away`) something else may have cut it
-    /// meanwhile: what this setup's runs cut is unknown
-    /// (`Run::note_history_unknown`) until New stock loaded (LIO-595).
+    /// The part this setup's runs cut, or took as cut (LIO-606), this
+    /// session is still the one held, but after a disconnect (`Run::away`)
+    /// something else may have cut it meanwhile: what this setup's runs cut
+    /// is unknown (`Run::note_history_unknown`) until New stock loaded
+    /// (LIO-595).
     OtherRunsMayHaveCut,
-    /// New stock is held: what this setup's runs cut this session is
-    /// forgotten (`Run::stock_unconfirmed`).
+    /// New stock is held: what this setup's runs cut, or took as cut, this
+    /// session is forgotten (`Run::stock_unconfirmed`).
     NewStock,
     CycleStart,
     Hold,
@@ -376,7 +378,7 @@ const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed` after a disconnect (`Run::away`, LIO-595).
-pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier, and the machine was disconnected or AXIS CAM closed since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
+pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier, or took operations or steps of it as cut, and the machine was disconnected or AXIS CAM closed since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
 
 /// What runs this computer did not follow may have cut, said as
 /// `Partly::cut` (`HISTORY_UNKNOWN` in `Run::cut_in_run`): another
@@ -625,9 +627,10 @@ pub struct Run {
     /// (`Action::SamePart`, `Action::NewStock`): nothing sets Z or probes
     /// until then (`partly`, LIO-582 review).
     pub stock_unconfirmed: bool,
-    /// `cut_in_run` was kept across a disconnect from the machine, while
-    /// which anything may have run on it (LIO-595): the operator is asked
-    /// too whether something else ran meanwhile (`Action::SamePart`,
+    /// `cut_in_run`, or what was taken as cut (`declared`, LIO-606), was
+    /// kept across a disconnect from the machine, while which anything may
+    /// have run on it (LIO-595): the operator is asked too whether
+    /// something else ran meanwhile (`Action::SamePart`,
     /// `Action::OtherRunsMayHaveCut`). Cleared once answered.
     pub away: Option<Away>,
     /// Operations or steps were taken as cut (`declared`) and dropped since:

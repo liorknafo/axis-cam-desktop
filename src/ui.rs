@@ -11664,7 +11664,13 @@ fn stock_question<'a>(
             // Why Same part with nothing else run is off, said above the
             // answers so it shows with them in a short window (LIO-595
             // review).
-            let mut col = column![text(AWAY_ASKED).size(12)].spacing(4);
+            // Only taken as cut, as above (LIO-606).
+            let asked = if run.cut_in_run.is_empty() {
+                AWAY_DECLARED_ASKED
+            } else {
+                AWAY_ASKED
+            };
+            let mut col = column![text(asked).size(12)].spacing(4);
             if let Some(why) = refused {
                 col = col.push(text(why).size(12).color(AMBER));
             }
@@ -11744,6 +11750,10 @@ fn stock_question<'a>(
 /// What the Work zero tab asks of a setup whose runs cut a part before a
 /// disconnect from the machine (`run::Run::away`, LIO-595).
 pub const AWAY_ASKED: &str = "This setup's runs cut a part earlier, and the machine was disconnected or AXIS CAM closed since. Is it still the one held, and did anything else run on the machine meanwhile?";
+
+/// `AWAY_ASKED` for a setup whose runs cut nothing but with operations or
+/// steps taken as cut (`run::Run::declared`, LIO-606).
+pub const AWAY_DECLARED_ASKED: &str = "Operations or steps of this setup were taken as cut earlier, and the machine was disconnected or AXIS CAM closed since. Is it still the same part, and did anything else run on the machine meanwhile?";
 
 /// Said with New stock loaded on the Work zero tab while runs this
 /// computer did not follow may have cut the part (`run::Run::history_unknown`).
