@@ -3030,6 +3030,18 @@ flood = { pin = 8 }
         run_of(a).op_steps(1).expect("the Drill's holes").clone()
     }
 
+    /// What the session keeps of setup `id` once all it took as cut was
+    /// dropped, by a project edit say (`App::run_declared`, LIO-583 review).
+    fn dropped_record(id: &str) -> crate::run::KeptDeclared {
+        crate::run::KeptDeclared {
+            setup: id.to_owned(),
+            skips: vec![],
+            steps: vec![],
+            lost: true,
+            prints: vec![],
+        }
+    }
+
     /// AXIS CAM closed (`a`, disconnected as closing does) and opened again
     /// on the same workspace and project: nothing of its run is left in
     /// memory, only what it kept on disk; the journals it wrote are
@@ -3276,7 +3288,7 @@ flood = { pin = 8 }
         // Let go, as another machine connected meanwhile does.
         a.pi_run = None;
         let setup = a.doc.setups[0].id.clone();
-        assert_eq!(a.run_declared, [(setup.clone(), (vec![], vec![]), true)]);
+        assert_eq!(a.run_declared, [dropped_record(&setup)]);
         let _ = a.update(Message::Connect);
         follow_again(&mut a).unwrap();
         let run = run_of(&a);
@@ -3288,7 +3300,7 @@ flood = { pin = 8 }
         assert!(conn(&a).touch_off().is_none());
         // Picked again: not given back by the old index, and nothing sets Z.
         let _ = a.update(Message::Run(R::Setup(0)));
-        assert_eq!(a.run_declared, [(setup, (vec![], vec![]), true)]);
+        assert_eq!(a.run_declared, [dropped_record(&setup)]);
         answer_skips(&mut a, 0);
         let _ = a.update(Message::Run(R::SamePart));
         let run = run_of(&a);
@@ -11907,7 +11919,7 @@ flood = { pin = 8 }
         let window = iced::Size::new(1440., 2400.);
         let texts = crate::ui::probe::texts(a.view(), window).join("\n");
         assert!(
-            texts.contains("Operations or steps of this setup were taken as cut this session. Is it still the same part?"),
+            texts.contains("Operations or steps of this setup were taken as cut earlier. Is it still the same part?"),
             "{texts}"
         );
         // The same part: still taken as cut, still waiting.
@@ -12029,16 +12041,344 @@ flood = { pin = 8 }
         assert!(a.control.is_none());
         a.doc.title = format!("{} again", a.doc.title);
         a.touch();
-        assert_eq!(
-            a.run_declared,
-            [(a.doc.setups[0].id.clone(), (vec![], vec![]), true)]
-        );
+        assert_eq!(a.run_declared, [dropped_record(&a.doc.setups[0].id)]);
         zeroed(&mut a);
         let _ = a.update(Message::Run(R::Setup(0)));
         answer_skips(&mut a, 0);
         assert!(run_of(&a).stock_unconfirmed);
         let _ = a.update(Message::Run(R::SamePart));
         refused(&a);
+    }
+
+    /// The Pocket's level 1 taken as cut in the run of setup 0 of
+    /// `ops_app`, connected and zeroed (LIO-611).
+    fn level_taken_as_cut(dir: &std::path::Path) -> App {
+        let mut a = ops_app(dir);
+        take_level(&mut a);
+        a
+    }
+
+    /// `level_taken_as_cut` in `a`.
+    fn take_level(a: &mut App) {
+        use crate::run::Action as R;
+        zeroed(a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(a, 0);
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(a, 0);
+        assert_eq!(run_of(a).all_cut(), [(1, vec![0])]);
+    }
+
+    /// What `dir`'s `uc100/cuts.json` keeps as taken as cut (LIO-611).
+    fn kept_declared(dir: &std::path::Path) -> Vec<crate::run::KeptDeclared> {
+        let path = dir.join("uc100").join("cuts.json");
+        (crate::run::CutHistory::read(&path).unwrap())
+            .unwrap_or_default()
+            .declared
+    }
+
+    /// Nothing sets Z or probes, and Cycle Start waits for the work zero.
+    fn sets_no_z(a: &App) {
+        assert!(run_of(a).asks_zero() && !run_of(a).zeroed);
+        assert!(conn(a).touch_off().is_none() && conn(a).stock_top().is_err());
+        assert!(conn(a).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+    }
+
+    /// LIO-611: the Pocket's level 1 taken as cut is kept on disk as it is
+    /// taken, with the print of the Pocket's plan, so that AXIS CAM closed
+    /// and opened again gives it back when the setup is picked: it asks
+    /// whether the same part is still held, and until then nothing sets Z
+    /// or probes and Cycle Start waits. Same part keeps it taken as cut,
+    /// the Face's touch-off still refused, for the level after it may have
+    /// cut where Z is touched off; New stock loaded forgets it, on disk
+    /// too.
+    #[test]
+    fn steps_taken_as_cut_before_axis_cam_was_closed_come_back_and_set_no_z() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = level_taken_as_cut(dir.path());
+        let setup = a.doc.setups[0].id.clone();
+        let print = run_of(&a).op_steps(1).unwrap().declared_print();
+        let kept = kept_declared(dir.path());
+        assert_eq!(
+            kept,
+            [crate::run::KeptDeclared {
+                setup: setup.clone(),
+                skips: vec![],
+                steps: vec![(1, vec![0])],
+                lost: false,
+                prints: vec![(1, Some(print))],
+            }]
+        );
+        let _ = a.update(Message::Disconnect);
+        let mut b = reopen(a, dir.path());
+        zeroed(&mut b);
+        let _ = b.update(Message::Run(R::Setup(0)));
+        assert!(run_of(&b).stock_unconfirmed);
+        assert_eq!(run_of(&b).declared_from, Some(vec![(1, Some(print))]));
+        answer_skips(&mut b, 0);
+        let run = run_of(&b);
+        assert_eq!(run.all_cut(), [(1, vec![0])]);
+        assert!(run.stock_unconfirmed && !run.declared_lost && run.declared_from.is_none());
+        sets_no_z(&b);
+        let _ = b.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let window = iced::Size::new(1440., 2400.);
+        let texts = crate::ui::probe::texts(b.view(), window).join("\n");
+        assert!(
+            texts.contains("Operations or steps of this setup were taken as cut earlier. Is it still the same part?"),
+            "{texts}"
+        );
+        // Same part: still taken as cut, and still nothing sets Z.
+        let _ = b.update(Message::Run(R::SamePart));
+        assert!(!run_of(&b).stock_unconfirmed);
+        assert_eq!(run_of(&b).all_cut(), [(1, vec![0])]);
+        sets_no_z(&b);
+        assert_eq!(kept_declared(dir.path()), kept);
+        // New stock loaded: forgotten, here and on disk.
+        let _ = b.update(Message::Run(R::NewStock));
+        let _ = b.update(Message::Tick);
+        answer_skips(&mut b, 0);
+        let run = run_of(&b);
+        assert!(run.all_cut().is_empty() && !run.stock_unconfirmed && !run.asks_zero());
+        assert!(conn(&b).touch_off().is_some());
+        assert_eq!(kept_declared(dir.path()), []);
+        let _ = b.update(Message::Disconnect);
+        let mut c = reopen(b, dir.path());
+        zeroed(&mut c);
+        let _ = c.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut c, 0);
+        assert!(run_of(&c).all_cut().is_empty() && !run_of(&c).stock_unconfirmed);
+        let _ = c.update(Message::Disconnect);
+    }
+
+    /// LIO-611 review: as above, but the setup picked on MACHINE before the
+    /// part is loaded (it loads only with Continue project): the check that
+    /// refuses for want of the part keeps the level taken as cut as it is,
+    /// on disk too, and nothing sets Z meanwhile. The part restored, the
+    /// setup is checked again, and it is as when the part was in first.
+    #[test]
+    fn steps_taken_as_cut_wait_for_the_part_after_axis_cam_opened_again() {
+        use crate::run::Action as R;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = level_taken_as_cut(dir.path());
+        let kept = kept_declared(dir.path());
+        let _ = a.update(Message::Disconnect);
+        let mut b = reopen(a, dir.path());
+        let mesh = b.imported_mesh.take().expect("the fixture's part");
+        zeroed(&mut b);
+        let _ = b.update(Message::Run(R::Setup(0)));
+        // As `App::check_run` answers with no part.
+        let epoch = run_of(&b).epoch;
+        let refused = Err(vec![crate::run::PART_NOT_LOADED.to_string()]);
+        let _ = b.update(Message::RunChecked(epoch, Arc::new(refused)));
+        let run = run_of(&b);
+        assert_eq!(run.all_cut(), [(1, vec![0])]);
+        assert!(run.declared_from.is_some() && !run.declared_lost && !run.recheck);
+        assert!(run.stock_unconfirmed && run.checked().is_none());
+        assert!(conn(&b).touch_off().is_none() && conn(&b).stock_top().is_err());
+        assert!(conn(&b).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        let _ = b.update(Message::Tick);
+        assert_eq!(kept_declared(dir.path()), kept);
+        // Continue project restores the part: checked again with it.
+        let file = b.doc.file.clone().expect("the fixture's file");
+        let _ = b.update(Message::ModelRestored(file, Ok(mesh)));
+        assert!(run_of(&b).recheck);
+        let _ = b.update(Message::Tick);
+        answer_skips(&mut b, 0);
+        let run = run_of(&b);
+        assert_eq!(run.all_cut(), [(1, vec![0])]);
+        assert!(!run.declared_lost && run.declared_from.is_none() && run.stock_unconfirmed);
+        sets_no_z(&b);
+        assert_eq!(kept_declared(dir.path()), kept);
+        let _ = b.update(Message::Run(R::SamePart));
+        assert_eq!(run_of(&b).all_cut(), [(1, vec![0])]);
+        sets_no_z(&b);
+        let _ = b.update(Message::Run(R::NewStock));
+        assert_eq!(kept_declared(dir.path()), []);
+        let _ = b.update(Message::Disconnect);
+    }
+
+    /// LIO-611: as above, but the Pocket changed while AXIS CAM was closed
+    /// (its stepdown, saved by another computer say): the level kept by its
+    /// index is not given back as taken as cut, as an edit drops it, and
+    /// with its material still gone from the stock held, nothing sets Z or
+    /// probes until New stock loaded, Same part or not. Dropped, it stays
+    /// so across closing AXIS CAM again.
+    #[test]
+    fn steps_taken_as_cut_before_the_project_changed_while_closed_set_no_z() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = level_taken_as_cut(dir.path());
+        let setup = a.doc.setups[0].id.clone();
+        let _ = a.update(Message::Disconnect);
+        let pocket = &mut a.doc.setups[0].operations[1];
+        assert_eq!(pocket.strategy, crate::model::Strategy::Pocket);
+        pocket.p.insert("stepdown".into(), "5".into());
+        let mut b = reopen(a, dir.path());
+        zeroed(&mut b);
+        let _ = b.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut b, 0);
+        // Its plan's print is not the one kept: dropped, and checked again.
+        let run = run_of(&b);
+        assert!(
+            run.all_cut().is_empty() && run.declared_lost && run.recheck,
+            "{:?}",
+            run.all_cut()
+        );
+        let _ = b.update(Message::Tick);
+        answer_skips(&mut b, 0);
+        let refused = |a: &App| {
+            let run = run_of(a);
+            assert!(run.all_cut().is_empty() && run.skips.is_empty() && run.declared_lost);
+            sets_no_z(a);
+            assert!(
+                problems(a)
+                    .iter()
+                    .any(|p| p.contains("taken as cut before the project changed")),
+                "{:?}",
+                problems(a)
+            );
+        };
+        refused(&b);
+        assert!(run_of(&b).stock_unconfirmed);
+        let _ = b.update(Message::Run(R::SamePart));
+        refused(&b);
+        assert_eq!(kept_declared(dir.path()), [dropped_record(&setup)]);
+        // Closed and opened again: still dropped, and asked again.
+        let _ = b.update(Message::Disconnect);
+        let mut c = reopen(b, dir.path());
+        zeroed(&mut c);
+        let _ = c.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut c, 0);
+        assert!(run_of(&c).stock_unconfirmed);
+        refused(&c);
+        let _ = c.update(Message::Run(R::SamePart));
+        refused(&c);
+        // New stock loaded: as any new part, here and on disk.
+        let _ = c.update(Message::Run(R::NewStock));
+        let run = run_of(&c);
+        assert!(!run.declared_lost && !run.asks_zero());
+        assert!(conn(&c).touch_off().is_some());
+        assert_eq!(kept_declared(dir.path()), []);
+        let _ = c.update(Message::Disconnect);
+    }
+
+    /// LIO-611: two AXIS CAMs open on the same folder. The second, opened
+    /// first, takes the Pocket's level 1 of its own setup as cut after the
+    /// first took that of its setup: writing what it knows keeps what the
+    /// first took. Picking the first's setup, it knows what was taken there;
+    /// skipping the Drill as cut there too, while the first's run is on that
+    /// setup, the first no longer holds what it took as the part's, and
+    /// nothing sets Z there until New stock loaded.
+    #[test]
+    fn another_axis_cam_on_the_folder_keeps_what_this_one_took_as_cut() {
+        use crate::run::{Action as R, Skip};
+        let dir = tempfile::tempdir().unwrap();
+        // The same project, but for the second's setup's id.
+        let mut a = ops_app(dir.path());
+        let mut b = ops_app(dir.path());
+        b.replace_document(a.doc.clone(), None);
+        b.imported_mesh = a.imported_mesh.clone();
+        b.page = Page::Control;
+        b.doc.setups[0].id = crate::id();
+        let own = b.doc.setups[0].id.clone();
+        zeroed(&mut b);
+        take_level(&mut a);
+        let first = a.doc.setups[0].id.clone();
+        let _ = b.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut b, 0);
+        let _ = b.update(Message::Run(R::Steps(Some(1))));
+        let _ = b.update(Message::Run(R::PickStep(1, 0)));
+        let _ = b.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut b, 0);
+        let kept = kept_declared(dir.path());
+        let setups: Vec<&str> = kept.iter().map(|k| k.setup.as_str()).collect();
+        assert_eq!(setups, [first.as_str(), own.as_str()], "{kept:?}");
+        // The first's setup, picked there: what was taken as cut, asked.
+        b.doc.setups[0].id = first.clone();
+        let _ = b.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut b, 0);
+        assert_eq!(run_of(&b).all_cut(), [(1, vec![0])]);
+        assert!(run_of(&b).stock_unconfirmed);
+        sets_no_z(&b);
+        let _ = b.update(Message::Run(R::SamePart));
+        assert!(skip(&mut b, 3, Some(Skip::Cut)));
+        let k = kept_declared(dir.path());
+        let k = k.iter().find(|k| k.setup == first).unwrap();
+        assert_eq!(
+            (&k.skips, &k.steps),
+            (&vec![(3, Skip::Cut)], &vec![(1, vec![0])])
+        );
+        // The first, its run on that setup still, takes it in.
+        assert!(!run_of(&a).declared_lost);
+        let _ = a.update(Message::Tick);
+        assert!(run_of(&a).declared_lost && !run_of(&a).zeroed);
+        sets_no_z(&a);
+        let _ = a.update(Message::Disconnect);
+        let _ = b.update(Message::Disconnect);
+    }
+
+    /// LIO-611: the Drill skipped as cut, the Face sent to the Pi, and AXIS
+    /// CAM closed while it cuts there; the Drill changed meanwhile (pecked,
+    /// saved by another computer say). Opened again and connected, the run
+    /// built anew follows the Face as it was sent, the Drill still skipped,
+    /// but what was taken as cut is the Drill as it was: none of it is kept
+    /// as taken as cut, and nothing sets Z, then or once the setup is
+    /// picked again.
+    #[test]
+    fn a_pi_tool_run_followed_after_the_project_changed_while_closed_sets_no_z() {
+        use crate::run::{Action as R, Skip};
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(skip(&mut a, 1, Some(Skip::Cut)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 5.0, "the Face running on the Pi", |s| {
+            s.state == Some(State::Run)
+        });
+        let _ = a.update(Message::Run(R::Hold));
+        pi_until(&server, 10.0, "Hold on the Pi", |s| {
+            s.state == Some(State::Hold)
+        });
+        let _ = a.update(Message::Disconnect);
+        let setup = a.doc.setups[0].id.clone();
+        let kept = kept_declared(dir.path());
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            (&kept[0].setup, &kept[0].skips),
+            (&setup, &vec![(1, Skip::Cut)])
+        );
+        let drill = &mut a.doc.setups[0].operations[1];
+        assert_eq!(drill.strategy, crate::model::Strategy::Drill);
+        drill.p.insert("cycle".into(), "Deep drilling".into());
+        let mut a = reopen(a, dir.path());
+        let _ = a.update(Message::Connect);
+        follow_again(&mut a).unwrap();
+        let run = run_of(&a);
+        assert_eq!(run.skips, [(1, Skip::Cut)], "followed as sent");
+        assert!(run.running.is_some());
+        assert!(run.declared_lost && run.declared_stale);
+        assert_eq!(run.declared(), (vec![], vec![]));
+        let _ = a.update(Message::Run(R::Resume));
+        run_until(&mut a, 60.0, "tool run 1 done", |r| r.done[0]);
+        assert!(conn(&a).touch_off().is_none());
+        assert_eq!(kept_declared(dir.path()), [dropped_record(&setup)]);
+        // Picked again: not given back by the old index, and nothing sets Z.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::SamePart));
+        let run = run_of(&a);
+        assert!(run.skips.is_empty() && run.declared_lost, "{:?}", run.skips);
+        sets_no_z(&a);
+        let _ = a.update(Message::Disconnect);
+        drop(server);
     }
 
     /// By touch in a 960 × 552 window (LIO-583 review), the Work zero tab of
