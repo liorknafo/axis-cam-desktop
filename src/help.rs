@@ -1996,7 +1996,7 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
         ),
         StartStep => (
             "Start at the first step picked: the steps before it and the operations before this one are taken as cut. Cycle Start re-enters as a Start here does: across at the clearance, down over the step's entry, and waits there until Resume feeds in.",
-            "Before Cycle Start: the machine position, the work zero the steps were cut with (Keep it, or set it again) and the tool's Z (Same tool, keep Z, or Set Z from reference).",
+            "Before Cycle Start: the machine position, the work zero the steps were cut with (Keep it, or set it again) and the tool's Z (Same tool, keep Z, or Set Z from reference; only Set Z from reference at a tool change).",
         ),
         StopAfterStep => (
             "Stop once the step being cut ends: when the tool is back at its operation's clearance, the tool run stops there, Z goes up to the clearance plane and the spindle stops. Where it stopped is kept on disk, and the next step is picked. Press again to cancel.",

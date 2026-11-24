@@ -3337,9 +3337,16 @@ impl Run {
                 ));
             }
             if !self.tool_kept && !touched {
+                // At a tool change the tool in the spindle is another one:
+                // not Same tool, keep Z (LIO-652).
                 e.push(format!(
-                    "Confirm {}'s Z for the start at {step}: Same tool, keep Z if it was not taken out since, or Set Z from reference.",
-                    crate::model::tool_label(first.tool, &first.tool_name)
+                    "Confirm {}'s Z for the start at {step}: {}.",
+                    crate::model::tool_label(first.tool, &first.tool_name),
+                    if self.tool_change().is_some() {
+                        "Set Z from reference"
+                    } else {
+                        "Same tool, keep Z if it was not taken out since, or Set Z from reference"
+                    }
                 ));
             }
         } else if self.asks_zero() {

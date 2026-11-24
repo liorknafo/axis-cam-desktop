@@ -3551,6 +3551,57 @@ flood = { pin = 8 }
         assert_eq!(confirm(&a), 0, "{:?}", problems(&a));
     }
 
+    /// LIO-652: tool run 1 ran with T1, then a start at the Drill's third
+    /// hole, a T3 tool run: the tool in the spindle is another one, so the
+    /// start asks for T3's Z with Set Z from reference only, offers no Same
+    /// tool, keep Z, and takes none; Set Z from reference ends both asks.
+    #[test]
+    fn a_start_at_a_step_after_a_tool_change_offers_no_same_tool() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 2.0, "the job", |s| s.state == Some(State::Run));
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 2)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, 2)));
+        assert!(run_of(&a).tool_change().is_some());
+        let _ = a.update(Message::Run(R::KeepZero));
+        let wants = problems(&a);
+        let confirm = (wants.iter())
+            .find(|p| p.starts_with("Confirm "))
+            .unwrap_or_else(|| panic!("{wants:?}"));
+        assert!(
+            confirm.starts_with("Confirm T3 ") && confirm.ends_with(": Set Z from reference."),
+            "{confirm}"
+        );
+        assert!(
+            wants.iter().any(|p| p.contains("touch off its Z first")),
+            "{wants:?}"
+        );
+        // Nowhere on the Control page, and not taken if sent (by MCP, say).
+        a.page = Page::Control;
+        let texts = page_texts(&a);
+        assert!(!texts.iter().any(|t| t.contains("Same tool")), "{texts:?}");
+        let _ = a.update(Message::Run(R::KeepToolZ));
+        assert!(!run_of(&a).tool_kept);
+        assert_eq!(problems(&a), wants);
+        // Set Z from reference for T3: both asks end.
+        let _ = a.update(Message::Run(R::RecordReference));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+    }
+
     /// The Drill's tool run started at its operation, its work zero and
     /// tool kept: Cycle Start sent and running, `run_app`'s Face and Drill.
     fn drilling(a: &mut App) -> crate::run::OpSteps {
