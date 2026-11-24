@@ -6893,7 +6893,7 @@ impl App {
         run::Session {
             cuts,
             lost: self.others_unknown,
-            declared: declared.into_iter().map(|(id, ..)| id).collect(),
+            declared: declared.into_iter().map(|k| k.setup).collect(),
         }
     }
     fn update_turn(&mut self, message: Message) -> Task<Message> {
