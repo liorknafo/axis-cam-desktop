@@ -11016,6 +11016,47 @@ flood = { pin = 8 }
         assert_eq!(conn(&a).touch_off(), None);
     }
 
+    /// LIO-607 review: two AXIS CAMs open on the same folder and project,
+    /// one of them with the project renamed since (not saved yet, say).
+    /// Each keeps its own setups' owner as its project is now, and once one
+    /// has cut, neither writes what runs cut again while nothing changes:
+    /// the two do not write over each other's owner at every update.
+    #[test]
+    fn two_axis_cams_that_name_a_project_differently_settle() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = two_pass_app(dir.path());
+        let mut b = two_pass_app(dir.path());
+        b.replace_document(a.doc.clone(), None);
+        b.imported_mesh = a.imported_mesh.clone();
+        b.page = Page::Control;
+        b.doc.title = "Renamed".into();
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        cycle_start(&mut a);
+        run_until(&mut a, 90., "tool run 1", |r| r.running.is_none());
+        let path = dir.path().join("uc100").join("cuts.json");
+        let version = || {
+            let m = std::fs::metadata(&path).unwrap();
+            (m.modified().unwrap(), std::fs::read(&path).unwrap())
+        };
+        for _ in 0..3 {
+            let _ = a.update(Message::Tick);
+            let _ = b.update(Message::Tick);
+        }
+        let settled = version();
+        for _ in 0..20 {
+            let _ = a.update(Message::Tick);
+            let _ = b.update(Message::Tick);
+        }
+        assert!(
+            version() == settled,
+            "cuts.json written again while nothing changed"
+        );
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// LIO-594 review: two AXIS CAMs open on the same folder and setup,
     /// the second's run picked before the first cuts. The first cuts the
     /// Face's two passes; the second, starting at Face pass 2, takes in

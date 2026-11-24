@@ -2808,7 +2808,7 @@ impl Run {
         };
         Some((
             format!(
-                "{whose} cut stock on this machine earlier ({which}), cuts this project's check does not have"
+                "{whose} cut stock on this machine earlier ({which}), which this project's check does not follow"
             ),
             own,
         ))
@@ -10322,7 +10322,7 @@ pub(crate) mod tests {
             note(&[(&a.setup, &[0, 1, 0, HISTORY_UNKNOWN])]),
             (
                 format!(
-                    "Another project's runs cut stock on this machine earlier (\"Bracket\": {face} and {pocket}), cuts this project's check does not have."
+                    "Another project's runs cut stock on this machine earlier (\"Bracket\": {face} and {pocket}), which this project's check does not follow."
                 ),
                 "Another project's runs (\"Bracket\") may have cut this stock.".into()
             )
@@ -10331,7 +10331,7 @@ pub(crate) mod tests {
             note(&[(&a.setup, &[1]), (&b.setup, &[0])]),
             (
                 format!(
-                    "Other projects' runs cut stock on this machine earlier (\"Bracket\": {pocket}; \"Lid\": {face}), cuts this project's check does not have."
+                    "Other projects' runs cut stock on this machine earlier (\"Bracket\": {pocket}; \"Lid\": {face}), which this project's check does not follow."
                 ),
                 "Other projects' runs (\"Bracket\" and \"Lid\") may have cut this stock.".into()
             )
@@ -10346,7 +10346,7 @@ pub(crate) mod tests {
             note(&[(&gone.setup, &[0]), (&a.setup, &[0])]),
             (
                 format!(
-                    "Another setup's run cut this part earlier in a way the check does not follow, and another project's runs cut stock on this machine earlier (\"Bracket\": {face}), cuts this project's check does not have."
+                    "Another setup's run cut this part earlier in a way the check does not follow, and another project's runs cut stock on this machine earlier (\"Bracket\": {face}), which this project's check does not follow."
                 ),
                 "Another setup's run cut this part in a way the check does not follow, and another project's runs (\"Bracket\") may have cut it too.".into()
             )

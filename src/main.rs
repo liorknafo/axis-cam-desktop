@@ -4098,6 +4098,12 @@ impl App {
         }
         self.others_unknown |= theirs.others_unknown;
         control::remember_sent_tool_runs(&theirs.sent);
+        // Kept as this one would write it, its own setups' owners its
+        // project's as it is now: another AXIS CAM's that differ (another
+        // title, say) are no change of this one's, so the two do not write
+        // over each other at every update (LIO-607 review).
+        let mut theirs = theirs;
+        theirs.owners = owners_of(&theirs.cuts, &self.doc, &theirs.owners);
         self.cuts_kept = Some(theirs);
         grew
     }
@@ -4139,15 +4145,7 @@ impl App {
         }
         let sent = control::sent_tool_runs();
         let sent = sent[sent.len().saturating_sub(run::SENT_KEPT)..].to_vec();
-        // Whose each setup is: this project's as it is now (LIO-607).
-        let owners = (cuts.iter())
-            .filter_map(
-                |(id, _)| match self.doc.setups.iter().position(|s| s.id == *id) {
-                    Some(si) => Some(run::CutOwner::of(&self.doc, si)),
-                    None => self.cut_owners.iter().find(|o| o.setup == *id).cloned(),
-                },
-            )
-            .collect();
+        let owners = owners_of(&cuts, &self.doc, &self.cut_owners);
         run::CutHistory {
             cuts,
             journals: self.cut_journals.clone(),
@@ -12290,6 +12288,23 @@ fn give_earlier_cuts(cuts: &[(String, Vec<run::CutInRun>)], run: &mut run::Run) 
         .cloned()
         .collect();
     run.earlier_given = run.earlier_cuts.iter().map(|(id, _)| id.clone()).collect();
+}
+
+/// Whose each setup of `cuts` is (`run::CutHistory::owners`, LIO-607):
+/// `doc`'s setups its project's as it is now, any other's as `known` has it.
+fn owners_of(
+    cuts: &[(String, Vec<run::CutInRun>)],
+    doc: &Document,
+    known: &[run::CutOwner],
+) -> Vec<run::CutOwner> {
+    (cuts.iter())
+        .filter_map(
+            |(id, _)| match doc.setups.iter().position(|s| s.id == *id) {
+                Some(si) => Some(run::CutOwner::of(doc, si)),
+                None => known.iter().find(|o| o.setup == *id).cloned(),
+            },
+        )
+        .collect()
 }
 
 /// Gives `run` whose the setups of its `earlier_cuts` that are another
