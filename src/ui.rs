@@ -11631,8 +11631,9 @@ fn stock_question<'a>(
     let stock = (run.stock_unconfirmed && run.away.is_none()).then(|| {
         column![
             text(if run.cut_in_run.is_empty() {
-                // Only taken as cut (LIO-583 review).
-                "Operations or steps of this setup were taken as cut this session. Is it still the same part?"
+                // Only taken as cut, this session or before AXIS CAM was
+                // last closed (LIO-583 review, LIO-611).
+                "Operations or steps of this setup were taken as cut earlier. Is it still the same part?"
             } else {
                 "This setup's runs cut a part earlier. Is it still the one held?"
             })
