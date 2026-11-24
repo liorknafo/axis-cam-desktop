@@ -30,16 +30,16 @@ pub enum Action {
     /// one set by hand on a surface they left.
     KeepZero,
     /// The part this setup's runs cut, or with operations or steps of it
-    /// taken as cut, this session is still the one held (`Run::stock_unconfirmed`), and nothing else has
-    /// cut it since: what they cut stays the stock's. Refused after a
-    /// disconnect while the Pi shows a tool run this computer did not send
-    /// (`Run::away`, LIO-595).
+    /// taken as cut, this session is still the one held
+    /// (`Run::stock_unconfirmed`), and nothing else has cut it since: that
+    /// stays the stock's. Refused after a disconnect while the Pi shows a
+    /// tool run this computer did not send (`Run::away`, LIO-595).
     SamePart,
     /// The part this setup's runs cut, or with operations or steps of it
-    /// taken as cut (LIO-606), this session is still the one held, but after a disconnect (`Run::away`)
-    /// something else may have cut it meanwhile: what this setup's runs cut
-    /// is unknown (`Run::note_history_unknown`) until New stock loaded
-    /// (LIO-595).
+    /// taken as cut (LIO-606), this session is still the one held, but
+    /// after a disconnect (`Run::away`) something else may have cut it
+    /// meanwhile: what cut it is unknown (`Run::note_history_unknown`)
+    /// until New stock loaded (LIO-595).
     OtherRunsMayHaveCut,
     /// New stock is held: what this setup's runs cut, and what was taken as
     /// cut, this session is forgotten (`Run::stock_unconfirmed`).
