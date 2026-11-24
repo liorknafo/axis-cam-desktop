@@ -10984,7 +10984,7 @@ pub(crate) mod tests {
         // Before the disconnect, its start touches off on the stock the
         // check carves with setup 1's cuts.
         assert!(run.touch_off().is_some() && run.partway_blocked().is_none());
-        crate::give_away(&away, &mut run);
+        crate::give_away(&away, &mut run, &doc);
         assert!(run.stock_unconfirmed);
         assert_eq!(
             run.away,
@@ -11002,7 +11002,17 @@ pub(crate) mod tests {
         // Nothing of setup 1's kept: nothing to ask.
         let mut run = Run::new(&doc, 1, 0);
         crate::give_earlier_cuts(&[], &mut run);
-        crate::give_away(&away, &mut run);
+        crate::give_away(&away, &mut run, &doc);
+        assert!(!run.stock_unconfirmed && run.away.is_none());
+        // Another project's setup kept so: its cuts set no Z until New
+        // stock loaded whatever is answered, and are said as its own
+        // (LIO-607), so nothing is asked for them.
+        let mut other = doc.clone();
+        other.remove_setup(0).unwrap();
+        let si = (other.setups.iter()).position(|s| s.p.get("rx").is_some_and(|r| r == "180"));
+        let mut run = Run::new(&other, si.unwrap(), 0);
+        crate::give_earlier_cuts(&session, &mut run);
+        crate::give_away(&away, &mut run, &other);
         assert!(!run.stock_unconfirmed && run.away.is_none());
     }
 

@@ -5000,7 +5000,7 @@ impl App {
         give_earlier_cuts(&self.run_cuts, &mut following);
         give_elsewhere(&self.cut_owners, &self.doc, &mut following);
         // Kept across a disconnect: was anything else run meanwhile?
-        give_away(&self.run_away, &mut following);
+        give_away(&self.run_away, &mut following, &self.doc);
         c.run = Some(following);
         c.probe_spot = None;
         self.run_on_connect = None;
@@ -9093,7 +9093,7 @@ impl App {
                             // Its cuts were kept across the disconnect:
                             // was anything else run meanwhile (LIO-595)?
                             if let Some(r) = c.run.as_mut() {
-                                give_away(&self.run_away, r);
+                                give_away(&self.run_away, r, &self.doc);
                             }
                         }
                         self.status = format!("Connecting to {}…", m.name());
@@ -9308,7 +9308,7 @@ impl App {
                 }
                 let skipped = !r.skips.is_empty();
                 give_elsewhere(&self.cut_owners, &self.doc, &mut r);
-                give_away(&self.run_away, &mut r);
+                give_away(&self.run_away, &mut r, &self.doc);
                 c.run = Some(r);
                 // A spot picked to probe from was for the setup before.
                 c.probe_spot = None;
@@ -12386,15 +12386,20 @@ fn mark_away(
 /// Gives `run` its setup's entry of `away` (`App::run_away`): its cuts were
 /// kept across a disconnect, so the operator is asked whether it is the
 /// same part and whether anything else ran meanwhile (LIO-595). So is it
-/// when it has none, but has another setup's kept so (`earlier_cuts`),
-/// which the answer covers too (LIO-596); given after them.
-fn give_away(away: &[(String, run::Away)], run: &mut run::Run) {
+/// when it has none, but has another setup's of `doc` kept so
+/// (`earlier_cuts`), which the answer covers too (LIO-596); given after
+/// them. Not for a setup `doc` does not have (another project's, or one
+/// deleted): its cuts set no Z until New stock loaded whatever is answered
+/// (`Run::earlier_unfollowed`, LIO-607).
+fn give_away(away: &[(String, run::Away)], run: &mut run::Run, doc: &Document) {
     let own = (away.iter())
         .find(|(id, _)| *id == run.setup_id)
         .filter(|_| !run.cuts_so_far().is_empty());
+    let ours = |id: &String| doc.setups.iter().any(|s| s.id == *id);
     let earlier = || {
-        away.iter()
-            .find(|(id, _)| (run.earlier_cuts.iter()).any(|(e, cuts)| e == id && !cuts.is_empty()))
+        away.iter().find(|(id, _)| {
+            ours(id) && (run.earlier_cuts.iter()).any(|(e, cuts)| e == id && !cuts.is_empty())
+        })
     };
     if let Some((_, a)) = own.or_else(earlier) {
         run.away = Some(a.clone());
