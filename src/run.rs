@@ -263,12 +263,13 @@ pub struct Before {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TouchedFor {
     /// The tool's id (`tool_id`): the next tool run's when it was touched
-    /// off. None when no tool run was checked then: it holds for no tool.
+    /// off; while the setup is checked again (after an edit, a skip or a
+    /// new start), the one the check before found next (`Run::check_again`),
+    /// which the Tool change tab showed. None when no tool run was checked
+    /// then: it holds for no tool.
     tool: Option<String>,
     /// Made before the setup's first check answered: tool run 1's tool
-    /// once that check starts the run there (`checked_as`). A touch-off
-    /// made while a later check runs (after an edit, a skip or a new start)
-    /// may be for the tool before it, so it holds for none.
+    /// once that check starts the run there (`checked_as`).
     #[serde(default)]
     first: bool,
     /// The Z work offset it left, once the machine shows what was sent
@@ -545,6 +546,9 @@ pub struct Run {
     touched_for: Option<TouchedFor>,
     /// A check of the setup has answered since it was picked.
     answered: bool,
+    /// While the setup is checked again: the tool of the tool run the check
+    /// before found next (`check_again`), what a touch-off is for meanwhile.
+    rechecked_tool: Option<String>,
     /// How the last tool run ended (ok, the driver's message).
     pub outcome: Option<(bool, String)>,
     /// The stock after each of the setup's operations, by its index in the
@@ -1215,6 +1219,7 @@ impl Run {
             length: None,
             touched_for: None,
             answered: false,
+            rechecked_tool: None,
             outcome: None,
             pictures: vec![],
             left: None,
@@ -1640,7 +1645,23 @@ impl Run {
     /// Z is touched off for the next tool run's tool: Set Z from
     /// reference, Zero Z, Set Z, a probe or a touch-off.
     pub fn z_touched(&mut self) {
-        self.z_touched_for(self.tool_of(self.next));
+        let tool = (self.tool_of(self.next)).or_else(|| self.rechecked_tool.clone());
+        self.z_touched_for(tool);
+    }
+
+    /// The setup is checked again, as check `epoch`, keeping its progress:
+    /// a touch-off meanwhile is for the tool the check before found next.
+    pub fn check_again(&mut self, epoch: u64) {
+        self.keep_next_tool();
+        (self.epoch, self.programs, self.stale, self.recheck) = (epoch, None, false, false);
+    }
+
+    /// Keeps the next tool run's tool for touch-offs while the setup is
+    /// checked again (`rechecked_tool`).
+    fn keep_next_tool(&mut self) {
+        if let Some(tool) = self.tool_of(self.next) {
+            self.rechecked_tool = Some(tool);
+        }
     }
 
     /// Z is touched off for `tool` (None: not known, `TouchedFor::first`).
@@ -1690,6 +1711,7 @@ impl Run {
             // Its steps taken as cut go: their material is not the check's.
             self.declared_lost |= !self.cut_steps.is_empty();
             self.cut_steps.clear();
+            self.keep_next_tool();
             (self.programs, self.recheck) = (None, true);
             // Checked otherwise, it is not the program sent.
             if self.follow.take().is_some() {
@@ -1777,7 +1799,7 @@ impl Run {
         {
             t.tool = start;
         }
-        self.answered = true;
+        (self.answered, self.rechecked_tool) = (true, None);
     }
 
     /// Where a run of this setup stopped (`journal`), once it is checked:
@@ -8110,6 +8132,7 @@ pub(crate) mod tests {
             length: None,
             touched_for: None,
             answered: false,
+            rechecked_tool: None,
             outcome: None,
             pictures: vec![],
             left: None,

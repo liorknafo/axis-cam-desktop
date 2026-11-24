@@ -3094,6 +3094,49 @@ flood = { pin = 8 }
         let _ = a.update(Message::Machine(crate::control::Action::WorkZero(Some(2))));
         touch_shown(&mut a);
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Touched off again while the setup is checked again: for T1, next
+        // as the check before found it, and next in this one too.
+        let _ = a.update(Message::Run(R::Check));
+        assert!(run_of(&a).programs.is_none());
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        let epoch = run_of(&a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+        assert!(run_of(&a).touched());
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+    }
+
+    /// A touch-off made while a skip checks the setup again is for the tool
+    /// the Tool change tab showed (LIO-619): the Face skipped as cut makes
+    /// the Drill's T3 first, which T1's touch-off is not for.
+    #[test]
+    fn a_touch_off_while_a_skip_is_checked_holds_for_the_tool_shown() {
+        use crate::run::{Action as R, Skip};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let _ = a.update(Message::Run(R::RecordReference));
+        let _ = a.update(Message::Run(R::Skip(0, Some(Skip::Cut))));
+        assert!(run_of(&a).programs.is_none());
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        answer_skips(&mut a, 0);
+        let first = &run_of(&a).checked().unwrap()[run_of(&a).next];
+        assert_eq!(first.ops[0].tool, 3);
+        assert!(!run_of(&a).touched());
+        let said = touch_first(&a);
+        assert!(
+            said.len() == 1
+                && said[0].starts_with(&format!("Tool run {} uses T3", run_of(&a).next + 1)),
+            "{:?}",
+            problems(&a)
+        );
+        // T3 touched off: it holds.
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        assert!(run_of(&a).touched() && touch_first(&a).is_empty());
     }
 
     /// A touch-off holds for its tool only (LIO-619): an edit that puts
@@ -3126,8 +3169,8 @@ flood = { pin = 8 }
         a.doc.setups[0].operations[1].tool = t4.id.clone();
         a.doc.tools.push(t4);
         let _ = a.update(Message::Run(R::Check));
-        // A touch-off while it is checked again may be T3's: it holds for
-        // no tool.
+        // A touch-off while it is checked again is for T3, the tool the
+        // Tool change tab showed.
         assert!(run_of(&a).programs.is_none());
         let _ = a.update(Message::Run(R::ZFromReference));
         touch_shown(&mut a);
