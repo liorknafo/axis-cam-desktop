@@ -6694,6 +6694,15 @@ impl Connection {
         since
     }
 
+    /// The link to the Pi is live and the Pi has said its start and count
+    /// of control takes (`pi_control_since`): what this computer heard of
+    /// them is current.
+    pub fn pi_heard(&self) -> bool {
+        self.link
+            .as_ref()
+            .is_some_and(|l| l.live && l.boot.is_some())
+    }
+
     /// The journal of where a run stopped on this machine, if any.
     pub fn journal(&self) -> Option<crate::run::Journal> {
         crate::run::Journal::read(&self.journal)

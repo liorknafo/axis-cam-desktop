@@ -1136,6 +1136,21 @@ pub struct CutHistory {
     /// written before it was kept, which loads with none (LIO-611).
     #[serde(default)]
     pub declared: Vec<KeptDeclared>,
+    /// The Pi's start and count of control takes as last heard
+    /// (`App::pi_control_seen`, LIO-597): opened again, a new start or a
+    /// take this computer did not make since means something else may
+    /// have cut the part while AXIS CAM was closed, by a jog or a plain job
+    /// that leaves no tool run. None from an AXIS CAM before it, or before
+    /// any Pi was heard.
+    #[serde(default)]
+    pub pi_control: Option<PiControl>,
+}
+
+/// The Pi's start and count of control takes (`CutHistory::pi_control`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PiControl {
+    pub boot: u64,
+    pub takes: u64,
 }
 
 /// The project and names of a setup whose runs cut (`CutHistory::owners`),

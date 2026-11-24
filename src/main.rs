@@ -1662,8 +1662,10 @@ pub struct App {
     journal_changes_seen: u64,
     /// The Pi's start and count of control takes as last heard
     /// (`control::Connection::pi_control_since`, LIO-597), kept across
-    /// link drops and disconnects: a new start, or a take this computer did
-    /// not make, means something else may have cut the part.
+    /// link drops and disconnects, and on disk with what runs cut across
+    /// AXIS CAM closed (`run::CutHistory::pi_control`): a new start, or a
+    /// take this computer did not make, means something else may have cut
+    /// the part.
     pi_control_seen: Option<(u64, u64)>,
     /// For a setup whose run was dropped while a tool run ran: that tool run
     /// (index, and the operation it started at) and what was cut before it.
@@ -2237,6 +2239,9 @@ impl App {
             }
         };
         control::remember_sent_tool_runs(&history.sent);
+        // As heard before AXIS CAM was closed: what the Pi says since
+        // follows on from it (LIO-597).
+        let pi_control_seen = history.pi_control.map(|p| (p.boot, p.takes));
         // Kept from before AXIS CAM was closed, while which anything may
         // have run on the machine, the Pi's tool runs then not known: asked
         // as after a disconnect (LIO-595).
@@ -2287,7 +2292,7 @@ impl App {
             cuts_seen: None,
             cuts_grew: false,
             journal_changes_seen: 0,
-            pi_control_seen: None,
+            pi_control_seen,
             run_pending: vec![],
             run_declared: history.declared,
             jog_key: None,
@@ -4245,6 +4250,14 @@ impl App {
         let sent = control::sent_tool_runs();
         let sent = sent[sent.len().saturating_sub(run::SENT_KEPT)..].to_vec();
         let owners = owners_of(&cuts, &self.doc, &self.cut_owners);
+        // As this AXIS CAM heard the Pi, while it hears it; else as kept
+        // (by another AXIS CAM on this folder that hears it, say), so that
+        // one not connected writes nothing older over it (LIO-597).
+        let heard = (self.control.as_ref()).is_some_and(|c| c.pi_heard());
+        let pi_control = match (heard, &self.cuts_kept) {
+            (false, Some(kept)) => kept.pi_control,
+            _ => (self.pi_control_seen).map(|(boot, takes)| run::PiControl { boot, takes }),
+        };
         run::CutHistory {
             cuts,
             journals: self.cut_journals.clone(),
@@ -4252,6 +4265,7 @@ impl App {
             sent,
             owners,
             declared,
+            pi_control,
         }
     }
     /// Writes what setups' runs cut (`cut_history`, `starting`), with what
