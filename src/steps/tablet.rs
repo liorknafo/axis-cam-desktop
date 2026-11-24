@@ -1007,7 +1007,7 @@ mod tests {
                 s.machine.p.insert("cross_reads".into(), "Diameter".into());
             }
         }
-        let bytes = crate::bundle::pack_with(&job, Ok(&mesh)).unwrap();
+        let bytes = crate::bundle::pack_with(&job, Ok(&mesh), &Default::default()).unwrap();
         std::fs::write(dir.join("shaft-lathe.axisjob"), bytes).unwrap();
     }
 

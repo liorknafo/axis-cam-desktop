@@ -25,6 +25,7 @@
 //! sends it at the next sync.
 use crate::lathe;
 use crate::model::Document;
+use crate::run::Session;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -137,6 +138,29 @@ type Reply = mpsc::Sender<Result<String, String>>;
 /// Answers to the project open in the app saving its workspace to the path,
 /// waiting for the app's next tick (`for_app`).
 static TO_APP: Mutex<Vec<(PathBuf, Answer, Reply)>> = Mutex::new(Vec::new());
+
+/// What the setups' runs cut in the app that saves its workspace to the
+/// path (`App::session_cuts`): the tablet files sent go by it, as Save for
+/// tablet's do (LIO-590).
+static SESSION: Mutex<Vec<(PathBuf, Session)>> = Mutex::new(Vec::new());
+
+/// Keeps `session` as what the setups' runs of the app saving its workspace
+/// to `state_path` cut (`SESSION`).
+pub fn set_session_cuts(state_path: &Path, session: Session) {
+    let mut all = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(at) = all.iter_mut().find(|(p, _)| p == state_path) {
+        at.1 = session;
+    } else if session != Session::default() {
+        all.push((state_path.to_path_buf(), session));
+    }
+}
+
+/// What the setups' runs of the app saving its workspace to `state_path`
+/// cut (`SESSION`).
+fn session_cuts(state_path: &Path) -> Session {
+    let all = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    (all.iter().find(|(p, _)| p == state_path)).map_or_else(Session::default, |(_, c)| c.clone())
+}
 
 /// The answers tablets sent the app that saves its workspace to
 /// `state_path`, each with where what came of it goes: the app keeps each
@@ -262,14 +286,17 @@ fn answer(mut s: TcpStream, state_path: &Path, computer: &str, app: bool) -> io:
             {
                 return wire::write(&mut s, &ToTablet::Refused(NOT_PAIRED.into()));
             }
-            let mut shared = shared(state_path);
+            // The session each project's version was made with: what its
+            // tablet file is packed with, so that a version stands for one
+            // file only (LIO-590 review).
+            let (mut shared, mut session) = shared_with(state_path);
             loop {
                 let reply = match wire::read(&mut s, SMALL) {
                     Ok(ToComputer::List) => {
                         ToTablet::List(shared.iter().map(|(s, ..)| s.clone()).collect())
                     }
                     Ok(ToComputer::Get(key)) => match shared.iter().find(|(s, ..)| s.key == key) {
-                        Some((.., doc)) => match crate::bundle::pack(doc) {
+                        Some((.., doc)) => match crate::bundle::pack(doc, &session) {
                             Ok(bytes) => ToTablet::Bundle(bytes),
                             Err(e) => ToTablet::Refused(e),
                         },
@@ -278,7 +305,7 @@ fn answer(mut s: TcpStream, state_path: &Path, computer: &str, app: bool) -> io:
                     Ok(ToComputer::Answer { project, answer }) => {
                         let kept = keep(state_path, app, &project, &answer);
                         // The project changed: listed with its new version.
-                        shared = self::shared(state_path);
+                        (shared, session) = shared_with(state_path);
                         kept.map_or_else(ToTablet::Refused, ToTablet::Kept)
                     }
                     Ok(_) => return Err(bad()),
@@ -309,6 +336,12 @@ fn reword(why: String) -> String {
 /// them: the open project first, then the recent project files. A project
 /// with no setups, or whose part is gone, is left out. Each with its file.
 fn shared(state_path: &Path) -> Vec<(Shared, PathBuf, Document)> {
+    shared_with(state_path).0
+}
+
+/// `shared`, with what this session cut (`SESSION`) as its versions were
+/// made with it.
+fn shared_with(state_path: &Path) -> (Vec<(Shared, PathBuf, Document)>, Session) {
     let settings: crate::settings::Settings = fs::read(crate::settings::path(state_path))
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
@@ -319,7 +352,8 @@ fn shared(state_path: &Path) -> Vec<(Shared, PathBuf, Document)> {
         .take(RECENT)
         .map(|p| (key_of(p), p.as_path()));
     let open_key = open.as_deref().map_or("open".into(), key_of);
-    std::iter::once((open_key, state_path))
+    let session = session_cuts(state_path);
+    let shared = std::iter::once((open_key, state_path))
         .chain(recent)
         .filter_map(|(key, path)| {
             let bytes = fs::read(path).ok()?;
@@ -339,6 +373,11 @@ fn shared(state_path: &Path) -> Vec<(Shared, PathBuf, Document)> {
                 h.update(meta.len().to_le_bytes());
                 h.update(format!("{:?}", meta.modified().ok()).as_bytes());
             }
+            // The tablet file's work zeros go by what this session cut
+            // (LIO-590): a tablet takes it again once that changes.
+            if session != Session::default() {
+                h.update(format!("{session:?}").as_bytes());
+            }
             let shared = Shared {
                 key,
                 title: doc.title.clone(),
@@ -346,7 +385,8 @@ fn shared(state_path: &Path) -> Vec<(Shared, PathBuf, Document)> {
             };
             Some((shared, path.to_path_buf(), doc))
         })
-        .collect()
+        .collect();
+    (shared, session)
 }
 
 fn key_of(path: &Path) -> String {
@@ -672,6 +712,61 @@ mod tests {
             thickness: None,
         });
         crate::storage::save(path, &doc).unwrap();
+    }
+
+    /// What the app's runs cut this session (`set_session_cuts`, LIO-590)
+    /// is in the version of each project it shares, so that a tablet takes
+    /// the tablet file again, its work zeros made with it; another app's,
+    /// saving its workspace elsewhere, is not.
+    #[test]
+    fn a_shared_project_is_a_new_version_once_this_session_cut() {
+        let mac = tempfile::tempdir().unwrap();
+        let state = mac.path().join("workspace.json");
+        let part = mac.path().join("block.stl");
+        fs::write(&part, b"solid x\nendsolid x\n").unwrap();
+        project(&state, "Open job", &part);
+        let version = || shared(&state)[0].0.version.clone();
+        let cut = |steps| Session {
+            cuts: vec![("a".into(), vec![(0, steps, Some(1))])],
+            ..Session::default()
+        };
+        let before = version();
+        let other = mac.path().join("other.json");
+        set_session_cuts(&other, cut(None));
+        assert_eq!(version(), before);
+        set_session_cuts(&state, cut(None));
+        let once = version();
+        assert_ne!(once, before);
+        // The session a version was made with is the one its file is packed
+        // with (`answer`): New stock loaded after the list changes neither.
+        let (listed, session) = shared_with(&state);
+        set_session_cuts(&state, Session::default());
+        assert_eq!(listed[0].0.version, once);
+        assert_eq!(session, cut(None));
+        set_session_cuts(&state, session);
+        assert_eq!(session_cuts(&state), cut(None));
+        set_session_cuts(&state, cut(Some(2)));
+        assert_ne!(version(), once);
+        // What runs cut was lost (LIO-594): a new version too.
+        set_session_cuts(
+            &state,
+            Session {
+                lost: true,
+                ..Session::default()
+            },
+        );
+        assert_ne!(version(), before);
+        // Operations taken as cut (LIO-583): a new version too.
+        let declared = Session {
+            declared: vec!["a".into()],
+            ..Session::default()
+        };
+        set_session_cuts(&state, declared);
+        assert_ne!(version(), before);
+        // New stock loaded: nothing cut.
+        set_session_cuts(&state, Session::default());
+        assert_eq!(version(), before);
+        set_session_cuts(&other, Session::default());
     }
 
     #[test]

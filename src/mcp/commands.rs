@@ -2185,8 +2185,9 @@ fn table() -> Vec<Command> {
                 if let Some(mesh) = &ctx.app.imported_mesh {
                     crate::picks::record(&mut doc, mesh);
                 }
+                let session = ctx.app.session_cuts();
                 Ok((vec![], off_thread(
-                    move || crate::bundle::write(&path, &doc).map(|()| path),
+                    move || crate::bundle::write(&path, &doc, &session).map(|()| path),
                     |written| Message::TabletSaved(Some(written)),
                 )))
             })
