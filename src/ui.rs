@@ -11625,12 +11625,18 @@ fn stock_question<'a>(
 ) -> Option<iced::widget::Column<'a, Message>> {
     use crate::run::Action as R;
     let running = run.running.is_some();
-    // This setup's runs cut a part earlier this session: is it still
-    // the one held? Asked on a row of its own, so the work zero's
+    // This setup's runs cut a part earlier, this session or before AXIS
+    // CAM was last closed (LIO-594): is it still the one held? Asked on a row of its own, so the work zero's
     // buttons keep their room (LIO-582 review).
     let stock = (run.stock_unconfirmed && run.away.is_none()).then(|| {
         column![
-            text("This setup's runs cut a part this session. Is it still the one held?").size(12),
+            text(if run.cut_in_run.is_empty() {
+                // Only taken as cut (LIO-583 review).
+                "Operations or steps of this setup were taken as cut this session. Is it still the same part?"
+            } else {
+                "This setup's runs cut a part earlier. Is it still the one held?"
+            })
+            .size(12),
             row![
                 small(
                     "Same part",
@@ -11702,10 +11708,26 @@ fn stock_question<'a>(
     });
     // Another setup's cuts the check does not follow: only new stock
     // clears them (LIO-582 review).
-    stock.or_else(|| {
+    let stock = stock.or_else(|| {
         run.earlier_unfollowed().then(|| {
             column![
                 text("Another setup's run cut this part in a way the check does not follow.")
+                    .size(12),
+                small(
+                    "New stock loaded",
+                    (!running).then_some(Message::Run(R::NewStock)),
+                    false,
+                ),
+            ]
+            .spacing(4)
+        })
+    });
+    // What was taken as cut and dropped by a project edit: only new stock
+    // clears it (LIO-583 review).
+    stock.or_else(|| {
+        run.declared_lost.then(|| {
+            column![
+                text("Operations or steps of this setup were taken as cut before the project changed.")
                     .size(12),
                 small(
                     "New stock loaded",
@@ -11720,7 +11742,7 @@ fn stock_question<'a>(
 
 /// What the Work zero tab asks of a setup whose runs cut a part before a
 /// disconnect from the machine (`run::Run::away`, LIO-595).
-pub const AWAY_ASKED: &str = "Runs this session cut a part, and the machine was disconnected since. Is it still the one held, and did anything else run on the machine meanwhile? The answer covers every setup.";
+pub const AWAY_ASKED: &str = "Runs cut a part earlier, and the machine was disconnected or AXIS CAM closed since. Is it still the one held, and did anything else run on the machine meanwhile? The answer covers every setup.";
 
 /// Said with New stock loaded on the Work zero tab while runs this
 /// computer did not follow may have cut the part (`run::Run::history_unknown`).
@@ -11844,7 +11866,8 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
             ),
         });
         let stock = stock_question(c, run);
-        if run.partway() {
+        // Asked for whenever Cycle Start waits for it (LIO-583 review).
+        if run.asks_zero() {
             buttons = buttons.push(small(
                 "Keep this work zero",
                 (checked.is_ok() && !run.zeroed && !running).then_some(Message::Run(R::KeepZero)),
@@ -11888,7 +11911,9 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
         if let Some(stock) = stock {
             col = col.push(stock);
         }
-        col = col.push(buttons);
+        // Narrow, by touch, the row wraps rather than squeezes a button
+        // (LIO-583 review).
+        col = col.push(buttons.wrap().vertical_spacing(6));
     } else if run.checked().is_some() {
         col = col.push(rule::horizontal(1)).push(muted(
             "The setup's work zero was set on the stock before its first tool run: X and Y stay as they are from here.",
@@ -11910,6 +11935,22 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
                 .size(12)
                 .color(AMBER),
             );
+        } else if run.asks_zero() {
+            // Operations or steps taken as cut since: Cycle Start waits for
+            // the work zero they were cut with, kept here (LIO-583 review).
+            let why = c.partway_blocked().unwrap_or_else(|| {
+                "Steps of the operation Cycle Start starts at are taken as cut since a tool run of this run started.".into()
+            });
+            col = col
+                .push(text(format!(
+                    "{why} Set Z by hand on a surface whose height you know (Set above), then press Keep this work zero, or press it if the work zero is still the one they were cut with."
+                )).size(12))
+                .push(small(
+                    "Keep this work zero",
+                    (c.run_program().is_ok() && !run.zeroed && !running)
+                        .then_some(Message::Run(R::KeepZero)),
+                    run.zeroed,
+                ));
         }
     }
     if run.checked().is_some_and(|p| p.len() > 1) {
@@ -13458,6 +13499,22 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
     };
     let o = &p.ops[run.from.min(p.ops.len() - 1)];
     let skipped = run.taken_as_cut();
+    // Partway only by what was taken as cut and dropped since: nothing it
+    // takes as cut to name (LIO-583 review).
+    if skipped.is_empty() && run.declared_lost {
+        return vec![
+            format!(
+                "This run starts at {} (tool run {}). Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut: set Z by hand on a surface whose height you know, or press New stock loaded below if the stock is new.",
+                o.name,
+                run.next + 1
+            ),
+            if run.zeroed {
+                "The work zero is set for this start.".into()
+            } else {
+                "Cycle Start waits until you press Keep this work zero, or New stock loaded.".into()
+            },
+        ];
+    }
     let mut steps = vec![format!(
         "This run starts at {} (tool run {}), taking {} as cut: nothing of {} is sent. Load {} and set the work zero on the stock they left.",
         o.name,
@@ -17206,6 +17263,60 @@ pub(crate) mod probe {
         step: f32,
     ) -> Vec<(Point, Message)> {
         presses_after(page, window, None, area, step)
+    }
+    /// `presses` over `area` every `step` px, after the mouse wheel
+    /// scrolled `down` px (none: 0) over `over` (LIO-583 review): what a
+    /// press reaches once a scrollable there is scrolled, at the window's
+    /// own size. Keep `area` off the scrollbars, whose presses scroll too.
+    pub(crate) fn presses_scrolled(
+        page: Element<'_, Message>,
+        window: Size,
+        over: Point,
+        down: f32,
+        area: iced::Rectangle,
+        step: f32,
+    ) -> Vec<(Point, Message)> {
+        let mut renderer = renderer();
+        let mut ui = UserInterface::build(page, window, Cache::default(), &mut renderer);
+        let wheel = [
+            Event::Mouse(mouse::Event::CursorMoved { position: over }),
+            Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Pixels { x: 0., y: -down },
+            }),
+        ];
+        let _ = ui.update(
+            &wheel,
+            mouse::Cursor::Available(over),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut vec![],
+        );
+        let mut out = vec![];
+        let mut y = area.y;
+        while y < area.y + area.height {
+            let mut x = area.x;
+            while x < area.x + area.width {
+                let at = Point::new(x, y);
+                let mut messages = vec![];
+                for event in [
+                    mouse::Event::CursorMoved { position: at },
+                    mouse::Event::ButtonPressed(mouse::Button::Left),
+                    mouse::Event::ButtonReleased(mouse::Button::Left),
+                ] {
+                    let _ = ui.update(
+                        &[Event::Mouse(event)],
+                        mouse::Cursor::Available(at),
+                        &mut renderer,
+                        &mut clipboard::Null,
+                        &mut messages,
+                    );
+                }
+                out.extend(messages.into_iter().map(|m| (at, m)));
+                x += step;
+            }
+            y += step;
+        }
+        out
     }
     /// `presses`, after the pointer came to `rest` and stayed there long
     /// enough for a hover card there to open.

@@ -2551,6 +2551,14 @@ pub struct PiRun {
     job_name: Option<String>,
     tool_run_id: Option<u64>,
 }
+impl PiRun {
+    /// Its run, kept for the link to come back: a project edit meanwhile
+    /// reaches it as it reaches the run picked (`App::run_follows_project`,
+    /// LIO-583 review).
+    pub fn run_mut(&mut self) -> &mut crate::run::Run {
+        &mut self.run
+    }
+}
 
 /// How long the Pi, the link live, may show neither having nor having
 /// ended a tool run sent to it before it is taken as lost on the way.
@@ -2773,6 +2781,17 @@ pub struct Connection {
     /// Where a run stopped on this machine is kept (`run::Journal`): beside
     /// its saved position, one file per machine, the simulator's apart.
     journal: std::path::PathBuf,
+    /// Counts this connection's writes and removals of `journal`: the app
+    /// keeps the version it wrote in what its runs cut
+    /// (`App::keep_cut_history`, LIO-594).
+    pub journal_changes: u64,
+    /// Cycle Start sends a tool run only once what it may cut is kept on
+    /// disk (`App::keep_cut_history`): set by the app, which keeps it.
+    pub keep_cuts: bool,
+    /// The setup (id), tool run and operation whose start was kept on
+    /// disk as cutting all it runs, for the Cycle Start pressed (LIO-594
+    /// review).
+    pub cuts_kept_for: Option<(String, usize, usize)>,
     /// After a Stop after step: the machine Z to lift the tool to once Idle.
     z_up: Option<f64>,
     /// Keeps macOS from throttling AXIS CAM in the background, which would
@@ -2808,15 +2827,38 @@ pub fn sent_tool_runs() -> Vec<u64> {
     SENT_TOOL_RUNS.with(|s| s.borrow().clone())
 }
 
+/// Takes `ids` as tool runs this computer sent a Pi: kept in what runs cut
+/// (`run::CutHistory::sent`) by an earlier session, or another AXIS CAM on
+/// the same folder, which kept what they may cut before sending them
+/// (LIO-594).
+pub fn remember_sent_tool_runs(ids: &[u64]) {
+    SENT_TOOL_RUNS.with(|s| {
+        let mut s = s.borrow_mut();
+        for id in ids {
+            if !s.contains(id) {
+                s.push(*id);
+            }
+        }
+    });
+}
+
+/// Tests: AXIS CAM closed, so the tool runs it sent are only those kept
+/// on disk (`remember_sent_tool_runs`) to the one opened next.
+#[cfg(test)]
+pub(crate) fn forget_sent_tool_runs() {
+    SENT_TOOL_RUNS.with(|s| s.borrow_mut().clear());
+}
+
 /// Why Same part with nothing else run is refused while the Pi shows a
 /// tool run this computer did not send (`Connection::same_part_refused`).
 pub const RAN_ELSEWHERE: &str =
     "The Pi ran a tool run this computer did not send while it was disconnected.";
 
-/// Why Same part with nothing else run is refused when the machine was not
-/// reached through the Pi before the disconnect, and the Pi shows a tool run
+/// Why Same part with nothing else run is refused when the Pi's tool runs
+/// before are not known (not reached through it before the disconnect, or
+/// AXIS CAM closed since, LIO-594), and the Pi shows a tool run
 /// this computer did not send (`Connection::same_part_refused`).
-pub const PI_UNHEARD: &str = "The Pi shows a tool run this computer did not send, and the machine was not reached through the Pi before it was disconnected, so it may have run meanwhile.";
+pub const PI_UNHEARD: &str = "The Pi shows a tool run this computer did not send, and which tool runs the Pi had before is not known here (the machine was not reached through the Pi before it was disconnected, or AXIS CAM was closed since), so it may have run meanwhile.";
 
 /// Why Same part with nothing else run waits on a Pi whose link is not
 /// live yet (`Connection::same_part_refused`).
@@ -3035,6 +3077,9 @@ impl Connection {
             sim_gauge: None,
             sim_bars_sent: vec![],
             journal,
+            journal_changes: 0,
+            keep_cuts: false,
+            cuts_kept_for: None,
             z_up: None,
         };
         c.send_sim_blocks();
@@ -3387,6 +3432,7 @@ impl Connection {
                 // The setup's last: it is done.
                 None => {
                     let _ = std::fs::remove_file(&self.journal);
+                    self.journal_changes += 1;
                     self.pi_note = Some("The Pi finished the setup's last tool run.".into());
                     return;
                 }
@@ -3408,6 +3454,7 @@ impl Connection {
             true => j.write_own(&self.journal),
             false => j.write(&self.journal),
         };
+        self.journal_changes += 1;
         if let Err(e) = written {
             self.pi_note = Some(format!("Where the Pi stopped could not be kept: {e}."));
             return;
@@ -4011,7 +4058,9 @@ impl Connection {
             // A probe under way sets the work zero for the start it began with.
             R::Next(i) if i < run.done.len() && !self.probing() => run.start_at(i, 0),
             R::From(i, k) if !self.probing() => run.start_at(i, k),
-            R::KeepZero if run.running.is_none() && run.partway() => run.zeroed = true,
+            // Operations or steps taken as cut ask for it once a tool run has
+            // started too (LIO-583 review).
+            R::KeepZero if run.running.is_none() && run.asks_zero() => run.zeroed = true,
             // Nothing else ran meanwhile: not while the Pi shows a tool run
             // this computer did not send (LIO-595).
             R::SamePart if run.running.is_none() && self.same_part_refused_for(&run).is_none() => {
@@ -4019,20 +4068,23 @@ impl Connection {
                 run.away = None;
             }
             R::OtherRunsMayHaveCut if run.running.is_none() && run.away.is_some() => {
-                // Its own record, when it has one: a setup asked for the
-                // other setups' it has (`earlier_cuts`) cut nothing itself,
-                // and theirs are marked (`App::answered_away`, LIO-596
-                // review).
-                if !run.cut_in_run.is_empty() {
+                // Its own record, unless it has none and was asked for the
+                // other setups' it has (`earlier_cuts`): it cut nothing
+                // itself, and theirs are marked (`App::answered_away`).
+                // Asked with nothing inherited either, its own is marked:
+                // the operator said something else may have cut the part
+                // (LIO-596 review).
+                let inherited = (run.earlier_cuts.iter()).any(|(_, c)| !c.is_empty());
+                if !run.cut_in_run.is_empty() || !inherited {
                     run.note_history_unknown();
                 }
                 run.stock_unconfirmed = false;
                 run.away = None;
             }
+            // What was taken as cut goes too, the setup checked again
+            // without it (LIO-583 review).
             R::NewStock if run.running.is_none() => {
-                run.cut_in_run.clear();
-                run.earlier_cuts.clear();
-                run.stock_unconfirmed = false;
+                run.new_stock();
                 run.away = None;
             }
             R::More(oi) => {
@@ -4125,6 +4177,11 @@ impl Connection {
             Some(format!(
                 "Cycle Start did not start the tool run: {why} The tool run was not sent."
             ))
+        } else if self.keep_cuts
+            && self.cuts_kept_for.as_ref() != Some(&(run.setup_id.clone(), run.next, run.from))
+        {
+            // A later session must know what it may cut (LIO-594 review).
+            Some("Cycle Start did not start the tool run: what it may cut could not be kept on disk first, so AXIS CAM opened again would not know it. The tool run was not sent.".into())
         } else if self.driver.handed() != press.handed || self.driver.sent() != press.sent {
             Some("Cycle Start did not start the tool run: something was sent to the machine after it was pressed, or a message on its way was dropped. The tool run was not sent; press Cycle Start again.".into())
         } else if press.at.elapsed() > PRESS_WAIT {
@@ -4142,6 +4199,9 @@ impl Connection {
         };
         if let Some(why) = dropped {
             run.press_dropped(why);
+        }
+        if self.press.is_none() {
+            self.cuts_kept_for = None;
         }
         self.run = Some(run);
     }
@@ -4599,12 +4659,17 @@ impl Connection {
             .map(|r| (r.partly(), r.cut_by()))
         {
             _ if later && p.probe.is_ok() => Some("Operations or steps after the start are taken as cut, and the check does not follow the stock they cut where a probe finds this work zero.".into()),
+            Some((Some(partly), _))
+                if p.probe.is_ok() && partly.cut == [crate::run::DECLARED_LOST] =>
+            {
+                Some("Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut where a probe finds this work zero.".into())
+            }
             Some((None, _)) => Some(crate::run::PARTWAY_UNKNOWN.to_string()),
             // Not a part of the stock: the reason the check cannot tell it.
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::EARLIER_UNFOLLOWED] =>
             {
-                Some("Another setup's run cut this part this session in a way the check does not follow, where a probe finds this work zero.".into())
+                Some("Another setup's run cut this part earlier in a way the check does not follow, where a probe finds this work zero.".into())
             }
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::HISTORY_UNFOLLOWED] =>
@@ -4614,7 +4679,7 @@ impl Connection {
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::STOCK_UNCONFIRMED] =>
             {
-                Some("Runs this session cut the stock earlier: say under Work zero whether it is the same part or new stock before a probe finds this work zero.".into())
+                Some("Earlier runs cut the stock, or took operations or steps of it as cut: say under Work zero whether it is the same part or new stock before a probe finds this work zero.".into())
             }
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::STEPS_UNFOLLOWED] =>
@@ -4638,11 +4703,17 @@ impl Connection {
         let (Some(run), Ok(p)) = (&self.run, self.run_program()) else {
             return vec![];
         };
-        if run.later_cut() {
+        if run.later_cut() || run.declared_lost {
             // What operations or steps after the start, taken as cut, cut is
-            // in no stock the check found (LIO-582).
+            // in no stock the check found (LIO-582), nor what was taken as
+            // cut and dropped since (LIO-583 review).
+            let why = if run.later_cut() {
+                crate::run::LATER_UNFOLLOWED_WHY
+            } else {
+                crate::run::DECLARED_LOST_WHY
+            };
             (p.probe_from.iter())
-                .map(|(r, _)| (*r, Err(crate::run::LATER_UNFOLLOWED_WHY.to_string())))
+                .map(|(r, _)| (*r, Err(why.to_string())))
                 .collect()
         } else if run.on_cut_stock() {
             run.partly().map_or_else(Vec::new, |x| x.probe_from.clone())
@@ -6167,6 +6238,7 @@ impl Connection {
         };
         if std::mem::take(&mut run.completed) {
             let _ = std::fs::remove_file(&self.journal);
+            self.journal_changes += 1;
             let _ = std::fs::remove_file(&pending);
         }
         let Some(st) = run.stopped.take() else {
@@ -6175,6 +6247,7 @@ impl Connection {
         // Followed to its stop: what was kept for not following it is done.
         let _ = std::fs::remove_file(&pending);
         self.z_up = st.up;
+        self.journal_changes += 1;
         if let Some(j) = run.journal_of(&st, s.active_wcs, s.work_offset)
             && let Err(e) = j.write_own(&self.journal)
             && let Some((_, message)) = &mut run.outcome
@@ -6275,6 +6348,21 @@ impl Connection {
     /// (`run::read_own`).
     pub fn journal_own(&self) -> Option<(crate::run::Journal, bool)> {
         crate::run::Journal::read_own(&self.journal)
+    }
+
+    /// The journal, its very text, and whether it is as this session
+    /// wrote it (`run::read_own`): its text is what `run::KeptJournal`
+    /// keeps (LIO-594).
+    pub fn journal_text(&self) -> Option<(crate::run::Journal, String, bool)> {
+        let (data, own) = crate::run::read_own(&self.journal)?;
+        let j = serde_json::from_slice(&data).ok()?;
+        Some((j, String::from_utf8(data).ok()?, own))
+    }
+
+    /// The name of the file the journal is kept in, which tells this
+    /// machine's from its simulator's and from its Pi's (`run::KeptJournal`).
+    pub fn journal_name(&self) -> String {
+        (self.journal.file_name()).map_or_else(String::new, |n| n.to_string_lossy().into_owned())
     }
 
     /// Keeps where a running tool run is in the journal before the
