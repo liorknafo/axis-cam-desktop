@@ -11707,12 +11707,17 @@ fn stock_question<'a>(
         })
     });
     // Another setup's cuts the check does not follow: only new stock
-    // clears them (LIO-582 review).
+    // clears them (LIO-582 review). Those of setups this project does not
+    // have alone are said so: another project's, maybe (LIO-635).
     let stock = stock.or_else(|| {
         run.earlier_unfollowed().then(|| {
             column![
-                text("Another setup's run cut this part in a way the check does not follow.")
-                    .size(12),
+                text(if run.earlier_elsewhere() {
+                    "This computer's runs cut stock for a setup this project does not have: another project's, or one deleted since."
+                } else {
+                    "Another setup's run cut this part in a way the check does not follow."
+                })
+                .size(12),
                 small(
                     "New stock loaded",
                     (!running).then_some(Message::Run(R::NewStock)),

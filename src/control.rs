@@ -4650,6 +4650,14 @@ impl Connection {
             Some((None, _)) => Some(crate::run::PARTWAY_UNKNOWN.to_string()),
             // Not a part of the stock: the reason the check cannot tell it.
             Some((Some(partly), _))
+                if p.probe.is_ok()
+                    && partly.cut == [crate::run::EARLIER_UNFOLLOWED]
+                    && self.run.as_ref().is_some_and(|r| r.earlier_elsewhere()) =>
+            {
+                // Another project's, maybe (LIO-635).
+                Some("This computer's runs cut stock for a setup this project does not have, another project's or one deleted since: if that is the part held, they may have cut it where a probe finds this work zero. If new stock is held, press New stock loaded under Work zero.".into())
+            }
+            Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::EARLIER_UNFOLLOWED] =>
             {
                 Some("Another setup's run cut this part earlier in a way the check does not follow, where a probe finds this work zero.".into())

@@ -365,18 +365,36 @@ pub(crate) const EARLIER_UNFOLLOWED: &str =
 
 /// Why a probe cannot find a work zero from a spot of a stock
 /// `EARLIER_UNFOLLOWED` cut.
-const EARLIER_UNFOLLOWED_WHY: &str = "Another setup's run cut this part earlier in a way the check does not follow: an operation disabled or changed since, its setup deleted or moved after this one, or a setup this project does not have.";
+const EARLIER_UNFOLLOWED_WHY: &str = "Another setup's run cut this part earlier in a way the check does not follow: an operation disabled or changed since, its setup deleted or moved after this one, or a setup of another project.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z where
 /// `EARLIER_UNFOLLOWED` cut (`Run::partway_blocked`).
-const EARLIER_UNFOLLOWED_BLOCKED: &str = "Another setup's run cut this part earlier in a way the check does not follow (an operation disabled or changed since, its setup deleted or moved after this one, or a setup this project does not have), so it cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero.";
+const EARLIER_UNFOLLOWED_BLOCKED: &str = "Another setup's run cut this part earlier in a way the check does not follow (an operation disabled or changed since, its setup deleted or moved after this one, or a setup of another project), so it cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero.";
+
+/// Why a probe cannot find a work zero from a spot of a stock
+/// `EARLIER_UNFOLLOWED` cut by setups this project does not have alone
+/// (`Run::earlier_elsewhere`, LIO-635).
+const EARLIER_ELSEWHERE_WHY: &str = "This computer's runs cut stock for a setup this project does not have, another project's or one deleted since, and the check cannot tell whether that stock is the one held.";
+
+/// Why Zero Z on the stock top and Probe Z cannot set Z where
+/// `EARLIER_UNFOLLOWED` cut by setups this project does not have alone
+/// (`Run::earlier_elsewhere`, LIO-635).
+const EARLIER_ELSEWHERE_BLOCKED: &str = "This computer's runs cut stock for a setup this project does not have, another project's or one deleted since, and the check cannot tell whether that stock is the one held, so it cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero.";
+
+/// The way out of another setup's cut on the tablet (LIO-635): the
+/// computer's New stock loaded, then a new sync.
+macro_rules! new_stock_on_the_computer {
+    () => {
+        " If new stock is held, press New stock loaded on the computer (Run panel, under Work zero), then Sync projects here."
+    };
+}
 
 /// The computer's reasons for this session's cuts in the tablet file's
 /// words (LIO-590): the tablet has no Same part or New stock loaded, nor
 /// the computer's questions after a disconnect (LIO-595), and "this
 /// session" and "this computer" are the computer's, before the file was
 /// made.
-const FOR_TABLET: [(&str, &str); 7] = [
+const FOR_TABLET: [(&str, &str); 9] = [
     (
         STOCK_UNCONFIRMED_BLOCKED,
         "This setup's stock was cut, or taken as cut, on the computer before this tablet file was made, and the tablet cannot tell whether that part is still held, so it cannot tell the surface where the stock top is touched off.",
@@ -387,7 +405,10 @@ const FOR_TABLET: [(&str, &str); 7] = [
     ),
     (
         EARLIER_UNFOLLOWED_BLOCKED,
-        "Another setup's run on the computer cut this part before this tablet file was made, in a way the plan does not follow (an operation disabled or changed since, or its setup deleted or moved after this one), so the computer cannot tell the surface where the stock top is touched off.",
+        concat!(
+            "Another setup's run on the computer cut this part before this tablet file was made, in a way the plan does not follow (an operation disabled or changed since, its setup deleted or moved after this one, or a setup of another project), so the computer cannot tell the surface where the stock top is touched off.",
+            new_stock_on_the_computer!()
+        ),
     ),
     (
         STOCK_AWAY_BLOCKED,
@@ -403,7 +424,24 @@ const FOR_TABLET: [(&str, &str); 7] = [
     ),
     (
         EARLIER_UNFOLLOWED_WHY,
-        "Another setup's run on the computer cut this part before this tablet file was made, in a way the plan does not follow: an operation disabled or changed since, or its setup deleted or moved after this one.",
+        concat!(
+            "Another setup's run on the computer cut this part before this tablet file was made, in a way the plan does not follow: an operation disabled or changed since, its setup deleted or moved after this one, or a setup of another project.",
+            new_stock_on_the_computer!()
+        ),
+    ),
+    (
+        EARLIER_ELSEWHERE_BLOCKED,
+        concat!(
+            "Runs on the computer cut stock for a setup this project does not have, another project's or one deleted since, before this tablet file was made, and the tablet cannot tell whether that stock is the one held, so it cannot tell the surface where the stock top is touched off.",
+            new_stock_on_the_computer!()
+        ),
+    ),
+    (
+        EARLIER_ELSEWHERE_WHY,
+        concat!(
+            "Runs on the computer cut stock for a setup this project does not have, another project's or one deleted since, before this tablet file was made, and the tablet cannot tell whether that stock is the one held.",
+            new_stock_on_the_computer!()
+        ),
     ),
 ];
 
@@ -568,6 +606,10 @@ pub struct Run {
     /// The setups `earlier_cuts` was given for: one no longer in it was
     /// forgotten (New stock loaded).
     pub earlier_given: Vec<String>,
+    /// The ids of the project's setups, as `follow` last found them: a cut
+    /// in `earlier_cuts` by none of them is another project's, or a deleted
+    /// setup's (`earlier_elsewhere`, LIO-635).
+    pub(crate) project_setups: Vec<String>,
     /// A run following on the Pi the tool run its run ran when dropped
     /// (`App::run_pending`): what was cut before that tool run. Kept only
     /// once the follow holds (`follow_again`) and until this computer starts
@@ -1258,6 +1300,7 @@ impl Run {
             declared_stale: false,
             earlier_cuts: vec![],
             earlier_given: vec![],
+            project_setups: doc.setups.iter().map(|s| s.id.clone()).collect(),
             before_follow: None,
             running: None,
             xy: None,
@@ -1657,6 +1700,7 @@ impl Run {
     /// setups may have been moved. None once the setup was removed: the run
     /// then has nothing to check, and says so instead of its programs.
     pub fn follow(&mut self, doc: &Document) -> Option<usize> {
+        self.project_setups = doc.setups.iter().map(|s| s.id.clone()).collect();
         match doc.setups.iter().position(|s| s.id == self.setup_id) {
             Some(i) => {
                 self.setup = i;
@@ -2894,12 +2938,28 @@ impl Run {
     /// moved after this one (`Left::earlier`). Its stock lacks what was cut
     /// (LIO-582 review).
     pub fn earlier_unfollowed(&self) -> bool {
+        self.unfollowed_setups().next().is_some()
+    }
+
+    /// The setups whose cuts make `earlier_unfollowed`, by id.
+    fn unfollowed_setups(&self) -> impl Iterator<Item = &str> {
         let earlier = self.left.as_ref().map_or(&[][..], |l| &l.earlier[..]);
-        (self.earlier_cuts.iter()).any(|(id, cuts)| {
-            cuts.iter().any(|&(op, _, print)| {
-                !(earlier.iter()).any(|(s, o, p)| s == id && *o == op && Some(*p) == print)
+        (self.earlier_cuts.iter())
+            .filter(move |(id, cuts)| {
+                cuts.iter().any(|&(op, _, print)| {
+                    !(earlier.iter()).any(|(s, o, p)| s == id && *o == op && Some(*p) == print)
+                })
             })
-        })
+            .map(|(id, _)| id.as_str())
+    }
+
+    /// Every cut that makes `earlier_unfollowed` is by a setup this project
+    /// does not have (`project_setups`): another project's, the computer
+    /// keeping one record for all of them (`App::run_cuts`), or one deleted
+    /// since. Said so, with New stock loaded as the way out (LIO-635).
+    pub fn earlier_elsewhere(&self) -> bool {
+        let mut ids = self.unfollowed_setups().peekable();
+        ids.peek().is_some() && ids.all(|id| !self.project_setups.iter().any(|s| s == id))
     }
 
     /// The stock the start begins from is not the setup's own: the run
@@ -3058,6 +3118,8 @@ impl Run {
             STOCK_UNCONFIRMED_BLOCKED.into()
         } else if partly.cut == [HISTORY_UNFOLLOWED] {
             HISTORY_UNFOLLOWED_BLOCKED.into()
+        } else if partly.cut == [EARLIER_UNFOLLOWED] && self.earlier_elsewhere() {
+            EARLIER_ELSEWHERE_BLOCKED.into()
         } else if partly.cut == [EARLIER_UNFOLLOWED] {
             EARLIER_UNFOLLOWED_BLOCKED.into()
         } else if partly.cut == [STEPS_UNFOLLOWED] {
@@ -3328,12 +3390,16 @@ impl Run {
         // Another setup's run cut an operation the check does not simulate
         // so before this setup (LIO-582 review).
         if self.earlier_unfollowed() {
+            let why = match self.earlier_elsewhere() {
+                true => EARLIER_ELSEWHERE_WHY,
+                false => EARLIER_UNFOLLOWED_WHY,
+            };
             return Some(Cow::Owned(Partly {
                 cut: vec![EARLIER_UNFOLLOWED.into()],
                 surface: None,
                 top_cut: true,
                 probe_from: (before.probe_from.iter())
-                    .map(|(r, _)| (*r, Err(EARLIER_UNFOLLOWED_WHY.into())))
+                    .map(|(r, _)| (*r, Err(why.into())))
                     .collect(),
                 steps: vec![],
             }));
@@ -8127,6 +8193,7 @@ pub(crate) mod tests {
             declared_stale: false,
             earlier_cuts: vec![],
             earlier_given: vec![],
+            project_setups: vec![],
             before_follow: None,
             running: Some(Running {
                 index: 0,
@@ -10607,9 +10674,16 @@ pub(crate) mod tests {
             assert!(run.earlier_unfollowed() && unfollowed(&run));
             assert!(run.touch_off().is_none());
             let why = run.partway_blocked().unwrap();
-            assert!(
-                why.starts_with("Another setup's run cut this part"),
-                "{why}"
+            // A setup deleted since is one this project does not have, as
+            // another project's is (LIO-635).
+            let gone = !(edited.setups.iter()).any(|s| s.id == doc.setups[0].id);
+            assert_eq!(run.earlier_elsewhere(), gone);
+            assert_eq!(
+                why,
+                match gone {
+                    true => EARLIER_ELSEWHERE_BLOCKED,
+                    false => EARLIER_UNFOLLOWED_BLOCKED,
+                },
             );
             // From setup 2's start too.
             run.start_at(0, 0);
@@ -10688,9 +10762,11 @@ pub(crate) mod tests {
                 })
                 .collect()
         };
-        // No tablet text names what only the computer has.
+        // No tablet text names what only the computer has, but as the
+        // computer's way out of another setup's cut (LIO-635).
         for (computer, said) in FOR_TABLET {
             assert_eq!(for_tablet(computer.into()), said);
+            let said = said.replace(new_stock_on_the_computer!(), "");
             for only in ["Same part", "New stock", "under Work zero", "this computer"] {
                 assert!(!said.contains(only), "{said}");
             }
@@ -10735,13 +10811,14 @@ pub(crate) mod tests {
         assert_eq!(two.tool_runs.len(), 2);
         assert!(!two.tool_runs[0].step_starts.is_empty());
         refused(&two, EARLIER_UNFOLLOWED_BLOCKED, EARLIER_UNFOLLOWED_WHY);
-        // Deleted since: the same.
+        // Deleted since: refused too, as a setup this project does not
+        // have, as another project's is (LIO-635).
         let mut deleted = doc.clone();
         deleted.remove_setup(0).unwrap();
         refused(
             &setup(&deleted, 0, &session),
-            EARLIER_UNFOLLOWED_BLOCKED,
-            EARLIER_UNFOLLOWED_WHY,
+            EARLIER_ELSEWHERE_BLOCKED,
+            EARLIER_ELSEWHERE_WHY,
         );
         // The bore as the plan has it: setup 2's is the plan's alone. Setup
         // 1's own run cut it: whether that part is still held, the tablet
@@ -10823,6 +10900,111 @@ pub(crate) mod tests {
             ..Session::default()
         };
         assert_eq!(setup_in(&doc, 1, &other), setup(&doc, 1, &[]));
+    }
+
+    /// LIO-635: the computer keeps one record of what runs cut for all its
+    /// projects, so a cut by another project's setup, or one deleted since,
+    /// reaches every project it shares: a setup this project does not have.
+    /// The Run panel and the tablet file refuse every start over it, as
+    /// before, and say so: the cut may be another project's, and New stock
+    /// loaded on the computer clears it, then a new sync. A cut by a setup
+    /// of the project the plan no longer follows says it may be one too.
+    #[test]
+    fn another_projects_cut_is_said_as_one_with_the_way_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (mut doc, _) = tablet_fixture(&profile);
+        let (path, mesh, [mill, small]) = ring(dir.path());
+        let mut first = ring_setup(&doc, "G54", "1", "1");
+        let top = ring_top(&mesh, &first, true);
+        first.operations = vec![ring_bore(&mill, top, "0.5")];
+        let mut flipped = ring_setup(&doc, "G55", "1", "1");
+        flipped.p.insert("rx".into(), "180".into());
+        let top = ring_top(&mesh, &flipped, false);
+        flipped.operations = vec![ring_face(&mill, top.clone()), ring_face(&small, top)];
+        doc.active = flipped.id.clone();
+        doc.setups = vec![first, flipped];
+        doc.tools = vec![mill, small];
+        if let Some(f) = &mut doc.file {
+            (f.path, f.name, f.format) = (path, "ring.stl".into(), "stl".into());
+        }
+        // Another project's setup bored its part: an id this one lacks.
+        let (c, l) = check(&doc, &mesh, 0);
+        let mut run = Run::new(&doc, 0, 0);
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        run.note_cut(0, None);
+        let elsewhere = Session {
+            cuts: vec![(crate::id(), run.cut_in_run.clone())],
+            ..Session::default()
+        };
+        let zeros = |s: &TabletSetup| -> Vec<Option<TabletZero>> {
+            (s.tool_runs.iter())
+                .flat_map(|r| {
+                    let starts = r.starts.iter().map(|t| t.zero.clone());
+                    let steps = r.step_starts.iter().map(|t| t.zero.clone());
+                    std::iter::once(r.zero.clone()).chain(starts).chain(steps)
+                })
+                .collect()
+        };
+        let runs = crate::bundle::runs(&doc, Ok(&mesh), &elsewhere);
+        assert_eq!(runs.setups.len(), 2);
+        for s in &runs.setups {
+            assert!(s.problems.is_empty(), "{:?}", s.problems);
+            let all = zeros(s);
+            assert!(all.iter().all(Option::is_some), "{all:?}");
+            for z in all.into_iter().flatten() {
+                assert_eq!(z.set_z, None);
+                let blocked = z.blocked.unwrap();
+                for said in [
+                    "another project",
+                    "New stock loaded on the computer",
+                    "Sync projects",
+                ] {
+                    assert!(blocked.contains(said), "{said:?} not in {blocked:?}");
+                }
+                assert!(!z.probe_from.is_empty());
+                for spot in &z.probe_from {
+                    let why = spot.problem.as_deref().unwrap();
+                    assert!(why.contains("another project"), "{why}");
+                    assert!(why.contains("New stock loaded on the computer"), "{why}");
+                }
+            }
+        }
+        // The Run panel says it in its own words: New stock loaded is there.
+        for si in 0..2 {
+            let mut run = Run::new(&doc, si, 0);
+            run.given(&elsewhere);
+            let (c, l) = check(&doc, &mesh, si);
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            assert!(run.on_cut_stock() && run.touch_off().is_none());
+            let why = run.partway_blocked().unwrap();
+            assert!(why.contains("another project"), "{why}");
+            assert!(
+                why.contains("press New stock loaded under Work zero"),
+                "{why}"
+            );
+            run.earlier_cuts.clear();
+            assert!(!run.on_cut_stock());
+        }
+        // The plan's own setup 1's bore, disabled since, cut before setup 2:
+        // said as a cut the plan no longer follows, another project's among
+        // what it may be, with the same way out on the tablet.
+        let mut own = elsewhere.clone();
+        own.cuts[0].0 = doc.setups[0].id.clone();
+        let mut off = doc.clone();
+        off.setups[0].operations[0].enabled = false;
+        let runs = crate::bundle::runs(&off, Ok(&mesh), &own);
+        let two = (runs.setups.iter()).find(|s| s.setup_id == doc.setups[1].id);
+        for z in zeros(two.unwrap()).into_iter().flatten() {
+            let blocked = z.blocked.unwrap();
+            assert!(blocked.contains("operation disabled"), "{blocked}");
+            assert!(blocked.contains("another project"), "{blocked}");
+            assert!(
+                blocked.contains("New stock loaded on the computer"),
+                "{blocked}"
+            );
+        }
     }
 
     /// The journal of where a run stopped (LIO-275) is written and read
