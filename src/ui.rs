@@ -13522,7 +13522,7 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
                 o.name,
                 run.next + 1,
                 if reference {
-                    "set Z from the recorded reference (Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero"
+                    "set Z from the recorded reference (touch the tool on it and press Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero"
                 } else {
                     "set Z by hand on a surface whose height you know and press Keep this work zero"
                 }
@@ -13536,11 +13536,16 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
             },
         ];
     }
-    // Operations or steps after the start taken as cut, or what was taken
-    // as cut and dropped by an edit: Zero Z on the stock top and Probe Z
-    // are off (`partway_blocked`), so only Set Z from reference, or Z set
-    // by hand and kept, sets the work zero (LIO-621).
-    let by_hand = run.later_cut() || run.declared_lost;
+    // Where the check cannot tell the surface the work zero is touched off
+    // on (`partway_blocked`: operations or steps after the start taken as
+    // cut, what was taken as cut and dropped by an edit, a surface not
+    // known), Zero Z on the stock top and Probe Z are off, as step 3 says:
+    // only Set Z from reference, or Z set by hand and kept, sets the work
+    // zero (LIO-621).
+    let by_hand = run.partway_blocked().is_some();
+    // What was dropped by an edit, with nothing after the start taken as
+    // cut, may not have been cut with this work zero (LIO-583 review).
+    let kept_as_cut = !run.declared_lost || run.later_cut();
     let tool = crate::model::tool_label(o.tool, &o.tool_name);
     let mut steps = vec![format!(
         "This run starts at {} (tool run {}), taking {} as cut: nothing of {} is sent. {}",
@@ -13551,7 +13556,7 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
         match (by_hand, reference) {
             (false, _) => format!("Load {tool} and set the work zero on the stock they left."),
             (true, true) => format!(
-                "Load {tool}, then set Z from the recorded reference (Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero."
+                "Load {tool}, then set Z from the recorded reference (touch the tool on it and press Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero."
             ),
             (true, false) => format!(
                 "Load {tool}, then set Z by hand on a surface whose height you know and press Keep this work zero."
@@ -13593,9 +13598,9 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
             } else {
                 ""
             },
-            // Kept as it was: the operations after the start were cut with
-            // it, not those dropped by an edit (LIO-583).
-            if run.later_cut() {
+            // Kept as it was: what was taken as cut was cut with it, but
+            // not what was only dropped by an edit (LIO-583).
+            if kept_as_cut {
                 "when it is still the one they were cut with (the stock has not moved since), or "
             } else {
                 ""

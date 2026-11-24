@@ -12721,6 +12721,11 @@ flood = { pin = 8 }
                 "Operations or steps of this setup were taken as cut before the project changed, and the check may not take all of them as cut now, so it cannot tell the surface where the stock top is touched off."
             )
         );
+        let why = conn(&a).edges_setup().unwrap_err();
+        assert!(
+            why.starts_with("Operations or steps of this setup were taken as cut before the project changed, and the check may not take all of them as cut now where a probe finds this work zero."),
+            "{why}"
+        );
         let start = run_of(&a).checked().unwrap()[0].ops[2].clone();
         let tool = crate::model::tool_label(start.tool, &start.tool_name);
         let taken = run_of(&a).taken_as_cut();
@@ -12790,7 +12795,7 @@ flood = { pin = 8 }
         assert_eq!(
             first(&a),
             format!(
-                "This run starts at {} (tool run 1), taking {hole} as cut: nothing of it is sent. Load {tool}, then set Z from the recorded reference (Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero.\nCycle Start waits until Z is set from the reference, or until you press Keep this work zero: when it is still the one they were cut with (the stock has not moved since), or after you set Z by hand on a surface whose height you know.",
+                "This run starts at {} (tool run 1), taking {hole} as cut: nothing of it is sent. Load {tool}, then set Z from the recorded reference (touch the tool on it and press Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero.\nCycle Start waits until Z is set from the reference, or until you press Keep this work zero: when it is still the one they were cut with (the stock has not moved since), or after you set Z by hand on a surface whose height you know.",
                 face.name
             )
         );
@@ -12830,7 +12835,7 @@ flood = { pin = 8 }
         assert_eq!(
             steps[1..3].join("\n"),
             format!(
-                "This run starts at {} (tool run 1). Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut: set Z from the recorded reference (Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero, or press New stock loaded below if the stock is new.\nCycle Start waits until Z is set from the reference, or until you press Keep this work zero, or New stock loaded.",
+                "This run starts at {} (tool run 1). Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut: set Z from the recorded reference (touch the tool on it and press Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero, or press New stock loaded below if the stock is new.\nCycle Start waits until Z is set from the reference, or until you press Keep this work zero, or New stock loaded.",
                 face.name
             )
         );
@@ -13010,6 +13015,17 @@ flood = { pin = 8 }
                 && steps.contains("Load T3")
                 && steps.contains("Zero Z on the stock top and Probe Z are off")
                 && !steps.contains("Zero all"),
+            "{steps}"
+        );
+        // Zero Z and Probe Z off, the steps above step 3 do not say to set
+        // the work zero on that stock, but name what sets it (LIO-621
+        // review).
+        assert!(run_of(&a).reference.is_none());
+        assert!(
+            steps.contains("Load T3, then set Z by hand on a surface whose height you know and press Keep this work zero.")
+                && steps.contains("Cycle Start waits until you press Keep this work zero: when it is still the one they were cut with (the stock has not moved since), or after you set Z by hand on a surface whose height you know.")
+                && !steps.contains("set the work zero on the stock they left")
+                && !steps.contains("the work zero is set below"),
             "{steps}"
         );
         // Touch off does nothing; Cycle Start waits.

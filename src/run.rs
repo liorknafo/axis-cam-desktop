@@ -394,8 +394,7 @@ pub(crate) const HISTORY_UNFOLLOWED_BLOCKED: &str = "Runs this computer did not 
 
 /// What was taken as cut before the project changed, said as `Partly::cut`
 /// (`Run::declared_lost`, LIO-583 review).
-pub(crate) const DECLARED_LOST: &str =
-    "stock taken as cut before the project changed, which the check may not all take as cut now";
+pub(crate) const DECLARED_LOST: &str = "stock taken as cut before the project changed, some of which the check may no longer take as cut";
 
 /// Why a probe cannot find a work zero from a spot while
 /// `Run::declared_lost`.
