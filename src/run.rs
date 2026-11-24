@@ -2153,6 +2153,7 @@ impl Run {
         if next > 0 && next < count {
             // Nothing is started until the check answers with its program.
             if self.start_at_step(oi, next) {
+                self.keep_next_tool();
                 (self.recheck, self.programs) = (true, None);
             }
         } else {
