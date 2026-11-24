@@ -2974,7 +2974,12 @@ impl Connection {
         // Sent by AXIS CAM here, before it opened again perhaps: this
         // computer's, not another's (`done_elsewhere`, LIO-596).
         if let Some(p) = &pending {
-            SENT_TOOL_RUNS.with(|s| s.borrow_mut().push(p.id));
+            SENT_TOOL_RUNS.with(|s| {
+                let mut s = s.borrow_mut();
+                if !s.contains(&p.id) {
+                    s.push(p.id);
+                }
+            });
         }
         c.reattach = pending.and_then(|p| Some((p.id, p.follow?)));
         Ok(c)

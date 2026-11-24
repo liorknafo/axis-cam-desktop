@@ -391,7 +391,7 @@ const FOR_TABLET: [(&str, &str); 7] = [
     ),
     (
         STOCK_AWAY_BLOCKED,
-        "This setup's runs on the computer cut the stock before this tablet file was made, and the machine was disconnected from it since: the tablet cannot tell whether that part is still held, or what else ran on the machine, so it cannot tell the surface where the stock top is touched off.",
+        "Runs on the computer cut the stock before this tablet file was made, and the machine was disconnected from it or AXIS CAM closed since: the tablet cannot tell whether that part is still held, or what else ran on the machine, so it cannot tell the surface where the stock top is touched off.",
     ),
     (
         HISTORY_UNFOLLOWED_BLOCKED,
