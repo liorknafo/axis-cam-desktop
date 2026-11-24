@@ -4674,7 +4674,7 @@ impl Connection {
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::EARLIER_UNFOLLOWED] =>
             {
-                Some("Another setup's run cut this part earlier in a way the check does not follow, where a probe finds this work zero.".into())
+                self.run.as_ref().map(|r| r.earlier_unfollowed_probe())
             }
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::HISTORY_UNFOLLOWED] =>
