@@ -263,9 +263,14 @@ pub struct Before {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TouchedFor {
     /// The tool's id (`tool_id`): the next tool run's when it was touched
-    /// off. None while the setup was not checked yet: the next tool run's
-    /// once it is (`checked_as`).
+    /// off. None when no tool run was checked then: it holds for no tool.
     tool: Option<String>,
+    /// Made before the setup's first check answered: tool run 1's tool
+    /// once that check starts the run there (`checked_as`). A touch-off
+    /// made while a later check runs (after an edit, a skip or a new start)
+    /// may be for the tool before it, so it holds for none.
+    #[serde(default)]
+    first: bool,
     /// The Z work offset it left, once the machine shows what was sent
     /// (`Run::touch_shown`); None until then.
     z: Option<f64>,
@@ -538,6 +543,8 @@ pub struct Run {
     /// Z touched off on the Control page since the last tool run started
     /// (`z_touched`): it holds for its tool only (`touched`, LIO-619).
     touched_for: Option<TouchedFor>,
+    /// A check of the setup has answered since it was picked.
+    answered: bool,
     /// How the last tool run ended (ok, the driver's message).
     pub outcome: Option<(bool, String)>,
     /// The stock after each of the setup's operations, by its index in the
@@ -1207,6 +1214,7 @@ impl Run {
             last: None,
             length: None,
             touched_for: None,
+            answered: false,
             outcome: None,
             pictures: vec![],
             left: None,
@@ -1635,10 +1643,14 @@ impl Run {
         self.z_touched_for(self.tool_of(self.next));
     }
 
-    /// Z is touched off for `tool` (None: the next tool run's once the
-    /// setup is checked).
+    /// Z is touched off for `tool` (None: not known, `TouchedFor::first`).
     pub fn z_touched_for(&mut self, tool: Option<String>) {
-        self.touched_for = Some(TouchedFor { tool, z: None });
+        let first = tool.is_none() && !self.answered;
+        self.touched_for = Some(TouchedFor {
+            tool,
+            first,
+            z: None,
+        });
     }
 
     /// The Z work offset the last touch-off left, once shown.
@@ -1754,14 +1766,18 @@ impl Run {
             Some(f) => self.followed = Some(self.follow_again(f)),
             None => self.take_journal(),
         }
-        // A touch-off made while no tool run was checked was for the next
-        // tool run's tool, as the check finds it (LIO-619).
-        let next = self.tool_of(self.next);
+        // A touch-off made before the setup's first check answered was for
+        // tool run 1's tool, when the run starts there; else for none
+        // known (LIO-619).
+        let start = (self.next == 0 && self.from == 0 && self.at_step().is_none())
+            .then(|| self.tool_of(0))
+            .flatten();
         if let Some(t) = &mut self.touched_for
-            && t.tool.is_none()
+            && std::mem::take(&mut t.first)
         {
-            t.tool = next;
+            t.tool = start;
         }
+        self.answered = true;
     }
 
     /// Where a run of this setup stopped (`journal`), once it is checked:
@@ -8093,6 +8109,7 @@ pub(crate) mod tests {
             last: None,
             length: None,
             touched_for: None,
+            answered: false,
             outcome: None,
             pictures: vec![],
             left: None,

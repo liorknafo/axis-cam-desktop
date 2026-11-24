@@ -3042,16 +3042,20 @@ flood = { pin = 8 }
         let dir = tempfile::tempdir().unwrap();
         let mut a = run_app(dir.path());
         zeroed(&mut a);
-        check_run(&mut a, 0);
+        // T1 on the reference surface: Set Z from reference before the
+        // setup's first check answers, for tool run 1 where it starts.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        assert!(run_of(&a).programs.is_none());
+        let _ = a.update(Message::Run(R::RecordReference));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        let epoch = run_of(&a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
         let tools: Vec<u32> = (run_of(&a).checked().unwrap().iter())
             .map(|p| p.ops[0].tool)
             .collect();
         assert_eq!(tools, [1, 3]);
-        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
-        // T1 on the reference surface: Set Z from reference, for tool run 1.
-        let _ = a.update(Message::Run(R::RecordReference));
-        let _ = a.update(Message::Run(R::ZFromReference));
-        touch_shown(&mut a);
         assert!(run_of(&a).touched());
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
         // Tool run 2 picked: T3 would cut with T1's Z.
@@ -3122,6 +3126,11 @@ flood = { pin = 8 }
         a.doc.setups[0].operations[1].tool = t4.id.clone();
         a.doc.tools.push(t4);
         let _ = a.update(Message::Run(R::Check));
+        // A touch-off while it is checked again may be T3's: it holds for
+        // no tool.
+        assert!(run_of(&a).programs.is_none());
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
         let epoch = run_of(&a).epoch;
         let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
         let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
@@ -11623,7 +11632,7 @@ flood = { pin = 8 }
         )));
         let _ = a.update(Message::Machine(crate::control::Action::WorkSet(2)));
         tick_for(&mut a, 100);
-        assert!(run_of(&a).touched && !run_of(&a).zeroed);
+        assert!(run_of(&a).touched() && !run_of(&a).zeroed);
         assert!(problems(&a).contains(&waits));
         let _ = a.update(Message::Run(R::KeepZero));
         assert!(run_of(&a).zeroed);
