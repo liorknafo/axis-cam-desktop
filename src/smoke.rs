@@ -10762,10 +10762,10 @@ flood = { pin = 8 }
         reconnect(&mut a);
         let _ = a.update(Message::Run(R::OtherRunsMayHaveCut));
         assert!(a.run_away.is_empty(), "{:?}", a.run_away);
-        let others = others(&a).unwrap();
+        let marked = others(&a).unwrap();
         assert!(
-            others.iter().any(|c| c.0 == crate::run::HISTORY_UNKNOWN),
-            "{others:?}"
+            marked.iter().any(|c| c.0 == crate::run::HISTORY_UNKNOWN),
+            "{marked:?}"
         );
         let run = run_of(&a);
         assert!(
@@ -10774,6 +10774,34 @@ flood = { pin = 8 }
             "{:?}",
             run.earlier_cuts
         );
+        // New stock loaded: every record is forgotten at once, so evidence
+        // seen after it has nothing to mark and says nothing (LIO-596
+        // review).
+        let _ = a.update(Message::Run(R::NewStock));
+        assert!(a.run_cuts.is_empty(), "{:?}", a.run_cuts);
+        assert!(!a.cut_elsewhere());
+        assert!(conn(&a).touch_off().is_some());
+        // The Face's setup cut nothing on the new stock; another setup's
+        // runs did, then a disconnect. Asked for that record, it is said
+        // unknown, and the Face's setup gets no record of its own: it cut
+        // nothing, so picked again it is not asked whether "this setup's
+        // runs" cut the part held (LIO-596 review).
+        // A run made on the new stock (the one that forgot it would forget
+        // it again as it is dropped), then the other setup's cuts.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        a.run_cuts.push((other.clone(), cut.clone()));
+        reconnect(&mut a);
+        assert!(run_of(&a).cut_in_run.is_empty());
+        assert!(conn(&a).touch_off().is_none());
+        let _ = a.update(Message::Run(R::OtherRunsMayHaveCut));
+        let run = run_of(&a);
+        assert!(run.cut_in_run.is_empty(), "{:?}", run.cut_in_run);
+        assert!(run.history_unknown() && conn(&a).touch_off().is_none());
+        assert!(others(&a).is_some_and(|c| c.iter().any(|c| c.0 == crate::run::HISTORY_UNKNOWN)));
     }
 
     /// The Pi's tool run, Stop after step armed in the Face's pass 1, goes on

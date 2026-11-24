@@ -4019,7 +4019,13 @@ impl Connection {
                 run.away = None;
             }
             R::OtherRunsMayHaveCut if run.running.is_none() && run.away.is_some() => {
-                run.note_history_unknown();
+                // Its own record, when it has one: a setup asked for the
+                // other setups' it has (`earlier_cuts`) cut nothing itself,
+                // and theirs are marked (`App::answered_away`, LIO-596
+                // review).
+                if !run.cut_in_run.is_empty() {
+                    run.note_history_unknown();
+                }
                 run.stock_unconfirmed = false;
                 run.away = None;
             }

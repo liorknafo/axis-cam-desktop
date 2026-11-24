@@ -8994,6 +8994,14 @@ impl App {
                     if away && c.run.as_ref().is_some_and(|r| r.away.is_none()) {
                         self.answered_away(&action);
                     }
+                    // New stock loaded: what this session's runs cut is
+                    // forgotten now, not only once the run is dropped, so
+                    // nothing seen since says it is unknown (LIO-596 review).
+                    if let (run::Action::NewStock, Some(c)) = (&action, &self.control)
+                        && let Some(r) = c.run.as_ref().filter(|r| r.cut_in_run.is_empty())
+                    {
+                        keep_run_cuts(&mut self.run_cuts, r);
+                    }
                 }
             }
             Message::RunChecked(epoch, programs) => {
