@@ -12803,6 +12803,11 @@ flood = { pin = 8 }
                 .any(|t| t == "Set Z from reference")
         );
         assert!(problems(&a).iter().any(|p| p.contains("taken as cut")));
+        let steps = crate::ui::work_zero_steps(&a, conn(&a)).unwrap().join("\n");
+        assert!(
+            steps.contains("Zero Z on the stock top and Probe Z are off: set Z by hand on a surface whose height you know (Set under Work zero), or from the recorded reference (Set Z from reference)."),
+            "{steps}"
+        );
         let _ = a.update(Message::Run(R::ZFromReference));
         tick_for(&mut a, 100);
         assert!(run_of(&a).zeroed);
@@ -12810,6 +12815,83 @@ flood = { pin = 8 }
             !problems(&a).iter().any(|p| p.contains("taken as cut")),
             "{:?}",
             problems(&a)
+        );
+        // The project edited: the hole is dropped, nothing is taken as cut,
+        // and the reference, still recorded, sets Z too (LIO-621 review).
+        a.doc.title = format!("{} renamed", a.doc.title);
+        a.touch();
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert!(run.declared_lost && run.taken_as_cut().is_empty() && !run.zeroed);
+        assert!(run.reference.is_some());
+        let steps = crate::ui::work_zero_steps(&a, conn(&a)).unwrap();
+        assert_eq!(
+            steps[1..3].join("\n"),
+            format!(
+                "This run starts at {} (tool run 1). Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut: set Z from the recorded reference (Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero, or press New stock loaded below if the stock is new.\nCycle Start waits until Z is set from the reference, or until you press Keep this work zero, or New stock loaded.",
+                face.name
+            )
+        );
+        assert!(
+            steps
+                .join("\n")
+                .contains("or from the recorded reference (Set Z from reference)."),
+            "{steps:?}"
+        );
+        let _ = a.update(Message::Run(R::ZFromReference));
+        tick_for(&mut a, 100);
+        assert!(run_of(&a).zeroed);
+        assert!(
+            !problems(&a)
+                .iter()
+                .any(|p| p.contains("before the project changed")),
+            "{:?}",
+            problems(&a)
+        );
+    }
+
+    /// A setup of one tool run, its Pocket's level 1 taken as cut after a
+    /// start at the Face (LIO-621 review): the Work zero tab has no
+    /// Reference surface rows, so no step offers Set Z from reference, even
+    /// with a reference recorded; Z set by hand and kept is what is said.
+    #[test]
+    fn one_tool_run_steps_offer_no_set_z_from_reference() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), FAST, &[0, 1]);
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).checked().unwrap().len(), 1);
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert_eq!(run.all_cut(), [(1, vec![0])]);
+        assert!(run.later_cut() && run.partway() && !run.zeroed);
+        let _ = a.update(Message::Run(R::RecordReference));
+        assert!(run_of(&a).reference.is_some());
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let window = iced::Size::new(1440., 2400.);
+        let texts = crate::ui::probe::texts(a.view(), window);
+        assert!(
+            !texts.iter().any(|t| t == "Set Z from reference"),
+            "{texts:?}"
+        );
+        let steps = crate::ui::work_zero_steps(&a, conn(&a)).unwrap();
+        let all = steps.join("\n");
+        assert!(
+            !all.contains("Set Z from reference") && !all.contains("set from the reference"),
+            "{all}"
+        );
+        assert!(
+            steps[1].ends_with("then set Z by hand on a surface whose height you know and press Keep this work zero.")
+                && all.contains("Zero Z on the stock top and Probe Z are off: set Z by hand on a surface whose height you know (Set under Work zero)."),
+            "{all}"
         );
     }
 

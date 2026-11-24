@@ -13357,8 +13357,14 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
         }
     } else if let Some(why) = &blocked {
         steps.push(format!(
-            "3. {why} Zero Z on the stock top and Probe Z are off{}: set Z by hand on a surface whose height you know (Set under Work zero), or from a recorded reference (Set Z from reference).",
-            also_off.map_or_else(String::new, |name| format!(", and so is {name}"))
+            "3. {why} Zero Z on the stock top and Probe Z are off{}: set Z by hand on a surface whose height you know (Set under Work zero){}.",
+            also_off.map_or_else(String::new, |name| format!(", and so is {name}")),
+            // Only where Set Z from reference is shown and has one (LIO-621).
+            if reference_set(run) {
+                ", or from the recorded reference (Set Z from reference)"
+            } else {
+                ""
+            }
         ));
     } else if let (true, Some((_, work)), Some(refs)) = (
         run.partway(),
@@ -13484,6 +13490,13 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     }
     Some(steps)
 }
+/// Set Z from reference can set the work Z: a reference is recorded, and the
+/// setup has more than one tool run, so the Work zero tab shows the
+/// Reference surface rows that hold the button (LIO-621). Where it is
+/// false, the steps do not offer it.
+fn reference_set(run: &crate::run::Run) -> bool {
+    run.reference.is_some() && run.checked().is_some_and(|p| p.len() > 1)
+}
 /// What Work zero on the stock says first of a run that starts partway
 /// (`run::Run::partway`): where it starts, which operations it takes as
 /// cut and the tool to load, what they cut where the work zero is found,
@@ -13499,17 +13512,25 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
     };
     let o = &p.ops[run.from.min(p.ops.len() - 1)];
     let skipped = run.taken_as_cut();
+    let reference = reference_set(run);
     // Partway only by what was taken as cut and dropped since: nothing it
     // takes as cut to name (LIO-583 review).
     if skipped.is_empty() && run.declared_lost {
         return vec![
             format!(
-                "This run starts at {} (tool run {}). Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut: set Z by hand on a surface whose height you know, or press New stock loaded below if the stock is new.",
+                "This run starts at {} (tool run {}). Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut: {}, or press New stock loaded below if the stock is new.",
                 o.name,
-                run.next + 1
+                run.next + 1,
+                if reference {
+                    "set Z from the recorded reference (Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero"
+                } else {
+                    "set Z by hand on a surface whose height you know and press Keep this work zero"
+                }
             ),
             if run.zeroed {
                 "The work zero is set for this start.".into()
+            } else if reference {
+                "Cycle Start waits until Z is set from the reference, or until you press Keep this work zero, or New stock loaded.".into()
             } else {
                 "Cycle Start waits until you press Keep this work zero, or New stock loaded.".into()
             },
@@ -13518,10 +13539,8 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
     // Operations or steps after the start taken as cut, or what was taken
     // as cut and dropped by an edit: Zero Z on the stock top and Probe Z
     // are off (`partway_blocked`), so only Set Z from reference, or Z set
-    // by hand and kept, sets the work zero (LIO-621). Set Z from reference
-    // is said only when a reference is recorded, under Reference surface.
+    // by hand and kept, sets the work zero (LIO-621).
     let by_hand = run.later_cut() || run.declared_lost;
-    let reference = run.reference.is_some() && programs.len() > 1;
     let tool = crate::model::tool_label(o.tool, &o.tool_name);
     let mut steps = vec![format!(
         "This run starts at {} (tool run {}), taking {} as cut: nothing of {} is sent. {}",
