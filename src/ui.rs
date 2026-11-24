@@ -11290,7 +11290,7 @@ fn tool_change_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Eleme
         .and_then(|i| programs.get(i))
         .map(|q| crate::model::tool_label(q.ops[0].tool, &q.ops[0].tool_name));
     let recorded = run.reference.is_some();
-    let touched = run.touched;
+    let touched = run.touched();
     let mut col = column![
         row![
             chip("TOOL CHANGE", Color::from_rgb8(209, 139, 22)),
@@ -11554,7 +11554,7 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
     col = col.push(step_box(2, run.zeroed, placed && !run.zeroed, two));
     // 3. The tool's Z.
     let tool = crate::model::tool_label(o.tool, &o.tool_name);
-    let kept = run.tool_kept || run.touched;
+    let kept = run.tool_kept || run.touched();
     let three = column![
         text(format!(
             "{tool}'s Z: the same tool, not taken out since, or touched off again."
@@ -11570,7 +11570,7 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
                 "Set Z from reference",
                 (manual && run.reference.is_some() && run.reference_a_problem(c).is_none())
                     .then_some(Message::Run(R::ZFromReference)),
-                run.touched
+                run.touched()
             ),
         ]
         .spacing(6)

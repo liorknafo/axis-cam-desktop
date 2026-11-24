@@ -139,7 +139,7 @@ pub struct Running {
     seq: u64,
     /// The work offset it was lowered with.
     pub offset: [f64; 6],
-    /// What Cycle Start recorded over (`xy`, `zero`, `last`, `touched`), put
+    /// What Cycle Start recorded over (`xy`, `zero`, `last`, `touched_for`), put
     /// back when the driver refuses the job: nothing ran then (#168).
     before: Before,
     /// The line each of its blocks moves the tool tip along (`paths`),
@@ -276,7 +276,30 @@ pub struct Before {
     xy: Option<(usize, [f64; 2])>,
     zero: Option<(String, [f32; 3])>,
     last: Option<(String, f64)>,
-    touched: bool,
+    /// A file from before LIO-619 kept a `touched` flag: no touch-off is
+    /// known from it, so another is made.
+    #[serde(default)]
+    touched_for: Option<TouchedFor>,
+}
+
+/// Z touched off on the Control page (`Run::touched_for`): for which tool,
+/// and the Z work offset it left. That Z is the tool's, so it holds for no
+/// other (LIO-619).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TouchedFor {
+    /// The tool's id (`tool_id`): the next tool run's when it was touched
+    /// off; while the setup is checked again (after an edit, a skip or a
+    /// new start), the one the check before found next (`Run::check_again`),
+    /// which the Tool change tab showed. None when no tool run was checked
+    /// then: it holds for no tool.
+    tool: Option<String>,
+    /// Made before the setup's first check answered: tool run 1's tool
+    /// once that check starts the run there (`checked_as`).
+    #[serde(default)]
+    first: bool,
+    /// The Z work offset it left, once the machine shows what was sent
+    /// (`Run::touch_shown`); None until then.
+    z: Option<f64>,
 }
 
 /// The driver's outcome of a job it refused before anything moved: "<name>:
@@ -651,8 +674,14 @@ pub struct Run {
     /// turning A runs with (`rotary_problems`), while that reference is the
     /// one kept with the centreline.
     pub length: Option<(String, f64, f64)>,
-    /// Z was touched off on the Control page since the last tool run started.
-    pub touched: bool,
+    /// Z touched off on the Control page since the last tool run started
+    /// (`z_touched`): it holds for its tool only (`touched`, LIO-619).
+    touched_for: Option<TouchedFor>,
+    /// A check of the setup has answered since it was picked.
+    answered: bool,
+    /// While the setup is checked again: the tool of the tool run the check
+    /// before found next (`check_again`), what a touch-off is for meanwhile.
+    rechecked_tool: Option<String>,
     /// How the last tool run ended (ok, the driver's message).
     pub outcome: Option<(bool, String)>,
     /// The stock after each of the setup's operations, by its index in the
@@ -1359,7 +1388,9 @@ impl Run {
             reference_a: None,
             last: None,
             length: None,
-            touched: false,
+            touched_for: None,
+            answered: false,
+            rechecked_tool: None,
             outcome: None,
             pictures: vec![],
             left: None,
@@ -1769,6 +1800,65 @@ impl Run {
         self.programs.as_deref()?.as_deref().ok()
     }
 
+    /// The tool (`tool_id`) of tool run `i`, as checked.
+    fn tool_of(&self, i: usize) -> Option<String> {
+        Some(self.checked()?.get(i)?.ops[0].tool_id.clone())
+    }
+
+    /// Z was touched off on the Control page since the last tool run
+    /// started, for the next tool run's tool: a touch-off holds for its
+    /// tool only (LIO-619).
+    pub fn touched(&self) -> bool {
+        let next = self.tool_of(self.next);
+        (self.touched_for.as_ref()).is_some_and(|t| next.is_some() && t.tool == next)
+    }
+
+    /// Z is touched off for the next tool run's tool: Set Z from
+    /// reference, Zero Z, Set Z, a probe or a touch-off.
+    pub fn z_touched(&mut self) {
+        let tool = (self.tool_of(self.next)).or_else(|| self.rechecked_tool.clone());
+        self.z_touched_for(tool);
+    }
+
+    /// The setup is checked again, as check `epoch`, keeping its progress:
+    /// a touch-off meanwhile is for the tool the check before found next.
+    pub fn check_again(&mut self, epoch: u64) {
+        self.keep_next_tool();
+        (self.epoch, self.programs, self.stale, self.recheck) = (epoch, None, false, false);
+    }
+
+    /// Keeps the next tool run's tool for touch-offs while the setup is
+    /// checked again (`rechecked_tool`).
+    fn keep_next_tool(&mut self) {
+        if let Some(tool) = self.tool_of(self.next) {
+            self.rechecked_tool = Some(tool);
+        }
+    }
+
+    /// Z is touched off for `tool` (None: not known, `TouchedFor::first`).
+    pub fn z_touched_for(&mut self, tool: Option<String>) {
+        let first = tool.is_none() && !self.answered;
+        self.touched_for = Some(TouchedFor {
+            tool,
+            first,
+            z: None,
+        });
+    }
+
+    /// The Z work offset the last touch-off left, once shown.
+    #[cfg(test)]
+    pub fn touched_z(&self) -> Option<f64> {
+        self.touched_for.as_ref()?.z
+    }
+
+    /// The machine shows everything sent, with Z work offset `z`: what a
+    /// touch-off not shown yet left.
+    pub fn touch_shown(&mut self, z: f64) {
+        if let Some(t) = &mut self.touched_for {
+            t.z.get_or_insert(z);
+        }
+    }
+
     /// Whether what is taken as cut (`skips`, `cut_steps`) was taken as cut
     /// from the plans and cutters a check found (`now`): each operation it
     /// names has the print `from` gives it (`declared_from`, LIO-611).
@@ -1815,6 +1905,7 @@ impl Run {
             // Its steps taken as cut go: their material is not the check's.
             self.declared_lost |= !self.cut_steps.is_empty();
             self.cut_steps.clear();
+            self.keep_next_tool();
             (self.programs, self.recheck) = (None, true);
             // Checked otherwise, it is not the program sent.
             if self.follow.take().is_some() {
@@ -1840,6 +1931,7 @@ impl Run {
             } else {
                 self.skips.retain(|s| s.1 != Skip::Cut);
                 self.cut_steps.clear();
+                self.keep_next_tool();
                 (self.programs, self.recheck) = (None, true);
                 return;
             }
@@ -1910,6 +2002,18 @@ impl Run {
             Some(f) => self.followed = Some(self.follow_again(f)),
             None => self.take_journal(),
         }
+        // A touch-off made before the setup's first check answered was for
+        // tool run 1's tool, when the run starts there; else for none
+        // known (LIO-619).
+        let start = (self.next == 0 && self.from == 0 && self.at_step().is_none())
+            .then(|| self.tool_of(0))
+            .flatten();
+        if let Some(t) = &mut self.touched_for
+            && std::mem::take(&mut t.first)
+        {
+            t.tool = start;
+        }
+        (self.answered, self.rechecked_tool) = (true, None);
     }
 
     /// Where a run of this setup stopped (`journal`), once it is checked:
@@ -2177,9 +2281,9 @@ impl Run {
                 xy,
                 zero,
                 last,
-                touched,
+                touched_for,
             } = r.before.clone();
-            (self.xy, self.zero, self.last, self.touched) = (xy, zero, last, touched);
+            (self.xy, self.zero, self.last, self.touched_for) = (xy, zero, last, touched_for);
         } else if let Some((op, s)) = stopping {
             // Stopped after a step, the tool at its clearance: lifted to the
             // clearance plane once the machine stands still.
@@ -2299,6 +2403,7 @@ impl Run {
         if next > 0 && next < count {
             // Nothing is started until the check answers with its program.
             if self.start_at_step(oi, next) {
+                self.keep_next_tool();
                 (self.recheck, self.programs) = (true, None);
             }
         } else {
@@ -2419,9 +2524,9 @@ impl Run {
             xy,
             zero,
             last,
-            touched,
+            touched_for,
         } = r.before;
-        (self.xy, self.zero, self.last, self.touched) = (xy, zero, last, touched);
+        (self.xy, self.zero, self.last, self.touched_for) = (xy, zero, last, touched_for);
         (self.stopping, self.stop_after) = (None, false);
         self.outcome = Some((false, why));
     }
@@ -2566,7 +2671,7 @@ impl Run {
                     c.place(&unset_ids(c), true, true)
                 ));
             }
-            if !self.tool_kept && !self.touched {
+            if !self.tool_kept && !self.touched() {
                 e.push(format!(
                     "Confirm {}'s Z for the start at {step}: Same tool, keep Z if it was not taken out since, or Set Z from reference.",
                     crate::model::tool_label(first.tool, &first.tool_name)
@@ -2784,11 +2889,16 @@ impl Run {
                 ));
             }
         }
-        if let Some((tool, z)) = &self.last
-            && *tool != p.ops[0].tool_id
-            && !self.touched
-            && (s.work_offset[2] - z).abs() < 1e-6
-        {
+        // Z touched off for another tool since (another tool run picked,
+        // or its tool changed by an edit, LIO-619): that tool's Z, while
+        // the offset is the one it left.
+        let tool = &p.ops[0].tool_id;
+        let unchanged = |z: f64| (s.work_offset[2] - z).abs() < 1e-6;
+        let other = (self.touched_for.as_ref())
+            .filter(|t| t.tool.as_ref() != Some(tool))
+            .is_some_and(|t| t.z.is_none_or(unchanged));
+        let change = (self.last.as_ref()).is_some_and(|(t, z)| t != tool && unchanged(*z));
+        if !self.touched() && (other || change) {
             e.push(format!(
                 "Tool run {} uses {}: touch off its Z first (Set Z from reference, or Zero Z).",
                 self.next + 1,
@@ -2859,7 +2969,7 @@ impl Run {
                 xy: self.xy,
                 zero: self.zero.clone(),
                 last: self.last.clone(),
-                touched: self.touched,
+                touched_for: self.touched_for.clone(),
             },
             paths,
             tip,
@@ -2873,7 +2983,7 @@ impl Run {
             .get_or_insert((s.active_wcs, [s.work_offset[0], s.work_offset[1]]));
         self.zero.get_or_insert(zero);
         self.last = Some((tool, s.work_offset[2]));
-        self.touched = false;
+        self.touched_for = None;
         self.outcome = None;
         Some(Command::Job {
             name,
@@ -6176,7 +6286,7 @@ fn tablet_job_from(
             xy: None,
             zero: None,
             last: None,
-            touched: false,
+            touched_for: None,
         },
         paths: vec![],
         tip: [0.; 3],
@@ -8490,7 +8600,7 @@ pub(crate) mod tests {
                     xy: None,
                     zero: None,
                     last: None,
-                    touched: false,
+                    touched_for: None,
                 },
                 paths: vec![],
                 tip: [0.; 3],
@@ -8506,7 +8616,9 @@ pub(crate) mod tests {
             reference_a: None,
             last: None,
             length: None,
-            touched: false,
+            touched_for: None,
+            answered: false,
+            rechecked_tool: None,
             outcome: None,
             pictures: vec![],
             left: None,
@@ -8638,7 +8750,7 @@ pub(crate) mod tests {
                 xy: None,
                 zero: None,
                 last: None,
-                touched: false,
+                touched_for: None,
             },
             paths: vec![],
             tip: [0.; 3],
@@ -10488,7 +10600,7 @@ pub(crate) mod tests {
                     xy: None,
                     zero: None,
                     last: None,
-                    touched: false,
+                    touched_for: None,
                 },
                 paths: paths(blocks, [0.; 3]),
                 tip: [0.; 3],
