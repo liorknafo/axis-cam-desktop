@@ -1109,7 +1109,7 @@ pub struct Run {
     /// (`programs` is None then) and over a refused one: what the next
     /// check that passes compares the start's tool run with (`checked_as`,
     /// LIO-636).
-    answered: Option<Arc<Result<Vec<Checked>, Vec<String>>>>,
+    last_passed: Option<Arc<Result<Vec<Checked>, Vec<String>>>>,
     /// A check moved a start partway into a tool run back to its first
     /// operation, its operations having changed: what it says, until a
     /// start is picked or Cycle Start sends a tool run.
@@ -1811,7 +1811,7 @@ impl Run {
             followed: None,
             cut_note: None,
             rows_from_skips: false,
-            answered: None,
+            last_passed: None,
             start_moved: None,
         }
     }
@@ -2440,7 +2440,7 @@ impl Run {
                     (p.indexes.clone(), ops.collect::<Vec<_>>())
                 })
             };
-            let last = (self.answered.as_deref()).and_then(|a| a.as_deref().ok());
+            let last = (self.last_passed.as_deref()).and_then(|a| a.as_deref().ok());
             let was = last.and_then(|c| c.get(self.next));
             let before = ops(was);
             if self.done.len() != new.len() {
@@ -2481,7 +2481,7 @@ impl Run {
         }
         (self.zeroed, self.tool_kept, self.recheck) = (false, false, false);
         if programs.is_ok() {
-            self.answered = Some(programs.clone());
+            self.last_passed = Some(programs.clone());
         }
         self.programs = Some(programs);
         self.before = left
@@ -9970,7 +9970,7 @@ pub(crate) mod tests {
             followed: None,
             cut_note: None,
             rows_from_skips: false,
-            answered: None,
+            last_passed: None,
             start_moved: None,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
