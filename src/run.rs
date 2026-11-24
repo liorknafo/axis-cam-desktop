@@ -4949,6 +4949,16 @@ pub struct TabletSetup {
     pub machine_profile: Option<String>,
     /// The work offset its zero is set in ("G54").
     pub work_offset: String,
+    /// The setup's work zero, one of `post::ORIGINS` (`Checked::origin`),
+    /// and where it is in the plan (`Checked::datum`): the tablet records
+    /// them at the first tool run's start and refuses a later Cycle Start
+    /// once the work zero moved in the project since, as the Run panel
+    /// does (`Run::zero`, LIO-617). Null when it cannot run, and in a file
+    /// from before.
+    #[serde(default)]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub datum: Option<[f32; 3]>,
     /// Why it cannot run, as the computer's Run panel says; no tool runs then.
     pub problems: Vec<String>,
     pub tool_runs: Vec<TabletRun>,
@@ -5225,6 +5235,8 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
             .filter(|n| !n.trim().is_empty())
             .map(|n| n.trim().to_string()),
         work_offset: String::new(),
+        origin: None,
+        datum: None,
         problems: vec![],
         tool_runs: vec![],
     };
@@ -5329,6 +5341,10 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
             zero: if i > 0 { zero(i, 0) } else { start_zero.take() },
         });
     }
+    // One work zero for the whole setup: each tool run's `Checked` has it.
+    (out.origin, out.datum) = programs
+        .first()
+        .map_or((None, None), |p| (Some(p.origin.clone()), Some(p.datum)));
     out
 }
 
@@ -6719,6 +6735,61 @@ pub(crate) mod tests {
             });
         }
         out
+    }
+
+    /// The tablet file carries the setup's work zero (LIO-617), the one
+    /// the Run panel records at the first tool run's start (`Run::zero`):
+    /// its name and where it is in the plan, the same for every tool run.
+    /// Moved in the project, the file says so, as the check that refuses a
+    /// later tool run there finds it. A setup that cannot run has none,
+    /// and a file from before reads as none.
+    #[test]
+    fn the_tablet_file_carries_the_setups_work_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (mut doc, mesh) = tablet_fixture(&profile);
+        let file = |doc: &Document| {
+            let zip = crate::bundle::pack(doc).unwrap();
+            let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
+            let mut runs: crate::bundle::Runs =
+                serde_json::from_reader(zip.by_name(crate::bundle::RUNS).unwrap()).unwrap();
+            runs.setups.remove(0)
+        };
+        let s = file(&doc);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let all = programs(&doc, &mesh, 0).unwrap();
+        assert_eq!(all.len(), 2);
+        for p in &all {
+            assert_eq!(s.origin.as_deref(), Some(p.origin.as_str()));
+            assert_eq!(s.datum, Some(p.datum));
+        }
+        assert_eq!(s.origin.as_deref(), Some("Stock top center"));
+        // Moved to the stock's front-left corner: X and Y move, Z stays.
+        (doc.setups[0].p).insert("origin".into(), "Stock top front-left".into());
+        let moved = file(&doc);
+        assert!(moved.problems.is_empty(), "{:?}", moved.problems);
+        let p = &programs(&doc, &mesh, 0).unwrap()[0];
+        assert_eq!(moved.origin.as_deref(), Some("Stock top front-left"));
+        assert_eq!(moved.datum, Some(p.datum));
+        let (old, new) = (s.datum.unwrap(), moved.datum.unwrap());
+        assert!(
+            (0..2).all(|a| (old[a] - new[a]).abs() > 1e-3),
+            "{old:?} {new:?}"
+        );
+        assert!((old[2] - new[2]).abs() < 1e-6, "{old:?} {new:?}");
+        // As JSON, the computer's names; none in a setup that cannot run.
+        let json = serde_json::to_value(&moved).unwrap();
+        assert_eq!(json["origin"], "Stock top front-left");
+        assert_eq!(json["datum"].as_array().map(Vec::len), Some(3));
+        let none = tablet_runs(&doc, Err("no part"), 0);
+        assert_eq!((none.origin, none.datum), (None, None));
+        let mut json = serde_json::to_value(&s).unwrap();
+        let o = json.as_object_mut().unwrap();
+        o.remove("origin");
+        o.remove("datum");
+        let before: TabletSetup = serde_json::from_value(json).unwrap();
+        assert_eq!((before.origin, before.datum), (None, None));
     }
 
     /// One facing tool run: down to Z5, across at F600, a 1 s dwell.
