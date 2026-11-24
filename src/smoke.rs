@@ -11148,7 +11148,11 @@ flood = { pin = 8 }
             assert_eq!(conn(b).touch_off(), None);
             let why = conn(b).partway_blocked().unwrap_or_default();
             assert!(why.starts_with(&said), "{why}");
-            assert!(run_of(b).earlier_unfollowed_note().starts_with(&said));
+            let note = run_of(b).earlier_unfollowed_note();
+            assert_eq!(
+                note,
+                "Another project's runs (\"Project A\") may have cut this stock."
+            );
         };
         asked(&mut a);
         let _ = a.update(Message::Disconnect);
@@ -11161,6 +11165,33 @@ flood = { pin = 8 }
         let mut b = reopen(a, dir.path());
         zeroed(&mut b);
         asked(&mut b);
+        // The Work zero tab says it, once, with New stock loaded.
+        let window = iced::Size::new(1440., 900.);
+        let _ = b.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let _ = b.update(Message::Resized(window));
+        if let Ok(out) = std::env::var("AXIS_RENDER_DIR") {
+            let tall = iced::Size::new(window.width, 2400.);
+            render_png(
+                &b,
+                tall,
+                &std::path::Path::new(&out).join("work-zero-another-project.png"),
+            );
+        }
+        let texts = crate::ui::probe::texts(b.view(), window);
+        let said: Vec<&String> = texts
+            .iter()
+            .filter(|t| t.contains("Another project's runs"))
+            .collect();
+        // Why, once, with the steps; the note with New stock loaded says
+        // only whose.
+        assert_eq!(said.len(), 2, "{said:#?}");
+        assert!(
+            said[0].starts_with("3. Another project's runs cut stock"),
+            "{}",
+            said[0]
+        );
+        assert!(said[1].ends_with("may have cut this stock."), "{}", said[1]);
+        assert!(texts.iter().any(|t| t == "New stock loaded"), "{texts:#?}");
         let _ = b.update(Message::Run(R::NewStock));
         assert!(conn(&b).touch_off().is_some());
         let _ = b.update(Message::Tick);

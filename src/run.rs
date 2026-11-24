@@ -2792,6 +2792,34 @@ impl Run {
     /// when none did. With whether a setup of this project's, or one whose
     /// project is not known, cut what it does not follow too.
     fn earlier_elsewhere_said(&self) -> Option<(String, bool)> {
+        let (projects, own) = self.earlier_elsewhere_projects()?;
+        let which = (projects.iter())
+            .map(|(title, ops)| match (title.trim(), ops.is_empty()) {
+                ("", true) => "one with no name".to_string(),
+                ("", false) => format!("one with no name: {}", crate::post::listed(ops)),
+                (t, true) => format!("\"{t}\""),
+                (t, false) => format!("\"{t}\": {}", crate::post::listed(ops)),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let whose = match projects.len() {
+            1 => "another project's runs",
+            _ => "other projects' runs",
+        };
+        Some((
+            format!(
+                "{whose} cut stock on this machine earlier ({which}), cuts this project's check does not have"
+            ),
+            own,
+        ))
+    }
+
+    /// The other projects whose runs cut what the check does not follow
+    /// (`earlier_unfollowed`, `earlier_elsewhere`), each its title and the
+    /// names of the operations that cut, and whether a setup of this
+    /// project's, or one whose project is not known, cut what it does not
+    /// follow too (LIO-607). None when no other project's did.
+    fn earlier_elsewhere_projects(&self) -> Option<(Vec<(&str, Vec<&str>)>, bool)> {
         let mut projects: Vec<(&str, &str, Vec<&str>)> = vec![];
         let mut own = false;
         for (id, cuts) in self.unfollowed_earlier() {
@@ -2817,25 +2845,8 @@ impl Run {
         if projects.is_empty() {
             return None;
         }
-        let which = (projects.iter())
-            .map(|(_, title, ops)| match (title.trim(), ops.is_empty()) {
-                ("", true) => "one with no name".to_string(),
-                ("", false) => format!("one with no name: {}", crate::post::listed(ops)),
-                (t, true) => format!("\"{t}\""),
-                (t, false) => format!("\"{t}\": {}", crate::post::listed(ops)),
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        let whose = match projects.len() {
-            1 => "another project's runs",
-            _ => "other projects' runs",
-        };
-        Some((
-            format!(
-                "{whose} cut stock on this machine earlier ({which}), cuts this project's check does not have"
-            ),
-            own,
-        ))
+        let projects = projects.into_iter().map(|(_, t, ops)| (t, ops)).collect();
+        Some((projects, own))
     }
 
     /// Why the stock is not the check's where another setup's or another
@@ -2853,11 +2864,28 @@ impl Run {
     }
 
     /// What the Work zero tab says of the cuts the check does not follow
-    /// (`earlier_unfollowed`), with New stock loaded.
+    /// (`earlier_unfollowed`), with New stock loaded: short, for why they
+    /// set no Z is said with the steps above it (`partway_blocked`); another
+    /// project's named (LIO-607).
     pub fn earlier_unfollowed_note(&self) -> String {
-        match self.earlier_elsewhere_cause() {
-            Some(cause) => format!("{cause}."),
-            None => "Another setup's run cut this part in a way the check does not follow.".into(),
+        const OWN: &str = "Another setup's run cut this part in a way the check does not follow";
+        let Some((projects, own)) = self.earlier_elsewhere_projects() else {
+            return format!("{OWN}.");
+        };
+        let titles: Vec<String> = (projects.iter())
+            .map(|(t, _)| match t.trim() {
+                "" => "one with no name".to_string(),
+                t => format!("\"{t}\""),
+            })
+            .collect();
+        let titles = crate::post::listed(&titles);
+        match (own, projects.len()) {
+            (false, 1) => format!("Another project's runs ({titles}) may have cut this stock."),
+            (false, _) => format!("Other projects' runs ({titles}) may have cut this stock."),
+            (true, 1) => {
+                format!("{OWN}, and another project's runs ({titles}) may have cut it too.")
+            }
+            (true, _) => format!("{OWN}, and other projects' runs ({titles}) may have cut it too."),
         }
     }
 
@@ -10287,28 +10315,52 @@ pub(crate) mod tests {
                 })
                 .collect();
             crate::give_elsewhere(&owners, &doc, &mut run);
-            run.earlier_unfollowed_note()
+            (run.earlier_unfollowed_why(), run.earlier_unfollowed_note())
         };
+        // Why, said with the steps, and the note with New stock loaded.
         assert_eq!(
             note(&[(&a.setup, &[0, 1, 0, HISTORY_UNKNOWN])]),
-            format!(
-                "Another project's runs cut stock on this machine earlier (\"Bracket\": {face} and {pocket}), cuts this project's check does not have."
+            (
+                format!(
+                    "Another project's runs cut stock on this machine earlier (\"Bracket\": {face} and {pocket}), cuts this project's check does not have."
+                ),
+                "Another project's runs (\"Bracket\") may have cut this stock.".into()
             )
         );
         assert_eq!(
             note(&[(&a.setup, &[1]), (&b.setup, &[0])]),
-            format!(
-                "Other projects' runs cut stock on this machine earlier (\"Bracket\": {pocket}; \"Lid\": {face}), cuts this project's check does not have."
+            (
+                format!(
+                    "Other projects' runs cut stock on this machine earlier (\"Bracket\": {pocket}; \"Lid\": {face}), cuts this project's check does not have."
+                ),
+                "Other projects' runs (\"Bracket\" and \"Lid\") may have cut this stock.".into()
             )
         );
-        let generic = "Another setup's run cut this part in a way the check does not follow.";
+        let generic = (
+            EARLIER_UNFOLLOWED_WHY.to_string(),
+            "Another setup's run cut this part in a way the check does not follow.".to_string(),
+        );
         assert_eq!(note(&[(&gone.setup, &[0])]), generic);
         assert_eq!(note(&[("kept-with-no-owner", &[0])]), generic);
         assert_eq!(
             note(&[(&gone.setup, &[0]), (&a.setup, &[0])]),
-            format!(
-                "Another setup's run cut this part earlier in a way the check does not follow, and another project's runs cut stock on this machine earlier (\"Bracket\": {face}), cuts this project's check does not have."
+            (
+                format!(
+                    "Another setup's run cut this part earlier in a way the check does not follow, and another project's runs cut stock on this machine earlier (\"Bracket\": {face}), cuts this project's check does not have."
+                ),
+                "Another setup's run cut this part in a way the check does not follow, and another project's runs (\"Bracket\") may have cut it too.".into()
             )
+        );
+        // A project with no name.
+        let mut nameless = a.clone();
+        (nameless.setup, nameless.title) = (crate::id(), " ".into());
+        let owners = [nameless.clone()];
+        let mut run = Run::new(&doc, 0, 0);
+        run.earlier_cuts = vec![(nameless.setup.clone(), vec![(0, None, None)])];
+        crate::give_elsewhere(&owners, &doc, &mut run);
+        assert_eq!(
+            run.earlier_unfollowed_note(),
+            "Another project's runs (one with no name) may have cut this stock."
         );
         // A history kept before owners were kept still reads.
         let old =
