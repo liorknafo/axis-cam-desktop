@@ -1661,6 +1661,12 @@ pub struct App {
     /// follow of that very tool run on the Pi starts from what was cut
     /// before it instead, and its outcome says what it cut (LIO-582 review).
     run_pending: Vec<(String, usize, usize, Vec<run::CutInRun>)>,
+    /// What the operator took as cut in each setup's run this session
+    /// (`run::Run::declared`), by setup id: kept when its run is dropped, as
+    /// `run_cuts` is, and given back when it is picked again, for the
+    /// operator to say whether the same part is still there; New stock
+    /// loaded forgets it (LIO-583 review).
+    run_declared: Vec<(String, run::Declared, bool)>,
     /// The jog key down on the Control page (axis, negative).
     pub jog_key: Option<(usize, bool)>,
     /// Counts the checks of setups to run, so a late answer is ignored.
@@ -2264,6 +2270,7 @@ impl App {
             cuts_grew: false,
             journal_changes_seen: 0,
             run_pending: vec![],
+            run_declared: vec![],
             jog_key: None,
             run_epoch: 0,
             shift: false,
@@ -2474,6 +2481,10 @@ impl App {
         // app is open (LIO-459); not from a test's or smoke run's workspace.
         if app.smoke_dir.is_none() && app.state_path == storage::state_path() {
             let path = app.state_path.clone();
+            // What setups' runs cut, as loaded (LIO-594), before a tablet
+            // can ask: the first update publishes it only later (LIO-590
+            // review).
+            tablet::set_session_cuts(&path, app.session_cuts());
             std::thread::spawn(move || tablet::serve(path, computer_name(), true));
             return (app, firewall(tablet::firewall_problem));
         }
@@ -3591,6 +3602,16 @@ impl App {
             run.follow(&self.doc);
             run.unskip();
         }
+        // So is the run of a tool run left running on the Pi while this
+        // computer was disconnected, which connecting again follows: what
+        // it took as cut is dropped, and noted so (LIO-583 review).
+        if let Some(kept) = self.pi_run.as_mut() {
+            let run = kept.run_mut();
+            run.stale = true;
+            run.follow(&self.doc);
+            run.unskip();
+        }
+        lose_declared(&mut self.run_declared);
     }
     fn touch(&mut self) {
         // A refused face's note belongs to the click before an edit (LIO-408).
@@ -4207,6 +4228,7 @@ impl App {
                 keep_run_cuts(&mut self.run_cuts, old, self.others_unknown);
                 keep_pending_cuts(&mut self.run_pending, old);
                 keep_away(&mut self.run_away, old);
+                keep_declared(&mut self.run_declared, old);
             }
             mark_away(&mut self.run_away, &self.run_cuts, &c);
             c.leaving("disconnected while it ran");
@@ -4880,10 +4902,17 @@ impl App {
             keep_run_cuts(&mut self.run_cuts, old, self.others_unknown);
             keep_pending_cuts(&mut self.run_pending, old);
             keep_away(&mut self.run_away, old);
+            keep_declared(&mut self.run_declared, old);
         }
         let (index, from) = (f.index, f.from);
         let mut following = run::Run::following(&self.doc, si, self.run_epoch, f);
         note_lost_cuts(&mut self.run_cuts, self.others_unknown, &following.setup_id);
+        // Sent before an edit the session noted: its skips say what was
+        // sent, by indexes the edit may have changed, and what was taken as
+        // cut is not known (LIO-583 review).
+        if (self.run_declared.iter()).any(|(id, _, lost)| *id == following.setup_id && *lost) {
+            (following.declared_lost, following.declared_stale) = (true, true);
+        }
         // It follows a tool run cutting the part: the same part (LIO-582).
         if let Some((_, cuts)) = (self.run_cuts.iter()).find(|(id, _)| *id == following.setup_id) {
             following.cut_in_run = cuts.clone();
@@ -6774,7 +6803,31 @@ impl App {
         self.mcp_arrive(&message);
         let task = self.update_turn(message);
         self.mcp_leave();
+        // The tablets this computer shares projects with are sent tablet
+        // files made with what this session cut (LIO-590).
+        tablet::set_session_cuts(&self.state_path, self.session_cuts());
         task
+    }
+    /// What each setup's runs cut (`run_cuts`), the run picked now's
+    /// included as far as a tool run it runs may get, as `cut_history`
+    /// keeps them, whether what runs cut was lost (`others_unknown`), and
+    /// the setups whose operations or steps were taken as cut
+    /// (`run_declared`): what the tablet file's work zeros go by
+    /// (`run::tablet_runs`, LIO-590).
+    pub(crate) fn session_cuts(&self) -> run::Session {
+        let mut cuts = self.run_cuts.clone();
+        if let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref()) {
+            keep_run_cuts(&mut cuts, r, self.others_unknown);
+        }
+        let mut declared = self.run_declared.clone();
+        if let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref()) {
+            keep_declared(&mut declared, r);
+        }
+        run::Session {
+            cuts,
+            lost: self.others_unknown,
+            declared: declared.into_iter().map(|(id, ..)| id).collect(),
+        }
     }
     fn update_turn(&mut self, message: Message) -> Task<Message> {
         let before = self.status.clone();
@@ -9166,6 +9219,7 @@ impl App {
                     keep_run_cuts(&mut self.run_cuts, old, self.others_unknown);
                     keep_pending_cuts(&mut self.run_pending, old);
                     keep_away(&mut self.run_away, old);
+                    keep_declared(&mut self.run_declared, old);
                 }
                 let mut r = run::Run::new(&self.doc, si, self.run_epoch);
                 (r.journal, r.journal_own) = (journal, journal_own);
@@ -9173,16 +9227,21 @@ impl App {
                 // last closed (LIO-594), until the operator says whether
                 // the same part is still there (LIO-582 review).
                 note_lost_cuts(&mut self.run_cuts, self.others_unknown, &id);
-                if let Some((_, cuts)) = (self.run_cuts.iter()).find(|(s, _)| *s == id)
-                    && !cuts.is_empty()
-                {
-                    r.cut_in_run = cuts.clone();
-                    r.stock_unconfirmed = true;
-                }
+                r.picked_in(&self.run_cuts, self.others_unknown);
                 if journal_gone {
                     r.note_history_unknown();
                 }
-                give_earlier_cuts(&self.run_cuts, &mut r);
+                // What was taken as cut in it this session, until the
+                // operator says whether the same part is still there: the
+                // stock top may be cut where Z is touched off (LIO-583
+                // review).
+                if let Some((_, (skips, steps), lost)) =
+                    (self.run_declared.iter()).find(|(id, ..)| *id == r.setup_id)
+                {
+                    (r.skips, r.cut_steps) = (skips.clone(), steps.clone());
+                    (r.declared_lost, r.stock_unconfirmed) = (*lost, true);
+                }
+                let skipped = !r.skips.is_empty();
                 give_elsewhere(&self.cut_owners, &self.doc, &mut r);
                 give_away(&self.run_away, &mut r);
                 c.run = Some(r);
@@ -9198,7 +9257,24 @@ impl App {
                 if self.check_waits() {
                     return Task::none();
                 }
-                return self.check_run();
+                // Its skipped operations keep their rows, as a follow's do.
+                let layout = match (skipped, self.part_mesh().cloned()) {
+                    (true, Some(mesh)) => {
+                        let (doc, setup) = (self.doc.clone(), self.doc.setups[si].id.clone());
+                        Task::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || run::programs(&doc, &mesh, si))
+                                    .await
+                                    .unwrap_or_else(|e| Err(vec![format!("The check failed: {e}")]))
+                            },
+                            move |programs| {
+                                Message::RunLayout(setup.clone(), std::sync::Arc::new(programs))
+                            },
+                        )
+                    }
+                    _ => Task::none(),
+                };
+                return Task::batch([self.check_run(), layout]);
             }
             Message::RunOnMachine(si) => {
                 let Some(s) = self.doc.setups.get(si) else {
@@ -9688,6 +9764,7 @@ impl App {
                 self.save_busy = true;
                 self.record_picks();
                 let doc = self.doc.clone();
+                let session = self.session_cuts();
                 let dialog = rfd::AsyncFileDialog::new()
                     .set_title("Save for the shop tablet")
                     .add_filter("AXIS tablet file", &[bundle::EXTENSION])
@@ -9701,7 +9778,7 @@ impl App {
                         let path = dialog.save_file().await?.path().to_path_buf();
                         Some(
                             tokio::task::spawn_blocking(move || {
-                                bundle::write(&path, &doc).map(|()| path)
+                                bundle::write(&path, &doc, &session).map(|()| path)
                             })
                             .await
                             .unwrap_or_else(|e| Err(e.to_string())),
@@ -12275,6 +12352,29 @@ fn journal_known(
             (Some(j), known, false)
         }
         _ => (None, false, kept.next().is_some()),
+    }
+}
+
+/// Keeps what the operator took as cut in `run` (`run::Run::declared`)
+/// under its setup in `declared` (`App::run_declared`), or forgets it there
+/// once nothing is (New stock loaded, or each skip undone), with whether
+/// some of it was dropped by a project edit (`run::Run::declared_lost`).
+fn keep_declared(declared: &mut Vec<(String, run::Declared, bool)>, run: &run::Run) {
+    declared.retain(|(id, ..)| *id != run.setup_id);
+    let now = run.declared();
+    if !now.0.is_empty() || !now.1.is_empty() || run.declared_lost {
+        declared.push((run.setup_id.clone(), now, run.declared_lost));
+    }
+}
+
+/// The project changed: what each setup kept in `declared` took as cut is
+/// no longer taken as cut, its operations named by an index that may now
+/// name others or cut otherwise, but its material is still gone from the
+/// stock held (`run::Run::declared_lost`, LIO-583 review).
+fn lose_declared(declared: &mut [(String, run::Declared, bool)]) {
+    for (_, (skips, steps), lost) in declared {
+        *lost |= !skips.is_empty() || !steps.is_empty();
+        (*skips, *steps) = (vec![], vec![]);
     }
 }
 

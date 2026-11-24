@@ -7,7 +7,7 @@
 //! copies it to `INBOX` beside the workspace). It also carries the tool runs
 //! worked out here for the TypeScript tablet app (`Runs`, LIO-475), and the
 //! hand setups' Steps screens drawn here (`steps::tablet`, LIO-477).
-use crate::model::Document;
+use crate::{model::Document, run::Session};
 use std::{
     fs,
     io::{Cursor, Read, Write},
@@ -27,16 +27,18 @@ pub const INBOX: &str = "inbox.axisjob";
 pub const EXTENSION: &str = "axisjob";
 
 /// The project, its part file, and for a STEP part the part converted as
-/// `step::load` reads it: the tablet has no converter (`step::load`).
-pub fn write(path: &Path, doc: &Document) -> Result<(), String> {
-    crate::storage::write_atomic(path, &pack(doc)?)
+/// `step::load` reads it: the tablet has no converter (`step::load`). The
+/// runs' work zeros go by what the setups' runs cut this session,
+/// `session` (`run::tablet_runs`, LIO-590).
+pub fn write(path: &Path, doc: &Document, session: &Session) -> Result<(), String> {
+    crate::storage::write_atomic(path, &pack(doc, session)?)
 }
 
 /// The tablet file `write` writes, in memory: what the computer sends a
 /// tablet over Wi-Fi (`tablet`).
-pub fn pack(doc: &Document) -> Result<Vec<u8>, String> {
+pub fn pack(doc: &Document, session: &Session) -> Result<Vec<u8>, String> {
     let mesh = part_mesh(doc);
-    pack_with(doc, mesh.as_ref().map_err(String::as_str))
+    pack_with(doc, mesh.as_ref().map_err(String::as_str), session)
 }
 
 /// `pack` with the part's `mesh` given: the runs and the steps are worked
@@ -44,6 +46,7 @@ pub fn pack(doc: &Document) -> Result<Vec<u8>, String> {
 pub fn pack_with(
     doc: &Document,
     mesh: Result<&crate::mesh::Mesh, &str>,
+    session: &Session,
 ) -> Result<Vec<u8>, String> {
     let mut w = zip::ZipWriter::new(Cursor::new(vec![]));
     let opt = zip::write::SimpleFileOptions::default()
@@ -58,7 +61,7 @@ pub fn pack_with(
     };
     let json = serde_json::to_vec_pretty(doc).map_err(|e| e.to_string())?;
     add(PROJECT, &json)?;
-    let runs = serde_json::to_vec_pretty(&runs(doc, mesh)).map_err(|e| e.to_string())?;
+    let runs = serde_json::to_vec_pretty(&runs(doc, mesh, session)).map_err(|e| e.to_string())?;
     add(RUNS, &runs)?;
     let (steps, pictures) = crate::steps::tablet::steps(doc, mesh);
     add(
@@ -113,14 +116,26 @@ pub fn pack_with(
 pub struct Runs {
     pub format: u32,
     pub setups: Vec<crate::run::TabletSetup>,
+    /// Every setup of the project by id, in order, on whatever machine
+    /// (LIO-610): "Setup N" is a setup's place in it, as the computer counts
+    /// it, where `setups` holds only the UC100 ones. Added without a new
+    /// `format`, as a tablet that does not know it reads the file as before
+    /// (`Runs.plan` in axis-shop's `runs.ts`); none in a file from before.
+    #[serde(default)]
+    pub plan: Vec<String>,
 }
 
-pub fn runs(doc: &Document, mesh: Result<&crate::mesh::Mesh, &str>) -> Runs {
+pub fn runs(doc: &Document, mesh: Result<&crate::mesh::Mesh, &str>, session: &Session) -> Runs {
     let setups = (0..doc.setups.len())
         .filter(|&si| crate::model::get(&doc.setups[si].machine.p, "controller") == "UC100")
-        .map(|si| crate::run::tablet_runs(doc, mesh, si))
+        .map(|si| crate::run::tablet_runs(doc, mesh, si, session))
         .collect();
-    Runs { format: 1, setups }
+    let plan = doc.setups.iter().map(|s| s.id.clone()).collect();
+    Runs {
+        format: 1,
+        setups,
+        plan,
+    }
 }
 
 /// The part, for the runs and the steps worked out for the tablet; not
@@ -265,7 +280,7 @@ mod tests {
         doc.machines.push(uc100.clone());
         doc.setups[0].machine = uc100;
         let zip = mac.path().join("Block.axisjob");
-        write(&zip, &doc).unwrap();
+        write(&zip, &doc, &Session::default()).unwrap();
 
         let tablet = tempfile::tempdir().unwrap();
         let (opened, path, _) = open(&zip, tablet.path()).unwrap();
@@ -321,7 +336,11 @@ mod tests {
         let mut twin = crate::control::owners_machine(&other).unwrap();
         twin.id = "twin".into();
         doc.machines.push(twin);
-        assert!(write(&zip, &doc).unwrap_err().contains("jy5800.toml"));
+        assert!(
+            write(&zip, &doc, &Session::default())
+                .unwrap_err()
+                .contains("jy5800.toml")
+        );
         assert_eq!(
             file_name(Path::new("/Users/x/part/a.step")).unwrap(),
             "a.step"
@@ -329,6 +348,39 @@ mod tests {
         assert_eq!(file_name(Path::new(r"C:\x\..\b.stl")).unwrap(), "b.stl");
         assert!(file_name(Path::new("part/..")).is_err());
         assert!(open(&tablet.path().join("tablet.axis.json"), tablet.path()).is_err());
+    }
+
+    /// The tablet file lists every setup of the project by id, in order,
+    /// whatever machine it is on (LIO-610): with Setup 1 on a lathe and
+    /// Setups 2 and 3 on a UC100, the tablet counts the third "Setup 3" as
+    /// the computer does, not "Setup 2" from the UC100 setups alone.
+    #[test]
+    fn the_tablet_file_lists_every_setup_whatever_its_machine() {
+        let mut doc = Document::sample();
+        let mut uc100 = doc.setups[0].machine.clone();
+        uc100.p.insert("controller".into(), "UC100".into());
+        let lathe = crate::model::Setup::new(crate::lathe::defaults(), "G54");
+        let second = crate::model::Setup::new(uc100.clone(), "G54");
+        let third = crate::model::Setup::new(uc100, "G55");
+        doc.setups = vec![lathe, second, third];
+        let ids: Vec<String> = doc.setups.iter().map(|s| s.id.clone()).collect();
+        let bytes = pack_with(&doc, Err("no part"), &Session::default()).unwrap();
+        let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+        let mut json = vec![];
+        (zip.by_name(RUNS).unwrap().read_to_end(&mut json)).unwrap();
+        // As the tablet reads it (`Runs.plan?: string[]`): an array of the
+        // setup ids under `plan`, the format unchanged.
+        let raw: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(raw["plan"], serde_json::json!(ids));
+        assert_eq!(raw["format"], 1);
+        let runs: Runs = serde_json::from_slice(&json).unwrap();
+        assert_eq!(runs.plan, ids);
+        let on_uc100: Vec<&str> = runs.setups.iter().map(|s| s.setup_id.as_str()).collect();
+        assert_eq!(on_uc100, [&ids[1], &ids[2]]);
+        assert!(!on_uc100.contains(&ids[0].as_str()));
+        // A tablet file from before it still reads, with no plan.
+        let older: Runs = serde_json::from_str(r#"{"format":1,"setups":[]}"#).unwrap();
+        assert!(older.plan.is_empty() && older.setups.is_empty());
     }
 
     /// The tablet file carries the hand setups' Steps screens and every
@@ -344,7 +396,7 @@ mod tests {
             thickness: None,
         });
         let started = std::time::Instant::now();
-        let bytes = pack(&doc).unwrap();
+        let bytes = pack(&doc, &Session::default()).unwrap();
         eprintln!("Packed in {:?}: {} bytes", started.elapsed(), bytes.len());
         let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         let mut read = |name: &str| {
