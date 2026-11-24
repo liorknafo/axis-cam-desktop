@@ -13022,7 +13022,7 @@ flood = { pin = 8 }
         // review).
         assert!(run_of(&a).reference.is_none());
         assert!(
-            steps.contains("Load T3, then set Z by hand on a surface whose height you know and press Keep this work zero.")
+            steps.contains("Load T3 Drill 4, then set Z by hand on a surface whose height you know and press Keep this work zero.")
                 && steps.contains("Cycle Start waits until you press Keep this work zero: when it is still the one they were cut with (the stock has not moved since), or after you set Z by hand on a surface whose height you know.")
                 && !steps.contains("set the work zero on the stock they left")
                 && !steps.contains("the work zero is set below"),
