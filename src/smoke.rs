@@ -12687,11 +12687,14 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::SamePart));
         assert!(run_of(&a).history_unknown());
         assert_eq!(none_set(&a), crate::run::HISTORY_UNFOLLOWED_BLOCKED);
-        // New stock: the start at pass 2 goes by the stock the check
-        // carves, pass 1 taken as cut.
+        // New stock: the start at pass 2, where the run stopped, goes back
+        // to pass 1, which sets Z on the stock top (LIO-634).
         let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
         assert!(!run_of(&a).history_unknown());
-        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        assert_eq!(run_of(&a).at_step(), None);
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(0.));
     }
 
     /// Setup 1 the fixture's Face, setup 2 its Pocket (a copy of setup 1,
@@ -14008,35 +14011,158 @@ flood = { pin = 8 }
         let _ = b.update(Message::Run(R::SamePart));
         assert_eq!(conn(&b).touch_off().map(|(_, w)| w[2]), Some(-2.));
         let _ = b.update(Message::Disconnect);
+        // The journal kept with what was cut, gone (an older AXIS CAM
+        // finished the run, say): not known.
+        std::fs::remove_file(&path).unwrap();
+        let mut e = reopened_at_pass_2(b, dir.path());
+        assert!(run_of(&e).resumed.is_none());
+        assert!(run_of(&e).history_unknown());
+        assert_eq!(conn(&e).touch_off(), None);
+        let _ = e.update(Message::Disconnect);
         // Its journal written over by a run no session kept the cuts of (an
         // older AXIS CAM's, say): what was cut is not known, the same part
         // or not, until new stock.
         let mut other = journal.clone();
         other.time += 60;
         other.write(&path).unwrap();
-        let mut c = reopened_at_pass_2(b, dir.path());
+        let mut c = reopened_at_pass_2(e, dir.path());
         assert!(run_of(&c).resumed.is_some());
         assert!(run_of(&c).stock_unconfirmed);
         assert_eq!(conn(&c).touch_off(), None);
         let _ = c.update(Message::Run(R::SamePart));
         assert_eq!(conn(&c).touch_off(), None);
+        // New stock: the start where the run stopped goes back to pass 1,
+        // on the stock top, and where it stopped is over (LIO-634).
         let _ = c.update(Message::Run(R::NewStock));
-        assert_eq!(conn(&c).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        let _ = c.update(Message::Tick);
+        answer_skips(&mut c, 0);
+        assert_eq!(run_of(&c).at_step(), None);
+        assert_eq!(conn(&c).touch_off().map(|(_, w)| w[2]), Some(0.));
+        assert_eq!(crate::run::Journal::read(&path), None);
         let _ = c.update(Message::Disconnect);
-        // New stock loaded is kept: that journal is known from then on.
+        // New stock loaded is kept: opened again, nothing is unknown, and
+        // pass 2 picked touches off on pass 1's floor.
         let mut d = reopened_at_pass_2(c, dir.path());
-        assert!(run_of(&d).resumed.is_some());
-        assert!(!run_of(&d).stock_unconfirmed);
+        assert!(run_of(&d).resumed.is_none());
+        assert!(!run_of(&d).stock_unconfirmed && !run_of(&d).history_unknown());
         assert_eq!(conn(&d).touch_off().map(|(_, w)| w[2]), Some(-2.));
         let _ = d.update(Message::Disconnect);
-        // The journal kept with what was cut, gone (an older AXIS CAM
-        // finished the run, say): not known either.
-        std::fs::remove_file(&path).unwrap();
-        let mut e = reopened_at_pass_2(d, dir.path());
-        assert!(run_of(&e).resumed.is_none());
-        assert!(run_of(&e).history_unknown());
-        assert_eq!(conn(&e).touch_off(), None);
-        let _ = e.update(Message::Disconnect);
+    }
+
+    /// LIO-634: a run of the Face stopped after pass 1 starts at pass 2,
+    /// this session or AXIS CAM opened again. New stock loaded takes that
+    /// start back to the Face's pass 1, so Zero Z on the stock top sets Z
+    /// on the stock top, not on pass 1's floor (Z−2), and ends where the
+    /// run stopped: AXIS CAM opened again starts at pass 1 too. Pass 2
+    /// picked by the operator (Start at a step) stays.
+    #[test]
+    fn new_stock_takes_a_start_where_a_run_stopped_back_to_the_first_operation() {
+        use crate::run::Action as R;
+        let z = |a: &App| conn(a).touch_off().map(|(_, w)| w[2]);
+        let new_stock = |a: &mut App| {
+            let _ = a.update(Message::Run(R::NewStock));
+            let _ = a.update(Message::Tick);
+            answer_skips(a, 0);
+            let run = run_of(a);
+            assert!(run.resumed.is_none() && !run.stock_unconfirmed);
+            assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
+            assert!(run.done.iter().all(|d| !d));
+            assert!(!run.partway() && !run.asks_zero(), "{:?}", problems(a));
+            assert!(conn(a).partway_blocked().is_none());
+            assert_eq!(z(a), Some(0.));
+        };
+        // This session: stopped, the start at pass 2 on pass 1's floor.
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = two_pass_app(dir.path());
+        let journal = stop_after(&mut a, 0, 0);
+        assert_eq!((journal.op, journal.step), (0, Some(0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        assert_eq!(z(&a), Some(-2.));
+        new_stock(&mut a);
+        assert!(conn(&a).journal().is_none());
+        let _ = a.update(Message::Disconnect);
+        // Opened again: no start where it stopped, and nothing unknown.
+        let mut b = reopen(a, dir.path());
+        zeroed(&mut b);
+        let _ = b.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut b, 0);
+        let run = run_of(&b);
+        assert!(run.resumed.is_none() && !run.history_unknown());
+        assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
+        assert_eq!(z(&b), Some(0.));
+        let _ = b.update(Message::Disconnect);
+        // Stopped after pass 1, then AXIS CAM opened again: the start at
+        // pass 2 from the journal, the same part asked; New stock takes it
+        // back too.
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = two_pass_app(dir.path());
+        let journal = stop_after(&mut c, 0, 0);
+        assert_eq!((journal.op, journal.step), (0, Some(0)));
+        let _ = c.update(Message::Disconnect);
+        let mut d = reopen(c, dir.path());
+        zeroed(&mut d);
+        let _ = d.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut d, 0);
+        // New stock pressed while the start at pass 2 is checked again: it
+        // goes back all the same.
+        let run = run_of(&d);
+        assert!(run.resumed.is_some() && run.stock_unconfirmed && run.programs.is_none());
+        assert_eq!(run.start_step, Some((0, 1)));
+        assert_eq!(z(&d), None);
+        new_stock(&mut d);
+        assert!(conn(&d).journal().is_none());
+        // Pass 2 picked by the operator: kept, on pass 1's floor.
+        let _ = d.update(Message::Run(R::Steps(Some(0))));
+        let _ = d.update(Message::Run(R::PickStep(0, 1)));
+        let _ = d.update(Message::Run(R::StartStep));
+        answer_skips(&mut d, 0);
+        assert_eq!(run_of(&d).at_step(), Some((0, 1)));
+        let _ = d.update(Message::Run(R::NewStock));
+        let _ = d.update(Message::Tick);
+        answer_skips(&mut d, 0);
+        assert_eq!(run_of(&d).at_step(), Some((0, 1)));
+        assert_eq!(z(&d), Some(-2.));
+        let _ = d.update(Message::Disconnect);
+    }
+
+    /// LIO-634: the Face and the Pocket's tool run cut to its end, so the
+    /// start is the Drilling's tool run. New stock loaded takes it back to
+    /// the Face, with no tool run done, so Zero Z on the stock top sets Z
+    /// on the stock top, not on the Face's floor. Next on the Drilling's
+    /// tool run, picked by the operator, stays.
+    #[test]
+    fn new_stock_takes_a_start_after_a_tool_run_done_back_to_the_first_operation() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let z = |a: &App| conn(a).touch_off().map(|(_, w)| w[2]);
+        let mut a = two_pass_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_some(), "{:?}", problems(&a));
+        run_until(&mut a, 90., "tool run 1", |r| r.running.is_none());
+        assert!(run_of(&a).done[0] && run_of(&a).next == 1);
+        let floor = z(&a);
+        assert!(floor.is_none_or(|f| f < -1.), "{floor:?}");
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
+        assert!(run.done.iter().all(|d| !d));
+        assert!(!run.partway() && !run.asks_zero(), "{:?}", problems(&a));
+        assert_eq!(z(&a), Some(0.));
+        // Next on the Drilling's tool run: the operator's, kept.
+        let _ = a.update(Message::Run(R::Next(1)));
+        assert_eq!(run_of(&a).next, 1);
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).next, 1);
+        assert_eq!(z(&a), floor);
+        let _ = a.update(Message::Disconnect);
     }
 
     /// LIO-594 review: Cycle Start sends nothing until what the tool run
@@ -15877,10 +16003,11 @@ flood = { pin = 8 }
 
     /// The Face's tool run done in this run, then the Drill after it
     /// skipped as cut, so the run starts at the Parallel (LIO-633): New
-    /// stock loaded takes the start back to the Drill, the first operation
-    /// after the tool run done, not to the Parallel the skip moved it to.
+    /// stock loaded takes the start back to the Face, with no tool run
+    /// done, not to the Parallel the skip moved it to, nor to the Drill
+    /// after the Face cut on the old stock (LIO-634).
     #[test]
-    fn new_stock_takes_a_start_past_a_skip_after_a_tool_run_done_back_to_the_skip() {
+    fn new_stock_takes_a_start_past_a_skip_after_a_tool_run_done_back_to_the_first() {
         use crate::run::{Action as R, Skip};
         let dir = tempfile::tempdir().unwrap();
         // Face, Drill, Parallel and Pocket: a tool run each, none merged
@@ -15908,7 +16035,7 @@ flood = { pin = 8 }
         assert_eq!(sent(&a), [vec![0], vec![1], vec![2], vec![3]]);
         assert_eq!(
             (run.done.clone(), run.next, run.from),
-            (vec![true, false, false, false], 1, 0)
+            (vec![false; 4], 0, 0)
         );
     }
 

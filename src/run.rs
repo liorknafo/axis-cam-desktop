@@ -4522,50 +4522,72 @@ impl Run {
 
     /// New stock loaded: what this setup's runs and the other setups' cut
     /// this session is forgotten, and so is what the operator took as cut
-    /// (`declared`), the setup to be checked again without it. Whether it
-    /// changed what was taken as cut, and the setup is checked again,
-    /// keeping where Cycle Start starts (`recheck`), unless operations
-    /// skipped as cut moved it there: it then goes back to the start the
-    /// operator picked, unless its tool run is done, or else to the first
-    /// operation of no tool run done in this run (LIO-633).
+    /// (`declared`), the setup to be checked again without it (`recheck`).
+    /// A start the operator picked stays (`start_picked`). One the run
+    /// came to by itself goes back, with no tool run done, to the start
+    /// the operator picked before it, or else to the setup's first
+    /// operation sent: past operations skipped as cut (LIO-633), where a
+    /// run stopped, this session's or a journal's, or after tool runs done.
+    /// Kept there, what comes before it would be taken as cut on stock that
+    /// is new, and Zero Z on the stock top would set Z on its floor
+    /// (LIO-634). Whether it went back so: where a run of the setup stopped
+    /// is then over (`Connection::run_act`).
     pub fn new_stock(&mut self) -> bool {
         (self.cut_in_run, self.earlier_cuts) = (vec![], vec![]);
         self.earlier_taken.clear();
         (self.stock_unconfirmed, self.declared_lost) = (false, false);
         (self.declared_stale, self.declared_from) = (false, None);
         let (skips, steps) = self.declared();
-        if skips.is_empty() && steps.is_empty() {
-            return false;
-        }
-        if let Some(programs) = self.checked() {
-            let (done, start) = self.progress_kept(programs);
-            // Where the run would start but for the skips: the start the
-            // operator picked, unless its tool run is done, or else the
-            // first operation of no tool run done in this run (a later one
-            // may be, run first by Start here). Operations skipped as cut
-            // from there to the start, or to the end when they left none,
-            // moved it on, and go now: kept there, they would be before the
-            // start, so taken as cut all the same, and Zero Z on the stock
-            // top would set Z on their floor on stock that is new
-            // (LIO-633). It goes back there. A start at a step it did not
-            // come to by a pick (where a run stopped) is LIO-634's.
-            let s = start.unwrap_or(usize::MAX);
-            let picked = (self.start_picked).filter(|&(p, _)| !done.contains(&p) && p <= s);
-            let open = (0..).find(|oi| !done.contains(oi)).unwrap_or(0);
-            let base = picked.map_or(open, |p| p.0);
-            let back = self.at_step().is_none_or(|a| Some(a) == picked)
-                && skips.iter().any(|&(oi, _)| oi >= base && oi < s);
-            if back {
-                // A pick at a step is that step again.
-                self.start_step = picked.filter(|p| p.1 > 0);
-                self.resumed = None;
+        let mut to = None;
+        let back = match self.checked() {
+            Some(programs) => {
+                let (done, start) = self.progress_kept(programs);
+                // The start, its operation and step; None once all is done.
+                let at = start.map(|s| (s, self.at_step().map_or(0, |(_, n)| n)));
+                // The operator's pick before it, which the run went on from.
+                to = (self.start_picked).filter(|&p| at.is_none_or(|a| p <= a));
+                at.is_none_or(|a| self.start_picked != Some(a))
+                    && (to.is_some()
+                        || !done.is_empty()
+                        || at.is_some_and(|(s, n)| {
+                            (self.next, self.from) != (0, 0)
+                                || n > 0
+                                || skips.iter().any(|&(oi, _)| oi < s)
+                        }))
             }
-            self.keep = Some((done, if back { Some(base) } else { start }));
+            // Pressed while the check answers (a start at a step where a
+            // run stopped is checked again, say): which operation the start
+            // is cannot be told without its programs, so it goes back to the
+            // setup's first operation unless it is the operator's start at
+            // a step. A start the operator picked otherwise goes back too
+            // then, which sets no Z on a floor that new stock does not have.
+            None => match self.start_step {
+                Some(at) => self.start_picked != Some(at),
+                None => {
+                    (self.next, self.from) != (0, 0)
+                        || self.done.contains(&true)
+                        || !skips.is_empty()
+                }
+            },
+        };
+        if back {
+            // A pick at a step is that step again.
+            (self.start_step, self.resumed) = (to.filter(|p| p.1 > 0), None);
+            // Nothing sets Z from programs checked for the old start until
+            // the check answers.
+            ((self.next, self.from), self.programs) = ((0, 0), None);
+            self.done.iter_mut().for_each(|d| *d = false);
+            // The first operation sent from there once nothing is cut.
+            self.keep = Some((vec![], Some(to.map_or(0, |p| p.0))));
+        } else if skips.is_empty() && steps.is_empty() {
+            return false;
+        } else if let Some(programs) = self.checked() {
+            self.keep = Some(self.progress_kept(programs));
         }
         self.skips.retain(|s| s.1 != Skip::Cut);
         self.cut_steps.clear();
         (self.recheck, self.picked, self.carving) = (true, None, None);
-        true
+        back
     }
 
     /// Cycle Start waits for the work zero to be set or kept for the stock

@@ -4189,7 +4189,16 @@ impl Connection {
             // What was taken as cut goes too, the setup checked again
             // without it (LIO-583 review).
             R::NewStock if run.running.is_none() => {
-                run.new_stock();
+                // Its start gone back to the setup's first operation, where a
+                // run of it stopped is over, as when its last tool run ends:
+                // AXIS CAM opened again starts there no more (LIO-634).
+                if run.new_stock()
+                    && crate::run::Journal::read(&self.journal)
+                        .is_some_and(|j| j.setup == run.setup_id)
+                {
+                    let _ = std::fs::remove_file(&self.journal);
+                    self.journal_changes += 1;
+                }
                 run.away = None;
             }
             R::More(oi) => {
