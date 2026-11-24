@@ -11711,8 +11711,7 @@ fn stock_question<'a>(
     let stock = stock.or_else(|| {
         run.earlier_unfollowed().then(|| {
             column![
-                text("Another setup's run cut this part in a way the check does not follow.")
-                    .size(12),
+                text(run.earlier_unfollowed_note()).size(12),
                 small(
                     "New stock loaded",
                     (!running).then_some(Message::Run(R::NewStock)),

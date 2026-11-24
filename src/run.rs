@@ -394,6 +394,84 @@ const EARLIER_UNFOLLOWED_WHY: &str = "Another setup's run cut this part earlier 
 /// `EARLIER_UNFOLLOWED` cut (`Run::partway_blocked`).
 const EARLIER_UNFOLLOWED_BLOCKED: &str = "Another setup's run cut this part earlier in a way the check does not follow (an operation disabled or changed since, its setup deleted or moved after this one, or a setup this project does not have), so it cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero.";
 
+/// The computer's reasons for this session's cuts in the tablet file's
+/// words (LIO-590): the tablet has no Same part or New stock loaded, nor
+/// the computer's questions after a disconnect (LIO-595), and "this
+/// session" and "this computer" are the computer's, before the file was
+/// made.
+const FOR_TABLET: [(&str, &str); 7] = [
+    (
+        STOCK_UNCONFIRMED_BLOCKED,
+        "This setup's stock was cut, or taken as cut, on the computer before this tablet file was made, and the tablet cannot tell whether that part is still held, so it cannot tell the surface where the stock top is touched off.",
+    ),
+    (
+        STOCK_UNCONFIRMED_WHY,
+        "This setup's stock was cut, or taken as cut, on the computer before this tablet file was made, and the tablet cannot tell whether that part is still held.",
+    ),
+    (
+        EARLIER_UNFOLLOWED_BLOCKED,
+        "Another setup's run on the computer cut this part before this tablet file was made, in a way the plan does not follow (an operation disabled or changed since, or its setup deleted or moved after this one), so the computer cannot tell the surface where the stock top is touched off.",
+    ),
+    (
+        STOCK_AWAY_BLOCKED,
+        "This setup's runs on the computer cut the stock before this tablet file was made, and the machine was disconnected from it since: the tablet cannot tell whether that part is still held, or what else ran on the machine, so it cannot tell the surface where the stock top is touched off.",
+    ),
+    (
+        HISTORY_UNFOLLOWED_BLOCKED,
+        "Runs the computer did not follow may have cut the stock before this tablet file was made, so it cannot tell the surface where the stock top is touched off.",
+    ),
+    (
+        HISTORY_UNFOLLOWED_WHY,
+        "Runs the computer did not follow may have cut the stock before this tablet file was made, and it does not know what they cut here.",
+    ),
+    (
+        EARLIER_UNFOLLOWED_WHY,
+        "Another setup's run on the computer cut this part before this tablet file was made, in a way the plan does not follow: an operation disabled or changed since, or its setup deleted or moved after this one.",
+    ),
+];
+
+/// `why`, from the Run panel, as the tablet file says it (`FOR_TABLET`).
+fn for_tablet(why: String) -> String {
+    (FOR_TABLET.iter())
+        .find(|(computer, _)| *computer == why)
+        .map_or(why, |(_, tablet)| tablet.to_string())
+}
+
+/// What each setup's runs cut, by setup id (`App::run_cuts`).
+pub type SessionCuts = [(String, Vec<CutInRun>)];
+
+/// What the tablet file is made with (`App::session_cuts`, LIO-590): what
+/// each setup's runs cut (`App::run_cuts`, with the run picked now),
+/// whether what runs cut was lost (`App::others_unknown`, LIO-594), which
+/// makes a setup with none kept cut by runs no session here knows of, and
+/// the setups whose operations or steps the operator took as cut
+/// (`App::run_declared`, LIO-583), the run picked now's included.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Session {
+    pub cuts: Vec<(String, Vec<CutInRun>)>,
+    pub lost: bool,
+    pub declared: Vec<String>,
+}
+
+impl Run {
+    /// Given `session` as the tablet file's work zeros go by it (LIO-590):
+    /// as a pick of the setup on the Run panel (`picked_in`); and with its
+    /// operations or steps taken as cut on the computer (`declared`), whose
+    /// material may be gone though nothing here says where, its stock is
+    /// not the setup's own and the part held is not known to be that one
+    /// (`stock_unconfirmed`), as on the Run panel once picked again
+    /// (LIO-583), which the tablet cannot answer: no Z from the stock top.
+    pub fn given(&mut self, session: &Session) {
+        self.picked_in(&session.cuts, session.lost);
+        if session.declared.contains(&self.setup_id) {
+            if self.cut_in_run.is_empty() {
+                self.note_history_unknown();
+            }
+            self.stock_unconfirmed = true;
+        }
+    }
+}
+
 /// What a tool run of a run cut (`Run::cut_in_run`): the operation (index in
 /// the setup), all of it (None) or its steps before the one given, and the
 /// print of the plan and cutter it cut (`OpSteps::cut_print`).
@@ -513,6 +591,9 @@ pub struct Run {
     /// The setups `earlier_cuts` was given for: one no longer in it was
     /// forgotten (New stock loaded).
     pub earlier_given: Vec<String>,
+    /// Of the setups of `earlier_cuts`, those of another project, whose
+    /// (`CutOwner`, LIO-607): their cuts are said as that project's.
+    pub earlier_elsewhere: Vec<CutOwner>,
     /// A run following on the Pi the tool run its run ran when dropped
     /// (`App::run_pending`): what was cut before that tool run. Kept only
     /// once the follow holds (`follow_again`) and until this computer starts
@@ -935,6 +1016,37 @@ pub struct CutHistory {
     /// none ran while it was away (LIO-595), whichever session sent it.
     #[serde(default)]
     pub sent: Vec<u64>,
+    /// Whose each setup in `cuts` is (`CutOwner`), so that another
+    /// project's cuts are said to be so (LIO-607). A setup with none, kept
+    /// by an AXIS CAM before it, is said as any setup the check does not
+    /// follow.
+    #[serde(default)]
+    pub owners: Vec<CutOwner>,
+}
+
+/// The project and names of a setup whose runs cut (`CutHistory::owners`),
+/// as they were when its cuts were last kept (LIO-607).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CutOwner {
+    pub setup: String,
+    /// The project's identity (`Document::project_id`) and title.
+    pub project: String,
+    pub title: String,
+    /// The names of the setup's operations, by index.
+    pub ops: Vec<String>,
+}
+
+impl CutOwner {
+    /// Setup `si` of `doc`'s.
+    pub fn of(doc: &Document, si: usize) -> Self {
+        let s = &doc.setups[si];
+        Self {
+            setup: s.id.clone(),
+            project: doc.project_id.clone(),
+            title: doc.title.clone(),
+            ops: s.operations.iter().map(|o| o.name().to_string()).collect(),
+        }
+    }
 }
 
 /// How many of the tool runs sent a Pi `CutHistory::sent` keeps.
@@ -1209,6 +1321,7 @@ impl Run {
             declared_stale: false,
             earlier_cuts: vec![],
             earlier_given: vec![],
+            earlier_elsewhere: vec![],
             before_follow: None,
             running: None,
             xy: None,
@@ -2900,18 +3013,165 @@ impl Run {
         })
     }
 
+    /// Given what the setups' runs cut (`App::run_cuts`) as a pick of the
+    /// setup on the Run panel takes it: its own setup's cuts, until the
+    /// operator says whether the same part is still held
+    /// (`stock_unconfirmed`), and the others' (`earlier_cuts`). With what
+    /// runs cut `lost` (LIO-594) and none kept for it, it was cut by runs
+    /// no session here knows of (`note_lost_cuts`).
+    pub fn picked_in(&mut self, cuts: &SessionCuts, lost: bool) {
+        let own = cuts
+            .iter()
+            .find(|(id, _)| *id == self.setup_id)
+            .map(|(_, c)| c.clone());
+        let own = own.or_else(|| lost.then(|| vec![(HISTORY_UNKNOWN, None, None)]));
+        if let Some(own) = own.filter(|c| !c.is_empty()) {
+            self.cut_in_run = own;
+            self.stock_unconfirmed = true;
+        }
+        crate::give_earlier_cuts(cuts, self);
+    }
+
     /// Another setup's run cut an operation this session (`earlier_cuts`)
     /// that the check does not simulate before this setup as it was cut:
     /// disabled, left, its plan or cutter changed, or its setup deleted or
     /// moved after this one (`Left::earlier`). Its stock lacks what was cut
     /// (LIO-582 review).
     pub fn earlier_unfollowed(&self) -> bool {
+        self.unfollowed_earlier().next().is_some()
+    }
+
+    /// The setups of `earlier_cuts` whose cuts the check does not follow
+    /// (`earlier_unfollowed`), with those cuts.
+    fn unfollowed_earlier(&self) -> impl Iterator<Item = &(String, Vec<CutInRun>)> {
         let earlier = self.left.as_ref().map_or(&[][..], |l| &l.earlier[..]);
-        (self.earlier_cuts.iter()).any(|(id, cuts)| {
+        (self.earlier_cuts.iter()).filter(move |(id, cuts)| {
             cuts.iter().any(|&(op, _, print)| {
                 !(earlier.iter()).any(|(s, o, p)| s == id && *o == op && Some(*p) == print)
             })
         })
+    }
+
+    /// What another project's runs cut that the check does not follow
+    /// (`earlier_unfollowed`, `earlier_elsewhere`), said (LIO-607): None
+    /// when none did. With whether a setup of this project's, or one whose
+    /// project is not known, cut what it does not follow too.
+    fn earlier_elsewhere_said(&self) -> Option<(String, bool)> {
+        let (projects, own) = self.earlier_elsewhere_projects()?;
+        let which = (projects.iter())
+            .map(|(title, ops)| match (title.trim(), ops.is_empty()) {
+                ("", true) => "one with no name".to_string(),
+                ("", false) => format!("one with no name: {}", crate::post::listed(ops)),
+                (t, true) => format!("\"{t}\""),
+                (t, false) => format!("\"{t}\": {}", crate::post::listed(ops)),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let whose = match projects.len() {
+            1 => "another project's runs",
+            _ => "other projects' runs",
+        };
+        Some((
+            format!(
+                "{whose} cut stock on this machine earlier ({which}), which this project's check does not follow"
+            ),
+            own,
+        ))
+    }
+
+    /// The other projects whose runs cut what the check does not follow
+    /// (`earlier_unfollowed`, `earlier_elsewhere`), each its title and the
+    /// names of the operations that cut, and whether a setup of this
+    /// project's, or one whose project is not known, cut what it does not
+    /// follow too (LIO-607). None when no other project's did.
+    fn earlier_elsewhere_projects(&self) -> Option<(Vec<(&str, Vec<&str>)>, bool)> {
+        let mut projects: Vec<(&str, &str, Vec<&str>)> = vec![];
+        let mut own = false;
+        for (id, cuts) in self.unfollowed_earlier() {
+            let Some(o) = self.earlier_elsewhere.iter().find(|o| o.setup == *id) else {
+                own = true;
+                continue;
+            };
+            let i = match projects.iter().position(|p| p.0 == o.project) {
+                Some(i) => i,
+                None => {
+                    projects.push((&o.project, &o.title, vec![]));
+                    projects.len() - 1
+                }
+            };
+            for &(op, _, _) in cuts {
+                if let Some(name) = o.ops.get(op).filter(|n| !n.is_empty())
+                    && !projects[i].2.contains(&name.as_str())
+                {
+                    projects[i].2.push(name);
+                }
+            }
+        }
+        if projects.is_empty() {
+            return None;
+        }
+        let projects = projects.into_iter().map(|(_, t, ops)| (t, ops)).collect();
+        Some((projects, own))
+    }
+
+    /// Why the stock is not the check's where another setup's or another
+    /// project's run cut it (`earlier_unfollowed`), the start of a sentence
+    /// (LIO-607): None when only this project's setups did, said as
+    /// `EARLIER_UNFOLLOWED_WHY` is.
+    fn earlier_elsewhere_cause(&self) -> Option<String> {
+        let (said, own) = self.earlier_elsewhere_said()?;
+        Some(match own {
+            true => format!(
+                "Another setup's run cut this part earlier in a way the check does not follow, and {said}"
+            ),
+            false => format!("{}{}", said[..1].to_uppercase(), &said[1..]),
+        })
+    }
+
+    /// What the Work zero tab says of the cuts the check does not follow
+    /// (`earlier_unfollowed`), with New stock loaded: short, for why they
+    /// set no Z is said with the steps above it (`partway_blocked`); another
+    /// project's named (LIO-607).
+    pub fn earlier_unfollowed_note(&self) -> String {
+        const OWN: &str = "Another setup's run cut this part in a way the check does not follow";
+        let Some((projects, own)) = self.earlier_elsewhere_projects() else {
+            return format!("{OWN}.");
+        };
+        let titles: Vec<String> = (projects.iter())
+            .map(|(t, _)| match t.trim() {
+                "" => "one with no name".to_string(),
+                t => format!("\"{t}\""),
+            })
+            .collect();
+        let titles = crate::post::listed(&titles);
+        match (own, projects.len()) {
+            (false, 1) => format!("Another project's runs ({titles}) may have cut this stock."),
+            (false, _) => format!("Other projects' runs ({titles}) may have cut this stock."),
+            (true, 1) => {
+                format!("{OWN}, and another project's runs ({titles}) may have cut it too.")
+            }
+            (true, _) => format!("{OWN}, and other projects' runs ({titles}) may have cut it too."),
+        }
+    }
+
+    /// Why a probe cannot find a work zero from a spot of a stock
+    /// `EARLIER_UNFOLLOWED` cut.
+    fn earlier_unfollowed_why(&self) -> String {
+        match self.earlier_elsewhere_cause() {
+            Some(cause) => format!("{cause}."),
+            None => EARLIER_UNFOLLOWED_WHY.into(),
+        }
+    }
+
+    /// Why a probe cannot find this work zero where `EARLIER_UNFOLLOWED`
+    /// cut (`Connection::cut_probe_blocked`).
+    pub fn earlier_unfollowed_probe(&self) -> String {
+        match self.earlier_elsewhere_cause() {
+            Some(cause) => format!(
+                "{cause}, so the check cannot tell the stock where a probe finds this work zero."
+            ),
+            None => "Another setup's run cut this part earlier in a way the check does not follow, where a probe finds this work zero.".into(),
+        }
     }
 
     /// The stock the start begins from is not the setup's own: the run
@@ -3071,7 +3331,12 @@ impl Run {
         } else if partly.cut == [HISTORY_UNFOLLOWED] {
             HISTORY_UNFOLLOWED_BLOCKED.into()
         } else if partly.cut == [EARLIER_UNFOLLOWED] {
-            EARLIER_UNFOLLOWED_BLOCKED.into()
+            match self.earlier_elsewhere_cause() {
+                Some(cause) => format!(
+                    "{cause}, so the check cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero."
+                ),
+                None => EARLIER_UNFOLLOWED_BLOCKED.into(),
+            }
         } else if partly.cut == [STEPS_UNFOLLOWED] {
             // Not a part of the stock: said as the reason it is (LIO-579).
             "The check does not follow the stock cut by the steps taken as cut, so it cannot tell the surface they left where the stock top is touched off.".into()
@@ -3345,7 +3610,7 @@ impl Run {
                 surface: None,
                 top_cut: true,
                 probe_from: (before.probe_from.iter())
-                    .map(|(r, _)| (*r, Err(EARLIER_UNFOLLOWED_WHY.into())))
+                    .map(|(r, _)| (*r, Err(self.earlier_unfollowed_why())))
                     .collect(),
                 steps: vec![],
             }));
@@ -5333,8 +5598,15 @@ pub struct TabletStep {
 
 /// The tool runs of setup `si` for the tablet: those Cycle Start sends
 /// after the Run panel's check, or why it refuses them.
-/// `mesh` is the part, or why it could not be loaded.
-pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> TabletSetup {
+/// `mesh` is the part, or why it could not be loaded. Their work zeros go
+/// by what the setups' runs cut this session, `session`, as the Run panel's
+/// do with the setup picked (`Run::picked_in`, LIO-590).
+pub fn tablet_runs(
+    doc: &Document,
+    mesh: Result<&Mesh, &str>,
+    si: usize,
+    session: &Session,
+) -> TabletSetup {
     let setup = &doc.setups[si];
     let profile = crate::model::get(&setup.machine.p, "uc100_profile");
     let mut out = TabletSetup {
@@ -5361,13 +5633,16 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
     let mut run = Run::new(doc, si, 0);
     run.checked_as(Arc::new(programs), Some(left.clone()), None);
     let all = run.programs.clone().expect("checked");
-    // Each start's work zero as the Run panel finds it started there.
+    // Each start's work zero as the Run panel finds it started there, the
+    // setup picked with this session's cuts (LIO-590); the jobs are the
+    // plan's alone.
     let mut started = Run::new(doc, si, 0);
+    started.given(session);
     started.checked_as(all.clone(), Some(left), None);
     let orient = crate::orient::Orient::of(&setup.machine);
     // The setup's start's, on the stock earlier setups left (LIO-584).
     let inherited = crate::model::get(&setup.p, "stock_source") != "fresh";
-    let mut start_zero = tablet_start_zero(&run, orient, inherited);
+    let mut start_zero = tablet_start_zero(&started, orient, inherited);
     let mut zero = |i: usize, k: usize| {
         started.start_at(i, k);
         tablet_zero(&started, orient)
@@ -5424,7 +5699,7 @@ pub fn tablet_runs(doc: &Document, mesh: Result<&Mesh, &str>, si: usize) -> Tabl
                 }
             })
             .collect();
-        let step_starts = tablet_step_starts(doc, mesh, si, &run, p, lift, &actions);
+        let step_starts = tablet_step_starts(doc, mesh, si, session, &run, p, lift, &actions);
         let o = &p.ops[0];
         out.tool_runs.push(TabletRun {
             name: format!("{} · tool run {} of {count}", run.name, i + 1),
@@ -5480,19 +5755,39 @@ fn tablet_zero(run: &Run, orient: crate::orient::Orient) -> Option<TabletZero> {
 /// on the stock top there (`Run::touch_off` None: `INHERITED_UNKNOWN`, or
 /// `STOCK_TOP_CUT`) or a probe spot (`Checked::probe_from`, as
 /// `Connection::probe_spots` has them then), an earlier setup's cut maybe
-/// reaching under them (LIO-584). None otherwise, and always on fresh
-/// stock, which no earlier setup cut (its spots refused for a jaw at most),
-/// and for a zero not on the stock, which no touch-off on its top finds.
+/// reaching under them (LIO-584); or this session's cuts the check does
+/// not have make the Run panel refuse them (`Run::on_cut_stock`, LIO-590).
+/// None otherwise: on fresh stock, as no earlier setup of the plan cut it
+/// (its spots refused for a jaw at most), and for a zero not on the stock,
+/// which no touch-off on its top finds; but for this session's cuts.
 fn tablet_start_zero(
     run: &Run,
     orient: crate::orient::Orient,
     inherited: bool,
 ) -> Option<TabletZero> {
-    if run.partway() || !inherited {
+    if run.partway() {
         return None;
     }
     let p = run.checked()?.first()?;
+    // This session's cuts the check does not have, of this setup's runs or
+    // another's (`Run::on_cut_stock`): the Run panel's Work zero goes by
+    // them from the setup's start too, on fresh stock or not, and with a
+    // zero not on the stock top (A axis at stock end), whose touch-off it
+    // refuses as well (LIO-590 review).
+    if run.on_cut_stock() {
+        let partly = run.partly();
+        return zero_said(
+            run,
+            orient,
+            partly.as_ref().map_or_else(Vec::new, |x| x.cut.clone()),
+            partly.as_ref().is_none_or(|x| x.top_cut),
+            partly.as_ref().map_or(&[][..], |x| &x.probe_from[..]),
+        );
+    }
     crate::post::references(&p.origin)?;
+    if !inherited {
+        return None;
+    }
     let refused = run.touch_off().is_none() || p.probe_from.iter().any(|(_, ok)| ok.is_err());
     if !refused {
         return None;
@@ -5515,7 +5810,7 @@ fn zero_said(
     spots: &[([crate::post::At; 2], Result<(), String>)],
 ) -> Option<TabletZero> {
     let p = run.checked()?.first()?;
-    let blocked = run.partway_blocked();
+    let blocked = run.partway_blocked().map(for_tablet);
     let set_z = run.touch_off().map(|(_, work)| work[2]);
     Some(TabletZero {
         set_z,
@@ -5535,7 +5830,7 @@ fn zero_said(
             .map(|([x, y], ok)| TabletSpot {
                 x: *x,
                 y: *y,
-                problem: ok.clone().err(),
+                problem: ok.clone().err().map(for_tablet),
             })
             .collect(),
     })
@@ -5567,10 +5862,12 @@ fn way_out_line(blocks: &[Block]) -> Option<u32> {
 /// the run of the setup's own check, whose steps they are; `lift` the tool
 /// run's, said with a refused start; `own` its actions, which each start
 /// shares the rest of its job with (`share`).
+#[allow(clippy::too_many_arguments)]
 fn tablet_step_starts(
     doc: &Document,
     mesh: &Mesh,
     si: usize,
+    session: &Session,
     base: &Run,
     p: &Checked,
     lift: Lift,
@@ -5598,7 +5895,7 @@ fn tablet_step_starts(
                 way_out: None,
                 zero: None,
             };
-            match tablet_step_job(doc, mesh, si, p.chuck.is_some(), oi, n) {
+            match tablet_step_job(doc, mesh, si, session, p.chuck.is_some(), oi, n) {
                 Ok((mut actions, steps, lift, entry, way_out, zero)) => {
                     start.rest = share(&mut actions, own);
                     (start.actions, start.steps, start.lift) = (actions, steps, lift);
@@ -5665,6 +5962,7 @@ fn tablet_step_job(
     doc: &Document,
     mesh: &Mesh,
     si: usize,
+    session: &Session,
     chuck: bool,
     oi: usize,
     n: usize,
@@ -5713,6 +6011,7 @@ fn tablet_step_job(
     // check puts Cycle Start at the step's operation (`keep`), so the start
     // is the run's (`at_step`). One it would not be at is said as none.
     let mut started = Run::new(doc, si, 0);
+    started.given(session);
     started.start_step = Some((oi, n));
     started.keep = Some((vec![], Some(oi)));
     started.checked_as(all.clone(), Some(left), None);
@@ -6859,7 +7158,7 @@ pub(crate) mod tests {
         std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
         let (mut doc, mesh) = tablet_fixture(&profile);
         let file = |doc: &Document| {
-            let zip = crate::bundle::pack(doc).unwrap();
+            let zip = crate::bundle::pack(doc, &Session::default()).unwrap();
             let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
             let mut runs: crate::bundle::Runs =
                 serde_json::from_reader(zip.by_name(crate::bundle::RUNS).unwrap()).unwrap();
@@ -6891,7 +7190,7 @@ pub(crate) mod tests {
         let json = serde_json::to_value(&moved).unwrap();
         assert_eq!(json["origin"], "Stock top front-left");
         assert_eq!(json["datum"].as_array().map(Vec::len), Some(3));
-        let none = tablet_runs(&doc, Err("no part"), 0);
+        let none = tablet_runs(&doc, Err("no part"), 0, &Session::default());
         assert_eq!((none.origin, none.datum), (None, None));
         let mut json = serde_json::to_value(&s).unwrap();
         let o = json.as_object_mut().unwrap();
@@ -6913,7 +7212,7 @@ pub(crate) mod tests {
         let profile = dir.path().join("template.toml");
         std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
         let (doc, mesh) = tablet_fixture(&profile);
-        let zip = crate::bundle::pack(&doc).unwrap();
+        let zip = crate::bundle::pack(&doc, &Session::default()).unwrap();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
         let runs: crate::bundle::Runs =
             serde_json::from_reader(zip.by_name(crate::bundle::RUNS).unwrap()).unwrap();
@@ -7095,7 +7394,7 @@ pub(crate) mod tests {
         let profile = dir.path().join("template.toml");
         std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
         let (doc, mesh) = tablet_fixture(&profile);
-        let s = tablet_runs(&doc, Ok(&mesh), 0);
+        let s = tablet_runs(&doc, Ok(&mesh), 0, &Session::default());
         assert!(s.problems.is_empty(), "{:?}", s.problems);
         let offset = [120., 90., -35., 0., 0., 0.];
         // Only stops the spindle (and coolant), lifts and ends from there.
@@ -7258,7 +7557,7 @@ pub(crate) mod tests {
         let profile = dir.path().join("template.toml");
         std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
         let (doc, mesh) = tablet_fixture(&profile);
-        let s = tablet_runs(&doc, Ok(&mesh), 0);
+        let s = tablet_runs(&doc, Ok(&mesh), 0, &Session::default());
         assert!(s.problems.is_empty(), "{:?}", s.problems);
         let (programs, left) = check(&doc, &mesh, 0);
         let mut run = Run::new(&doc, 0, 0);
@@ -7334,7 +7633,7 @@ pub(crate) mod tests {
         let profile = dir.path().join("template.toml");
         std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
         let (doc, mesh) = tablet_fixture(&profile);
-        let s = tablet_runs(&doc, Ok(&mesh), 0);
+        let s = tablet_runs(&doc, Ok(&mesh), 0, &Session::default());
         assert!(s.problems.is_empty(), "{:?}", s.problems);
         let (programs, left) = check(&doc, &mesh, 0);
         let (whole, left) = (Arc::new(programs), Arc::new(left));
@@ -8105,6 +8404,7 @@ pub(crate) mod tests {
             declared_stale: false,
             earlier_cuts: vec![],
             earlier_given: vec![],
+            earlier_elsewhere: vec![],
             before_follow: None,
             running: Some(Running {
                 index: 0,
@@ -8389,7 +8689,7 @@ pub(crate) mod tests {
         }
         // The tablet file: the same 5 holes, each ending where Stop after
         // step stops, after its last peck.
-        let zip = crate::bundle::pack(&doc).unwrap();
+        let zip = crate::bundle::pack(&doc, &Session::default()).unwrap();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
         let runs: crate::bundle::Runs =
             serde_json::from_reader(zip.by_name(crate::bundle::RUNS).unwrap()).unwrap();
@@ -8605,7 +8905,7 @@ pub(crate) mod tests {
             }
         }
         // The tablet file names them the same.
-        let tablet = tablet_runs(&doc, Ok(&mesh), 0);
+        let tablet = tablet_runs(&doc, Ok(&mesh), 0, &Session::default());
         assert!(tablet.problems.is_empty(), "{:?}", tablet.problems);
         let said: Vec<&str> = (tablet.tool_runs.iter())
             .flat_map(|r| &r.steps)
@@ -8842,7 +9142,7 @@ pub(crate) mod tests {
             .iter()
             .position(|p| p.indexes.contains(&oi))
             .unwrap();
-        let zip = crate::bundle::pack(&doc).unwrap();
+        let zip = crate::bundle::pack(&doc, &Session::default()).unwrap();
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
         let runs: crate::bundle::Runs =
             serde_json::from_reader(zip.by_name(crate::bundle::RUNS).unwrap()).unwrap();
@@ -8931,6 +9231,47 @@ pub(crate) mod tests {
         doc.sample_model = false;
         doc.sync_stock_sources();
         doc.sync_turns(Some(&mesh));
+        // Its run cut this session, its zero not on the stock top (A axis at
+        // stock end): the Run panel refuses the touch-off until it is said
+        // whether the same part is held, and so does the tablet file, which
+        // carries the refusal though no stock-top spot (LIO-590 review).
+        assert!(crate::indexed::ORIGINS.contains(&crate::model::get(&doc.setups[0].p, "origin")));
+        let (c, l) = check(&doc, &mesh, 0);
+        let mut cut = Run::new(&doc, 0, 0);
+        cut.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        cut.note_cut(0, None);
+        let session = vec![(doc.setups[0].id.clone(), cut.cut_in_run.clone())];
+        let mut picked = Run::new(&doc, 0, 0);
+        picked.picked_in(&session, false);
+        let (c, l) = check(&doc, &mesh, 0);
+        picked.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        assert!(picked.touch_off().is_none());
+        assert_eq!(
+            picked.partway_blocked().as_deref(),
+            Some(STOCK_UNCONFIRMED_BLOCKED)
+        );
+        let session = Session {
+            cuts: session,
+            ..Session::default()
+        };
+        let zero = tablet_runs(&doc, Ok(&mesh), 0, &session).tool_runs[0]
+            .zero
+            .clone();
+        let zero = zero.expect("the setup's start carries the refusal");
+        assert_eq!((zero.set_z, zero.spot), (None, None));
+        assert_eq!(
+            zero.blocked,
+            Some(for_tablet(STOCK_UNCONFIRMED_BLOCKED.into()))
+        );
+        assert!(
+            zero.blocked
+                .as_ref()
+                .is_some_and(|b| !b.contains("Same part"))
+        );
+        assert_eq!(
+            tablet_runs(&doc, Ok(&mesh), 0, &Session::default()).tool_runs[0].zero,
+            None
+        );
         let sims = simulated(&doc, &mesh, 0);
         let plan = &sims[0].1.as_ref().unwrap().plan;
         let n = plan.holes.len();
@@ -8956,7 +9297,7 @@ pub(crate) mod tests {
         let labels: Vec<String> = (0..n).map(|s| steps[0].label(s)).collect();
         assert_eq!(labels, want);
         // The tablet file: a step a bore, each ending somewhere to stop.
-        let tablet = tablet_runs(&doc, Ok(&mesh), 0);
+        let tablet = tablet_runs(&doc, Ok(&mesh), 0, &Session::default());
         assert!(tablet.problems.is_empty(), "{:?}", tablet.problems);
         let tablet: Vec<_> = tablet.tool_runs.iter().flat_map(|r| &r.steps).collect();
         let labels: Vec<&str> = tablet.iter().map(|t| t.label.as_str()).collect();
@@ -9103,7 +9444,7 @@ pub(crate) mod tests {
         // not there: in the chuck, the tablet starts a tool run only at its
         // first point, the way in past the jaws it checked (LIO-476,
         // LIO-567).
-        let tablet = tablet_runs(&doc, Ok(&mesh), 0);
+        let tablet = tablet_runs(&doc, Ok(&mesh), 0, &Session::default());
         assert!(tablet.problems.is_empty(), "{:?}", tablet.problems);
         let starts: Vec<_> = (tablet.tool_runs.iter())
             .flat_map(|r| &r.step_starts)
@@ -9728,7 +10069,7 @@ pub(crate) mod tests {
         assert_eq!(partly.surface, None);
         assert_eq!(run.touch_off(), None);
         assert!(run.partway_blocked().is_some());
-        let s = tablet_runs(&doc, Ok(&mesh), 0);
+        let s = tablet_runs(&doc, Ok(&mesh), 0, &Session::default());
         assert!(s.problems.is_empty(), "{:?}", s.problems);
         let zero = s.tool_runs[1].zero.as_ref().unwrap();
         assert_eq!(zero.set_z, None);
@@ -9823,7 +10164,7 @@ pub(crate) mod tests {
         );
         // Not every spot: the corners, far from the bore, stay.
         assert!((partly.probe_from.iter()).any(|(_, ok)| ok.is_ok()));
-        let s = tablet_runs(&doc, Ok(&mesh), 0);
+        let s = tablet_runs(&doc, Ok(&mesh), 0, &Session::default());
         assert!(s.problems.is_empty(), "{:?}", s.problems);
         let zero = s.tool_runs[1].zero.as_ref().unwrap();
         let spot = (zero.probe_from.iter())
@@ -9857,7 +10198,7 @@ pub(crate) mod tests {
         let why = run.partway_blocked().unwrap();
         assert_eq!(why, INHERITED_UNKNOWN);
         let p = run.checked().unwrap()[0].clone();
-        let s = tablet_runs(&split, Ok(&mesh), 1);
+        let s = tablet_runs(&split, Ok(&mesh), 1, &Session::default());
         assert!(s.problems.is_empty(), "{:?}", s.problems);
         let zero = s.tool_runs[0].zero.as_ref().unwrap();
         assert_eq!(
@@ -9874,7 +10215,7 @@ pub(crate) mod tests {
         assert!(centre.is_some_and(|t| t.problem.is_some()), "{zero:?}");
         assert!(zero.probe_from.iter().any(|t| t.problem.is_none()));
         // The first setup, on fresh stock: none.
-        let s = tablet_runs(&split, Ok(&mesh), 0);
+        let s = tablet_runs(&split, Ok(&mesh), 0, &Session::default());
         assert!(s.problems.is_empty(), "{:?}", s.problems);
         assert!(s.tool_runs.iter().all(|r| r.zero.is_none()));
         // Bored nowhere, the second touches off as ever: none either.
@@ -9884,7 +10225,7 @@ pub(crate) mod tests {
         let mut run = Run::new(&plain, 1, 0);
         run.checked_as(Arc::new(programs), Some(Arc::new(left)), None);
         assert!(run.touch_off().is_some());
-        let s = tablet_runs(&plain, Ok(&mesh), 1);
+        let s = tablet_runs(&plain, Ok(&mesh), 1, &Session::default());
         assert!(s.problems.is_empty(), "{:?}", s.problems);
         assert_eq!(s.tool_runs[0].zero, None);
     }
@@ -9940,7 +10281,7 @@ pub(crate) mod tests {
         run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
         assert_eq!(run.at_step(), Some((0, 1)));
         let at_step = blocked(&run);
-        let s = tablet_runs(&doc, Ok(&mesh), 1);
+        let s = tablet_runs(&doc, Ok(&mesh), 1, &Session::default());
         assert!(s.problems.is_empty(), "{:?}", s.problems);
         let zero = s.tool_runs[1].zero.as_ref().unwrap();
         assert_eq!((zero.set_z, zero.blocked.as_ref()), (None, Some(&at_op)));
@@ -10473,6 +10814,95 @@ pub(crate) mod tests {
         );
     }
 
+    /// LIO-607: another project's setups' cuts, kept with whose they are
+    /// (`CutOwner`), are said as that project's, its name and the
+    /// operations cut; a setup deleted from this project, or one kept with
+    /// no owner (an older AXIS CAM's), as any setup the check does not
+    /// follow.
+    #[test]
+    fn another_projects_cuts_are_said_as_its() {
+        let doc = crate::post::fixture::job().0;
+        let mut other = doc.clone();
+        other.project_id = crate::id();
+        other.title = "Bracket".into();
+        for s in &mut other.setups {
+            s.id = crate::id();
+        }
+        let mut third = other.clone();
+        third.project_id = crate::id();
+        third.title = "Lid".into();
+        third.setups[0].id = crate::id();
+        let (a, b) = (CutOwner::of(&other, 0), CutOwner::of(&third, 0));
+        let (face, pocket) = (a.ops[0].clone(), a.ops[1].clone());
+        // Of this project, but deleted since.
+        let mut gone = CutOwner::of(&doc, 0);
+        gone.setup = crate::id();
+        let owners = [a.clone(), b.clone(), gone.clone()];
+        let note = |cuts: &[(&str, &[usize])]| {
+            let mut run = Run::new(&doc, 0, 0);
+            run.earlier_cuts = (cuts.iter())
+                .map(|(id, ops)| {
+                    (
+                        id.to_string(),
+                        ops.iter().map(|&o| (o, None, None)).collect(),
+                    )
+                })
+                .collect();
+            crate::give_elsewhere(&owners, &doc, &mut run);
+            (run.earlier_unfollowed_why(), run.earlier_unfollowed_note())
+        };
+        // Why, said with the steps, and the note with New stock loaded.
+        assert_eq!(
+            note(&[(&a.setup, &[0, 1, 0, HISTORY_UNKNOWN])]),
+            (
+                format!(
+                    "Another project's runs cut stock on this machine earlier (\"Bracket\": {face} and {pocket}), which this project's check does not follow."
+                ),
+                "Another project's runs (\"Bracket\") may have cut this stock.".into()
+            )
+        );
+        assert_eq!(
+            note(&[(&a.setup, &[1]), (&b.setup, &[0])]),
+            (
+                format!(
+                    "Other projects' runs cut stock on this machine earlier (\"Bracket\": {pocket}; \"Lid\": {face}), which this project's check does not follow."
+                ),
+                "Other projects' runs (\"Bracket\" and \"Lid\") may have cut this stock.".into()
+            )
+        );
+        let generic = (
+            EARLIER_UNFOLLOWED_WHY.to_string(),
+            "Another setup's run cut this part in a way the check does not follow.".to_string(),
+        );
+        assert_eq!(note(&[(&gone.setup, &[0])]), generic);
+        assert_eq!(note(&[("kept-with-no-owner", &[0])]), generic);
+        assert_eq!(
+            note(&[(&gone.setup, &[0]), (&a.setup, &[0])]),
+            (
+                format!(
+                    "Another setup's run cut this part earlier in a way the check does not follow, and another project's runs cut stock on this machine earlier (\"Bracket\": {face}), which this project's check does not follow."
+                ),
+                "Another setup's run cut this part in a way the check does not follow, and another project's runs (\"Bracket\") may have cut it too.".into()
+            )
+        );
+        // A project with no name.
+        let mut nameless = a.clone();
+        (nameless.setup, nameless.title) = (crate::id(), " ".into());
+        let owners = [nameless.clone()];
+        let mut run = Run::new(&doc, 0, 0);
+        run.earlier_cuts = vec![(nameless.setup.clone(), vec![(0, None, None)])];
+        crate::give_elsewhere(&owners, &doc, &mut run);
+        assert_eq!(
+            run.earlier_unfollowed_note(),
+            "Another project's runs (one with no name) may have cut this stock."
+        );
+        // A history kept before owners were kept still reads.
+        let old =
+            r#"{"cuts":[["s",[[0,null,null]]]],"journals":[],"others_unknown":false,"sent":[]}"#;
+        let h: CutHistory = serde_json::from_str(old).unwrap();
+        assert!(h.owners.is_empty() && h.cuts.len() == 1);
+    }
+
     /// Setup 1 bores the ring from below, leaving a 0.5 mm roof, cut in a
     /// run this session; setup 2, flipped, faces the roof away (LIO-582
     /// review). While setup 1's bore is checked as it was cut, setup 2's
@@ -10560,6 +10990,208 @@ pub(crate) mod tests {
             assert!(kept.is_empty(), "{kept:?}");
             assert!(!run.earlier_unfollowed());
         }
+    }
+
+    /// Setup 1 bores the ring from below in a run this session; setup 2,
+    /// flipped, faces the roof left over the bore (LIO-590). Disabled since,
+    /// the plan alone has no bore, and a tablet file made from it alone let
+    /// setup 2's start touch off on the stock top, in the bore. Made with
+    /// what this session cut, as Save for tablet makes it, each of its work
+    /// zeros refuses Z and every probe spot, in the tablet's words, as the
+    /// Run panel refuses them. A cut the plan follows changes nothing for
+    /// the setups after it; a setup's own runs' cut refuses its zeros until
+    /// it is known whether that part is held, which the tablet cannot say;
+    /// and a setup the cut came after, on fresh stock, is refused too, as on
+    /// the Run panel.
+    #[test]
+    fn the_tablet_file_refuses_a_touch_off_over_a_session_cut_the_plan_no_longer_follows() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (mut doc, _) = tablet_fixture(&profile);
+        let (path, mesh, [mill, small]) = ring(dir.path());
+        let mut first = ring_setup(&doc, "G54", "1", "1");
+        let top = ring_top(&mesh, &first, true);
+        first.operations = vec![ring_bore(&mill, top, "0.5")];
+        let mut flipped = ring_setup(&doc, "G55", "1", "1");
+        flipped.p.insert("rx".into(), "180".into());
+        let top = ring_top(&mesh, &flipped, false);
+        let mut opening = ring_face(&mill, top.clone());
+        opening.p.insert("stepdown".into(), "0.6".into());
+        flipped.operations = vec![opening, ring_face(&small, top)];
+        doc.active = flipped.id.clone();
+        doc.setups = vec![first, flipped];
+        doc.tools = vec![mill, small];
+        if let Some(f) = &mut doc.file {
+            (f.path, f.name, f.format) = (path, "ring.stl".into(), "stl".into());
+        }
+        let cut_by = |doc: &Document, si: usize| {
+            let (c, l) = check(doc, &mesh, si);
+            let mut run = Run::new(doc, si, 0);
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            run.note_cut(0, None);
+            vec![(doc.setups[si].id.clone(), run.cut_in_run.clone())]
+        };
+        let session = cut_by(&doc, 0);
+        let setup_in = |doc: &Document, si: usize, session: &Session| {
+            let runs = crate::bundle::runs(doc, Ok(&mesh), session);
+            let s = (runs.setups.into_iter()).find(|s| s.setup_id == doc.setups[si].id);
+            let s = s.unwrap();
+            assert!(s.problems.is_empty(), "{:?}", s.problems);
+            s
+        };
+        let setup = |doc: &Document, si: usize, cuts: &SessionCuts| {
+            let session = Session {
+                cuts: cuts.to_vec(),
+                ..Session::default()
+            };
+            setup_in(doc, si, &session)
+        };
+        // Every work zero the file carries, the setup's start's first.
+        let zeros = |s: &TabletSetup| -> Vec<Option<TabletZero>> {
+            (s.tool_runs.iter())
+                .flat_map(|r| {
+                    let starts = r.starts.iter().map(|t| t.zero.clone());
+                    let steps = r.step_starts.iter().map(|t| t.zero.clone());
+                    std::iter::once(r.zero.clone()).chain(starts).chain(steps)
+                })
+                .collect()
+        };
+        // No tablet text names what only the computer has.
+        for (computer, said) in FOR_TABLET {
+            assert_eq!(for_tablet(computer.into()), said);
+            for only in ["Same part", "New stock", "under Work zero", "this computer"] {
+                assert!(!said.contains(only), "{said}");
+            }
+        }
+        let tablet = |computer: &str| for_tablet(computer.into());
+        // All refused, in the tablet's words for the Run panel's `blocked`
+        // and `why`, the setup's start's included.
+        // Every start carries a zero: one with none leaves the tablet's
+        // Zero Z on there (LIO-590 review).
+        let refused = |s: &TabletSetup, blocked: &str, why: &str| {
+            let all = zeros(s);
+            assert!(
+                all.iter().all(Option::is_some),
+                "a start carries no zero: {all:?}"
+            );
+            for z in all.into_iter().flatten() {
+                assert_eq!(z.set_z, None);
+                assert_eq!(z.blocked.as_deref(), Some(&tablet(blocked)[..]));
+                assert!(!z.probe_from.is_empty());
+                for spot in &z.probe_from {
+                    assert_eq!(spot.problem.as_deref(), Some(&tablet(why)[..]));
+                }
+            }
+        };
+        // The bore disabled since: the Run panel refuses setup 2's start.
+        let mut off = doc.clone();
+        off.setups[0].operations[0].enabled = false;
+        let mut run = Run::new(&off, 1, 0);
+        run.picked_in(&session, false);
+        let (c, l) = check(&off, &mesh, 1);
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        assert!(run.on_cut_stock() && run.touch_off().is_none());
+        assert_eq!(
+            run.partway_blocked().as_deref(),
+            Some(EARLIER_UNFOLLOWED_BLOCKED)
+        );
+        // From the plan alone, Zero Z was on there.
+        assert_eq!(setup(&off, 1, &[]).tool_runs[0].zero, None);
+        // With this session's cuts, it is off, and so is every start's:
+        // the face's tool run's and its levels'.
+        let two = setup(&off, 1, &session);
+        assert_eq!(two.tool_runs.len(), 2);
+        assert!(!two.tool_runs[0].step_starts.is_empty());
+        refused(&two, EARLIER_UNFOLLOWED_BLOCKED, EARLIER_UNFOLLOWED_WHY);
+        // Deleted since: the same.
+        let mut deleted = doc.clone();
+        deleted.remove_setup(0).unwrap();
+        refused(
+            &setup(&deleted, 0, &session),
+            EARLIER_UNFOLLOWED_BLOCKED,
+            EARLIER_UNFOLLOWED_WHY,
+        );
+        // The bore as the plan has it: setup 2's is the plan's alone. Setup
+        // 1's own run cut it: whether that part is still held, the tablet
+        // cannot say.
+        assert_eq!(setup(&doc, 1, &session), setup(&doc, 1, &[]));
+        refused(
+            &setup(&doc, 0, &session),
+            STOCK_UNCONFIRMED_BLOCKED,
+            STOCK_UNCONFIRMED_WHY,
+        );
+        // Setup 2's own run cut its opening face: whether that part is
+        // still held, the tablet cannot say.
+        let own = cut_by(&doc, 1);
+        let (cut, plan) = (setup(&doc, 1, &own), setup(&doc, 1, &[]));
+        refused(&cut, STOCK_UNCONFIRMED_BLOCKED, STOCK_UNCONFIRMED_WHY);
+        // Its jobs are the plan's still: only the zeros go by the session.
+        for (a, b) in cut.tool_runs.iter().zip(&plan.tool_runs) {
+            assert_eq!(
+                (&a.actions, &a.steps, a.lift),
+                (&b.actions, &b.steps, b.lift)
+            );
+            for (x, y) in a.step_starts.iter().zip(&b.step_starts) {
+                assert_eq!(
+                    (&x.actions, &x.steps, x.rest),
+                    (&y.actions, &y.steps, y.rest)
+                );
+            }
+        }
+        // Setup 1, on fresh stock, before the setup that cut: as the Run
+        // panel, which does not simulate it before setup 1.
+        assert_eq!(crate::model::get(&doc.setups[0].p, "stock_source"), "fresh");
+        refused(
+            &setup(&doc, 0, &own),
+            EARLIER_UNFOLLOWED_BLOCKED,
+            EARLIER_UNFOLLOWED_WHY,
+        );
+        // What runs cut was lost (LIO-594): a setup with none kept was cut
+        // by runs no session here knows of, as the Run panel's pick has it
+        // (`note_lost_cuts`); one kept as having cut nothing was not.
+        let lost = |cuts: Vec<(String, Vec<CutInRun>)>| Session {
+            cuts,
+            lost: true,
+            ..Session::default()
+        };
+        let mut run = Run::new(&doc, 1, 0);
+        run.picked_in(&[], true);
+        let (c, l) = check(&doc, &mesh, 1);
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        assert!(run.history_unknown() && run.touch_off().is_none());
+        refused(
+            &setup_in(&doc, 1, &lost(vec![])),
+            STOCK_UNCONFIRMED_BLOCKED,
+            STOCK_UNCONFIRMED_WHY,
+        );
+        let kept_none = lost(vec![(doc.setups[1].id.clone(), vec![])]);
+        assert_eq!(setup_in(&doc, 1, &kept_none), setup(&doc, 1, &[]));
+        // Setup 2's opening face taken as cut on the computer, nothing cut
+        // there (LIO-583): picked again, the Run panel refuses every start
+        // until it is said whether that part is held, and so does the file.
+        let mut run = Run::new(&doc, 1, 0);
+        (run.skips, run.stock_unconfirmed) = (vec![(0, Skip::Cut)], true);
+        let (c, l) = check_skipping(&doc, &mesh, 1, &run.skips);
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        assert!(run.on_cut_stock() && run.touch_off().is_none());
+        run.start_at(0, 0);
+        assert!(run.touch_off().is_none());
+        let declared = Session {
+            declared: vec![doc.setups[1].id.clone()],
+            ..Session::default()
+        };
+        refused(
+            &setup_in(&doc, 1, &declared),
+            STOCK_UNCONFIRMED_BLOCKED,
+            STOCK_UNCONFIRMED_WHY,
+        );
+        // Another setup's: setup 2's own stock is the plan's.
+        let other = Session {
+            declared: vec![doc.setups[0].id.clone()],
+            ..Session::default()
+        };
+        assert_eq!(setup_in(&doc, 1, &other), setup(&doc, 1, &[]));
     }
 
     /// The journal of where a run stopped (LIO-275) is written and read

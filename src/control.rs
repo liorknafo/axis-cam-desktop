@@ -4659,7 +4659,7 @@ impl Connection {
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::EARLIER_UNFOLLOWED] =>
             {
-                Some("Another setup's run cut this part earlier in a way the check does not follow, where a probe finds this work zero.".into())
+                self.run.as_ref().map(|r| r.earlier_unfollowed_probe())
             }
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::HISTORY_UNFOLLOWED] =>
@@ -8368,7 +8368,7 @@ spindle_max_rpm = 24000
         let doc = library_bar_job(dir.path(), &mesh, 20., "100", 40., "UC100");
         // It writes the profile the check reads.
         let mut c = library_run(dir.path(), &doc, &mesh);
-        let s = crate::run::tablet_runs(&doc, Ok(&mesh), 1);
+        let s = crate::run::tablet_runs(&doc, Ok(&mesh), 1, &Default::default());
         assert!(s.problems.is_empty(), "{:?}", s.problems);
         let programs = c.run.as_ref().unwrap().checked().unwrap().to_vec();
         let ([r], [p]) = (&s.tool_runs[..], &programs[..]) else {
