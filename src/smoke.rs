@@ -12179,6 +12179,20 @@ flood = { pin = 8 }
         assert!(!run_of(&a).stale && run_of(&a).programs.is_none());
         answer_skips(&mut a, 0);
         kept(&a);
+        // A check refused in between (the project briefly did not check):
+        // the start stays for the next check that passes.
+        let _ = a.update(Message::Run(R::Check));
+        let epoch = run_of(&a).epoch;
+        let refused = vec!["Load the imported part before running.".to_string()];
+        let _ = a.update(Message::RunChecked(
+            epoch,
+            std::sync::Arc::new(Err(refused)),
+        ));
+        assert!(run_of(&a).checked().is_none());
+        assert_eq!(start(&a), (0, 1));
+        let _ = a.update(Message::Run(R::Check));
+        answer_skips(&mut a, 0);
+        kept(&a);
         // The Contour turned off: the tool run's operations changed, so the
         // start moves to the Face, and says so.
         a.doc.setups[0].operations[2].enabled = false;

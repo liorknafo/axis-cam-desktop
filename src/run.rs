@@ -1105,9 +1105,10 @@ pub struct Run {
     /// the rows are made from its programs once checked
     /// (`layout_with_skips`).
     pub rows_from_skips: bool,
-    /// The last check's answer, kept while the next check runs (`programs`
-    /// is None then): what that check compares the start's tool run with
-    /// (`checked_as`, LIO-636).
+    /// The last check's answer that passed, kept while the next check runs
+    /// (`programs` is None then) and over a refused one: what the next
+    /// check that passes compares the start's tool run with (`checked_as`,
+    /// LIO-636).
     answered: Option<Arc<Result<Vec<Checked>, Vec<String>>>>,
     /// A check moved a start partway into a tool run back to its first
     /// operation, its operations having changed: what it says, until a
@@ -2421,12 +2422,15 @@ impl Run {
                     })
                 })
                 .unwrap_or((new.len(), 0));
-        } else {
+            // The start is the skip's now.
+            self.start_moved = None;
+        } else if let Ok(new) = programs.as_ref() {
             // The start stays on its operation only when its tool run still
             // has the same operations; the work zero is set for it again.
-            // They are compared with the last check's answer: Check again
-            // drops `programs` before it asks (LIO-636). Coolant set to Off
-            // leaves them the same operations.
+            // They are compared with the last check that passed: Check again
+            // drops `programs` before it asks, and a refused check in
+            // between leaves the start and the progress as they were
+            // (LIO-636). Coolant set to Off leaves them the same operations.
             let ops = |p: Option<&Checked>| {
                 p.map(|p| {
                     let ops = (p.ops.iter()).map(|o| crate::post::OpState {
@@ -2439,12 +2443,11 @@ impl Run {
             let last = (self.answered.as_deref()).and_then(|a| a.as_deref().ok());
             let was = last.and_then(|c| c.get(self.next));
             let before = ops(was);
-            let count = programs.as_ref().as_ref().map_or(0, Vec::len);
-            if self.done.len() != count {
-                self.done = vec![false; count];
+            if self.done.len() != new.len() {
+                self.done = vec![false; new.len()];
                 self.next = 0;
             }
-            let now = programs.as_ref().as_ref().ok().and_then(|c| c.get(self.next));
+            let now = new.get(self.next);
             let after = ops(now);
             if before.is_none() || before != after {
                 // A start partway that moves says so (LIO-636).
@@ -2477,7 +2480,9 @@ impl Run {
             self.start_step = None;
         }
         (self.zeroed, self.tool_kept, self.recheck) = (false, false, false);
-        self.answered = Some(programs.clone());
+        if programs.is_ok() {
+            self.answered = Some(programs.clone());
+        }
         self.programs = Some(programs);
         self.before = left
             .as_ref()
