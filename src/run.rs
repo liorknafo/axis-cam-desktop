@@ -3469,9 +3469,13 @@ impl Run {
                 self.length.as_ref(),
             ));
         }
+        // Another work system active: the line saying so tells what to do, and
+        // no line says X/Y work zero changed then (LIO-696).
+        let mut other_wcs = false;
         match OFFSETS.iter().position(|o| *o == p.offset) {
             Some(i) if i < 6 => {
                 if i != s.active_wcs {
+                    other_wcs = true;
                     e.push(format!(
                         "This setup uses {} but the machine's active work system is G{}. Select {} under Work zero.",
                         p.offset,
@@ -3540,6 +3544,7 @@ impl Run {
             ));
         }
         if let Some((wcs, xy)) = self.xy
+            && !other_wcs
             && (wcs != s.active_wcs || (0..2).any(|a| (s.work_offset[a] - xy[a]).abs() > 1e-6))
         {
             e.push("X/Y work zero changed since the first tool run started. Tool changes keep X/Y zero: put it back, or pick the setup again to start over.".into());
