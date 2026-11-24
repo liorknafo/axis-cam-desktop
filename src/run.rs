@@ -110,7 +110,7 @@ pub struct Running {
     seq: u64,
     /// The work offset it was lowered with.
     pub offset: [f64; 6],
-    /// What Cycle Start recorded over (`xy`, `zero`, `last`, `touched`), put
+    /// What Cycle Start recorded over (`xy`, `zero`, `last`, `touched_for`), put
     /// back when the driver refuses the job: nothing ran then (#168).
     before: Before,
     /// The line each of its blocks moves the tool tip along (`paths`),
@@ -247,7 +247,24 @@ pub struct Before {
     xy: Option<(usize, [f64; 2])>,
     zero: Option<(String, [f32; 3])>,
     last: Option<(String, f64)>,
-    touched: bool,
+    /// A file from before LIO-619 kept a `touched` flag: no touch-off is
+    /// known from it, so another is made.
+    #[serde(default)]
+    touched_for: Option<TouchedFor>,
+}
+
+/// Z touched off on the Control page (`Run::touched_for`): for which tool,
+/// and the Z work offset it left. That Z is the tool's, so it holds for no
+/// other (LIO-619).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TouchedFor {
+    /// The tool's id (`tool_id`): the next tool run's when it was touched
+    /// off. None while the setup was not checked yet: the next tool run's
+    /// once it is (`checked_as`).
+    tool: Option<String>,
+    /// The Z work offset it left, once the machine shows what was sent
+    /// (`Run::touch_shown`); None until then.
+    z: Option<f64>,
 }
 
 /// The driver's outcome of a job it refused before anything moved: "<name>:
@@ -485,8 +502,9 @@ pub struct Run {
     /// turning A runs with (`rotary_problems`), while that reference is the
     /// one kept with the centreline.
     pub length: Option<(String, f64, f64)>,
-    /// Z was touched off on the Control page since the last tool run started.
-    pub touched: bool,
+    /// Z touched off on the Control page since the last tool run started
+    /// (`z_touched`): it holds for its tool only (`touched`, LIO-619).
+    touched_for: Option<TouchedFor>,
     /// How the last tool run ended (ok, the driver's message).
     pub outcome: Option<(bool, String)>,
     /// The stock after each of the setup's operations, by its index in the
@@ -1153,7 +1171,7 @@ impl Run {
             reference_a: None,
             last: None,
             length: None,
-            touched: false,
+            touched_for: None,
             outcome: None,
             pictures: vec![],
             left: None,
@@ -1563,6 +1581,45 @@ impl Run {
         self.programs.as_deref()?.as_deref().ok()
     }
 
+    /// The tool (`tool_id`) of tool run `i`, as checked.
+    fn tool_of(&self, i: usize) -> Option<String> {
+        Some(self.checked()?.get(i)?.ops[0].tool_id.clone())
+    }
+
+    /// Z was touched off on the Control page since the last tool run
+    /// started, for the next tool run's tool: a touch-off holds for its
+    /// tool only (LIO-619).
+    pub fn touched(&self) -> bool {
+        let next = self.tool_of(self.next);
+        (self.touched_for.as_ref()).is_some_and(|t| next.is_some() && t.tool == next)
+    }
+
+    /// Z is touched off for the next tool run's tool: Set Z from
+    /// reference, Zero Z, Set Z, a probe or a touch-off.
+    pub fn z_touched(&mut self) {
+        self.z_touched_for(self.tool_of(self.next));
+    }
+
+    /// Z is touched off for `tool` (None: the next tool run's once the
+    /// setup is checked).
+    pub fn z_touched_for(&mut self, tool: Option<String>) {
+        self.touched_for = Some(TouchedFor { tool, z: None });
+    }
+
+    /// The Z work offset the last touch-off left, once shown.
+    #[cfg(test)]
+    pub fn touched_z(&self) -> Option<f64> {
+        self.touched_for.as_ref()?.z
+    }
+
+    /// The machine shows everything sent, with Z work offset `z`: what a
+    /// touch-off not shown yet left.
+    pub fn touch_shown(&mut self, z: f64) {
+        if let Some(t) = &mut self.touched_for {
+            t.z.get_or_insert(z);
+        }
+    }
+
     /// A check's answer, the stock it left to picture and how long its tool
     /// runs take.
     pub fn checked_as(
@@ -1659,6 +1716,14 @@ impl Run {
         match self.follow.take() {
             Some(f) => self.followed = Some(self.follow_again(f)),
             None => self.take_journal(),
+        }
+        // A touch-off made while no tool run was checked was for the next
+        // tool run's tool, as the check finds it (LIO-619).
+        let next = self.tool_of(self.next);
+        if let Some(t) = &mut self.touched_for
+            && t.tool.is_none()
+        {
+            t.tool = next;
         }
     }
 
@@ -1898,9 +1963,9 @@ impl Run {
                 xy,
                 zero,
                 last,
-                touched,
+                touched_for,
             } = r.before.clone();
-            (self.xy, self.zero, self.last, self.touched) = (xy, zero, last, touched);
+            (self.xy, self.zero, self.last, self.touched_for) = (xy, zero, last, touched_for);
         } else if let Some((op, s)) = stopping {
             // Stopped after a step, the tool at its clearance: lifted to the
             // clearance plane once the machine stands still.
@@ -2133,9 +2198,9 @@ impl Run {
             xy,
             zero,
             last,
-            touched,
+            touched_for,
         } = r.before;
-        (self.xy, self.zero, self.last, self.touched) = (xy, zero, last, touched);
+        (self.xy, self.zero, self.last, self.touched_for) = (xy, zero, last, touched_for);
         (self.stopping, self.stop_after) = (None, false);
         self.outcome = Some((false, why));
     }
@@ -2280,7 +2345,7 @@ impl Run {
                     c.place(&unset_ids(c), true, true)
                 ));
             }
-            if !self.tool_kept && !self.touched {
+            if !self.tool_kept && !self.touched() {
                 e.push(format!(
                     "Confirm {}'s Z for the start at {step}: Same tool, keep Z if it was not taken out since, or Set Z from reference.",
                     crate::model::tool_label(first.tool, &first.tool_name)
@@ -2476,11 +2541,16 @@ impl Run {
                 ));
             }
         }
-        if let Some((tool, z)) = &self.last
-            && *tool != p.ops[0].tool_id
-            && !self.touched
-            && (s.work_offset[2] - z).abs() < 1e-6
-        {
+        // Z touched off for another tool since (another tool run picked,
+        // or its tool changed by an edit, LIO-619): that tool's Z, while
+        // the offset is the one it left.
+        let tool = &p.ops[0].tool_id;
+        let unchanged = |z: f64| (s.work_offset[2] - z).abs() < 1e-6;
+        let other = (self.touched_for.as_ref())
+            .filter(|t| t.tool.as_ref() != Some(tool))
+            .is_some_and(|t| t.z.is_none_or(unchanged));
+        let change = (self.last.as_ref()).is_some_and(|(t, z)| t != tool && unchanged(*z));
+        if !self.touched() && (other || change) {
             e.push(format!(
                 "Tool run {} uses {}: touch off its Z first (Set Z from reference, or Zero Z).",
                 self.next + 1,
@@ -2551,7 +2621,7 @@ impl Run {
                 xy: self.xy,
                 zero: self.zero.clone(),
                 last: self.last.clone(),
-                touched: self.touched,
+                touched_for: self.touched_for.clone(),
             },
             paths,
             tip,
@@ -2565,7 +2635,7 @@ impl Run {
             .get_or_insert((s.active_wcs, [s.work_offset[0], s.work_offset[1]]));
         self.zero.get_or_insert(zero);
         self.last = Some((tool, s.work_offset[2]));
-        self.touched = false;
+        self.touched_for = None;
         self.outcome = None;
         Some(Command::Job {
             name,
@@ -5525,7 +5595,7 @@ fn tablet_job_from(
             xy: None,
             zero: None,
             last: None,
-            touched: false,
+            touched_for: None,
         },
         paths: vec![],
         tip: [0.; 3],
@@ -7780,7 +7850,7 @@ pub(crate) mod tests {
                     xy: None,
                     zero: None,
                     last: None,
-                    touched: false,
+                    touched_for: None,
                 },
                 paths: vec![],
                 tip: [0.; 3],
@@ -7796,7 +7866,7 @@ pub(crate) mod tests {
             reference_a: None,
             last: None,
             length: None,
-            touched: false,
+            touched_for: None,
             outcome: None,
             pictures: vec![],
             left: None,
@@ -7928,7 +7998,7 @@ pub(crate) mod tests {
                 xy: None,
                 zero: None,
                 last: None,
-                touched: false,
+                touched_for: None,
             },
             paths: vec![],
             tip: [0.; 3],
@@ -9712,7 +9782,7 @@ pub(crate) mod tests {
                     xy: None,
                     zero: None,
                     last: None,
-                    touched: false,
+                    touched_for: None,
                 },
                 paths: paths(blocks, [0.; 3]),
                 tip: [0.; 3],

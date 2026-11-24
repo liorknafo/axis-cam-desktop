@@ -2951,6 +2951,168 @@ flood = { pin = 8 }
         assert!(run_of(&a).outcome.as_ref().unwrap().0);
     }
 
+    /// The problems saying a tool run's Z is to be touched off first.
+    fn touch_first(a: &App) -> Vec<String> {
+        (problems(a).into_iter())
+            .filter(|p| p.contains("touch off its Z first"))
+            .collect()
+    }
+
+    /// Ticks until the machine shows the Z a touch-off left.
+    fn touch_shown(a: &mut App) {
+        let mut deadline = Deadline::new(2.);
+        while run_of(a).touched_z().is_none() {
+            assert!(
+                deadline.within(&conn(a).snapshot),
+                "the touch-off not shown"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let _ = a.update(Message::Tick);
+        }
+    }
+
+    /// A touch-off holds for its tool only (LIO-619): T1 touched off for
+    /// tool run 1, tool run 2 picked next (the Drill's T3) waits for its own,
+    /// while the Z work offset is the one T1's left; T3's then holds for
+    /// tool run 2, not for tool run 1 picked again.
+    #[test]
+    fn a_touch_off_holds_for_its_tool_only_not_another_tool_run_picked() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let tools: Vec<u32> = (run_of(&a).checked().unwrap().iter())
+            .map(|p| p.ops[0].tool)
+            .collect();
+        assert_eq!(tools, [1, 3]);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // T1 on the reference surface: Set Z from reference, for tool run 1.
+        let _ = a.update(Message::Run(R::RecordReference));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        assert!(run_of(&a).touched());
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Tool run 2 picked: T3 would cut with T1's Z.
+        let _ = a.update(Message::Run(R::Next(1)));
+        assert!(!run_of(&a).touched());
+        let said = touch_first(&a);
+        assert!(
+            said.len() == 1 && said[0].starts_with("Tool run 2 uses T3"),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.view();
+        let _ = a.update(Message::Run(R::CycleStart));
+        assert!(run_of(&a).running.is_none());
+        // Back to tool run 1: T1's touch-off holds again.
+        let _ = a.update(Message::Run(R::Next(0)));
+        assert!(run_of(&a).touched() && touch_first(&a).is_empty());
+        // Z changed since, by other means than the touch-off: no longer
+        // T1's, as Z changed since the last tool run is not that tool's.
+        let _ = a.update(Message::Run(R::Next(1)));
+        mdi(&mut a, "G10 L2 P1 Z-25");
+        assert!(touch_first(&a).is_empty(), "{:?}", problems(&a));
+        // T3 touched off for tool run 2: it holds there, not for tool run 1.
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        assert!(run_of(&a).touched());
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::Next(0)));
+        let said = touch_first(&a);
+        assert!(
+            said.len() == 1 && said[0].starts_with("Tool run 1 uses T1"),
+            "{:?}",
+            problems(&a)
+        );
+        // Zero Z with T1 in the spindle is its touch-off.
+        let _ = a.update(Message::Machine(crate::control::Action::WorkZero(Some(2))));
+        touch_shown(&mut a);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+    }
+
+    /// A touch-off holds for its tool only (LIO-619): an edit that puts
+    /// another tool in the tool run it was for leaves that tool to be
+    /// touched off; so does a tool change after the first tool run.
+    #[test]
+    fn a_touch_off_holds_for_its_tool_only_not_another_put_in_by_an_edit() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        // Tool run 1 cut with T1.
+        cycle_start(&mut a);
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| {
+            s.state == Some(uc100::controller::State::Idle)
+        });
+        assert_eq!(run_of(&a).next, 1);
+        // T3 touched off for tool run 2.
+        let _ = a.update(Message::Run(R::RecordReference));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // The Drill edited to a 4 mm drill T4: T3's Z is not T4's.
+        let mut t4 = crate::model::Tool::new("Drill 4 long", "Drill", "4");
+        for (k, v) in [("length", "60"), ("stickout", "65"), ("number", "4")] {
+            t4.p.insert(k.into(), v.into());
+        }
+        a.doc.setups[0].operations[1].tool = t4.id.clone();
+        a.doc.tools.push(t4);
+        let _ = a.update(Message::Run(R::Check));
+        let epoch = run_of(&a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+        assert_eq!(run_of(&a).next, 1);
+        assert_eq!(run_of(&a).checked().unwrap()[1].ops[0].tool, 4);
+        assert!(!run_of(&a).touched());
+        let said = touch_first(&a);
+        assert!(
+            said.len() == 1 && said[0].starts_with("Tool run 2 uses T4"),
+            "{:?}",
+            problems(&a)
+        );
+        // T4 touched off: Cycle Start goes.
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+    }
+
+    /// A start at a step needs its tool's Z confirmed (LIO-619): a touch-off
+    /// made for another tool run's tool is not it.
+    #[test]
+    fn a_start_at_a_step_takes_a_touch_off_for_its_tool_only() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        // T1 touched off for tool run 1.
+        let _ = a.update(Message::Run(R::RecordReference));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        // Start at the Drill's hole 3, in tool run 2 (T3).
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 2)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!((run_of(&a).next, run_of(&a).at_step()), (1, Some((1, 2))));
+        let _ = a.update(Message::Run(R::KeepZero));
+        let confirm = |a: &App| {
+            (problems(a).into_iter())
+                .filter(|p| p.starts_with("Confirm T3"))
+                .count()
+        };
+        assert_eq!(confirm(&a), 1, "{:?}", problems(&a));
+        let _ = a.view();
+        // T3 touched off: confirmed.
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        assert_eq!(confirm(&a), 0, "{:?}", problems(&a));
+    }
+
     /// The Drill's tool run started at its operation, its work zero and
     /// tool kept: Cycle Start sent and running, `run_app`'s Face and Drill.
     fn drilling(a: &mut App) -> crate::run::OpSteps {
@@ -7075,7 +7237,7 @@ flood = { pin = 8 }
         // Z set from the reference: check 4 done, Cycle Start next (LIO-312).
         let _ = a.update(Message::Run(R::RecordReference));
         let _ = a.update(Message::Run(R::ZFromReference));
-        run_until(&mut a, 2.0, "Set Z from reference", |r| r.touched);
+        run_until(&mut a, 2.0, "Set Z from reference", |r| r.touched());
         shot(&mut a, "06-tool-change-z-set");
         // Resume (LIO-275): where a run stopped, after hole 2 of the Drill,
         // kept in the journal; the setup picked again, as in a new session.
@@ -15580,7 +15742,7 @@ flood = { pin = 8 }
         tick_until(&mut a, 2.0, "work Z set", |s| {
             (s.work_offset[2] - -20.).abs() < 0.06
         });
-        assert!(run_of(&a).touched);
+        assert!(run_of(&a).touched());
         let _ = a.view();
     }
 
@@ -15660,7 +15822,7 @@ flood = { pin = 8 }
         });
         work_offset(&a, [195., 140., -40.]);
         assert!(conn(&a).snapshot.machine_pos[1] > hi[1]);
-        assert!(!a.locked() && run_of(&a).touched);
+        assert!(!a.locked() && run_of(&a).touched());
         let _ = a.view();
     }
 
@@ -16302,14 +16464,14 @@ flood = { pin = 8 }
         assert!(ok, "{message}");
         // The work zero set is the first setup's, on its panel.
         assert_eq!(run_of(&a).setup, 0);
-        assert!(run_of(&a).touched);
+        assert!(run_of(&a).touched());
         tick_until(&mut a, 5.0, "work zero", |s| s.work_offset[2] < -39.);
         work_offset(&a, [lo[0] + 2., lo[1] + 2., -40.]);
         // Ended, the second setup can be picked, and starts untouched.
         assert!(!conn(&a).setup_locked());
         let _ = a.update(Message::Run(R::Setup(1)));
         assert_eq!(run_of(&a).setup, 1);
-        assert!(!run_of(&a).touched);
+        assert!(!run_of(&a).touched());
         let _ = a.view();
     }
 
@@ -16427,7 +16589,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::Machine(Action::TouchOff));
         mdi(&mut a, "G54");
         work_offset(&a, [195., 140., -20.]);
-        assert!(!run_of(&a).touched);
+        assert!(!run_of(&a).touched());
         // Checked again, as Check again does, both work.
         let _ = a.update(Message::Run(R::Check));
         let epoch = run_of(&a).epoch;
@@ -16447,7 +16609,7 @@ flood = { pin = 8 }
             s.work_pos[1].abs() < 1e-3 && (s.work_pos[2] - height).abs() < 1e-3
         });
         work_offset(&a, zero);
-        assert!(run_of(&a).touched);
+        assert!(run_of(&a).touched());
         let _ = a.view();
     }
 
