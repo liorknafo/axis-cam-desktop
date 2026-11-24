@@ -12100,7 +12100,7 @@ flood = { pin = 8 }
         let dir = tempfile::tempdir().unwrap();
         let mut a = level_taken_as_cut(dir.path());
         let setup = a.doc.setups[0].id.clone();
-        let print = run_of(&a).op_steps(1).unwrap().cut_print;
+        let print = run_of(&a).op_steps(1).unwrap().declared_print();
         let kept = kept_declared(dir.path());
         assert_eq!(
             kept,
@@ -12151,6 +12151,54 @@ flood = { pin = 8 }
         answer_skips(&mut c, 0);
         assert!(run_of(&c).all_cut().is_empty() && !run_of(&c).stock_unconfirmed);
         let _ = c.update(Message::Disconnect);
+    }
+
+    /// LIO-611 review: as above, but the setup picked on MACHINE before the
+    /// part is loaded (it loads only with Continue project): the check that
+    /// refuses for want of the part keeps the level taken as cut as it is,
+    /// on disk too, and nothing sets Z meanwhile. The part restored, the
+    /// setup is checked again, and it is as when the part was in first.
+    #[test]
+    fn steps_taken_as_cut_wait_for_the_part_after_axis_cam_opened_again() {
+        use crate::run::Action as R;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = level_taken_as_cut(dir.path());
+        let kept = kept_declared(dir.path());
+        let _ = a.update(Message::Disconnect);
+        let mut b = reopen(a, dir.path());
+        let mesh = b.imported_mesh.take().expect("the fixture's part");
+        zeroed(&mut b);
+        let _ = b.update(Message::Run(R::Setup(0)));
+        // As `App::check_run` answers with no part.
+        let epoch = run_of(&b).epoch;
+        let refused = Err(vec![crate::run::PART_NOT_LOADED.to_string()]);
+        let _ = b.update(Message::RunChecked(epoch, Arc::new(refused)));
+        let run = run_of(&b);
+        assert_eq!(run.all_cut(), [(1, vec![0])]);
+        assert!(run.declared_from.is_some() && !run.declared_lost && !run.recheck);
+        assert!(run.stock_unconfirmed && run.checked().is_none());
+        assert!(conn(&b).touch_off().is_none() && conn(&b).stock_top().is_err());
+        assert!(conn(&b).probe_spots().iter().all(|(_, ok)| ok.is_err()));
+        let _ = b.update(Message::Tick);
+        assert_eq!(kept_declared(dir.path()), kept);
+        // Continue project restores the part: checked again with it.
+        let file = b.doc.file.clone().expect("the fixture's file");
+        let _ = b.update(Message::ModelRestored(file, Ok(mesh)));
+        assert!(run_of(&b).recheck);
+        let _ = b.update(Message::Tick);
+        answer_skips(&mut b, 0);
+        let run = run_of(&b);
+        assert_eq!(run.all_cut(), [(1, vec![0])]);
+        assert!(!run.declared_lost && run.declared_from.is_none() && run.stock_unconfirmed);
+        sets_no_z(&b);
+        assert_eq!(kept_declared(dir.path()), kept);
+        let _ = b.update(Message::Run(R::SamePart));
+        assert_eq!(run_of(&b).all_cut(), [(1, vec![0])]);
+        sets_no_z(&b);
+        let _ = b.update(Message::Run(R::NewStock));
+        assert_eq!(kept_declared(dir.path()), []);
+        let _ = b.update(Message::Disconnect);
     }
 
     /// LIO-611: as above, but the Pocket changed while AXIS CAM was closed

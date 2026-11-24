@@ -2797,6 +2797,15 @@ impl App {
             .as_ref()
             .is_some_and(|o| o.fingerprint == mesh.fingerprint);
         self.imported_mesh = Some(mesh);
+        // A run whose check refused, the part not loaded then, is checked
+        // again with it: what was given back as taken as cut waits for that
+        // check (`run::Run::declared_from`, LIO-611 review).
+        if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut())
+            && r.running.is_none()
+            && r.programs.as_deref().is_some_and(Result::is_err)
+        {
+            r.recheck = true;
+        }
         self.sync_turns();
         self.undo = None;
         self.invalidate_post();
@@ -4837,12 +4846,7 @@ impl App {
         let check = move || {
             let (programs, left) = match mesh {
                 Some(mesh) => run::check_steps(&doc, &mesh, si, &skips, &steps),
-                None => (
-                    Err(vec![
-                        "Load the imported part before running a setup.".into(),
-                    ]),
-                    run::Left::default(),
-                ),
+                None => (Err(vec![run::PART_NOT_LOADED.into()]), run::Left::default()),
             };
             let times = run::Times::checked(&programs, &config);
             (programs, left, times)

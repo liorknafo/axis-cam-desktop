@@ -110,8 +110,9 @@ pub struct KeptDeclared {
     /// Some of what was taken as cut was dropped since, by a project edit
     /// say (`Run::declared_lost`).
     pub lost: bool,
-    /// The print of the plan and cutter (`OpSteps::cut_print`) of each
-    /// operation `skips` and `steps` name, as they were taken as cut; None
+    /// The print of the plan, its steps and its cutter
+    /// (`OpSteps::declared_print`) of each operation `skips` and `steps`
+    /// name, as they were taken as cut; None
     /// when not known. They hold only for a check whose prints are these
     /// (`Run::declared_from`).
     #[serde(default)]
@@ -1759,7 +1760,7 @@ impl Run {
             .chain(self.cut_steps.iter().map(|s| s.0));
         named.into_iter().all(|oi| {
             let was = from.iter().find(|p| p.0 == oi).and_then(|p| p.1);
-            let is = now.iter().find(|s| s.op == oi).map(|s| s.cut_print);
+            let is = now.iter().find(|s| s.op == oi).map(OpSteps::declared_print);
             was.is_some() && is == was
         })
     }
@@ -1775,9 +1776,17 @@ impl Run {
         // A start at a step, or steps taken as cut, that the check refuses:
         // dropped, and the setup checked again from that operation's start,
         // so that it never stays without a start to pick (LIO-311).
+        // A check that had no part to check against, not loaded yet after
+        // AXIS CAM opened say, says nothing of what was given back as taken
+        // as cut: kept as it is, on disk too, for the check once the part is
+        // in, nothing set from it meanwhile (`declared_from`, LIO-611 review).
+        let no_part = |w: &String| w == PART_NOT_LOADED || w == NO_PART;
+        let waits_for_part = self.declared_from.is_some()
+            && (programs.as_ref().as_ref()).is_err_and(|why| why.first().is_some_and(no_part));
         if let Err(why) = programs.as_ref()
             && (self.start_step.is_some() || !self.cut_steps.is_empty())
             && why.first().is_none_or(|w| w != REMOVED)
+            && !waits_for_part
         {
             self.journal_note = Some(format!(
                 "The start at a step or the steps taken as cut could not be checked, so they are dropped and the operation starts at its first step: {} Pick another start in the Operations list if you like.",
@@ -3197,7 +3206,7 @@ impl Run {
 
     /// The print of the plan and cutter of each operation `declared` names
     /// (`KeptDeclared::prints`): as given back, while no check has held it
-    /// since (`declared_from`), else the last check's (`OpSteps::cut_print`);
+    /// since (`declared_from`), else the last check's (`OpSteps::declared_print`);
     /// None when not known (LIO-611).
     pub fn declared_prints(&self, (skips, steps): &Declared) -> Vec<(usize, Option<u64>)> {
         let mut ops: Vec<usize> = (skips.iter().map(|s| s.0))
@@ -3209,7 +3218,7 @@ impl Run {
             .map(|oi| {
                 let print = match &self.declared_from {
                     Some(from) => from.iter().find(|p| p.0 == oi).and_then(|p| p.1),
-                    None => self.op_steps(oi).map(|s| s.cut_print),
+                    None => self.op_steps(oi).map(OpSteps::declared_print),
                 };
                 (oi, print)
             })
@@ -4378,6 +4387,19 @@ pub struct OpSteps {
 }
 
 impl OpSteps {
+    /// `cut_print` with how many steps the plan is split into: what was
+    /// taken as cut by step number holds only while both are the same, as
+    /// a journal holds only for as many steps (`Run::take_journal`), so that
+    /// an AXIS CAM that splits a plan otherwise never takes other cuts by
+    /// the old numbers (`KeptDeclared::prints`, LIO-611 review).
+    pub fn declared_print(&self) -> u64 {
+        let mut h = self.cut_print;
+        for b in (self.steps.len() as u64).to_le_bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
     /// What its steps are called: holes, levels when each cuts at one Z,
     /// else passes. A plan cut in passes (`Step::pass`) is named by them,
     /// each a visit of its holes (`label`).
@@ -4904,6 +4926,10 @@ fn beneath(doc: &Document, si: usize, sims: &Sims, cut: &[usize]) -> Vec<(usize,
 
 pub(crate) const NO_PART: &str = "Import a part before running a setup. The example project's paths are illustrative and cannot be machined.";
 pub const REMOVED: &str = "This setup was removed from the project.";
+
+/// Why a run's check refused while the project's part is not loaded yet,
+/// after AXIS CAM opened say (`App::check_run`).
+pub(crate) const PART_NOT_LOADED: &str = "Load the imported part before running a setup.";
 
 /// The `sequence` results of setup `si`'s enabled operations, from a
 /// simulation of the job up to the end of that setup.
