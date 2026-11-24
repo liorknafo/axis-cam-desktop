@@ -3548,6 +3548,13 @@ impl Connection {
             }
         }
         self.observe();
+        // The Z work offset a touch-off left, once the machine shows it
+        // (LIO-619).
+        if self.shows_all_sent()
+            && let Some(run) = &mut self.run
+        {
+            run.touch_shown(self.snapshot.work_offset[2]);
+        }
     }
 
     /// Acts on the snapshot `refresh` read.
@@ -3807,7 +3814,7 @@ impl Connection {
             Action::JogSpeed(percent) => self.jog_speed = percent.clamp(1., 100.),
             Action::WorkZero(axis) if self.manual() => {
                 if let (Some(run), None | Some(2)) = (&mut self.run, axis) {
-                    run.touched = true;
+                    run.z_touched();
                 }
                 let axes = axis.map_or(0..6, |a| a..a + 1);
                 for a in axes.filter(|&a| self.axis(a)) {
@@ -3816,7 +3823,7 @@ impl Connection {
             }
             Action::WorkHalf(a) if self.manual() && self.axis(a) => {
                 if let (Some(run), 2) = (&mut self.run, a) {
-                    run.touched = true;
+                    run.z_touched();
                 }
                 self.send(Command::SetWork {
                     axis: a,
@@ -3827,7 +3834,7 @@ impl Connection {
             Action::WorkSet(a) if self.manual() && self.axis(a) => {
                 if let Some(value) = self.preset(a) {
                     if let (Some(run), 2) = (&mut self.run, a) {
-                        run.touched = true;
+                        run.z_touched();
                     }
                     self.send(Command::SetWork { axis: a, value });
                 }
@@ -3940,7 +3947,7 @@ impl Connection {
                         self.send(Command::SetWork { axis: a, value });
                     }
                     if let Some(run) = &mut self.run {
-                        run.touched = true;
+                        run.z_touched();
                         run.zeroed = true;
                     }
                 }
@@ -4115,7 +4122,7 @@ impl Connection {
             R::ZFromReference if self.manual() && run.reference_a_problem(self).is_none() => {
                 if let Some(z) = run.reference {
                     self.send(Command::SetWork { axis: 2, value: z });
-                    run.touched = true;
+                    run.z_touched();
                     run.zeroed = true;
                 }
             }
@@ -4526,7 +4533,7 @@ impl Connection {
                     .map(|p| (p.ops[0].tool_id.clone(), p.ops[0].tool));
                 if let (Some(run), Some((id, _))) = (&mut self.run, &tool) {
                     run.length = Some((id.clone(), longer, reference));
-                    run.touched = true;
+                    run.z_touched_for(Some(id.clone()));
                     run.zeroed = true;
                 }
                 format!(
@@ -4542,7 +4549,7 @@ impl Connection {
                     value: work_z(at + plate, trip, now),
                 });
                 if let Some(run) = &mut self.run {
-                    run.touched = true;
+                    run.z_touched();
                     run.zeroed = true;
                 }
                 match p.plate {
@@ -5214,7 +5221,7 @@ impl Connection {
                     });
                 }
                 if let (Some(run), Feature::Top) = (&mut self.run, r.feature) {
-                    run.touched = true;
+                    run.z_touched();
                 }
                 self.probed = Some((true, r.found()));
                 let moves = moves_from(now, &back);
@@ -5975,7 +5982,7 @@ impl Connection {
             });
         }
         if let Some(run) = &mut self.run {
-            run.touched = true;
+            run.z_touched();
             run.zeroed = true;
         }
         let mut up = e.from;

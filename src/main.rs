@@ -5063,7 +5063,7 @@ impl App {
         }
         self.run_epoch += 1;
         if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
-            (r.epoch, r.programs, r.stale, r.recheck) = (self.run_epoch, None, false, false);
+            r.check_again(self.run_epoch);
             r.left = None;
         }
         self.check_run()
