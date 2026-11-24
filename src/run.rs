@@ -1105,6 +1105,14 @@ pub struct Run {
     /// the rows are made from its programs once checked
     /// (`layout_with_skips`).
     pub rows_from_skips: bool,
+    /// The last check's answer, kept while the next check runs (`programs`
+    /// is None then): what that check compares the start's tool run with
+    /// (`checked_as`, LIO-636).
+    answered: Option<Arc<Result<Vec<Checked>, Vec<String>>>>,
+    /// A check moved a start partway into a tool run back to its first
+    /// operation, its operations having changed: what it says, until a
+    /// start is picked or Cycle Start sends a tool run.
+    pub start_moved: Option<String>,
 }
 
 /// What a tool run sent to the Pi was sent from (`Run::follow_record`),
@@ -1802,6 +1810,8 @@ impl Run {
             followed: None,
             cut_note: None,
             rows_from_skips: false,
+            answered: None,
+            start_moved: None,
         }
     }
 
@@ -2414,19 +2424,40 @@ impl Run {
         } else {
             // The start stays on its operation only when its tool run still
             // has the same operations; the work zero is set for it again.
-            let ops = |p: Option<&Checked>| p.map(|p| (p.indexes.clone(), p.ops.clone()));
-            let before = ops(self.checked().and_then(|c| c.get(self.next)));
+            // They are compared with the last check's answer: Check again
+            // drops `programs` before it asks (LIO-636). Coolant set to Off
+            // leaves them the same operations.
+            let ops = |p: Option<&Checked>| {
+                p.map(|p| {
+                    let ops = (p.ops.iter()).map(|o| crate::post::OpState {
+                        coolant: (false, false),
+                        ..o.clone()
+                    });
+                    (p.indexes.clone(), ops.collect::<Vec<_>>())
+                })
+            };
+            let last = (self.answered.as_deref()).and_then(|a| a.as_deref().ok());
+            let was = last.and_then(|c| c.get(self.next));
+            let before = ops(was);
             let count = programs.as_ref().as_ref().map_or(0, Vec::len);
             if self.done.len() != count {
                 self.done = vec![false; count];
                 self.next = 0;
             }
-            let after = ops(programs
-                .as_ref()
-                .as_ref()
-                .ok()
-                .and_then(|c| c.get(self.next)));
+            let now = programs.as_ref().as_ref().ok().and_then(|c| c.get(self.next));
+            let after = ops(now);
             if before.is_none() || before != after {
+                // A start partway that moves says so (LIO-636).
+                if let (Some(was), Some(now)) = (was.filter(|_| self.from > 0), now)
+                    && let Some(picked) = was.ops.get(self.from)
+                {
+                    self.start_moved = Some(format!(
+                        "The start was at {}, but the operations of its tool run have changed since, so Cycle Start now starts at {}, the first operation of tool run {}. Pick the start again in the Operations list if the operations before it are cut.",
+                        picked.name,
+                        now.ops[0].name,
+                        self.next + 1
+                    ));
+                }
                 self.from = 0;
             }
         }
@@ -2446,6 +2477,7 @@ impl Run {
             self.start_step = None;
         }
         (self.zeroed, self.tool_kept, self.recheck) = (false, false, false);
+        self.answered = Some(programs.clone());
         self.programs = Some(programs);
         self.before = left
             .as_ref()
@@ -3527,7 +3559,7 @@ impl Run {
         self.zero.get_or_insert(zero);
         self.last = Some((tool, s.work_offset[2]));
         self.touched_for = None;
-        self.outcome = None;
+        (self.outcome, self.start_moved) = (None, None);
         Some(Command::Job {
             name,
             actions: Arc::new(actions),
@@ -4940,7 +4972,7 @@ impl Run {
         let done: Vec<usize> = done.into_iter().filter(|&o| o < oi).collect();
         self.start_step = start;
         (self.keep, self.picked, self.carving) = (Some((done, Some(oi))), None, None);
-        (self.zeroed, self.tool_kept) = (false, false);
+        (self.zeroed, self.tool_kept, self.start_moved) = (false, false, None);
         // A Z set before is asked for again, as the tool's Z kept is
         // (LIO-618).
         self.forget_touch();
@@ -5212,7 +5244,7 @@ impl Run {
                 (self.keep, self.recheck) = (Some((done, start)), true);
             }
             (self.next, self.from) = (i, k);
-            self.zeroed = false;
+            (self.zeroed, self.start_moved) = (false, None);
             // A Z set before is forgotten: Cycle Start waits for this
             // start's, at a tool change or a start at a step (LIO-618).
             self.forget_touch();
@@ -9933,6 +9965,8 @@ pub(crate) mod tests {
             followed: None,
             cut_note: None,
             rows_from_skips: false,
+            answered: None,
+            start_moved: None,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
         assert_eq!((op, block), (0, 2));
