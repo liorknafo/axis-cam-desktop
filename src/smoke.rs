@@ -3204,9 +3204,11 @@ flood = { pin = 8 }
         let _ = a.view();
         let _ = a.update(Message::Run(R::CycleStart));
         assert!(run_of(&a).running.is_none());
-        // Back to tool run 1: T1's touch-off holds again.
+        // Back to tool run 1: T1's touch-off is forgotten for the start
+        // picked since (LIO-618), but the Z is still T1's, so tool run 1
+        // asks for no touch-off.
         let _ = a.update(Message::Run(R::Next(0)));
-        assert!(run_of(&a).touched() && touch_first(&a).is_empty());
+        assert!(!run_of(&a).touched() && touch_first(&a).is_empty());
         // Z changed since, by other means than the touch-off: no longer
         // T1's, as Z changed since the last tool run is not that tool's.
         let _ = a.update(Message::Run(R::Next(1)));

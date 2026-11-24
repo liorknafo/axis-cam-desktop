@@ -308,6 +308,12 @@ pub struct TouchedFor {
     /// touched off for this one (LIO-627 review).
     #[serde(default)]
     held: bool,
+    /// It holds for the start picked: another start picked or the setup
+    /// checked again forgets it (`Run::forget_touch`, LIO-618), though the
+    /// offset stays its tool's Z. A file from before LIO-618 has none: it
+    /// holds no more.
+    #[serde(default)]
+    for_start: bool,
 }
 
 /// The driver's outcome of a job it refused before anything moved: "<name>:
@@ -732,7 +738,8 @@ pub struct Run {
     /// one kept with the centreline.
     pub length: Option<(String, f64, f64)>,
     /// Z touched off on the Control page since the last tool run started
-    /// (`z_touched`): it holds for its tool only (`touched`, LIO-619).
+    /// (`z_touched`): it holds for its tool only (`touched`, LIO-619), and
+    /// until another start is picked or the setup checked again (LIO-618).
     touched_for: Option<TouchedFor>,
     /// A check of the setup has answered since it was picked.
     answered: bool,
@@ -1882,10 +1889,11 @@ impl Run {
 
     /// Z was touched off on the Control page since the last tool run
     /// started, for the next tool run's tool: a touch-off holds for its
-    /// tool only (LIO-619).
+    /// tool only (LIO-619), and for the start picked then (LIO-618).
     pub fn touched(&self) -> bool {
         let next = self.tool_of(self.next);
-        (self.touched_for.as_ref()).is_some_and(|t| next.is_some() && t.tool == next && !t.held)
+        (self.touched_for.as_ref())
+            .is_some_and(|t| t.for_start && !t.held && next.is_some() && t.tool == next)
     }
 
     /// The tool a touch-off made before the setup's first check answered
@@ -1946,7 +1954,19 @@ impl Run {
             first,
             z: None,
             held: false,
+            for_start: true,
         });
+    }
+
+    /// A Z set before is forgotten for the start (`touched`), as the tool's
+    /// Z kept is: another start picked, or the setup checked again, which
+    /// may move it (a skip) or number the tool runs otherwise (an edit,
+    /// LIO-618). Whose Z the offset is stays known, so that another tool
+    /// next is touched off first (LIO-619).
+    fn forget_touch(&mut self) {
+        if let Some(t) = &mut self.touched_for {
+            t.for_start = false;
+        }
     }
 
     /// The Z work offset the last touch-off left, once shown; none while
@@ -2094,6 +2114,13 @@ impl Run {
             self.start_step = None;
         }
         (self.zeroed, self.tool_kept, self.recheck) = (false, false, false);
+        // Checked again, a Z set before is forgotten as the tool's Z kept
+        // is: a skip's check moves the start, maybe to another tool's tool
+        // run, and a project edit may number them otherwise (LIO-618
+        // review). One set before the first check is tool run 1's below.
+        if self.answered {
+            self.forget_touch();
+        }
         self.programs = Some(programs);
         self.before = left
             .as_ref()
@@ -3891,6 +3918,9 @@ impl Run {
         self.start_step = start;
         (self.keep, self.picked, self.carving) = (Some((done, Some(oi))), None, None);
         (self.zeroed, self.tool_kept) = (false, false);
+        // A Z set before is asked for again, as the tool's Z kept is
+        // (LIO-618).
+        self.forget_touch();
         true
     }
 
@@ -4141,6 +4171,9 @@ impl Run {
             }
             (self.next, self.from) = (i, k);
             self.zeroed = false;
+            // A Z set before is forgotten: Cycle Start waits for this
+            // start's, at a tool change or a start at a step (LIO-618).
+            self.forget_touch();
             // The stock is the one this start finds again.
             self.carving = None;
         }
@@ -10632,6 +10665,107 @@ pub(crate) mod tests {
             .unwrap();
         let zero = step.zero.as_ref().unwrap();
         assert_eq!((zero.set_z, zero.blocked.as_ref()), (None, Some(&at_step)));
+    }
+
+    /// A Z set before another start is picked (LIO-618): the end mill's
+    /// tool run was picked again after it ran, and Z set from the reference
+    /// left the offset as it was; the drill's tool run picked then waits
+    /// for the drill's Z. A start at a step asks for its tool's Z again
+    /// after another step is picked, as for the tool's Z kept, though the
+    /// tool is the same; so does a check, which a skip moves the start
+    /// with. The offset stays the touched-off tool's (LIO-619): another
+    /// tool next is touched off first while it is unchanged.
+    #[test]
+    fn a_z_set_before_another_start_is_picked_is_asked_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        let mut m = doc.setups[0].machine.clone();
+        m.p.insert("uc100_connection".into(), "Simulated".into());
+        let c = crate::control::Connection::open(&m, dir.path()).unwrap();
+        let offset = c.snapshot.work_offset[2];
+        let (whole, left) = check_steps(&doc, &mesh, 0, &[], &[]);
+        let (whole, left) = (Arc::new(whole), Arc::new(left));
+        let fresh = || {
+            let mut run = Run::new(&doc, 0, 0);
+            run.checked_as(whole.clone(), Some(left.clone()), None);
+            run
+        };
+        let mut run = fresh();
+        let tools: Vec<String> = (run.checked().unwrap().iter())
+            .map(|p| p.ops[0].tool_id.clone())
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert_ne!(tools[0], tools[1]);
+        let touch = "touch off its Z first";
+        let says =
+            |run: &Run, what: &str| (run.problems(&c, &doc).iter()).any(|p| p.contains(what));
+        let set_z = |run: &mut Run| {
+            run.z_touched();
+            run.touch_shown(offset);
+        };
+        // The end mill ran last, at this Z offset.
+        run.last = Some((tools[0].clone(), offset));
+        run.start_at(1, 0);
+        assert!(says(&run, touch), "{:?}", run.problems(&c, &doc));
+        set_z(&mut run);
+        assert!(run.touched() && !says(&run, touch));
+        // Its tool run picked again, Z set with the end mill, then the
+        // drill's: Cycle Start waits for the drill's Z.
+        run.start_at(0, 0);
+        set_z(&mut run);
+        assert!(run.touched() && !says(&run, touch));
+        run.start_at(1, 0);
+        assert!(!run.touched());
+        assert!(says(&run, touch), "{:?}", run.problems(&c, &doc));
+        // The end mill's tool run picked again: Z is the end mill's still,
+        // but the start was picked since it was set.
+        run.start_at(0, 0);
+        assert!(!run.touched());
+        // A start at a step: its tool's Z set, then another step picked.
+        let pocket = (run.op_steps(1).map(|s| s.steps.len())).unwrap_or(0);
+        assert!(pocket >= 3, "{pocket}");
+        let confirm = "Z for the start at";
+        for n in [1, 2] {
+            assert!(run.start_at_step(1, n));
+            let (p, l) = check_steps(&doc, &mesh, 0, &[], &[(1, (0..n).collect())]);
+            run.checked_as(Arc::new(p), Some(Arc::new(l)), None);
+            assert_eq!(run.at_step(), Some((1, n)));
+            assert!(!run.touched());
+            assert!(says(&run, confirm), "{n}: {:?}", run.problems(&c, &doc));
+            set_z(&mut run);
+            assert!(!says(&run, confirm), "{n}: {:?}", run.problems(&c, &doc));
+        }
+        // The end mill's tool run stopped partway, Z set again with the end
+        // mill, then the rest of its operations skipped as cut: the skip's
+        // check moves the start to the drill's tool run, which waits for
+        // the drill's Z (LIO-618 review).
+        let mut run = fresh();
+        run.last = Some((tools[0].clone(), offset));
+        set_z(&mut run);
+        assert!(!says(&run, touch), "{:?}", run.problems(&c, &doc));
+        for oi in [0, 1] {
+            assert!(run.skip(oi, Some(Skip::Cut)), "{oi}");
+            let (p, l) = check_steps(&doc, &mesh, 0, &run.skips.clone(), &[]);
+            run.checked_as(Arc::new(p), Some(Arc::new(l)), None);
+        }
+        let next = &run.checked().unwrap()[run.next];
+        assert_eq!(next.ops[0].tool_id, tools[1]);
+        assert!(!run.touched());
+        assert!(says(&run, touch), "{:?}", run.problems(&c, &doc));
+        // A check after a project edit forgets it too: it may number the
+        // tool runs otherwise.
+        let mut run = fresh();
+        set_z(&mut run);
+        assert!(run.touched());
+        run.checked_as(whole.clone(), Some(left.clone()), None);
+        assert!(!run.touched());
+        // Forgotten, the offset is still the end mill's: the drill's tool
+        // run picked next waits for the drill's Z, though no tool run ran
+        // (LIO-619).
+        run.start_at(1, 0);
+        assert!(says(&run, touch), "{:?}", run.problems(&c, &doc));
     }
 
     /// What this run's tool runs cut (`cut_in_run`, LIO-582 review): Face

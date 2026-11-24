@@ -1423,7 +1423,10 @@ bar, at once when that machine is connected, or when you press
    touch-off holds for the tool of the tool run that was next when it was
    made: another tool run picked next, or one an edit gives another tool,
    waits for its own tool's touch-off while the Z work offset is still the
-   one the touch-off left (LIO-619). It also
+   one the touch-off left (LIO-619). Picking another start, or the setup
+   checked again (a skip, an edit), forgets it as **Same tool, keep Z**
+   is forgotten: a tool change waits for the touch-off again, and a start
+   at a step asks for its tool's Z again (LIO-618). It also
    refuses a setup whose work zero moved in the project since then (its work
    coordinate origin picked anew, or the stock or the part moved under it),
    saying how far: the machine's work zero was touched off for the old one,
