@@ -1661,12 +1661,13 @@ pub struct App {
     /// follow of that very tool run on the Pi starts from what was cut
     /// before it instead, and its outcome says what it cut (LIO-582 review).
     run_pending: Vec<(String, usize, usize, Vec<run::CutInRun>)>,
-    /// What the operator took as cut in each setup's run this session
-    /// (`run::Run::declared`), by setup id: kept when its run is dropped, as
-    /// `run_cuts` is, and given back when it is picked again, for the
-    /// operator to say whether the same part is still there; New stock
-    /// loaded forgets it (LIO-583 review).
-    run_declared: Vec<(String, run::Declared, bool)>,
+    /// What the operator took as cut in each setup's run (`run::Run::declared`),
+    /// this session or before AXIS CAM was last closed (`run::CutHistory`,
+    /// LIO-611): kept when its run is dropped, as `run_cuts` is, and given
+    /// back when it is picked again, for the operator to say whether the
+    /// same part is still there; New stock loaded forgets it (LIO-583
+    /// review).
+    run_declared: Vec<run::KeptDeclared>,
     /// The jog key down on the Control page (axis, negative).
     pub jog_key: Option<(usize, bool)>,
     /// Counts the checks of setups to run, so a late answer is ignored.
@@ -2229,9 +2230,15 @@ impl App {
         // Kept from before AXIS CAM was closed, while which anything may
         // have run on the machine, the Pi's tool runs then not known: asked
         // as after a disconnect (LIO-595).
-        let run_away = (history.cuts.iter())
-            .map(|(id, _)| (id.clone(), run::Away { seen: None }))
-            .collect();
+        // So are setups with operations or steps taken as cut (LIO-611).
+        let mut run_away: Vec<(String, run::Away)> = vec![];
+        let kept = (history.cuts.iter().map(|(id, _)| id))
+            .chain(history.declared.iter().map(|k| &k.setup));
+        for id in kept {
+            if !run_away.iter().any(|(a, _)| a == id) {
+                run_away.push((id.clone(), run::Away { seen: None }));
+            }
+        }
         Self {
             smoke_dir,
             smoke_step: 0,
@@ -2270,7 +2277,7 @@ impl App {
             cuts_grew: false,
             journal_changes_seen: 0,
             run_pending: vec![],
-            run_declared: vec![],
+            run_declared: history.declared,
             jog_key: None,
             run_epoch: 0,
             shift: false,
@@ -3611,7 +3618,10 @@ impl App {
             run.follow(&self.doc);
             run.unskip();
         }
-        lose_declared(&mut self.run_declared);
+        // What the setups not picked keep as taken as cut (`run_declared`)
+        // is dropped by an edit (`touch`); a project opened instead holds
+        // it only for the plans it was taken as cut from, as AXIS CAM
+        // opened again does (`run::Run::declared_from`, LIO-611).
     }
     fn touch(&mut self) {
         // A refused face's note belongs to the click before an edit (LIO-408).
@@ -3680,6 +3690,7 @@ impl App {
         }
         self.drop_plan();
         self.run_follows_project();
+        lose_declared(&mut self.run_declared);
         self.dirty = true;
         self.project_dirty = true;
         self.last_edit = Instant::now();
@@ -4117,6 +4128,46 @@ impl App {
                 self.cut_journals.push(k.clone());
             }
         }
+        // What it took as cut and changed (LIO-611): taken in where this one
+        // has not changed it since; where both have, or the run's setup,
+        // whose own is the run's, it is dropped, as a project edit drops it:
+        // nothing sets Z until New stock loaded. What it forgot (New stock
+        // loaded there) stays here, the safe side.
+        let mut live = self.control.as_mut().and_then(|c| c.run.as_mut());
+        for k in &theirs.declared {
+            let before = base.declared.iter().find(|b| b.setup == k.setup);
+            if before == Some(k) {
+                continue;
+            }
+            if let Some(r) = live.as_deref_mut().filter(|r| r.setup_id == k.setup) {
+                if !r.declared_lost {
+                    r.declared_lost = true;
+                    grew = true;
+                    if r.running.is_none() {
+                        r.zeroed = false;
+                    }
+                }
+                continue;
+            }
+            let mine = self.run_declared.iter().position(|m| m.setup == k.setup);
+            match mine {
+                Some(i) if self.run_declared[i] == *k => {}
+                Some(i) if before == Some(&self.run_declared[i]) => {
+                    self.run_declared[i] = k.clone()
+                }
+                None if before.is_none() => self.run_declared.push(k.clone()),
+                _ => {
+                    self.run_declared.retain(|m| m.setup != k.setup);
+                    self.run_declared.push(run::KeptDeclared {
+                        setup: k.setup.clone(),
+                        skips: vec![],
+                        steps: vec![],
+                        lost: true,
+                        prints: vec![],
+                    });
+                }
+            }
+        }
         self.others_unknown |= theirs.others_unknown;
         control::remember_sent_tool_runs(&theirs.sent);
         // Kept as this one would write it, its own setups' owners its
@@ -4164,6 +4215,12 @@ impl App {
             };
             keep_cuts_of(&mut cuts, r, self.others_unknown, cut);
         }
+        // What the run took as cut, as it would be kept were it dropped
+        // now (LIO-611).
+        let mut declared = self.run_declared.clone();
+        if let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref()) {
+            keep_declared(&mut declared, r);
+        }
         let sent = control::sent_tool_runs();
         let sent = sent[sent.len().saturating_sub(run::SENT_KEPT)..].to_vec();
         let owners = owners_of(&cuts, &self.doc, &self.cut_owners);
@@ -4173,6 +4230,7 @@ impl App {
             others_unknown: self.others_unknown,
             sent,
             owners,
+            declared,
         }
     }
     /// Writes what setups' runs cut (`cut_history`, `starting`), with what
@@ -4910,8 +4968,13 @@ impl App {
         // Sent before an edit the session noted: its skips say what was
         // sent, by indexes the edit may have changed, and what was taken as
         // cut is not known (LIO-583 review).
-        if (self.run_declared.iter()).any(|(id, _, lost)| *id == following.setup_id && *lost) {
-            (following.declared_lost, following.declared_stale) = (true, true);
+        match (self.run_declared.iter()).find(|k| k.setup == following.setup_id) {
+            Some(k) if k.lost => (following.declared_lost, following.declared_stale) = (true, true),
+            // Kept before AXIS CAM was last closed, or a project opened
+            // since: what it was sent with as taken as cut holds only for
+            // the plans it was taken as cut from (LIO-611).
+            Some(k) => following.declared_from = Some(k.prints.clone()),
+            None => {}
         }
         // It follows a tool run cutting the part: the same part (LIO-582).
         if let Some((_, cuts)) = (self.run_cuts.iter()).find(|(id, _)| *id == following.setup_id) {
@@ -9235,11 +9298,13 @@ impl App {
                 // operator says whether the same part is still there: the
                 // stock top may be cut where Z is touched off (LIO-583
                 // review).
-                if let Some((_, (skips, steps), lost)) =
-                    (self.run_declared.iter()).find(|(id, ..)| *id == r.setup_id)
-                {
-                    (r.skips, r.cut_steps) = (skips.clone(), steps.clone());
-                    (r.declared_lost, r.stock_unconfirmed) = (*lost, true);
+                // Kept before AXIS CAM was last closed, or a project opened
+                // since: it holds only for the plans it was taken as cut
+                // from, which its first check finds (LIO-611).
+                if let Some(k) = (self.run_declared.iter()).find(|k| k.setup == r.setup_id) {
+                    (r.skips, r.cut_steps) = (k.skips.clone(), k.steps.clone());
+                    (r.declared_lost, r.stock_unconfirmed) = (k.lost, true);
+                    r.declared_from = Some(k.prints.clone());
                 }
                 let skipped = !r.skips.is_empty();
                 give_elsewhere(&self.cut_owners, &self.doc, &mut r);
@@ -12313,7 +12378,7 @@ fn give_away(away: &[(String, run::Away)], run: &mut run::Run) {
 /// Why Cycle Start sent nothing: what another AXIS CAM open on the same
 /// folder kept, taken in as it was pressed, says it cut the run's setup
 /// since (`App::sync_cut_history`, LIO-594 review).
-const CUT_ELSEWHERE: &str = "another AXIS CAM open on this folder cut this setup since. Say under Work zero whether the same part is held, and set the work zero again";
+const CUT_ELSEWHERE: &str = "another AXIS CAM open on this folder cut this setup, or took some of it as cut, since. Say under Work zero whether the same part is held, and set the work zero again";
 
 /// Where what setups' runs cut is kept (`run::CutHistory`), beside the
 /// machines' journals (LIO-594).
@@ -12359,11 +12424,20 @@ fn journal_known(
 /// under its setup in `declared` (`App::run_declared`), or forgets it there
 /// once nothing is (New stock loaded, or each skip undone), with whether
 /// some of it was dropped by a project edit (`run::Run::declared_lost`).
-fn keep_declared(declared: &mut Vec<(String, run::Declared, bool)>, run: &run::Run) {
-    declared.retain(|(id, ..)| *id != run.setup_id);
+/// Each operation it names is kept with the print of its plan and cutter
+/// (`run::Run::declared_prints`, LIO-611).
+fn keep_declared(declared: &mut Vec<run::KeptDeclared>, run: &run::Run) {
+    declared.retain(|k| k.setup != run.setup_id);
     let now = run.declared();
     if !now.0.is_empty() || !now.1.is_empty() || run.declared_lost {
-        declared.push((run.setup_id.clone(), now, run.declared_lost));
+        let prints = run.declared_prints(&now);
+        declared.push(run::KeptDeclared {
+            setup: run.setup_id.clone(),
+            skips: now.0,
+            steps: now.1,
+            lost: run.declared_lost,
+            prints,
+        });
     }
 }
 
@@ -12371,10 +12445,10 @@ fn keep_declared(declared: &mut Vec<(String, run::Declared, bool)>, run: &run::R
 /// no longer taken as cut, its operations named by an index that may now
 /// name others or cut otherwise, but its material is still gone from the
 /// stock held (`run::Run::declared_lost`, LIO-583 review).
-fn lose_declared(declared: &mut [(String, run::Declared, bool)]) {
-    for (_, (skips, steps), lost) in declared {
-        *lost |= !skips.is_empty() || !steps.is_empty();
-        (*skips, *steps) = (vec![], vec![]);
+fn lose_declared(declared: &mut [run::KeptDeclared]) {
+    for k in declared {
+        k.lost |= !k.skips.is_empty() || !k.steps.is_empty();
+        (k.skips, k.steps, k.prints) = (vec![], vec![], vec![]);
     }
 }
 

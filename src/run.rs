@@ -94,6 +94,30 @@ pub enum Action {
 /// and its steps skipped, by operation (index in the setup).
 pub type Declared = (Vec<(usize, Skip)>, Vec<(usize, Vec<usize>)>);
 
+/// What the operator took as cut in a setup's run (`Run::declared`), kept
+/// once its run is dropped by the session (`App::run_declared`) and on disk
+/// with what runs cut (`CutHistory::declared`), so that it survives closing
+/// AXIS CAM, and given back when the setup is picked again, until New
+/// stock loaded (LIO-583 review, LIO-611).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct KeptDeclared {
+    /// The setup's id.
+    pub setup: String,
+    /// Its operations skipped as cut (`Skip::Cut`), by index in the setup.
+    pub skips: Vec<(usize, Skip)>,
+    /// Its steps taken as cut, by operation (index in the setup).
+    pub steps: Vec<(usize, Vec<usize>)>,
+    /// Some of what was taken as cut was dropped since, by a project edit
+    /// say (`Run::declared_lost`).
+    pub lost: bool,
+    /// The print of the plan and cutter (`OpSteps::cut_print`) of each
+    /// operation `skips` and `steps` name, as they were taken as cut; None
+    /// when not known. They hold only for a check whose prints are these
+    /// (`Run::declared_from`).
+    #[serde(default)]
+    pub prints: Vec<(usize, Option<u64>)>,
+}
+
 /// How a run skips an operation of its setup (`Run::skips`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Skip {
@@ -534,8 +558,8 @@ pub struct Run {
     /// `cut_in_run` came from an earlier pick of this setup, this session
     /// or before AXIS CAM was last closed (`CutHistory`, LIO-594), or
     /// tells of runs whose cuts are not known (`HISTORY_UNKNOWN`), or what
-    /// was taken as cut came from an earlier pick this session (`declared`,
-    /// LIO-583 review), and the
+    /// was taken as cut came from an earlier pick, this session or before
+    /// AXIS CAM was last closed (`declared`, LIO-583 review, LIO-611), and the
     /// operator has not said whether the same part is still held
     /// (`Action::SamePart`, `Action::NewStock`): nothing sets Z or probes
     /// until then (`partly`, LIO-582 review).
@@ -559,6 +583,14 @@ pub struct Run {
     /// that something was (`declared_lost`). An edit or New stock loaded,
     /// which drop them, ends it (LIO-583 review).
     pub declared_stale: bool,
+    /// What was taken as cut (`skips`, `cut_steps`) was given back from what
+    /// the session kept (`App::run_declared`), from before AXIS CAM was
+    /// last closed too (`CutHistory::declared`), with the print of each
+    /// operation it names as it was taken as cut (`KeptDeclared::prints`).
+    /// The first check that answers holds it only while its prints are the
+    /// same: else the project, the part or AXIS CAM changed since, and it is
+    /// dropped as a project edit drops it (`declared_lost`, LIO-611).
+    pub declared_from: Option<Vec<(usize, Option<u64>)>>,
     /// What the other setups cut this session (`App::run_cuts`), by setup
     /// id: in the part whether those setups come before it, were deleted or
     /// moved after it since. The check's stock has it only while it
@@ -993,6 +1025,11 @@ pub struct CutHistory {
     /// follow.
     #[serde(default)]
     pub owners: Vec<CutOwner>,
+    /// What the operator took as cut in each setup's run, by setup
+    /// (`App::run_declared`), as the session kept it: absent from a file
+    /// written before it was kept, which loads with none (LIO-611).
+    #[serde(default)]
+    pub declared: Vec<KeptDeclared>,
 }
 
 /// The project and names of a setup whose runs cut (`CutHistory::owners`),
@@ -1290,6 +1327,7 @@ impl Run {
             away: None,
             declared_lost: false,
             declared_stale: false,
+            declared_from: None,
             earlier_cuts: vec![],
             earlier_given: vec![],
             earlier_elsewhere: vec![],
@@ -1711,6 +1749,21 @@ impl Run {
         self.programs.as_deref()?.as_deref().ok()
     }
 
+    /// Whether what is taken as cut (`skips`, `cut_steps`) was taken as cut
+    /// from the plans and cutters a check found (`now`): each operation it
+    /// names has the print `from` gives it (`declared_from`, LIO-611).
+    fn declared_holds(&self, from: &[(usize, Option<u64>)], now: &[OpSteps]) -> bool {
+        let named = (self.skips.iter())
+            .filter(|s| s.1 == Skip::Cut)
+            .map(|s| s.0)
+            .chain(self.cut_steps.iter().map(|s| s.0));
+        named.into_iter().all(|oi| {
+            let was = from.iter().find(|p| p.0 == oi).and_then(|p| p.1);
+            let is = now.iter().find(|s| s.op == oi).map(|s| s.cut_print);
+            was.is_some() && is == was
+        })
+    }
+
     /// A check's answer, the stock it left to picture and how long its tool
     /// runs take.
     pub fn checked_as(
@@ -1743,6 +1796,25 @@ impl Run {
                 ))));
             }
             return;
+        }
+        // What was taken as cut, given back from before, holds only for the
+        // plans and cutters it was taken as cut from: changed or not known
+        // since, the project, the part or AXIS CAM changed, and it is
+        // dropped as a project edit drops it (LIO-611).
+        if programs.is_ok()
+            && let Some(from) = self.declared_from.take()
+            && !self.declared_holds(&from, left.as_ref().map_or(&[][..], |l| &l.steps[..]))
+        {
+            self.declared_lost = true;
+            if self.follow.is_some() {
+                // Followed as sent (`follow_again`), none kept as taken as cut.
+                self.declared_stale = true;
+            } else {
+                self.skips.retain(|s| s.1 != Skip::Cut);
+                self.cut_steps.clear();
+                (self.programs, self.recheck) = (None, true);
+                return;
+            }
         }
         // Refused, the progress stays kept for the skip's undoing (`skip`).
         let keep = programs
@@ -3123,6 +3195,27 @@ impl Run {
         (skips, self.cut_steps.clone())
     }
 
+    /// The print of the plan and cutter of each operation `declared` names
+    /// (`KeptDeclared::prints`): as given back, while no check has held it
+    /// since (`declared_from`), else the last check's (`OpSteps::cut_print`);
+    /// None when not known (LIO-611).
+    pub fn declared_prints(&self, (skips, steps): &Declared) -> Vec<(usize, Option<u64>)> {
+        let mut ops: Vec<usize> = (skips.iter().map(|s| s.0))
+            .chain(steps.iter().map(|s| s.0))
+            .collect();
+        ops.sort_unstable();
+        ops.dedup();
+        (ops.into_iter())
+            .map(|oi| {
+                let print = match &self.declared_from {
+                    Some(from) => from.iter().find(|p| p.0 == oi).and_then(|p| p.1),
+                    None => self.op_steps(oi).map(|s| s.cut_print),
+                };
+                (oi, print)
+            })
+            .collect()
+    }
+
     /// New stock loaded: what this setup's runs and the other setups' cut
     /// this session is forgotten, and so is what the operator took as cut
     /// (`declared`), the setup to be checked again without it. Whether it
@@ -3131,7 +3224,7 @@ impl Run {
     pub fn new_stock(&mut self) -> bool {
         (self.cut_in_run, self.earlier_cuts) = (vec![], vec![]);
         (self.stock_unconfirmed, self.declared_lost) = (false, false);
-        self.declared_stale = false;
+        (self.declared_stale, self.declared_from) = (false, None);
         let (skips, steps) = self.declared();
         if skips.is_empty() && steps.is_empty() {
             return false;
@@ -3691,7 +3784,7 @@ impl Run {
         // review).
         let (cut, steps) = self.declared();
         self.declared_lost |= !cut.is_empty() || !steps.is_empty();
-        self.declared_stale = false;
+        (self.declared_stale, self.declared_from) = (false, None);
         (self.skips, self.keep, self.menu) = (vec![], None, None);
         (self.cut_steps, self.start_step, self.picked) = (vec![], None, None);
     }
@@ -8293,6 +8386,7 @@ pub(crate) mod tests {
             away: None,
             declared_lost: false,
             declared_stale: false,
+            declared_from: None,
             earlier_cuts: vec![],
             earlier_given: vec![],
             earlier_elsewhere: vec![],
@@ -11288,5 +11382,32 @@ pub(crate) mod tests {
             let config = MachineConfig::from_toml(&toml).unwrap();
             assert!(a_problems(&owners, &config).is_empty());
         }
+    }
+
+    /// LIO-611: a cuts.json written before what was taken as cut was kept
+    /// with it loads, with none taken as cut; one written now keeps it.
+    #[test]
+    fn an_older_cut_history_loads_with_nothing_taken_as_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cuts.json");
+        let older =
+            r#"{"cuts":[["s1",[[0,null,7]]]],"journals":[],"others_unknown":false,"sent":[3]}"#;
+        std::fs::write(&path, older).unwrap();
+        let h = CutHistory::read(&path).unwrap().unwrap();
+        assert_eq!(h.cuts, [("s1".to_string(), vec![(0, None, Some(7))])]);
+        assert!(h.declared.is_empty());
+        let kept = KeptDeclared {
+            setup: "s1".into(),
+            skips: vec![(2, Skip::Cut)],
+            steps: vec![(1, vec![0, 3])],
+            lost: false,
+            prints: vec![(1, Some(11)), (2, None)],
+        };
+        let h = CutHistory {
+            declared: vec![kept],
+            ..h
+        };
+        h.write(&path).unwrap();
+        assert_eq!(CutHistory::read(&path).unwrap(), Some(h));
     }
 }
