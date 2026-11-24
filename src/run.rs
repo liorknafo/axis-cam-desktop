@@ -370,15 +370,15 @@ pub(crate) const STOCK_UNCONFIRMED: &str =
 
 /// Why a probe cannot find a work zero from a spot while
 /// `Run::stock_unconfirmed`.
-const STOCK_UNCONFIRMED_WHY: &str = "This setup's runs cut the stock earlier, or took operations or steps of it as cut: say under Work zero whether it is the same part or new stock.";
+const STOCK_UNCONFIRMED_WHY: &str = "This setup's runs cut the stock earlier, or operations or steps of it were taken as cut: say under Work zero whether it is the same part or new stock.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed`.
-const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier, or took operations or steps of it as cut: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
+const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier, or operations or steps of it were taken as cut: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed` after a disconnect (`Run::away`, LIO-595).
-pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier, or took operations or steps of it as cut, and the machine was disconnected or AXIS CAM closed since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
+pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier, or operations or steps of it were taken as cut, and the machine was disconnected or AXIS CAM closed since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
 
 /// What runs this computer did not follow may have cut, said as
 /// `Partly::cut` (`HISTORY_UNKNOWN` in `Run::cut_in_run`): another
