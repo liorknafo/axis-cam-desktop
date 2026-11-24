@@ -10912,8 +10912,15 @@ flood = { pin = 8 }
         face.insert("feed".into(), "6000".into());
         stop_after(&mut a, 0, 0);
         answer_skips(&mut a, 0);
-        // Another setup's runs cut its first operation whole this session.
-        let other = "lio596-other".to_string();
+        // Another setup of the project, whose runs cut its first operation
+        // whole this session.
+        let mut second = a.doc.setups[0].clone();
+        second.id = crate::id();
+        for op in &mut second.operations {
+            op.id = crate::id();
+        }
+        let other = second.id.clone();
+        a.doc.setups.push(second);
         let cut: Vec<crate::run::CutInRun> = vec![(0, None, Some(1))];
         a.run_cuts.push((other.clone(), cut.clone()));
         let reconnect = |a: &mut App| {
