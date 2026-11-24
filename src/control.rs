@@ -2551,6 +2551,14 @@ pub struct PiRun {
     job_name: Option<String>,
     tool_run_id: Option<u64>,
 }
+impl PiRun {
+    /// Its run, kept for the link to come back: a project edit meanwhile
+    /// reaches it as it reaches the run picked (`App::run_follows_project`,
+    /// LIO-583 review).
+    pub fn run_mut(&mut self) -> &mut crate::run::Run {
+        &mut self.run
+    }
+}
 
 /// How long the Pi, the link live, may show neither having nor having
 /// ended a tool run sent to it before it is taken as lost on the way.
@@ -4049,7 +4057,9 @@ impl Connection {
             // A probe under way sets the work zero for the start it began with.
             R::Next(i) if i < run.done.len() && !self.probing() => run.start_at(i, 0),
             R::From(i, k) if !self.probing() => run.start_at(i, k),
-            R::KeepZero if run.running.is_none() && run.partway() => run.zeroed = true,
+            // Operations or steps taken as cut ask for it once a tool run has
+            // started too (LIO-583 review).
+            R::KeepZero if run.running.is_none() && run.asks_zero() => run.zeroed = true,
             // Nothing else ran meanwhile: not while the Pi shows a tool run
             // this computer did not send (LIO-595).
             R::SamePart if run.running.is_none() && self.same_part_refused_for(&run).is_none() => {
@@ -4061,10 +4071,10 @@ impl Connection {
                 run.stock_unconfirmed = false;
                 run.away = None;
             }
+            // What was taken as cut goes too, the setup checked again
+            // without it (LIO-583 review).
             R::NewStock if run.running.is_none() => {
-                run.cut_in_run.clear();
-                run.earlier_cuts.clear();
-                run.stock_unconfirmed = false;
+                run.new_stock();
                 run.away = None;
             }
             R::More(oi) => {
@@ -4639,6 +4649,11 @@ impl Connection {
             .map(|r| (r.partly(), r.cut_by()))
         {
             _ if later && p.probe.is_ok() => Some("Operations or steps after the start are taken as cut, and the check does not follow the stock they cut where a probe finds this work zero.".into()),
+            Some((Some(partly), _))
+                if p.probe.is_ok() && partly.cut == [crate::run::DECLARED_LOST] =>
+            {
+                Some("Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut where a probe finds this work zero.".into())
+            }
             Some((None, _)) => Some(crate::run::PARTWAY_UNKNOWN.to_string()),
             // Not a part of the stock: the reason the check cannot tell it.
             Some((Some(partly), _))
@@ -4654,7 +4669,7 @@ impl Connection {
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::STOCK_UNCONFIRMED] =>
             {
-                Some("This setup's runs cut the stock earlier: say under Work zero whether it is the same part or new stock before a probe finds this work zero.".into())
+                Some("This setup's runs cut the stock earlier, or took operations or steps of it as cut: say under Work zero whether it is the same part or new stock before a probe finds this work zero.".into())
             }
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::STEPS_UNFOLLOWED] =>
@@ -4678,11 +4693,17 @@ impl Connection {
         let (Some(run), Ok(p)) = (&self.run, self.run_program()) else {
             return vec![];
         };
-        if run.later_cut() {
+        if run.later_cut() || run.declared_lost {
             // What operations or steps after the start, taken as cut, cut is
-            // in no stock the check found (LIO-582).
+            // in no stock the check found (LIO-582), nor what was taken as
+            // cut and dropped since (LIO-583 review).
+            let why = if run.later_cut() {
+                crate::run::LATER_UNFOLLOWED_WHY
+            } else {
+                crate::run::DECLARED_LOST_WHY
+            };
             (p.probe_from.iter())
-                .map(|(r, _)| (*r, Err(crate::run::LATER_UNFOLLOWED_WHY.to_string())))
+                .map(|(r, _)| (*r, Err(why.to_string())))
                 .collect()
         } else if run.on_cut_stock() {
             run.partly().map_or_else(Vec::new, |x| x.probe_from.clone())
