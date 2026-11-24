@@ -7,7 +7,7 @@
 //! copies it to `INBOX` beside the workspace). It also carries the tool runs
 //! worked out here for the TypeScript tablet app (`Runs`, LIO-475), and the
 //! hand setups' Steps screens drawn here (`steps::tablet`, LIO-477).
-use crate::model::Document;
+use crate::{model::Document, run::Session};
 use std::{
     fs,
     io::{Cursor, Read, Write},
@@ -27,16 +27,18 @@ pub const INBOX: &str = "inbox.axisjob";
 pub const EXTENSION: &str = "axisjob";
 
 /// The project, its part file, and for a STEP part the part converted as
-/// `step::load` reads it: the tablet has no converter (`step::load`).
-pub fn write(path: &Path, doc: &Document) -> Result<(), String> {
-    crate::storage::write_atomic(path, &pack(doc)?)
+/// `step::load` reads it: the tablet has no converter (`step::load`). The
+/// runs' work zeros go by what the setups' runs cut this session,
+/// `session` (`run::tablet_runs`, LIO-590).
+pub fn write(path: &Path, doc: &Document, session: &Session) -> Result<(), String> {
+    crate::storage::write_atomic(path, &pack(doc, session)?)
 }
 
 /// The tablet file `write` writes, in memory: what the computer sends a
 /// tablet over Wi-Fi (`tablet`).
-pub fn pack(doc: &Document) -> Result<Vec<u8>, String> {
+pub fn pack(doc: &Document, session: &Session) -> Result<Vec<u8>, String> {
     let mesh = part_mesh(doc);
-    pack_with(doc, mesh.as_ref().map_err(String::as_str))
+    pack_with(doc, mesh.as_ref().map_err(String::as_str), session)
 }
 
 /// `pack` with the part's `mesh` given: the runs and the steps are worked
@@ -44,6 +46,7 @@ pub fn pack(doc: &Document) -> Result<Vec<u8>, String> {
 pub fn pack_with(
     doc: &Document,
     mesh: Result<&crate::mesh::Mesh, &str>,
+    session: &Session,
 ) -> Result<Vec<u8>, String> {
     let mut w = zip::ZipWriter::new(Cursor::new(vec![]));
     let opt = zip::write::SimpleFileOptions::default()
@@ -58,7 +61,7 @@ pub fn pack_with(
     };
     let json = serde_json::to_vec_pretty(doc).map_err(|e| e.to_string())?;
     add(PROJECT, &json)?;
-    let runs = serde_json::to_vec_pretty(&runs(doc, mesh)).map_err(|e| e.to_string())?;
+    let runs = serde_json::to_vec_pretty(&runs(doc, mesh, session)).map_err(|e| e.to_string())?;
     add(RUNS, &runs)?;
     let (steps, pictures) = crate::steps::tablet::steps(doc, mesh);
     add(
@@ -122,10 +125,10 @@ pub struct Runs {
     pub plan: Vec<String>,
 }
 
-pub fn runs(doc: &Document, mesh: Result<&crate::mesh::Mesh, &str>) -> Runs {
+pub fn runs(doc: &Document, mesh: Result<&crate::mesh::Mesh, &str>, session: &Session) -> Runs {
     let setups = (0..doc.setups.len())
         .filter(|&si| crate::model::get(&doc.setups[si].machine.p, "controller") == "UC100")
-        .map(|si| crate::run::tablet_runs(doc, mesh, si))
+        .map(|si| crate::run::tablet_runs(doc, mesh, si, session))
         .collect();
     let plan = doc.setups.iter().map(|s| s.id.clone()).collect();
     Runs {
@@ -277,7 +280,7 @@ mod tests {
         doc.machines.push(uc100.clone());
         doc.setups[0].machine = uc100;
         let zip = mac.path().join("Block.axisjob");
-        write(&zip, &doc).unwrap();
+        write(&zip, &doc, &Session::default()).unwrap();
 
         let tablet = tempfile::tempdir().unwrap();
         let (opened, path, _) = open(&zip, tablet.path()).unwrap();
@@ -333,7 +336,11 @@ mod tests {
         let mut twin = crate::control::owners_machine(&other).unwrap();
         twin.id = "twin".into();
         doc.machines.push(twin);
-        assert!(write(&zip, &doc).unwrap_err().contains("jy5800.toml"));
+        assert!(
+            write(&zip, &doc, &Session::default())
+                .unwrap_err()
+                .contains("jy5800.toml")
+        );
         assert_eq!(
             file_name(Path::new("/Users/x/part/a.step")).unwrap(),
             "a.step"
@@ -357,7 +364,7 @@ mod tests {
         let third = crate::model::Setup::new(uc100, "G55");
         doc.setups = vec![lathe, second, third];
         let ids: Vec<String> = doc.setups.iter().map(|s| s.id.clone()).collect();
-        let bytes = pack_with(&doc, Err("no part")).unwrap();
+        let bytes = pack_with(&doc, Err("no part"), &Session::default()).unwrap();
         let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         let mut json = vec![];
         (zip.by_name(RUNS).unwrap().read_to_end(&mut json)).unwrap();
@@ -389,7 +396,7 @@ mod tests {
             thickness: None,
         });
         let started = std::time::Instant::now();
-        let bytes = pack(&doc).unwrap();
+        let bytes = pack(&doc, &Session::default()).unwrap();
         eprintln!("Packed in {:?}: {} bytes", started.elapsed(), bytes.len());
         let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
         let mut read = |name: &str| {

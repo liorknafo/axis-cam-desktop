@@ -8407,7 +8407,7 @@ spindle_max_rpm = 24000
         let doc = library_bar_job(dir.path(), &mesh, 20., "100", 40., "UC100");
         // It writes the profile the check reads.
         let mut c = library_run(dir.path(), &doc, &mesh);
-        let s = crate::run::tablet_runs(&doc, Ok(&mesh), 1);
+        let s = crate::run::tablet_runs(&doc, Ok(&mesh), 1, &Default::default());
         assert!(s.problems.is_empty(), "{:?}", s.problems);
         let programs = c.run.as_ref().unwrap().checked().unwrap().to_vec();
         let ([r], [p]) = (&s.tool_runs[..], &programs[..]) else {
