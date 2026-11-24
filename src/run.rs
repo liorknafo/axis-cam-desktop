@@ -4372,7 +4372,8 @@ pub struct OpSteps {
     /// `fingerprint` with what the cutter takes away along the moves: its
     /// shape and sizes, and the A of each move (`cut_print`). What a run
     /// cut is the check's only while this is the same (`Run::cut_in_run`,
-    /// LIO-582 review); kept in memory only.
+    /// LIO-582 review). Kept on disk with what runs cut and what was taken
+    /// as cut (`CutHistory`, LIO-594, LIO-611).
     pub cut_print: u64,
 }
 
@@ -4659,8 +4660,11 @@ fn op_steps(doc: &Document, si: usize, sims: &Sims) -> Vec<OpSteps> {
 /// the moves: its shape, radius (and form), flute length, the reach below
 /// its tip and its neck, a lathe plan's rings, and the A each move is at.
 /// A tool saved at another size, or an operation posed at another angle,
-/// cuts other stock along the same moves (LIO-582 review). Not kept on
-/// disk, so its words for the cutter (`Debug`) may change between builds.
+/// cuts other stock along the same moves (LIO-582 review). Kept on disk
+/// (`CutHistory`), its words for the cutter (`Debug`) may still change
+/// between builds: an AXIS CAM updated since then finds another print, and
+/// what was cut or taken as cut no longer counts as the check's, the safe
+/// side (LIO-611).
 fn cut_print(plan: &crate::simulation::Plan, tool: &str) -> u64 {
     let mut h = fingerprint(plan, tool);
     let mut eat = |w: u64| h = (h ^ w).wrapping_mul(0x100000001b3);
