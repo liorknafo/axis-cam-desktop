@@ -11296,7 +11296,7 @@ flood = { pin = 8 }
                 blocked.starts_with(
                     "Runs on the computer cut stock for a setup this project does not have, another project's or one deleted since"
                 ) && blocked.ends_with(
-                    "If new stock is held, press New stock loaded on the computer (Run panel, under Work zero), then Sync projects here."
+                    "If new stock is held, press New stock loaded on the computer (Control page, Work zero tab, the machine connected and a setup of this project picked in the run bar), then Sync projects here, or save the project for the tablet again."
                 ),
                 "{blocked}"
             );

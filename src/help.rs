@@ -1912,7 +1912,7 @@ fn run_help(a: &crate::run::Action) -> (&'static str, &'static str) {
             "",
         ),
         NewStock => (
-            "New stock is held: what this setup's runs cut earlier is forgotten, and the work zero is found on the new stock.",
+            "New stock is held: what this setup's runs and the other setups' runs cut earlier, another project's too, is forgotten, and the work zero is found on the new stock.",
             "",
         ),
         KeepZero => (
