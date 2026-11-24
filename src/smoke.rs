@@ -12652,8 +12652,9 @@ flood = { pin = 8 }
     /// LIO-611: the Pocket's level 1 taken as cut is kept on disk as it is
     /// taken, with the print of the Pocket's plan, so that AXIS CAM closed
     /// and opened again gives it back when the setup is picked: it asks
-    /// whether the same part is still held, and until then nothing sets Z
-    /// or probes and Cycle Start waits. Same part keeps it taken as cut,
+    /// whether the same part is still held and, as after a disconnect,
+    /// whether anything else ran on the machine meanwhile (LIO-606); until
+    /// then nothing sets Z or probes and Cycle Start waits. Same part keeps it taken as cut,
     /// the Face's touch-off still refused, for the level after it may have
     /// cut where Z is touched off; New stock loaded forgets it, on disk
     /// too.
@@ -12685,17 +12686,21 @@ flood = { pin = 8 }
         let run = run_of(&b);
         assert_eq!(run.all_cut(), [(1, vec![0])]);
         assert!(run.stock_unconfirmed && !run.declared_lost && run.declared_from.is_none());
+        assert!(run.away.is_some() && run.cut_in_run.is_empty());
         sets_no_z(&b);
         let _ = b.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        shows(&b, &[crate::ui::AWAY_DECLARED_ASKED]);
         let window = iced::Size::new(1440., 2400.);
-        let texts = crate::ui::probe::texts(b.view(), window).join("\n");
-        assert!(
-            texts.contains("Operations or steps of this setup were taken as cut earlier. Is it still the same part?"),
-            "{texts}"
-        );
-        // Same part: still taken as cut, and still nothing sets Z.
+        let clicks = crate::ui::probe::clicks(b.view(), window);
+        let offered =
+            |f: fn(&R) -> bool| (clicks.iter()).any(|m| matches!(m, Message::Run(r) if f(r)));
+        assert!(offered(|r| matches!(r, R::SamePart)));
+        assert!(offered(|r| matches!(r, R::OtherRunsMayHaveCut)));
+        assert!(offered(|r| matches!(r, R::NewStock)));
+        // Same part, nothing else ran (no Pi to say otherwise): still taken
+        // as cut, and still nothing sets Z.
         let _ = b.update(Message::Run(R::SamePart));
-        assert!(!run_of(&b).stock_unconfirmed);
+        assert!(!run_of(&b).stock_unconfirmed && run_of(&b).away.is_none());
         assert_eq!(run_of(&b).all_cut(), [(1, vec![0])]);
         sets_no_z(&b);
         assert_eq!(kept_declared(dir.path()), kept);
@@ -12713,6 +12718,7 @@ flood = { pin = 8 }
         let _ = c.update(Message::Run(R::Setup(0)));
         answer_skips(&mut c, 0);
         assert!(run_of(&c).all_cut().is_empty() && !run_of(&c).stock_unconfirmed);
+        assert!(run_of(&c).away.is_none());
         let _ = c.update(Message::Disconnect);
     }
 

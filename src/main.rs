@@ -12354,12 +12354,12 @@ fn keep_away(away: &mut Vec<(String, run::Away)>, run: &run::Run) {
 fn mark_away(
     away: &mut Vec<(String, run::Away)>,
     cuts: &[(String, Vec<run::CutInRun>)],
-    declared: &[(String, run::Declared, bool)],
+    declared: &[run::KeptDeclared],
     c: &control::Connection,
 ) {
     let now = c.pi_tool_runs();
     let mut ids: Vec<&String> = vec![];
-    for id in (cuts.iter().map(|(id, _)| id)).chain(declared.iter().map(|(id, ..)| id)) {
+    for id in (cuts.iter().map(|(id, _)| id)).chain(declared.iter().map(|k| &k.setup)) {
         if !ids.contains(&id) {
             ids.push(id);
         }
