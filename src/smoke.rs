@@ -3139,6 +3139,59 @@ flood = { pin = 8 }
         assert!(run_of(&a).touched() && touch_first(&a).is_empty());
     }
 
+    /// A touch-off made while the check a Stop after step starts runs is
+    /// for the tool that stopped (LIO-619): T3, still next at the hole
+    /// after, so it is confirmed there; tool run 1's T1 is not.
+    #[test]
+    fn a_touch_off_while_a_stop_is_checked_holds_for_the_tool_stopped() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        let _ = drilling(&mut a);
+        let _ = a.update(Message::Run(R::StopAfterStep));
+        assert!(run_of(&a).stop_after);
+        let mut deadline = Deadline::new(30.);
+        loop {
+            let _ = a.update(Message::Tick);
+            let s = &conn(&a).snapshot;
+            if run_of(&a).running.is_none() && s.state == Some(State::Idle) {
+                break;
+            }
+            assert!(deadline.within(s));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.starts_with("Stopped after hole"),
+            "{message}"
+        );
+        // The hole after is the start, checked again: T3 touched off meanwhile.
+        assert!(run_of(&a).programs.is_none());
+        let _ = a.update(Message::Run(R::RecordReference));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert!(run.next == 1 && run.at_step().is_some_and(|(oi, _)| oi == 1));
+        assert!(run.touched());
+        let said = problems(&a);
+        assert!(
+            !said
+                .iter()
+                .any(|p| p.starts_with("Confirm") || p.contains("touch off its Z first")),
+            "{said:?}"
+        );
+        // Tool run 1 picked: T1 would cut with T3's Z.
+        let _ = a.update(Message::Run(R::Next(0)));
+        let said = touch_first(&a);
+        assert!(
+            said.len() == 1 && said[0].starts_with("Tool run 1 uses T1"),
+            "{:?}",
+            problems(&a)
+        );
+    }
+
     /// A touch-off holds for its tool only (LIO-619): an edit that puts
     /// another tool in the tool run it was for leaves that tool to be
     /// touched off; so does a tool change after the first tool run.
