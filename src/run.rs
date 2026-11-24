@@ -29,20 +29,20 @@ pub enum Action {
     /// leaves (`Run::partway`): the one those operations were cut with, or
     /// one set by hand on a surface they left.
     KeepZero,
-    /// The part this setup's runs cut, or took as cut, this session is
-    /// still the one held (`Run::stock_unconfirmed`), and nothing else has
+    /// The part this setup's runs cut, or with operations or steps of it
+    /// taken as cut, this session is still the one held (`Run::stock_unconfirmed`), and nothing else has
     /// cut it since: what they cut stays the stock's. Refused after a
     /// disconnect while the Pi shows a tool run this computer did not send
     /// (`Run::away`, LIO-595).
     SamePart,
-    /// The part this setup's runs cut, or took as cut (LIO-606), this
-    /// session is still the one held, but after a disconnect (`Run::away`)
+    /// The part this setup's runs cut, or with operations or steps of it
+    /// taken as cut (LIO-606), this session is still the one held, but after a disconnect (`Run::away`)
     /// something else may have cut it meanwhile: what this setup's runs cut
     /// is unknown (`Run::note_history_unknown`) until New stock loaded
     /// (LIO-595).
     OtherRunsMayHaveCut,
-    /// New stock is held: what this setup's runs cut, or took as cut, this
-    /// session is forgotten (`Run::stock_unconfirmed`).
+    /// New stock is held: what this setup's runs cut, and what was taken as
+    /// cut, this session is forgotten (`Run::stock_unconfirmed`).
     NewStock,
     CycleStart,
     Hold,
@@ -365,8 +365,7 @@ pub(crate) const LATER_UNFOLLOWED_WHY: &str = "Operations or steps after the sta
 /// What this setup's runs cut earlier, said as `Partly::cut`,
 /// while the operator has not said whether the same part is still held
 /// (`Run::stock_unconfirmed`).
-pub(crate) const STOCK_UNCONFIRMED: &str =
-    "stock this setup's runs cut, or took as cut, earlier, which may or may not still be held";
+pub(crate) const STOCK_UNCONFIRMED: &str = "stock this setup's runs cut, or with operations or steps of it taken as cut, earlier, which may or may not still be held";
 
 /// Why a probe cannot find a work zero from a spot while
 /// `Run::stock_unconfirmed`.
