@@ -12057,6 +12057,112 @@ flood = { pin = 8 }
         let _ = b.update(Message::Disconnect);
     }
 
+    /// LIO-635: a project's tool run on the simulated machine, and another
+    /// project on the same part (its own id, title and setup id) shared to
+    /// the tablet. The tablet file made with what the computer's runs cut
+    /// (`App::session_cuts`), as the Wi-Fi share packs it, knows no owners:
+    /// it refuses every start's Z and probe spots, saying the cut may be
+    /// another project's and how to clear it on the computer. There, that
+    /// project opened names the project that cut (LIO-607). New stock
+    /// loaded on the computer, the file is the plan's alone again.
+    #[test]
+    fn another_projects_tool_run_refuses_the_tablets_starts_until_new_stock() {
+        use crate::run::Action as R;
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = two_pass_app(dir.path());
+        let mut other = a.doc.clone();
+        other.setups[0].id = crate::id();
+        other.project_id = crate::id();
+        other.title = "Other bracket".into();
+        let runs_of = |bytes: Vec<u8>| -> crate::bundle::Runs {
+            let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+            let mut json = vec![];
+            let mut file = zip.by_name(crate::bundle::RUNS).unwrap();
+            file.read_to_end(&mut json).unwrap();
+            serde_json::from_slice(&json).unwrap()
+        };
+        let file =
+            |session: &crate::run::Session| runs_of(crate::bundle::pack(&other, session).unwrap());
+        let plan = file(&crate::run::Session::default());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_some(), "{:?}", problems(&a));
+        run_until(&mut a, 90., "tool run 1", |r| r.running.is_none());
+        let session = a.session_cuts();
+        let cut = session
+            .cuts
+            .iter()
+            .find(|(id, _)| *id == a.doc.setups[0].id);
+        assert!(cut.is_some_and(|(_, c)| !c.is_empty()), "{session:?}");
+        let cut = file(&session);
+        assert_eq!(cut.setups.len(), 1);
+        let s = &cut.setups[0];
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let zeros: Vec<_> = (s.tool_runs.iter())
+            .flat_map(|r| {
+                let starts = r.starts.iter().map(|t| t.zero.clone());
+                let steps = r.step_starts.iter().map(|t| t.zero.clone());
+                std::iter::once(r.zero.clone()).chain(starts).chain(steps)
+            })
+            .collect();
+        assert!(
+            zeros.len() > 1 && zeros.iter().all(Option::is_some),
+            "{zeros:?}"
+        );
+        for z in zeros.into_iter().flatten() {
+            assert_eq!(z.set_z, None);
+            let blocked = z.blocked.unwrap();
+            assert!(
+                blocked.starts_with(
+                    "Runs on the computer cut stock for a setup this project does not have, another project's or one deleted since"
+                ) && blocked.ends_with(
+                    "If new stock is held, press New stock loaded on the computer (Control page, Work zero tab, the machine connected and a setup of this project picked in the run bar), then Sync projects here, or save the project for the tablet again."
+                ),
+                "{blocked}"
+            );
+            assert!(!z.probe_from.is_empty());
+            for spot in &z.probe_from {
+                let why = spot.problem.as_deref().unwrap();
+                assert!(why.contains("another project's"), "{why}");
+            }
+        }
+        // The other project opened on the computer, which knows whose the
+        // cut is: its Run panel names that project, with New stock loaded
+        // beside it.
+        let mut b = two_pass_app(dir.path());
+        b.replace_document(other.clone(), None);
+        b.imported_mesh = a.imported_mesh.clone();
+        b.page = Page::Control;
+        zeroed(&mut b);
+        let _ = b.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut b, 0);
+        assert!(run_of(&b).earlier_not_here());
+        assert_eq!(conn(&b).touch_off(), None);
+        let why = conn(&b).partway_blocked().unwrap();
+        let named = format!(
+            "Another project's runs cut stock on this machine earlier (\"{}\"",
+            a.doc.title
+        );
+        assert!(why.starts_with(&named), "{why}");
+        assert!(
+            why.ends_with("press New stock loaded under Work zero."),
+            "{why}"
+        );
+        let _ = b.update(Message::Disconnect);
+        // New stock loaded on the computer: the file is the plan's alone.
+        let _ = a.update(Message::Run(R::NewStock));
+        let session = a.session_cuts();
+        assert!(
+            session.cuts.iter().all(|(_, c)| c.is_empty()),
+            "{session:?}"
+        );
+        assert_eq!(file(&session), plan);
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// LIO-594 review: two AXIS CAMs open on the same folder and part, each
     /// with its own setup (another project's, say), the second's run
     /// picked before the first cuts. What the first cuts reaches the

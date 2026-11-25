@@ -11708,7 +11708,8 @@ fn stock_question<'a>(
         })
     });
     // Another setup's cuts the check does not follow: only new stock
-    // clears them (LIO-582 review).
+    // clears them (LIO-582 review). Those of setups this project does not
+    // have alone are said so: another project's, maybe (LIO-635).
     let stock = stock.or_else(|| {
         run.earlier_unfollowed().then(|| {
             column![
