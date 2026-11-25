@@ -11625,12 +11625,22 @@ fn stock_question<'a>(
 ) -> Option<iced::widget::Column<'a, Message>> {
     use crate::run::Action as R;
     let running = run.running.is_some();
+    // Only taken as cut: this computer saw none of its runs cut, and the
+    // mark that runs it did not follow may have (`history_unknown`) is not
+    // the whole story either, for something is taken as cut, or was and
+    // has been dropped or undone since, Don't skip pressed before the
+    // answer say (LIO-606 review).
+    let only_taken = {
+        let (skips, steps) = run.declared();
+        let taken = !skips.is_empty() || !steps.is_empty() || run.declared_lost;
+        !run.cut_by_runs() && (taken || !run.history_unknown())
+    };
     // This setup's runs cut a part earlier, this session or before AXIS
     // CAM was last closed (LIO-594): is it still the one held? Asked on a row of its own, so the work zero's
     // buttons keep their room (LIO-582 review).
     let stock = (run.stock_unconfirmed && run.away.is_none()).then(|| {
         column![
-            text(if run.cut_in_run.is_empty() {
+            text(if only_taken {
                 // Only taken as cut, this session or before AXIS CAM was
                 // last closed (LIO-583 review, LIO-611).
                 "Operations or steps of this setup were taken as cut earlier. Is it still the same part?"
@@ -11664,7 +11674,13 @@ fn stock_question<'a>(
             // Why Same part with nothing else run is off, said above the
             // answers so it shows with them in a short window (LIO-595
             // review).
-            let mut col = column![text(AWAY_ASKED).size(12)].spacing(4);
+            // Only taken as cut, as above (LIO-606).
+            let asked = if only_taken {
+                AWAY_DECLARED_ASKED
+            } else {
+                AWAY_ASKED
+            };
+            let mut col = column![text(asked).size(12)].spacing(4);
             if let Some(why) = refused {
                 col = col.push(text(why).size(12).color(AMBER));
             }
@@ -11744,6 +11760,10 @@ fn stock_question<'a>(
 /// What the Work zero tab asks of a setup whose runs cut a part before a
 /// disconnect from the machine (`run::Run::away`, LIO-595).
 pub const AWAY_ASKED: &str = "This setup's runs cut a part earlier, and the machine was disconnected or AXIS CAM closed since. Is it still the one held, and did anything else run on the machine meanwhile?";
+
+/// `AWAY_ASKED` for a setup whose runs cut nothing but with operations or
+/// steps taken as cut (`run::Run::declared`, LIO-606).
+pub const AWAY_DECLARED_ASKED: &str = "Operations or steps of this setup were taken as cut earlier, and the machine was disconnected or AXIS CAM closed since. Is it still the same part, and did anything else run on the machine meanwhile?";
 
 /// Said with New stock loaded on the Work zero tab while runs this
 /// computer did not follow may have cut the part (`run::Run::history_unknown`).
