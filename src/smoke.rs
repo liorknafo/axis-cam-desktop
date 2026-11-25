@@ -5876,6 +5876,47 @@ flood = { pin = 8 }
         assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
     }
 
+    /// LIO-627 review: Set Z from reference pressed while a jog sent just
+    /// before it still moves Z (the snapshot still Idle): the controller
+    /// does not apply it, and it is said so; nothing is touched off.
+    #[test]
+    fn a_set_z_from_reference_pressed_during_a_jog_touches_nothing_off() {
+        use crate::run::Action as R;
+        use uc100::controller::{Command, State};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Run(R::RecordReference));
+        let reference = run_of(&a).reference.unwrap();
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 2.));
+        let before = conn(&a).snapshot.work_offset[2];
+        conn(&a).send(Command::JogStep {
+            axis: 2,
+            distance: -1.,
+            feed: 100.,
+        });
+        let _ = a.update(Message::Run(R::ZFromReference));
+        assert!(conn(&a).z_set_waits(run_of(&a)));
+        let mut deadline = Deadline::new(5.);
+        while conn(&a).z_set_waits(run_of(&a)) {
+            assert!(deadline.within(&conn(&a).snapshot), "the Z set still waits");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = a.update(Message::Tick);
+        }
+        assert!(!run_of(&a).touched());
+        assert!((conn(&a).snapshot.work_offset[2] - before).abs() < 1e-9);
+        let said = conn(&a).z_said(run_of(&a)).expect("said").to_string();
+        assert!(
+            said.starts_with("Set Z from reference did not reach the controller, or the controller did not apply it,"),
+            "{said}"
+        );
+        assert!(problems(&a).contains(&said), "{:?}", problems(&a));
+    }
+
     /// LIO-627 review: a Set Z from reference that did not take is over
     /// once the tool is touched off another way (Zero Z here): run with
     /// that Z and stopped, nothing says it did not take, and nothing holds
@@ -17644,6 +17685,18 @@ flood = { pin = 8 }
         let _ = a.view();
         // From Z -30: contact at the block's top, Z -40, which becomes the
         // stock top's Z 0 with no plate; then the tool lifts 5 mm.
+        mdi(&mut a, "G0 X195 Y140 Z-30");
+        // No setup picked, the work Z the link does not take: said so,
+        // never "Work Z set" (LIO-627 review).
+        let before = conn(&a).snapshot.work_offset[2];
+        a.control.as_mut().unwrap().lose_next_z = Some(false);
+        let _ = a.update(Message::Machine(Action::ProbeZ));
+        let (ok, message) = probed(&mut a);
+        assert!(
+            !ok && message.starts_with("The work Z the probe found was not sent ("),
+            "{message}"
+        );
+        assert!((conn(&a).snapshot.work_offset[2] - before).abs() < 1e-9);
         mdi(&mut a, "G0 X195 Y140 Z-30");
         let _ = a.update(Message::Machine(Action::ProbeZ));
         let (ok, message) = probed(&mut a);

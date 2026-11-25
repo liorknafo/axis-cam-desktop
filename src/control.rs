@@ -4319,17 +4319,21 @@ impl Connection {
             Some(false) => false,
             None => self.driver.send(Command::SetWork { axis: 2, value }),
         };
-        let Some(run) = run else {
-            return false;
-        };
-        run.untouch();
-        (run.zeroed, run.tool_kept) = (false, false);
+        let key = run.map(|run| {
+            run.untouch();
+            (run.zeroed, run.tool_kept) = (false, false);
+            (run.epoch, run.next)
+        });
         if sent {
+            // With no run, nothing is touched off by it: said at once.
+            let Some((epoch, next)) = key else {
+                return false;
+            };
             self.z_set = Some(ZSet {
                 by,
                 offset,
-                epoch: run.epoch,
-                next: run.next,
+                epoch,
+                next,
                 then,
             });
             return true;
@@ -4347,14 +4351,14 @@ impl Connection {
                     .to_string()
             })
             .unwrap_or_else(|| "the link to the Pi is not answering".into());
-        let key = (run.epoch, run.next);
         self.z_not_set(by, key, &format!("was not sent ({why})"));
         false
     }
 
-    /// Says that the Z set by `by` for the run and tool run `key` did not
-    /// take (`how`): nothing changed, and how to set it again.
-    fn z_not_set(&mut self, by: ZBy, key: (u64, usize), how: &str) {
+    /// Says that the Z set by `by` for the run and tool run `key` (None: no
+    /// run) did not take (`how`): nothing changed, and how to set it
+    /// again.
+    fn z_not_set(&mut self, by: ZBy, key: Option<(u64, usize)>, how: &str) {
         let said = match by {
             ZBy::Reference => format!(
                 "Set Z from reference {how}, so Z is as it was: touch the tool on the reference again and press Set Z from reference."
@@ -4366,7 +4370,7 @@ impl Connection {
         if by == ZBy::Probe {
             self.probed = Some((false, said.clone()));
         }
-        self.z_said = Some((key.0, key.1, by, said));
+        self.z_said = key.map(|(epoch, next)| (epoch, next, by, said));
     }
 
     /// A Z set for the run's tool on its way (`z_set`), once the machine
@@ -4385,7 +4389,9 @@ impl Connection {
             .as_ref()
             .is_some_and(|r| r.touched() || r.tool_kept)
         {
-            self.z_said = None;
+            // And one on its way that another touch-off overtook: that one
+            // is the latest Z (LIO-627 review).
+            (self.z_said, self.z_set) = (None, None);
         }
         let Some(z) = &self.z_set else {
             return;
@@ -4416,7 +4422,7 @@ impl Connection {
             let machine = self.machine_name();
             self.z_not_set(
                 z.by,
-                (z.epoch, z.next),
+                Some((z.epoch, z.next)),
                 &format!("did not reach {machine}, or {machine} did not apply it"),
             );
         }
