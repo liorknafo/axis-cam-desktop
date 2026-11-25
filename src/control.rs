@@ -2605,6 +2605,10 @@ struct ZSet {
     /// run's first (LIO-627 review).
     epoch: u64,
     next: usize,
+    /// The tool it is pressed for (`Run::next_tool`): once shown applied
+    /// with another tool run picked meanwhile, it is that tool's Z, which
+    /// holds for no other (LIO-627 review).
+    tool: Option<String>,
     /// What a probe says once it is shown (`Connection::probed`).
     then: Option<String>,
 }
@@ -4319,9 +4323,11 @@ impl Connection {
             Some(false) => false,
             None => self.driver.send(Command::SetWork { axis: 2, value }),
         };
+        let mut tool = None;
         let key = run.map(|run| {
-            run.untouch();
+            run.hold_touch();
             (run.zeroed, run.tool_kept) = (false, false);
+            tool = run.next_tool();
             (run.epoch, run.next)
         });
         if sent {
@@ -4334,6 +4340,7 @@ impl Connection {
                 offset,
                 epoch,
                 next,
+                tool,
                 then,
             });
             return true;
@@ -4361,10 +4368,12 @@ impl Connection {
     fn z_not_set(&mut self, by: ZBy, key: Option<(u64, usize)>, how: &str) {
         let said = match by {
             ZBy::Reference => format!(
-                "Set Z from reference {how}, so Z is as it was: touch the tool on the reference again and press Set Z from reference."
+                "Set Z from reference {how}, so the tool does not count as touched off: touch it on the reference again and press Set Z from reference."
             ),
             ZBy::Probe => {
-                format!("The work Z the probe found {how}, so Z is as it was: probe again.")
+                format!(
+                    "The work Z the probe found {how}, so the tool does not count as touched off: probe again."
+                )
             }
         };
         if by == ZBy::Probe {
@@ -4391,14 +4400,15 @@ impl Connection {
         {
             // And one on its way that another touch-off overtook: that one
             // is the latest Z (LIO-627 review).
-            (self.z_said, self.z_set) = (None, None);
+            self.z_said = None;
+            self.drop_z_set();
         }
         let Some(z) = &self.z_set else {
             return;
         };
-        let current = (self.run.as_ref()).is_some_and(|r| r.epoch == z.epoch && r.next == z.next);
-        if !current {
-            self.z_set = None;
+        // Another run (another setup picked) knows nothing of it.
+        if self.run.as_ref().is_none_or(|r| r.epoch != z.epoch) {
+            self.drop_z_set();
             return;
         }
         if !self.shows_all_sent() {
@@ -4410,11 +4420,19 @@ impl Connection {
         let step = (self.config.axes.get(2))
             .map_or(0., |a| 1. / a.steps_per_unit)
             .max(Z_SHOWN);
-        if (self.snapshot.work_offset[2] - z.offset).abs() <= step {
-            if let Some(run) = &mut self.run {
+        let applied = (self.snapshot.work_offset[2] - z.offset).abs() <= step;
+        let current = self.run.as_ref().is_some_and(|r| r.next == z.next);
+        match (applied, &mut self.run) {
+            (true, Some(run)) if current => {
                 run.z_touched();
                 run.zeroed = true;
             }
+            // Another tool run picked meanwhile: the offset is the tool's it
+            // was pressed for, which holds for no other (LIO-627 review).
+            (true, Some(run)) => run.z_touched_for(z.tool.clone()),
+            _ => {}
+        }
+        if applied {
             if let Some(said) = z.then {
                 self.probed = Some((true, said));
             }
@@ -4422,9 +4440,16 @@ impl Connection {
             let machine = self.machine_name();
             self.z_not_set(
                 z.by,
-                Some((z.epoch, z.next)),
+                current.then_some((z.epoch, z.next)),
                 &format!("did not reach {machine}, or {machine} did not apply it"),
             );
+        }
+    }
+
+    /// Forgets the Z set on its way, and a probe's line that it waits.
+    fn drop_z_set(&mut self) {
+        if self.z_set.take().is_some_and(|z| z.then.is_some()) {
+            self.probed = None;
         }
     }
 

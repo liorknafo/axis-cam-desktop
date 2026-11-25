@@ -5732,7 +5732,7 @@ flood = { pin = 8 }
             let said = conn(a).z_said(run_of(a)).expect("said").to_string();
             assert!(
                 said.ends_with(
-                    "so Z is as it was: touch the tool on the reference again and press Set Z from reference."
+                    "so the tool does not count as touched off: touch it on the reference again and press Set Z from reference."
                 ),
                 "{said}"
             );
@@ -5915,6 +5915,73 @@ flood = { pin = 8 }
             "{said}"
         );
         assert!(problems(&a).contains(&said), "{:?}", problems(&a));
+    }
+
+    /// LIO-627 review: Set Z from reference pressed again for T3 and lost
+    /// does not forget that the machine's Z is T3's: tool run 1 picked
+    /// next asks for T1's touch-off. Nor does one still on its way when
+    /// tool run 1 is picked: once the machine shows it, it is T3's Z.
+    #[test]
+    fn a_set_z_from_reference_lost_or_on_its_way_keeps_whose_z_the_machine_holds() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Run(R::RecordReference));
+        let reference = run_of(&a).reference.unwrap();
+        // T3 touched off on the reference.
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 2.));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        run_until(&mut a, 5.0, "the touch-off", |r| r.touched());
+        touch_shown(&mut a);
+        // Seated again, and Set Z from reference lost.
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 5.));
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Run(R::ZFromReference));
+        let mut deadline = Deadline::new(5.);
+        while conn(&a).z_set_waits(run_of(&a)) {
+            assert!(deadline.within(&conn(&a).snapshot), "the Z set still waits");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = a.update(Message::Tick);
+        }
+        let lost = conn(&a).z_said(run_of(&a)).expect("said").to_string();
+        // Tool run 1 picked: T1 would cut with T3's Z.
+        let _ = a.update(Message::Run(R::Next(0)));
+        let said = touch_first(&a);
+        assert!(
+            said.len() == 1 && said[0].starts_with("Tool run 1 uses T1"),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_for(&mut a, 200);
+        assert!(run_of(&a).running.is_none());
+        // Back to tool run 2: its lost Set Z still holds it.
+        let _ = a.update(Message::Run(R::Next(1)));
+        assert!(problems(&a).contains(&lost), "{:?}", problems(&a));
+        // Pressed again, and tool run 1 picked before the machine shows
+        // it: once shown, the Z is T3's.
+        let _ = a.update(Message::Run(R::ZFromReference));
+        let _ = a.update(Message::Run(R::Next(0)));
+        tick_for(&mut a, 300);
+        let said = touch_first(&a);
+        assert!(
+            said.len() == 1 && said[0].starts_with("Tool run 1 uses T1"),
+            "{:?}",
+            problems(&a)
+        );
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_for(&mut a, 200);
+        assert!(run_of(&a).running.is_none());
+        // And it holds for T3's tool run.
+        let _ = a.update(Message::Run(R::Next(1)));
+        assert!(run_of(&a).touched());
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
     }
 
     /// LIO-627 review: a Set Z from reference that did not take is over
@@ -17873,7 +17940,7 @@ flood = { pin = 8 }
         let (ok, message) = probed(&mut a);
         assert!(
             !ok && message.starts_with("The work Z the probe found was not sent (")
-                && message.ends_with("so Z is as it was: probe again."),
+                && message.ends_with("so the tool does not count as touched off: probe again."),
             "{message}"
         );
         assert!(!conn(&a).z_set_waits(run_of(&a)));
@@ -17892,7 +17959,7 @@ flood = { pin = 8 }
         }
         let (ok, message) = conn(&a).probed.clone().unwrap();
         assert!(
-            !ok && message.ends_with("so Z is as it was: probe again."),
+            !ok && message.ends_with("so the tool does not count as touched off: probe again."),
             "{message}"
         );
         assert!(!run_of(&a).touched() && !run_of(&a).zeroed);

@@ -302,6 +302,12 @@ pub struct TouchedFor {
     /// The Z work offset it left, once the machine shows what was sent
     /// (`Run::touch_shown`); None until then.
     z: Option<f64>,
+    /// A Z set from the reference or by probe was pressed since, and is
+    /// not shown applied (`Run::hold_touch`): the offset may still be this
+    /// tool's, so it still holds for no other, but it no longer counts as
+    /// touched off for this one (LIO-627 review).
+    #[serde(default)]
+    held: bool,
 }
 
 /// The driver's outcome of a job it refused before anything moved: "<name>:
@@ -1845,20 +1851,27 @@ impl Run {
     /// tool only (LIO-619).
     pub fn touched(&self) -> bool {
         let next = self.tool_of(self.next);
-        (self.touched_for.as_ref()).is_some_and(|t| next.is_some() && t.tool == next)
+        (self.touched_for.as_ref()).is_some_and(|t| next.is_some() && t.tool == next && !t.held)
+    }
+
+    /// The tool a touch-off now is for (`z_touched`).
+    pub fn next_tool(&self) -> Option<String> {
+        (self.tool_of(self.next)).or_else(|| self.rechecked_tool.clone())
     }
 
     /// Z is touched off for the next tool run's tool: Set Z from
     /// reference, Zero Z, Set Z, a probe or a touch-off.
     pub fn z_touched(&mut self) {
-        let tool = (self.tool_of(self.next)).or_else(|| self.rechecked_tool.clone());
-        self.z_touched_for(tool);
+        self.z_touched_for(self.next_tool());
     }
 
-    /// Z is no longer touched off for any tool: a Z set for it is on its
-    /// way, and counts once the machine shows it (LIO-627).
-    pub fn untouch(&mut self) {
-        self.touched_for = None;
+    /// A Z set for the next tool is on its way: the touch-off before it no
+    /// longer counts for its tool until the machine shows the new one, but
+    /// still says whose Z the offset is for the others (LIO-627).
+    pub fn hold_touch(&mut self) {
+        if let Some(t) = &mut self.touched_for {
+            t.held = true;
+        }
     }
 
     /// The setup is checked again, as check `epoch`, keeping its progress:
@@ -1883,13 +1896,15 @@ impl Run {
             tool,
             first,
             z: None,
+            held: false,
         });
     }
 
-    /// The Z work offset the last touch-off left, once shown.
+    /// The Z work offset the last touch-off left, once shown; none while
+    /// a Z set pressed since waits (`hold_touch`).
     #[cfg(test)]
     pub fn touched_z(&self) -> Option<f64> {
-        self.touched_for.as_ref()?.z
+        self.touched_for.as_ref().filter(|t| !t.held)?.z
     }
 
     /// The machine shows everything sent, with Z work offset `z`: what a
