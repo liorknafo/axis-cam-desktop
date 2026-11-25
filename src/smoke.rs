@@ -6001,6 +6001,68 @@ flood = { pin = 8 }
         assert!(run_of(&a).running.is_none());
     }
 
+    /// LIO-627 review: T1 in tool runs 1 and 3. Touched off for tool run
+    /// 3, seated again and its Set Z from reference lost: tool run 1,
+    /// picked next, has the same tool, and is held too.
+    #[test]
+    fn a_lost_set_z_from_reference_holds_another_tool_run_of_the_same_tool() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        // The Face (T1), the Drill (T3), the Pocket (T1).
+        let mut a = run_app_of(dir.path(), FAST, &[0, 3, 1]);
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let tools: Vec<u32> = (run_of(&a).checked().unwrap().iter())
+            .map(|p| p.ops[0].tool)
+            .collect();
+        assert_eq!(tools, [1, 3, 1]);
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 60., "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 5., "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Run(R::RecordReference));
+        let at = conn(&a).snapshot.machine_pos[2];
+        // T3, 2 mm longer, touched off and run.
+        mdi(&mut a, &format!("G53 G0 Z{:.3}", at - 2.));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        run_until(&mut a, 5.0, "T3's touch-off", |r| r.touched());
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 60., "tool run 2", |r| r.done[1]);
+        tick_until(&mut a, 5., "Idle", |s| s.state == Some(State::Idle));
+        // T1 back, touched off for tool run 3.
+        mdi(&mut a, &format!("G53 G0 Z{at:.3}"));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        run_until(&mut a, 5.0, "T1's touch-off", |r| r.touched());
+        let offset = conn(&a).snapshot.work_offset[2];
+        // Seated again 3 mm lower, and Set Z from reference lost.
+        mdi(&mut a, &format!("G53 G0 Z{:.3}", at - 3.));
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Run(R::ZFromReference));
+        let mut deadline = Deadline::new(5.);
+        while conn(&a).z_set_waits(run_of(&a)) {
+            assert!(deadline.within(&conn(&a).snapshot), "the Z set still waits");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = a.update(Message::Tick);
+        }
+        let said = conn(&a).z_said(run_of(&a)).expect("said").to_string();
+        assert!(problems(&a).contains(&said), "{:?}", problems(&a));
+        // Tool run 1, T1 too: held the same.
+        let _ = a.update(Message::Run(R::Next(0)));
+        assert_eq!(conn(&a).z_said(run_of(&a)), Some(said.as_str()));
+        assert!(problems(&a).contains(&said), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_for(&mut a, 200);
+        assert!(run_of(&a).running.is_none());
+        assert!((conn(&a).snapshot.work_offset[2] - offset).abs() < 1e-9);
+        // Tool run 2, T3: the Z is not T3's either.
+        let _ = a.update(Message::Run(R::Next(1)));
+        assert!(!problems(&a).is_empty());
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_for(&mut a, 200);
+        assert!(run_of(&a).running.is_none());
+    }
+
     /// LIO-627 review: a Set Z from reference that did not take is over
     /// once the tool is touched off another way (Zero Z here): run with
     /// that Z and stopped, nothing says it did not take, and nothing holds

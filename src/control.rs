@@ -2620,6 +2620,10 @@ struct ZSet {
 /// apart, which is allowed too (`z_set_check`, LIO-628 review).
 const Z_SHOWN: f64 = 1e-4;
 
+/// The run (`Run::epoch`), tool run (`Run::next`) and tool
+/// (`Run::next_tool`) a Z set is for.
+type ZKey = (u64, usize, Option<String>);
+
 /// What sent a `ZSet`.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum ZBy {
@@ -2716,11 +2720,12 @@ pub struct Connection {
     /// applied (`z_set_check`, LIO-627).
     z_set: Option<ZSet>,
     /// A Z set from the reference or by probe that did not take, for the
-    /// run of that epoch (`Run::epoch`) and the tool run of its start
-    /// (`Run::next`, as `ZSet::next`), by what, and what is said of it:
-    /// what holds Cycle Start back, and the Tool change tab says, until
-    /// the tool is touched off (`z_failed`, LIO-627).
-    z_said: Option<(u64, usize, ZBy, String)>,
+    /// run of that epoch (`Run::epoch`), the tool run of its start
+    /// (`Run::next`, as `ZSet::next`) and its tool (`ZSet::tool`), by
+    /// what, and what is said of it: what holds Cycle Start back, and the
+    /// Tool change tab says, until the tool is touched off (`z_failed`,
+    /// LIO-627).
+    z_said: Option<(ZKey, ZBy, String)>,
     /// Machine positions still to declare (axis, value), sent one at a time
     /// (`declaring`): the driver drops a second `SetMachine` until it has
     /// re-read the position.
@@ -4328,11 +4333,11 @@ impl Connection {
             run.hold_touch();
             (run.zeroed, run.tool_kept) = (false, false);
             tool = run.next_tool();
-            (run.epoch, run.next)
+            (run.epoch, run.next, tool.clone())
         });
         if sent {
             // With no run, nothing is touched off by it: said at once.
-            let Some((epoch, next)) = key else {
+            let Some((epoch, next, _)) = key else {
                 return false;
             };
             self.z_set = Some(ZSet {
@@ -4365,7 +4370,7 @@ impl Connection {
     /// Says that the Z set by `by` for the run and tool run `key` (None: no
     /// run) did not take (`how`): nothing changed, and how to set it
     /// again.
-    fn z_not_set(&mut self, by: ZBy, key: Option<(u64, usize)>, how: &str) {
+    fn z_not_set(&mut self, by: ZBy, key: Option<ZKey>, how: &str) {
         let said = match by {
             ZBy::Reference => format!(
                 "Set Z from reference {how}, so the tool does not count as touched off: touch it on the reference again and press Set Z from reference."
@@ -4379,7 +4384,7 @@ impl Connection {
         if by == ZBy::Probe {
             self.probed = Some((false, said.clone()));
         }
-        self.z_said = key.map(|(epoch, next)| (epoch, next, by, said));
+        self.z_said = key.map(|key| (key, by, said));
     }
 
     /// A Z set for the run's tool on its way (`z_set`), once the machine
@@ -4440,9 +4445,9 @@ impl Connection {
             let machine = self.machine_name();
             self.z_not_set(
                 z.by,
-                // Held for the tool run it was pressed for, whichever is
-                // picked now (`z_failed` asks of that one, LIO-627 review).
-                Some((z.epoch, z.next)),
+                // Held for the tool run and tool it was pressed for,
+                // whichever is picked now (`z_failed`, LIO-627 review).
+                Some((z.epoch, z.next, z.tool.clone())),
                 &format!("did not reach {machine}, or {machine} did not apply it"),
             );
         }
@@ -4462,8 +4467,8 @@ impl Connection {
         if let Some(z) = self.z_set.as_mut().filter(|z| z.epoch == was) {
             z.epoch = now;
         }
-        if let Some(z) = self.z_said.as_mut().filter(|z| z.0 == was) {
-            z.0 = now;
+        if let Some(z) = self.z_said.as_mut().filter(|z| z.0.0 == was) {
+            z.0.0 = now;
         }
     }
 
@@ -4490,21 +4495,27 @@ impl Connection {
     }
 
     /// What is said of a Z set from the reference or by probe for `run`
-    /// that did not take, while its start is in the same tool run and its
-    /// tool not touched off since: Cycle Start waits for the touch-off
-    /// (LIO-627 review).
+    /// that did not take, while its start is in the same tool run, or in
+    /// another with the same tool, and that tool is not touched off
+    /// since: Cycle Start waits for the touch-off (LIO-627 review).
     pub fn z_failed(&self, run: &crate::run::Run) -> Option<&str> {
+        // Its tool run, or another with the same tool: the Z on the
+        // machine is not that tool's either (LIO-627 review).
+        let next_tool = run.next_tool();
         (self.z_said.as_ref())
-            .filter(|(epoch, next, _, _)| {
-                *epoch == run.epoch && *next == run.next && !run.touched() && !run.tool_kept
+            .filter(|((epoch, next, tool), _, _)| {
+                *epoch == run.epoch
+                    && (*next == run.next || (tool.is_some() && *tool == next_tool))
+                    && !run.touched()
+                    && !run.tool_kept
             })
-            .map(|(_, _, _, said)| said.as_str())
+            .map(|(_, _, said)| said.as_str())
     }
 
     /// `z_failed` of Set Z from reference: the reference rows say it (a
     /// probe's is said with the probe, `probed`).
     pub fn z_said(&self, run: &crate::run::Run) -> Option<&str> {
-        let by = self.z_said.as_ref().map(|z| z.2);
+        let by = self.z_said.as_ref().map(|z| z.1);
         self.z_failed(run).filter(|_| by == Some(ZBy::Reference))
     }
 
