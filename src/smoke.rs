@@ -5982,6 +5982,23 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Next(1)));
         assert!(run_of(&a).touched());
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Seated again, Set Z from reference lost, and tool run 1 picked
+        // while it is on its way: back at tool run 2, it holds it.
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 7.));
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Run(R::ZFromReference));
+        let _ = a.update(Message::Run(R::Next(0)));
+        tick_for(&mut a, 300);
+        let _ = a.update(Message::Run(R::Next(1)));
+        let said = conn(&a).z_said(run_of(&a)).expect("said").to_string();
+        assert!(
+            said.starts_with("Set Z from reference did not reach the controller"),
+            "{said}"
+        );
+        assert!(problems(&a).contains(&said), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_for(&mut a, 200);
+        assert!(run_of(&a).running.is_none());
     }
 
     /// LIO-627 review: a Set Z from reference that did not take is over

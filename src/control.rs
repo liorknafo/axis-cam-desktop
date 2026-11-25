@@ -4440,7 +4440,9 @@ impl Connection {
             let machine = self.machine_name();
             self.z_not_set(
                 z.by,
-                current.then_some((z.epoch, z.next)),
+                // Held for the tool run it was pressed for, whichever is
+                // picked now (`z_failed` asks of that one, LIO-627 review).
+                Some((z.epoch, z.next)),
                 &format!("did not reach {machine}, or {machine} did not apply it"),
             );
         }
