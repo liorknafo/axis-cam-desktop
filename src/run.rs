@@ -2100,6 +2100,13 @@ impl Run {
         self.cut_in_run.iter().any(|c| c.0 == HISTORY_UNKNOWN)
     }
 
+    /// This computer saw this setup's runs cut it (`cut_in_run`), not
+    /// counting that runs it did not follow may have
+    /// (`history_unknown`).
+    pub fn cut_by_runs(&self) -> bool {
+        self.cut_in_run.iter().any(|c| c.0 != HISTORY_UNKNOWN)
+    }
+
     /// Where a run of this setup stopped, found while it is open (the Pi
     /// stopped a tool run this computer did not follow): its start is the
     /// step after, now or once it is checked.

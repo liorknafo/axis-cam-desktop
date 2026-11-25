@@ -10957,6 +10957,17 @@ flood = { pin = 8 }
         none_set(&a);
         pass_2(&mut a);
         assert_eq!(none_set(&a), crate::run::HISTORY_UNFOLLOWED_BLOCKED);
+        // Away once more: asked again, still as taken as cut, for what runs
+        // this computer did not follow may have cut is not this setup's
+        // runs' cut (LIO-606 review); answered the same part, still unknown.
+        reconnect(&mut a);
+        assert!(run_of(&a).away.is_some() && run_of(&a).history_unknown());
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        shows(&a, &[crate::ui::AWAY_DECLARED_ASKED]);
+        lacks(&a, &[crate::ui::AWAY_ASKED]);
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(run_of(&a).away.is_none() && run_of(&a).history_unknown());
+        assert_eq!(none_set(&a), crate::run::HISTORY_UNFOLLOWED_BLOCKED);
         // New stock: forgotten, what was taken as cut too, and the setup
         // checked again without it.
         let _ = a.update(Message::Run(R::NewStock));

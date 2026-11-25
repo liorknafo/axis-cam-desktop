@@ -11625,12 +11625,20 @@ fn stock_question<'a>(
 ) -> Option<iced::widget::Column<'a, Message>> {
     use crate::run::Action as R;
     let running = run.running.is_some();
+    // Only taken as cut: nothing this computer saw its runs cut, the mark
+    // that runs it did not follow may have (`history_unknown`) not counted
+    // as such, and operations or steps taken as cut, or dropped since
+    // (LIO-606 review).
+    let only_taken = {
+        let (skips, steps) = run.declared();
+        !run.cut_by_runs() && (!skips.is_empty() || !steps.is_empty() || run.declared_lost)
+    };
     // This setup's runs cut a part earlier, this session or before AXIS
     // CAM was last closed (LIO-594): is it still the one held? Asked on a row of its own, so the work zero's
     // buttons keep their room (LIO-582 review).
     let stock = (run.stock_unconfirmed && run.away.is_none()).then(|| {
         column![
-            text(if run.cut_in_run.is_empty() {
+            text(if only_taken {
                 // Only taken as cut, this session or before AXIS CAM was
                 // last closed (LIO-583 review, LIO-611).
                 "Operations or steps of this setup were taken as cut earlier. Is it still the same part?"
@@ -11665,7 +11673,7 @@ fn stock_question<'a>(
             // answers so it shows with them in a short window (LIO-595
             // review).
             // Only taken as cut, as above (LIO-606).
-            let asked = if run.cut_in_run.is_empty() {
+            let asked = if only_taken {
                 AWAY_DECLARED_ASKED
             } else {
                 AWAY_ASKED
