@@ -4674,7 +4674,7 @@ impl Connection {
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::DECLARED_LOST] =>
             {
-                Some("Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut where a probe finds this work zero.".into())
+                Some("Operations or steps of this setup were taken as cut before the project changed, and the check may not take all of them as cut now where a probe finds this work zero.".into())
             }
             Some((None, _)) => Some(crate::run::PARTWAY_UNKNOWN.to_string()),
             // Not a part of the stock: the reason the check cannot tell it.

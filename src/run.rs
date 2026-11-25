@@ -394,16 +394,15 @@ pub(crate) const HISTORY_UNFOLLOWED_BLOCKED: &str = "Runs this computer did not 
 
 /// What was taken as cut before the project changed, said as `Partly::cut`
 /// (`Run::declared_lost`, LIO-583 review).
-pub(crate) const DECLARED_LOST: &str =
-    "stock taken as cut before the project changed, which the check no longer takes as cut";
+pub(crate) const DECLARED_LOST: &str = "stock taken as cut before the project changed, some of which the check may no longer take as cut";
 
 /// Why a probe cannot find a work zero from a spot while
 /// `Run::declared_lost`.
-pub(crate) const DECLARED_LOST_WHY: &str = "Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut.";
+pub(crate) const DECLARED_LOST_WHY: &str = "Operations or steps of this setup were taken as cut before the project changed, and the check may not take all of them as cut now.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::declared_lost`.
-const DECLARED_LOST_BLOCKED: &str = "Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut, so it cannot tell the surface where the stock top is touched off.";
+const DECLARED_LOST_BLOCKED: &str = "Operations or steps of this setup were taken as cut before the project changed, and the check may not take all of them as cut now, so it cannot tell the surface where the stock top is touched off.";
 
 /// What other setups' runs cut this session, said as `Partly::cut`, when
 /// the check does not simulate it before this setup as it was cut
@@ -617,7 +616,10 @@ pub struct Run {
     /// (`checked_as`). The check no longer takes their material as cut, so
     /// it cannot tell the surface the stock top is touched off on: nothing
     /// sets Z or probes, and Cycle Start waits for the work zero, until New
-    /// stock loaded (`new_stock`, LIO-583 review).
+    /// stock loaded (`new_stock`, LIO-583 review). Taking operations or
+    /// steps as cut again keeps it, as what was dropped may not be what is
+    /// taken as cut again: the words say "may not all be taken as cut now"
+    /// (LIO-621).
     pub declared_lost: bool,
     /// Its skips came with a tool run it follows (`following`) that was
     /// sent before a project edit the session noted (`App::run_declared`
@@ -2696,7 +2698,7 @@ impl Run {
                         // Dropped by an edit: only a hand, or new stock,
                         // knows the surface (LIO-583 review).
                         _ if self.declared_lost && !later => format!(
-                            "This run starts at {}, and operations or steps taken as cut before the project changed are no longer taken as cut, so the check cannot tell the surface they left where the work zero is touched off: in the Work zero tab, set Z by hand on a surface whose height you know and press Keep this work zero, or press New stock loaded if the stock is new.",
+                            "This run starts at {}, and operations or steps taken as cut before the project changed may not all be taken as cut now, so the check cannot tell the surface they left where the work zero is touched off: in the Work zero tab, set Z by hand on a surface whose height you know and press Keep this work zero, or press New stock loaded if the stock is new.",
                             first.name
                         ),
                         // Nothing sets Z on the stock they left but a hand
