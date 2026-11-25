@@ -5916,6 +5916,107 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
     }
 
+    /// Another setup's steps taken as cut, kept from before, and setup 0
+    /// picked: evidence makes that record unknown, setup 0's too as it has
+    /// it, so no Set Z is offered, as the note says. New stock loaded
+    /// forgets it with the rest: setup 0 picked again offers Set Z on the
+    /// new stock at once (LIO-596 review).
+    #[test]
+    fn new_stock_after_evidence_forgets_another_setups_steps_taken_as_cut() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server, relay) = face_on_the_pi(dir.path());
+        a.run_declared.push(crate::run::KeptDeclared {
+            setup: "lio596-another-setup".into(),
+            skips: vec![],
+            steps: vec![(0, vec![0])],
+            lost: false,
+            prints: vec![],
+        });
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let fresh = conn(&a).touch_off().map(|(_, w)| w[2]);
+        assert_eq!(fresh, Some(0.));
+        assert!(tool_run_elsewhere_said(
+            &mut a,
+            dir.path(),
+            &server,
+            &relay,
+            99
+        ));
+        assert!(run_of(&a).history_unknown());
+        assert_eq!(conn(&a).touch_off(), None);
+        new_stock_checked(&mut a, 0);
+        assert!(
+            a.run_cuts.iter().all(|(_, c)| c.is_empty()),
+            "{:?}",
+            a.run_cuts
+        );
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), fresh);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert!(
+            !run_of(&a).history_unknown(),
+            "{:?}",
+            run_of(&a).earlier_cuts
+        );
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), fresh);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// As above in a project of two setups: pass 1 taken as cut on setup
+    /// 0, setup 1 picked, evidence, New stock loaded on setup 1. Neither
+    /// setup picked afterwards says unknown or withholds Set Z on the new
+    /// stock (LIO-596 review).
+    #[test]
+    fn new_stock_after_evidence_forgets_steps_taken_as_cut_on_the_setup_not_picked() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server, relay) = face_on_the_pi(dir.path());
+        let mut second = a.doc.setups[0].clone();
+        second.id = crate::id();
+        for op in &mut second.operations {
+            op.id = crate::id();
+        }
+        a.doc.setups.push(second);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let fresh0 = conn(&a).touch_off().map(|(_, w)| w[2]);
+        let _ = a.update(Message::Run(R::Steps(Some(0))));
+        let _ = a.update(Message::Run(R::PickStep(0, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Setup(1)));
+        answer_skips(&mut a, 1);
+        let fresh1 = conn(&a).touch_off().map(|(_, w)| w[2]);
+        assert!(tool_run_elsewhere_said(
+            &mut a,
+            dir.path(),
+            &server,
+            &relay,
+            99
+        ));
+        assert_eq!(conn(&a).touch_off(), None);
+        new_stock_checked(&mut a, 1);
+        for (si, fresh) in [(0, fresh0), (1, fresh1)] {
+            let _ = a.update(Message::Run(R::Setup(si)));
+            answer_skips(&mut a, si);
+            if run_of(&a).programs.is_none() {
+                answer_skips(&mut a, si);
+            }
+            assert!(
+                !run_of(&a).history_unknown(),
+                "setup {si}: {:?}",
+                a.run_cuts
+            );
+            assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), fresh, "setup {si}");
+        }
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// A start at the Drilling takes the Face as cut; evidence seen while
     /// its check is computed again (`partway` needs the check) still marks
     /// it, and no Set Z is offered once the check is in (LIO-596 review).

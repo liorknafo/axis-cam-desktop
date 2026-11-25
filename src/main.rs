@@ -4978,6 +4978,7 @@ impl App {
         }
         // A setup whose operations or steps were only taken as cut: their
         // material may be cut deeper since too (LIO-596 review).
+        let mut declared = vec![];
         for d in &self.run_declared {
             if d.skips.is_empty() && d.steps.is_empty() && !d.lost {
                 continue;
@@ -4990,8 +4991,25 @@ impl App {
                     marked |= run::note_unknown_before(cuts);
                 }
             }
+            declared.push(d.setup.clone());
         }
         if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
+            // The run picked has another such setup's mark as it would
+            // picked now (`give_earlier_cuts`), so it sets no Z as its note
+            // says, and New stock loaded forgets the mark with the rest
+            // (`keep_run_cuts`, LIO-596 review).
+            for id in declared.into_iter().filter(|id| *id != r.setup_id) {
+                match r.earlier_cuts.iter_mut().find(|(e, _)| *e == id) {
+                    Some((_, cuts)) => marked |= run::note_unknown_before(cuts),
+                    None => {
+                        let cuts = vec![(run::HISTORY_UNKNOWN, None, None)];
+                        r.earlier_cuts.push((id.clone(), cuts));
+                    }
+                }
+                if !r.earlier_given.contains(&id) {
+                    r.earlier_given.push(id);
+                }
+            }
             marked |= r.note_cut_elsewhere();
         }
         marked
