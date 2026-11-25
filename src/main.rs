@@ -12488,15 +12488,18 @@ fn owners_of(
 /// Gives `run` whose the setups of its `earlier_cuts` that are another
 /// project's are (`owners`, `App::cut_owners`; `run::Run::earlier_elsewhere`),
 /// so that their cuts are said as that project's (LIO-607). One `doc` has,
-/// or one deleted from it, is this project's; one with no owner kept, of a
-/// project not known.
+/// or one deleted from it (`run::Run::earlier_own`), is this project's; one
+/// with no owner kept, of a project not known (`run::Run::earlier_not_here`,
+/// LIO-635).
 fn give_elsewhere(owners: &[run::CutOwner], doc: &Document, run: &mut run::Run) {
-    run.earlier_elsewhere = (run.earlier_cuts.iter())
+    let gone = (run.earlier_cuts.iter())
         .filter(|(id, _)| !doc.setups.iter().any(|s| s.id == *id))
-        .filter_map(|(id, _)| owners.iter().find(|o| o.setup == *id))
-        .filter(|o| o.project != doc.project_id)
-        .cloned()
-        .collect();
+        .filter_map(|(id, _)| owners.iter().find(|o| o.setup == *id));
+    let (own, elsewhere): (Vec<&run::CutOwner>, Vec<&run::CutOwner>) =
+        gone.partition(|o| o.project == doc.project_id);
+    run.earlier_elsewhere = elsewhere.into_iter().cloned().collect();
+    // Deleted from it since: not another project's (LIO-635).
+    run.earlier_own = own.into_iter().map(|o| o.setup.clone()).collect();
 }
 
 /// Notes in `pending` (`App::run_pending`) the tool run `run` runs as it is
