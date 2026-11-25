@@ -9565,9 +9565,10 @@ impl App {
                     if away && c.run.as_ref().is_some_and(|r| r.away.is_none()) {
                         self.answered_away(&action);
                     }
-                    // New stock loaded: what runs cut is forgotten now, not
-                    // only once the run is dropped, so nothing seen since
-                    // says it is unknown (LIO-596 review).
+                    // New stock loaded: what runs cut, and what every setup
+                    // took as cut, is forgotten now, not only once the run
+                    // is dropped, so nothing seen since says it is unknown
+                    // (LIO-596 review).
                     if new_stock
                         && let Some(r) = (self.control.as_ref())
                             .and_then(|c| c.run.as_ref())
@@ -9575,6 +9576,8 @@ impl App {
                     {
                         keep_run_cuts(&mut self.run_cuts, r, self.others_unknown);
                         keep_pending_cuts(&mut self.run_pending, r);
+                        self.run_declared.clear();
+                        keep_declared(&mut self.run_declared, r);
                     }
                 }
             }

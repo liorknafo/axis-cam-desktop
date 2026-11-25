@@ -2140,6 +2140,10 @@ impl Run {
             || declared
             || self.declared_lost
             || self.partway()
+            // A start at a later operation or step, while its check is
+            // pending (`partway` needs it).
+            || (((self.next, self.from) != (0, 0) || self.start_step.is_some())
+                && !self.started())
             || !self.all_cut().is_empty())
             && !(self.cut_in_run.iter()).any(|c| c.0 == HISTORY_UNKNOWN);
         if own {

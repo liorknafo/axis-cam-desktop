@@ -5789,6 +5789,165 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
     }
 
+    /// `run_app_of`'s Face, 2 mm a pass, on a Pi through a relay the test
+    /// can cut, the machine zeroed (LIO-596 review).
+    fn face_on_the_pi(dir: &std::path::Path) -> (App, uc100_remote::Server, Relay) {
+        let mut a = run_app_of(dir, &fast_z_slow(), &[0, 3]);
+        let face = &mut a.doc.setups[0].operations[0].p;
+        face.insert("stepdown".into(), "2".into());
+        face.insert("feed".into(), "6000".into());
+        let server = to_pi(&mut a, dir);
+        let relay = Relay::to(server.addr());
+        let _ = a.update(Message::PiAddress(relay.addr.to_string()));
+        zeroed(&mut a);
+        (a, server, relay)
+    }
+
+    /// New stock loaded on setup `si`, then the check it asks for.
+    fn new_stock_checked(a: &mut App, si: usize) {
+        let _ = a.update(Message::Run(crate::run::Action::NewStock));
+        for _ in 0..3 {
+            let _ = a.update(Message::Tick);
+            if run_of(a).programs.is_none() {
+                answer_skips(a, si);
+            }
+        }
+    }
+
+    /// Another computer's tool run `id` while the link is down; whether the
+    /// Pi note says this computer's record is not known any more.
+    fn tool_run_elsewhere_said(
+        a: &mut App,
+        dir: &std::path::Path,
+        server: &uc100_remote::Server,
+        relay: &Relay,
+        id: u64,
+    ) -> bool {
+        if let Some(c) = a.control.as_mut() {
+            c.pi_note = None;
+        }
+        drop_the_link(a, relay);
+        let other = another_computer_in_control(dir, server);
+        another_computers_tool_run(&other, server, id);
+        other.shutdown();
+        link_back(a, relay, true);
+        let note = conn(a).pi_note.clone().unwrap_or_default();
+        note.contains("not known any more")
+    }
+
+    /// Pass 1 of the Face taken as cut, kept for the setup as it is picked
+    /// again (`App::run_declared`), then New stock loaded: nothing is at
+    /// stake, so another computer's tool run marks nothing, says nothing,
+    /// and Set Z stays offered (LIO-596 review).
+    #[test]
+    fn evidence_after_new_stock_says_nothing_of_steps_taken_as_cut_before() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server, relay) = face_on_the_pi(dir.path());
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let fresh = conn(&a).touch_off().map(|(_, w)| w[2]);
+        let _ = a.update(Message::Run(R::Steps(Some(0))));
+        let _ = a.update(Message::Run(R::PickStep(0, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert!(!a.run_declared.is_empty() || !run_of(&a).all_cut().is_empty());
+        new_stock_checked(&mut a, 0);
+        assert!(a.run_declared.is_empty(), "{:?}", a.run_declared);
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), fresh);
+        assert!(!tool_run_elsewhere_said(
+            &mut a,
+            dir.path(),
+            &server,
+            &relay,
+            99
+        ));
+        assert!(
+            a.run_cuts.iter().all(|(_, c)| c.is_empty()),
+            "{:?}",
+            a.run_cuts
+        );
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), fresh);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// As above, the steps taken as cut another setup's, kept from before
+    /// (as cuts.json keeps them): New stock loaded on setup 0 forgets them
+    /// too, so evidence, now or after New stock loaded again, neither says
+    /// nor blocks anything (LIO-596 review).
+    #[test]
+    fn evidence_after_new_stock_says_nothing_of_another_setups_steps_taken_as_cut() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server, relay) = face_on_the_pi(dir.path());
+        a.run_declared.push(crate::run::KeptDeclared {
+            setup: "lio596-another-setup".into(),
+            skips: vec![],
+            steps: vec![(0, vec![0])],
+            lost: false,
+            prints: vec![],
+        });
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        new_stock_checked(&mut a, 0);
+        let fresh = conn(&a).touch_off().map(|(_, w)| w[2]);
+        assert_eq!(fresh, Some(0.));
+        for id in [99, 98] {
+            assert!(!tool_run_elsewhere_said(
+                &mut a,
+                dir.path(),
+                &server,
+                &relay,
+                id
+            ));
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(&mut a, 0);
+            if run_of(&a).programs.is_none() {
+                answer_skips(&mut a, 0);
+            }
+            assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), fresh);
+            new_stock_checked(&mut a, 0);
+        }
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// A start at the Drilling takes the Face as cut; evidence seen while
+    /// its check is computed again (`partway` needs the check) still marks
+    /// it, and no Set Z is offered once the check is in (LIO-596 review).
+    #[test]
+    fn evidence_while_a_later_starts_check_is_pending_marks_it() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _server, _relay) = face_on_the_pi(dir.path());
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::From(1, 0)));
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert!(run_of(&a).partway() && conn(&a).touch_off().is_some());
+        let epoch = a.run_epoch + 1;
+        a.run_epoch = epoch;
+        a.control
+            .as_mut()
+            .unwrap()
+            .run
+            .as_mut()
+            .unwrap()
+            .check_again(epoch);
+        assert!(run_of(&a).programs.is_none());
+        assert!(a.cut_elsewhere());
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).history_unknown(), "{:?}", run_of(&a).cut_in_run);
+        assert_eq!(conn(&a).touch_off(), None);
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// As above, but the other computer, having taken control while the
     /// link was down, still holds it when the link is back: this computer
     /// watches it, and whatever it does from now on, the record is unknown
