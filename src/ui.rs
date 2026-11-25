@@ -11625,13 +11625,15 @@ fn stock_question<'a>(
 ) -> Option<iced::widget::Column<'a, Message>> {
     use crate::run::Action as R;
     let running = run.running.is_some();
-    // Only taken as cut: nothing this computer saw its runs cut, the mark
-    // that runs it did not follow may have (`history_unknown`) not counted
-    // as such, and operations or steps taken as cut, or dropped since
-    // (LIO-606 review).
+    // Only taken as cut: this computer saw none of its runs cut, and the
+    // mark that runs it did not follow may have (`history_unknown`) is not
+    // the whole story either, for something is taken as cut, or was and
+    // has been dropped or undone since, Don't skip pressed before the
+    // answer say (LIO-606 review).
     let only_taken = {
         let (skips, steps) = run.declared();
-        !run.cut_by_runs() && (!skips.is_empty() || !steps.is_empty() || run.declared_lost)
+        let taken = !skips.is_empty() || !steps.is_empty() || run.declared_lost;
+        !run.cut_by_runs() && (taken || !run.history_unknown())
     };
     // This setup's runs cut a part earlier, this session or before AXIS
     // CAM was last closed (LIO-594): is it still the one held? Asked on a row of its own, so the work zero's

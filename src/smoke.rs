@@ -10992,6 +10992,80 @@ flood = { pin = 8 }
         assert!(!run.stock_unconfirmed && run.away.is_none() && !run.history_unknown());
     }
 
+    /// The Pocket's level 1 taken as cut, then the setup picked again: the
+    /// question is open, and the level is undone (Don't skip) before it is
+    /// answered. Nothing is taken as cut any more, and the setup's runs
+    /// cut nothing, so the question still says the level was taken as
+    /// cut, not that the runs cut a part: so too after a disconnect
+    /// (LIO-606 review).
+    #[test]
+    fn a_level_undone_before_the_answer_is_still_said_as_taken_as_cut() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = level_taken_as_cut(dir.path());
+        let undo = |a: &mut App| {
+            let _ = a.update(Message::Run(R::Steps(Some(1))));
+            let _ = a.update(Message::Run(R::PickStep(1, 0)));
+            let _ = a.update(Message::Run(R::SkipSteps(false)));
+            answer_skips(a, 0);
+            if run_of(a).programs.is_none() {
+                answer_skips(a, 0);
+            }
+            let run = run_of(a);
+            assert!(run.all_cut().is_empty() && run.cut_in_run.is_empty());
+            assert!(run.stock_unconfirmed);
+        };
+        let plain = "Operations or steps of this setup were taken as cut earlier. Is it still the same part?";
+        let runs = "This setup's runs cut a part earlier. Is it still the one held?";
+        // Picked again, undone before the answer.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_none());
+        undo(&mut a);
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        shows(&a, &[plain]);
+        lacks(&a, &[runs]);
+        // Taken as cut again, then a disconnect: undone before the answer.
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 0)));
+        let _ = a.update(Message::Run(R::SkipSteps(true)));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).all_cut(), [(1, vec![0])]);
+        let _ = a.update(Message::Disconnect);
+        assert!(a.control.is_none());
+        let _ = a.update(Message::Connect);
+        tick_until(&mut a, 5., "E-stop or Idle after connecting", |s| {
+            matches!(s.state, Some(State::EStop | State::Idle))
+        });
+        if conn(&a).snapshot.state == Some(State::EStop) {
+            let _ = a.update(Message::MachineReset);
+            tick_until(&mut a, 5., "Idle after Reset", |s| {
+                s.state == Some(State::Idle)
+            });
+        }
+        if !conn(&a).snapshot.referenced[..3].iter().all(|r| *r) {
+            let _ = a.update(Message::Machine(crate::control::Action::KeepPosition));
+            tick_until(&mut a, 3., "machine position kept", |s| {
+                s.referenced[..3].iter().all(|r| *r)
+            });
+        }
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert!(run_of(&a).away.is_some());
+        undo(&mut a);
+        assert!(run_of(&a).away.is_some());
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        shows(&a, &[crate::ui::AWAY_DECLARED_ASKED]);
+        lacks(&a, &[crate::ui::AWAY_ASKED]);
+    }
+
     /// A Drill hole taken as cut on the Pi, this setup's runs having cut
     /// nothing; then the machine disconnected, and another computer ran a
     /// tool run on the Pi meanwhile (LIO-606). Connected again and the
