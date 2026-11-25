@@ -2080,8 +2080,17 @@ impl Run {
     /// (`HISTORY_UNKNOWN`), until New stock loaded. True when any of them
     /// was not already.
     pub fn note_cut_elsewhere(&mut self) -> bool {
-        // A tool run running cuts, its check in or not (LIO-596 review).
-        let own = (self.running.is_some() || !self.cuts_so_far().is_empty())
+        // A tool run running cuts, its check in or not; what was taken as
+        // cut, skipped, stepped over or started after (`partway`), may be
+        // cut deeper since too (LIO-596 review).
+        let (skips, steps) = self.declared();
+        let declared = !skips.is_empty() || steps.iter().any(|(_, s)| !s.is_empty());
+        let own = (self.running.is_some()
+            || !self.cuts_so_far().is_empty()
+            || declared
+            || self.declared_lost
+            || self.partway()
+            || !self.all_cut().is_empty())
             && !(self.cut_in_run.iter()).any(|c| c.0 == HISTORY_UNKNOWN);
         if own {
             self.note_history_unknown();
@@ -11179,12 +11188,12 @@ pub(crate) mod tests {
             assert!(!run.earlier_unfollowed());
         }
         // Something else may have cut the part since (LIO-596): setup 1's
-        // record, as setup 2 has it, is unknown, and nothing of setup 2's
-        // own is.
+        // record, as setup 2 has it, is unknown, and so is the level setup
+        // 2's start at level 2 takes as cut (LIO-596 review).
         let mut run = at_level_2(&doc);
         assert!(run.note_cut_elsewhere(), "{:?}", run.earlier_cuts);
         assert!(!run.note_cut_elsewhere(), "noted once");
-        assert!(run.cut_in_run.is_empty(), "{:?}", run.cut_in_run);
+        assert_eq!(run.cut_in_run, [(HISTORY_UNKNOWN, None, None)]);
         let unknown = |run: &Run| run.partly().is_some_and(|p| p.cut == [HISTORY_UNFOLLOWED]);
         let said = |run: &Run| {
             let why = run.partway_blocked().unwrap();
@@ -11222,7 +11231,7 @@ pub(crate) mod tests {
         // Before the disconnect, its start touches off on the stock the
         // check carves with setup 1's cuts.
         assert!(run.touch_off().is_some() && run.partway_blocked().is_none());
-        crate::give_away(&away, &mut run, &doc);
+        crate::give_away(&away, &mut run);
         assert!(run.stock_unconfirmed);
         assert_eq!(
             run.away,
@@ -11240,17 +11249,26 @@ pub(crate) mod tests {
         // Nothing of setup 1's kept: nothing to ask.
         let mut run = Run::new(&doc, 1, 0);
         crate::give_earlier_cuts(&[], &mut run);
-        crate::give_away(&away, &mut run, &doc);
+        crate::give_away(&away, &mut run);
         assert!(!run.stock_unconfirmed && run.away.is_none());
-        // Another project's setup kept so: its cuts set no Z until New
-        // stock loaded whatever is answered, and are said as its own
-        // (LIO-607), so nothing is asked for them.
-        let mut other = doc.clone();
-        other.remove_setup(0).unwrap();
-        let si = (other.setups.iter()).position(|s| s.p.get("rx").is_some_and(|r| r == "180"));
-        let mut run = Run::new(&other, si.unwrap(), 0);
+        // Setup 1 deleted since: still asked for, as put back its cuts are
+        // followed again (LIO-596 review).
+        let mut deleted = doc.clone();
+        deleted.remove_setup(0).unwrap();
+        let si = (deleted.setups.iter()).position(|s| s.p.get("rx").is_some_and(|r| r == "180"));
+        let mut run = Run::new(&deleted, si.unwrap(), 0);
         crate::give_earlier_cuts(&session, &mut run);
-        crate::give_away(&away, &mut run, &other);
+        crate::give_away(&away, &mut run);
+        assert!(run.stock_unconfirmed && run.away.is_some());
+        // Another project's setup kept so (`earlier_elsewhere`): its cuts
+        // set no Z until New stock loaded whatever is answered, and are said
+        // as that project's (LIO-607), so nothing is asked for them.
+        let mut run = Run::new(&deleted, si.unwrap(), 0);
+        crate::give_earlier_cuts(&session, &mut run);
+        let mut owner = CutOwner::of(&doc, 0);
+        owner.project = "another project".into();
+        run.earlier_elsewhere = vec![owner];
+        crate::give_away(&away, &mut run);
         assert!(!run.stock_unconfirmed && run.away.is_none());
     }
 

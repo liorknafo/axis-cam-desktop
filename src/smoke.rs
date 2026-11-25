@@ -5738,6 +5738,57 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
     }
 
+    /// As above, but nothing was cut by this computer: the Face's pass 2 is
+    /// picked to start at, pass 1 taken as cut, so Set Z−2 is offered on the
+    /// floor the operator says it left. Another computer's tool run while
+    /// the link is down may have cut pass 2 to Z−4 there: what was taken as
+    /// cut is not known any more either (LIO-596 review).
+    #[test]
+    fn a_tool_run_another_computer_ran_while_the_pi_link_was_down_unknowns_steps_taken_as_cut() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 3]);
+        let face = &mut a.doc.setups[0].operations[0].p;
+        face.insert("stepdown".into(), "2".into());
+        face.insert("feed".into(), "6000".into());
+        let server = to_pi(&mut a, dir.path());
+        let relay = Relay::to(server.addr());
+        let _ = a.update(Message::PiAddress(relay.addr.to_string()));
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Steps(Some(0))));
+        let _ = a.update(Message::Run(R::PickStep(0, 1)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        assert!(run_of(&a).cut_in_run.is_empty());
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
+        drop_the_link(&mut a, &relay);
+        let other = another_computer_in_control(dir.path(), &server);
+        another_computers_tool_run(&other, &server, 99);
+        other.shutdown();
+        link_back(&mut a, &relay, true);
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        let z = conn(&a).touch_off().map(|(_, w)| w[2]);
+        assert_eq!(z, None, "Set Z offered on a floor only taken as cut");
+        assert!(run_of(&a).history_unknown(), "{:?}", run_of(&a).cut_in_run);
+        let note = conn(&a).pi_note.clone().unwrap_or_default();
+        assert!(note.contains("did not send"), "{note}");
+        // Kept so for the setup picked again.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        if run_of(&a).stock_unconfirmed {
+            let _ = a.update(Message::Run(R::SamePart));
+        }
+        assert!(run_of(&a).history_unknown(), "{:?}", run_of(&a).cut_in_run);
+        assert!(conn(&a).touch_off().is_none());
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// As above, but the other computer, having taken control while the
     /// link was down, still holds it when the link is back: this computer
     /// watches it, and whatever it does from now on, the record is unknown
@@ -11268,6 +11319,11 @@ flood = { pin = 8 }
             "{:?}",
             a.run_cuts
         );
+        // Started from the setup's start, nothing is taken as cut either:
+        // nothing is at stake (a start at pass 2 takes pass 1 as cut, which
+        // evidence would make unknown, LIO-596 review).
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        assert!(!run_of(&a).partway(), "{:?}", run_of(&a).at_step());
         assert!(!a.cut_elsewhere());
         assert!(conn(&a).touch_off().is_some());
         // The Face's setup cut nothing on the new stock; another setup's
@@ -11284,6 +11340,10 @@ flood = { pin = 8 }
         }
         a.run_cuts.push((other.clone(), cut.clone()));
         reconnect(&mut a);
+        // From the setup's start: it takes nothing as cut either (picked
+        // again, it starts at pass 2, after its run's stop).
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        assert!(!run_of(&a).partway(), "{:?}", run_of(&a).at_step());
         assert!(run_of(&a).cut_in_run.is_empty());
         assert!(conn(&a).touch_off().is_none());
         let _ = a.update(Message::Run(R::OtherRunsMayHaveCut));

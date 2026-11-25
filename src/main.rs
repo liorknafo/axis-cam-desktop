@@ -4976,6 +4976,21 @@ impl App {
         for p in &mut self.run_pending {
             marked |= run::note_unknown_before(&mut p.3);
         }
+        // A setup whose operations or steps were only taken as cut: their
+        // material may be cut deeper since too (LIO-596 review).
+        for d in &self.run_declared {
+            if d.skips.is_empty() && d.steps.is_empty() && !d.lost {
+                continue;
+            }
+            match self.run_cuts.iter_mut().find(|(id, _)| *id == d.setup) {
+                Some((_, cuts)) => marked |= run::note_unknown_before(cuts),
+                None => {
+                    self.run_cuts.push((d.setup.clone(), vec![]));
+                    let cuts = &mut self.run_cuts.last_mut().unwrap().1;
+                    marked |= run::note_unknown_before(cuts);
+                }
+            }
+        }
         if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
             marked |= r.note_cut_elsewhere();
         }
@@ -5067,7 +5082,7 @@ impl App {
         give_earlier_cuts(&self.run_cuts, &mut following);
         give_elsewhere(&self.cut_owners, &self.doc, &mut following);
         // Kept across a disconnect: was anything else run meanwhile?
-        give_away(&self.run_away, &mut following, &self.doc);
+        give_away(&self.run_away, &mut following);
         c.run = Some(following);
         c.probe_spot = None;
         self.run_on_connect = None;
@@ -9160,7 +9175,7 @@ impl App {
                             // Its cuts were kept across the disconnect:
                             // was anything else run meanwhile (LIO-595)?
                             if let Some(r) = c.run.as_mut() {
-                                give_away(&self.run_away, r, &self.doc);
+                                give_away(&self.run_away, r);
                             }
                         }
                         self.status = format!("Connecting to {}…", m.name());
@@ -9377,7 +9392,7 @@ impl App {
                 }
                 let skipped = !r.skips.is_empty();
                 give_elsewhere(&self.cut_owners, &self.doc, &mut r);
-                give_away(&self.run_away, &mut r, &self.doc);
+                give_away(&self.run_away, &mut r);
                 c.run = Some(r);
                 // A spot picked to probe from was for the setup before.
                 c.probe_spot = None;
@@ -12455,16 +12470,18 @@ fn mark_away(
 /// Gives `run` its setup's entry of `away` (`App::run_away`): its cuts were
 /// kept across a disconnect, so the operator is asked whether it is the
 /// same part and whether anything else ran meanwhile (LIO-595). So is it
-/// when it has none, but has another setup's of `doc` kept so
-/// (`earlier_cuts`), which the answer covers too (LIO-596); given after
-/// them. Not for a setup `doc` does not have (another project's, or one
-/// deleted): its cuts set no Z until New stock loaded whatever is answered
-/// (`Run::earlier_unfollowed`, LIO-607).
-fn give_away(away: &[(String, run::Away)], run: &mut run::Run, doc: &Document) {
+/// when it has none, but has another setup's kept so (`earlier_cuts`),
+/// which the answer covers too (LIO-596); given after them and after
+/// whose they are (`give_elsewhere`). Not for another project's setup
+/// (`Run::earlier_elsewhere`): its cuts set no Z until New stock loaded
+/// whatever is answered, and are said as that project's (LIO-607). A
+/// setup deleted from this project is asked for: put back, its cuts are
+/// followed again (LIO-596 review).
+fn give_away(away: &[(String, run::Away)], run: &mut run::Run) {
     let own = (away.iter())
         .find(|(id, _)| *id == run.setup_id)
         .filter(|_| !run.cuts_so_far().is_empty());
-    let ours = |id: &String| doc.setups.iter().any(|s| s.id == *id);
+    let ours = |id: &String| !run.earlier_elsewhere.iter().any(|o| o.setup == *id);
     let earlier = || {
         away.iter().find(|(id, _)| {
             ours(id) && (run.earlier_cuts.iter()).any(|(e, cuts)| e == id && !cuts.is_empty())
