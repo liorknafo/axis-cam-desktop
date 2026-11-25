@@ -5689,6 +5689,288 @@ flood = { pin = 8 }
         cycle_start_after_set_work(&mut a, crate::run::CONTROLLER_TAKING);
     }
 
+    /// LIO-627: Set Z from reference at a tool change on the Pi counts the
+    /// new tool as touched off only once the Pi shows it applied. One the
+    /// link does not take, or loses on its way, changes nothing: Cycle
+    /// Start, pressed meanwhile, waits for it and then asks for the
+    /// touch-off, nothing run with the old tool's Z, and the Tool change tab
+    /// says to set it again. Set again, Cycle Start pressed at once waits
+    /// for it and runs with the new Z.
+    #[test]
+    fn a_set_z_from_reference_that_never_reaches_the_pi_touches_nothing_off() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 60., "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 5., "Idle", |s| s.state == Some(State::Idle));
+        assert!(run_of(&a).tool_change().is_some());
+        let _ = a.update(Message::Run(R::RecordReference));
+        let reference = run_of(&a).reference.unwrap();
+        // The new tool, 2 mm longer, its tip on the reference.
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 2.));
+        let before = conn(&a).snapshot.work_offset[2];
+        let _ = a.update(Message::ControlPhaseTab(
+            crate::ui::ControlTab::ToolChange,
+            false,
+        ));
+        let unchanged = |a: &App| {
+            assert!(!run_of(a).touched() && !run_of(a).zeroed);
+            assert!(!conn(a).z_set_waits(run_of(a)));
+            assert!((conn(a).snapshot.work_offset[2] - before).abs() < 1e-9);
+            assert!(
+                problems(a)
+                    .iter()
+                    .any(|p| p.contains("touch off its Z first")),
+                "{:?}",
+                problems(a)
+            );
+            let said = conn(a).z_said(run_of(a)).expect("said").to_string();
+            assert!(
+                said.ends_with(
+                    "so Z is as it was: touch the tool on the reference again and press Set Z from reference."
+                ),
+                "{said}"
+            );
+            assert!(problems(a).contains(&said), "{:?}", problems(a));
+            assert!(page_texts(a).contains(&said), "{:?}", page_texts(a));
+            said
+        };
+        // Not taken by the link: said at once.
+        a.control.as_mut().unwrap().lose_next_z = Some(false);
+        let _ = a.update(Message::Run(R::ZFromReference));
+        let said = unchanged(&a);
+        assert!(
+            said.starts_with("Set Z from reference was not sent ("),
+            "{said}"
+        );
+        // Lost on its way: Cycle Start waits for it, then asks for the
+        // touch-off; nothing ran.
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Run(R::ZFromReference));
+        assert!(conn(&a).z_said(run_of(&a)).is_none());
+        assert!(!run_of(&a).touched() && conn(&a).z_set_waits(run_of(&a)));
+        assert!(
+            (page_texts(&a).iter())
+                .any(|t| t == "Work Z sent: the tool counts as touched off once the Pi shows it."),
+            "{:?}",
+            page_texts(&a)
+        );
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.contains("Set Z from reference did not reach the Pi"),
+            "{message}"
+        );
+        let said = unchanged(&a);
+        assert!(
+            said.starts_with(
+                "Set Z from reference did not reach the Pi, or the Pi did not apply it,"
+            ),
+            "{said}"
+        );
+        assert_eq!(server.snapshot().unwrap().program_name, None);
+        // Set again, Cycle Start at once: it waits for the Pi to show the
+        // new Z, and runs with it.
+        let _ = a.update(Message::Run(R::ZFromReference));
+        assert!(conn(&a).z_said(run_of(&a)).is_none());
+        cycle_start(&mut a);
+        let offset = run_of(&a).running.as_ref().expect("started").offset;
+        assert!(
+            (offset[2] - (before - 2.)).abs() < 1e-6,
+            "{offset:?} {before}"
+        );
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+    }
+
+    /// LIO-627: the same here: a Set Z from reference the controller does
+    /// not show applied touches nothing off.
+    #[test]
+    fn a_set_z_from_reference_the_controller_does_not_apply_touches_nothing_off() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Run(R::RecordReference));
+        let reference = run_of(&a).reference.unwrap();
+        // The new tool, 2 mm longer, its tip on the reference.
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 2.));
+        let before = conn(&a).snapshot.work_offset[2];
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Run(R::ZFromReference));
+        assert!(conn(&a).z_set_waits(run_of(&a)));
+        let mut deadline = Deadline::new(5.);
+        while conn(&a).z_set_waits(run_of(&a)) {
+            assert!(deadline.within(&conn(&a).snapshot), "the Z set still waits");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = a.update(Message::Tick);
+        }
+        assert!(!run_of(&a).touched());
+        assert!((conn(&a).snapshot.work_offset[2] - before).abs() < 1e-9);
+        let said = conn(&a).z_said(run_of(&a)).expect("said").to_string();
+        assert!(
+            said.starts_with(
+                "Set Z from reference did not reach the controller, or the controller did not apply it,"
+            ),
+            "{said}"
+        );
+        assert!(
+            problems(&a)
+                .iter()
+                .any(|p| p.contains("touch off its Z first")),
+            "{:?}",
+            problems(&a)
+        );
+        // Pressed again, Idle: the tool is touched off.
+        let _ = a.update(Message::Run(R::ZFromReference));
+        run_until(&mut a, 2.0, "the touch-off", |r| r.touched());
+        assert!(conn(&a).z_said(run_of(&a)).is_none());
+        assert!((conn(&a).snapshot.work_offset[2] - (before - 2.)).abs() < 1e-6);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Another tool put in, 3 mm longer, and Set Z from reference lost
+        // on its way (LIO-627 review): the touch-off before no longer
+        // counts, though Z differs from the first tool's, and Cycle Start
+        // asks for the touch-off; nothing ran.
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 5.));
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Run(R::ZFromReference));
+        assert!(!run_of(&a).touched() && conn(&a).z_set_waits(run_of(&a)));
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_none());
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.contains("Set Z from reference did not reach the controller"),
+            "{message}"
+        );
+        assert!(!run_of(&a).touched());
+        assert!((conn(&a).snapshot.work_offset[2] - (before - 2.)).abs() < 1e-6);
+        let said = conn(&a).z_said(run_of(&a)).expect("said").to_string();
+        assert!(problems(&a).contains(&said), "{:?}", problems(&a));
+        assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+        // Checked again, as after an edit: it still holds Cycle Start back
+        // (LIO-627 review).
+        let epoch = run_of(&a).epoch;
+        let _ = a.update(Message::Run(R::Check));
+        assert_ne!(run_of(&a).epoch, epoch);
+        let epoch = run_of(&a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+        assert_eq!(run_of(&a).next, 1);
+        assert_eq!(conn(&a).z_said(run_of(&a)), Some(said.as_str()));
+        assert!(problems(&a).contains(&said), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_for(&mut a, 200);
+        assert!(run_of(&a).running.is_none());
+        assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+    }
+
+    /// LIO-627 review: a Set Z from reference that did not take is over
+    /// once the tool is touched off another way (Zero Z here): run with
+    /// that Z and stopped, nothing says it did not take, and nothing holds
+    /// Cycle Start back for it.
+    #[test]
+    fn a_lost_set_z_from_reference_is_over_once_the_tool_is_touched_off_another_way() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Run(R::RecordReference));
+        let reference = run_of(&a).reference.unwrap();
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 2.));
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Run(R::ZFromReference));
+        let mut deadline = Deadline::new(5.);
+        while conn(&a).z_set_waits(run_of(&a)) {
+            assert!(deadline.within(&conn(&a).snapshot), "the Z set still waits");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = a.update(Message::Tick);
+        }
+        let said = conn(&a).z_said(run_of(&a)).expect("said").to_string();
+        // Zero Z instead, back where the work zero was.
+        mdi(&mut a, "G0 Z0");
+        let _ = a.update(Message::Machine(crate::control::Action::WorkZero(Some(2))));
+        tick_until(&mut a, 2.0, "Z zeroed", |s| s.work_pos[2].abs() < 1e-6);
+        assert!(run_of(&a).touched() && conn(&a).z_said(run_of(&a)).is_none());
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_some(), "{:?}", run_of(&a).outcome);
+        tick_until(&mut a, 5.0, "the tool run", |s| s.state == Some(State::Run));
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+        run_until(&mut a, 5.0, "the stop", |r| r.running.is_none());
+        assert_eq!(run_of(&a).next, 1);
+        assert!(!run_of(&a).touched());
+        assert!(conn(&a).z_said(run_of(&a)).is_none());
+        assert!(conn(&a).z_failed(run_of(&a)).is_none());
+        assert!(!problems(&a).contains(&said), "{:?}", problems(&a));
+    }
+
+    /// LIO-627 review: started partway into a tool run, a Set Z from
+    /// reference lost after a good one still holds Cycle Start back once
+    /// checked again, though the check moves the start to the tool run's
+    /// first operation: the tool is the same.
+    #[test]
+    fn a_lost_set_z_from_reference_holds_through_a_check_that_moves_the_start() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        // Tool run 1 the Drill; tool run 2 the Face, Pocket and Contour.
+        let mut a = run_app_of(dir.path(), FAST, &[3, 0, 1, 2]);
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 60., "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 5., "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Run(R::From(1, 1)));
+        answer_skips(&mut a, 0);
+        assert_eq!((run_of(&a).next, run_of(&a).from), (1, 1));
+        let _ = a.update(Message::Run(R::RecordReference));
+        let reference = run_of(&a).reference.unwrap();
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 2.));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        run_until(&mut a, 5.0, "the touch-off", |r| r.touched());
+        // Another tool put in, 3 mm longer, and its Set Z lost.
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 5.));
+        let offset = conn(&a).snapshot.work_offset[2];
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Run(R::ZFromReference));
+        let mut deadline = Deadline::new(5.);
+        while conn(&a).z_set_waits(run_of(&a)) {
+            assert!(deadline.within(&conn(&a).snapshot), "the Z set still waits");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = a.update(Message::Tick);
+        }
+        let said = conn(&a).z_said(run_of(&a)).expect("said").to_string();
+        let _ = a.update(Message::Run(R::Check));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).next, 1);
+        assert_eq!(conn(&a).z_said(run_of(&a)), Some(said.as_str()));
+        assert!(problems(&a).contains(&said), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_for(&mut a, 300);
+        assert!(run_of(&a).running.is_none());
+        assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
+        assert!((conn(&a).snapshot.work_offset[2] - offset).abs() < 1e-9);
+    }
+
     /// LIO-562: Set machine zero declares the axes one at a time; until the
     /// last is in, Cycle Start waits, so no tool run is made from a machine
     /// position about to change (starting one would drop the rest).
@@ -17511,6 +17793,64 @@ flood = { pin = 8 }
         });
         assert!(run_of(&a).touched());
         let _ = a.view();
+    }
+
+    /// LIO-627: Probe Z from reference whose work Z is lost on its way
+    /// touches nothing off, and says so; probed again, it does.
+    #[test]
+    fn a_probe_z_from_reference_lost_on_its_way_touches_nothing_off() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), &probe_profile());
+        plate(&mut a, "1000");
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        mdi(&mut a, "G53 G0 Z-30");
+        let _ = a.update(Message::Run(R::ProbeReference));
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        // Z set wrong, as for a new tool, by MDI: nothing touched off.
+        mdi(&mut a, "G53 G0 Z-30");
+        mdi(&mut a, "G10 L20 P1 Z0");
+        assert!(!run_of(&a).touched());
+        let before = conn(&a).snapshot.work_offset[2];
+        // Not taken by the link: said at once, never "Work Z set".
+        a.control.as_mut().unwrap().lose_next_z = Some(false);
+        let _ = a.update(Message::Run(R::ProbeFromReference));
+        let (ok, message) = probed(&mut a);
+        assert!(
+            !ok && message.starts_with("The work Z the probe found was not sent (")
+                && message.ends_with("so Z is as it was: probe again."),
+            "{message}"
+        );
+        assert!(!conn(&a).z_set_waits(run_of(&a)));
+        assert!(!run_of(&a).touched() && !run_of(&a).zeroed);
+        assert!((conn(&a).snapshot.work_offset[2] - before).abs() < 1e-9);
+        // Lost on its way: said once the machine shows it did not take.
+        mdi(&mut a, "G53 G0 Z-30");
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Run(R::ProbeFromReference));
+        let _ = probed(&mut a);
+        let mut deadline = Deadline::new(5.);
+        while conn(&a).z_set_waits(run_of(&a)) {
+            assert!(deadline.within(&conn(&a).snapshot), "the Z set still waits");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = a.update(Message::Tick);
+        }
+        let (ok, message) = conn(&a).probed.clone().unwrap();
+        assert!(
+            !ok && message.ends_with("so Z is as it was: probe again."),
+            "{message}"
+        );
+        assert!(!run_of(&a).touched() && !run_of(&a).zeroed);
+        assert!((conn(&a).snapshot.work_offset[2] - before).abs() < 1e-9);
+        // Probed again: touched off.
+        mdi(&mut a, "G53 G0 Z-30");
+        let _ = a.update(Message::Run(R::ProbeFromReference));
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        run_until(&mut a, 5.0, "the touch-off", |r| r.touched());
+        assert!((conn(&a).snapshot.work_offset[2] - -20.).abs() < 0.06);
     }
 
     /// The fixture's top setup (Stock top center, or `origin`) checked on a
