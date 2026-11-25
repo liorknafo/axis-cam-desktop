@@ -11290,7 +11290,7 @@ fn tool_change_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Eleme
         .and_then(|i| programs.get(i))
         .map(|q| crate::model::tool_label(q.ops[0].tool, &q.ops[0].tool_name));
     let recorded = run.reference.is_some();
-    let touched = run.touched;
+    let touched = run.touched();
     let mut col = column![
         row![
             chip("TOOL CHANGE", Color::from_rgb8(209, 139, 22)),
@@ -11554,7 +11554,7 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
     col = col.push(step_box(2, run.zeroed, placed && !run.zeroed, two));
     // 3. The tool's Z.
     let tool = crate::model::tool_label(o.tool, &o.tool_name);
-    let kept = run.tool_kept || run.touched;
+    let kept = run.tool_kept || run.touched();
     let three = column![
         text(format!(
             "{tool}'s Z: the same tool, not taken out since, or touched off again."
@@ -11570,7 +11570,7 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
                 "Set Z from reference",
                 (manual && run.reference.is_some() && run.reference_a_problem(c).is_none())
                     .then_some(Message::Run(R::ZFromReference)),
-                run.touched
+                run.touched()
             ),
         ]
         .spacing(6)
@@ -11631,8 +11631,9 @@ fn stock_question<'a>(
     let stock = (run.stock_unconfirmed && run.away.is_none()).then(|| {
         column![
             text(if run.cut_in_run.is_empty() {
-                // Only taken as cut (LIO-583 review).
-                "Operations or steps of this setup were taken as cut this session. Is it still the same part?"
+                // Only taken as cut, this session or before AXIS CAM was
+                // last closed (LIO-583 review, LIO-611).
+                "Operations or steps of this setup were taken as cut earlier. Is it still the same part?"
             } else {
                 "This setup's runs cut a part earlier. Is it still the one held?"
             })
@@ -11712,12 +11713,7 @@ fn stock_question<'a>(
     let stock = stock.or_else(|| {
         run.earlier_unfollowed().then(|| {
             column![
-                text(if run.earlier_elsewhere() {
-                    "This computer's runs cut stock for a setup this project does not have: another project's, or one deleted since."
-                } else {
-                    "Another setup's run cut this part in a way the check does not follow."
-                })
-                .size(12),
+                text(run.earlier_unfollowed_note()).size(12),
                 small(
                     "New stock loaded",
                     (!running).then_some(Message::Run(R::NewStock)),
@@ -11732,7 +11728,7 @@ fn stock_question<'a>(
     stock.or_else(|| {
         run.declared_lost.then(|| {
             column![
-                text("Operations or steps of this setup were taken as cut before the project changed.")
+                text("Operations or steps of this setup were taken as cut before the project changed, and the check may not take all of them as cut now.")
                     .size(12),
                 small(
                     "New stock loaded",
@@ -13362,8 +13358,14 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
         }
     } else if let Some(why) = &blocked {
         steps.push(format!(
-            "3. {why} Zero Z on the stock top and Probe Z are off{}: set Z by hand on a surface whose height you know (Set under Work zero), or from a recorded reference (Set Z from reference).",
-            also_off.map_or_else(String::new, |name| format!(", and so is {name}"))
+            "3. {why} Zero Z on the stock top and Probe Z are off{}: set Z by hand on a surface whose height you know (Set under Work zero){}.",
+            also_off.map_or_else(String::new, |name| format!(", and so is {name}")),
+            // Only where Set Z from reference is shown and has one (LIO-621).
+            if reference_set(run) {
+                ", or from the recorded reference (Set Z from reference)"
+            } else {
+                ""
+            }
         ));
     } else if let (true, Some((_, work)), Some(refs)) = (
         run.partway(),
@@ -13489,6 +13491,13 @@ pub(crate) fn work_zero_steps(app: &App, c: &crate::control::Connection) -> Opti
     }
     Some(steps)
 }
+/// Set Z from reference can set the work Z: a reference is recorded, and the
+/// setup has more than one tool run, so the Work zero tab shows the
+/// Reference surface rows that hold the button (LIO-621). Where it is
+/// false, the steps do not offer it.
+fn reference_set(run: &crate::run::Run) -> bool {
+    run.reference.is_some() && run.checked().is_some_and(|p| p.len() > 1)
+}
 /// What Work zero on the stock says first of a run that starts partway
 /// (`run::Run::partway`): where it starts, which operations it takes as
 /// cut and the tool to load, what they cut where the work zero is found,
@@ -13504,29 +13513,56 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
     };
     let o = &p.ops[run.from.min(p.ops.len() - 1)];
     let skipped = run.taken_as_cut();
+    let reference = reference_set(run);
     // Partway only by what was taken as cut and dropped since: nothing it
     // takes as cut to name (LIO-583 review).
     if skipped.is_empty() && run.declared_lost {
         return vec![
             format!(
-                "This run starts at {} (tool run {}). Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut: set Z by hand on a surface whose height you know, or press New stock loaded below if the stock is new.",
+                "This run starts at {} (tool run {}). Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut: {}, or press New stock loaded below if the stock is new.",
                 o.name,
-                run.next + 1
+                run.next + 1,
+                if reference {
+                    "set Z from the recorded reference (touch the tool on it and press Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero"
+                } else {
+                    "set Z by hand on a surface whose height you know and press Keep this work zero"
+                }
             ),
             if run.zeroed {
                 "The work zero is set for this start.".into()
+            } else if reference {
+                "Cycle Start waits until Z is set from the reference, or until you press Keep this work zero, or New stock loaded.".into()
             } else {
                 "Cycle Start waits until you press Keep this work zero, or New stock loaded.".into()
             },
         ];
     }
+    // Where the check cannot tell the surface the work zero is touched off
+    // on (`partway_blocked`: operations or steps after the start taken as
+    // cut, what was taken as cut and dropped by an edit, a surface not
+    // known), Zero Z on the stock top and Probe Z are off, as step 3 says:
+    // only Set Z from reference, or Z set by hand and kept, sets the work
+    // zero (LIO-621).
+    let by_hand = run.partway_blocked().is_some();
+    // What was dropped by an edit, with nothing after the start taken as
+    // cut, may not have been cut with this work zero (LIO-583 review).
+    let kept_as_cut = !run.declared_lost || run.later_cut();
+    let tool = crate::model::tool_label(o.tool, &o.tool_name);
     let mut steps = vec![format!(
-        "This run starts at {} (tool run {}), taking {} as cut: nothing of {} is sent. Load {} and set the work zero on the stock they left.",
+        "This run starts at {} (tool run {}), taking {} as cut: nothing of {} is sent. {}",
         o.name,
         run.next + 1,
         skipped.join(", "),
         if skipped.len() == 1 { "it" } else { "them" },
-        crate::model::tool_label(o.tool, &o.tool_name)
+        match (by_hand, reference) {
+            (false, _) => format!("Load {tool} and set the work zero on the stock they left."),
+            (true, true) => format!(
+                "Load {tool}, then set Z from the recorded reference (touch the tool on it and press Set Z from reference below), or set it by hand on a surface whose height you know and press Keep this work zero."
+            ),
+            (true, false) => format!(
+                "Load {tool}, then set Z by hand on a surface whose height you know and press Keep this work zero."
+            ),
+        }
     )];
     let datum = p.datum[2];
     // Where the check cannot tell the surface, step 3 says so.
@@ -13555,6 +13591,22 @@ fn partway_steps(run: &crate::run::Run) -> Vec<String> {
     }
     steps.push(if run.zeroed {
         "The work zero is set for this start.".into()
+    } else if by_hand {
+        format!(
+            "Cycle Start waits until {}you press Keep this work zero: {}after you set Z by hand on a surface whose height you know.",
+            if reference {
+                "Z is set from the reference, or until "
+            } else {
+                ""
+            },
+            // Kept as it was: what was taken as cut was cut with it, but
+            // not what was only dropped by an edit (LIO-583).
+            if kept_as_cut {
+                "when it is still the one they were cut with (the stock has not moved since), or "
+            } else {
+                ""
+            }
+        )
     } else {
         "Cycle Start waits until the work zero is set below after this start was chosen, or until you press Keep this work zero: when it is still the one they were cut with (the stock has not moved since), or you set Z by hand on a surface they left.".into()
     });

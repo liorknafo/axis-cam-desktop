@@ -94,6 +94,31 @@ pub enum Action {
 /// and its steps skipped, by operation (index in the setup).
 pub type Declared = (Vec<(usize, Skip)>, Vec<(usize, Vec<usize>)>);
 
+/// What the operator took as cut in a setup's run (`Run::declared`), kept
+/// once its run is dropped by the session (`App::run_declared`) and on disk
+/// with what runs cut (`CutHistory::declared`), so that it survives closing
+/// AXIS CAM, and given back when the setup is picked again, until New
+/// stock loaded (LIO-583 review, LIO-611).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct KeptDeclared {
+    /// The setup's id.
+    pub setup: String,
+    /// Its operations skipped as cut (`Skip::Cut`), by index in the setup.
+    pub skips: Vec<(usize, Skip)>,
+    /// Its steps taken as cut, by operation (index in the setup).
+    pub steps: Vec<(usize, Vec<usize>)>,
+    /// Some of what was taken as cut was dropped since, by a project edit
+    /// say (`Run::declared_lost`).
+    pub lost: bool,
+    /// The print of the plan, its steps and its cutter
+    /// (`OpSteps::declared_print`) of each operation `skips` and `steps`
+    /// name, as they were taken as cut; None
+    /// when not known. They hold only for a check whose prints are these
+    /// (`Run::declared_from`).
+    #[serde(default)]
+    pub prints: Vec<(usize, Option<u64>)>,
+}
+
 /// How a run skips an operation of its setup (`Run::skips`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Skip {
@@ -114,7 +139,7 @@ pub struct Running {
     seq: u64,
     /// The work offset it was lowered with.
     pub offset: [f64; 6],
-    /// What Cycle Start recorded over (`xy`, `zero`, `last`, `touched`), put
+    /// What Cycle Start recorded over (`xy`, `zero`, `last`, `touched_for`), put
     /// back when the driver refuses the job: nothing ran then (#168).
     before: Before,
     /// The line each of its blocks moves the tool tip along (`paths`),
@@ -251,7 +276,30 @@ pub struct Before {
     xy: Option<(usize, [f64; 2])>,
     zero: Option<(String, [f32; 3])>,
     last: Option<(String, f64)>,
-    touched: bool,
+    /// A file from before LIO-619 kept a `touched` flag: no touch-off is
+    /// known from it, so another is made.
+    #[serde(default)]
+    touched_for: Option<TouchedFor>,
+}
+
+/// Z touched off on the Control page (`Run::touched_for`): for which tool,
+/// and the Z work offset it left. That Z is the tool's, so it holds for no
+/// other (LIO-619).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TouchedFor {
+    /// The tool's id (`tool_id`): the next tool run's when it was touched
+    /// off; while the setup is checked again (after an edit, a skip or a
+    /// new start), the one the check before found next (`Run::check_again`),
+    /// which the Tool change tab showed. None when no tool run was checked
+    /// then: it holds for no tool.
+    tool: Option<String>,
+    /// Made before the setup's first check answered: tool run 1's tool
+    /// once that check starts the run there (`checked_as`).
+    #[serde(default)]
+    first: bool,
+    /// The Z work offset it left, once the machine shows what was sent
+    /// (`Run::touch_shown`); None until then.
+    z: Option<f64>,
 }
 
 /// The driver's outcome of a job it refused before anything moved: "<name>:
@@ -346,16 +394,15 @@ pub(crate) const HISTORY_UNFOLLOWED_BLOCKED: &str = "Runs this computer did not 
 
 /// What was taken as cut before the project changed, said as `Partly::cut`
 /// (`Run::declared_lost`, LIO-583 review).
-pub(crate) const DECLARED_LOST: &str =
-    "stock taken as cut before the project changed, which the check no longer takes as cut";
+pub(crate) const DECLARED_LOST: &str = "stock taken as cut before the project changed, some of which the check may no longer take as cut";
 
 /// Why a probe cannot find a work zero from a spot while
 /// `Run::declared_lost`.
-pub(crate) const DECLARED_LOST_WHY: &str = "Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut.";
+pub(crate) const DECLARED_LOST_WHY: &str = "Operations or steps of this setup were taken as cut before the project changed, and the check may not take all of them as cut now.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::declared_lost`.
-const DECLARED_LOST_BLOCKED: &str = "Operations or steps of this setup were taken as cut before the project changed, and the check no longer takes them as cut, so it cannot tell the surface where the stock top is touched off.";
+const DECLARED_LOST_BLOCKED: &str = "Operations or steps of this setup were taken as cut before the project changed, and the check may not take all of them as cut now, so it cannot tell the surface where the stock top is touched off.";
 
 /// What other setups' runs cut this session, said as `Partly::cut`, when
 /// the check does not simulate it before this setup as it was cut
@@ -572,8 +619,8 @@ pub struct Run {
     /// `cut_in_run` came from an earlier pick of this setup, this session
     /// or before AXIS CAM was last closed (`CutHistory`, LIO-594), or
     /// tells of runs whose cuts are not known (`HISTORY_UNKNOWN`), or what
-    /// was taken as cut came from an earlier pick this session (`declared`,
-    /// LIO-583 review), and the
+    /// was taken as cut came from an earlier pick, this session or before
+    /// AXIS CAM was last closed (`declared`, LIO-583 review, LIO-611), and the
     /// operator has not said whether the same part is still held
     /// (`Action::SamePart`, `Action::NewStock`): nothing sets Z or probes
     /// until then (`partly`, LIO-582 review).
@@ -588,7 +635,10 @@ pub struct Run {
     /// (`checked_as`). The check no longer takes their material as cut, so
     /// it cannot tell the surface the stock top is touched off on: nothing
     /// sets Z or probes, and Cycle Start waits for the work zero, until New
-    /// stock loaded (`new_stock`, LIO-583 review).
+    /// stock loaded (`new_stock`, LIO-583 review). Taking operations or
+    /// steps as cut again keeps it, as what was dropped may not be what is
+    /// taken as cut again: the words say "may not all be taken as cut now"
+    /// (LIO-621).
     pub declared_lost: bool,
     /// Its skips came with a tool run it follows (`following`) that was
     /// sent before a project edit the session noted (`App::run_declared`
@@ -597,6 +647,14 @@ pub struct Run {
     /// that something was (`declared_lost`). An edit or New stock loaded,
     /// which drop them, ends it (LIO-583 review).
     pub declared_stale: bool,
+    /// What was taken as cut (`skips`, `cut_steps`) was given back from what
+    /// the session kept (`App::run_declared`), from before AXIS CAM was
+    /// last closed too (`CutHistory::declared`), with the print of each
+    /// operation it names as it was taken as cut (`KeptDeclared::prints`).
+    /// The first check that answers holds it only while its prints are the
+    /// same: else the project, the part or AXIS CAM changed since, and it is
+    /// dropped as a project edit drops it (`declared_lost`, LIO-611).
+    pub declared_from: Option<Vec<(usize, Option<u64>)>>,
     /// What the other setups cut this session (`App::run_cuts`), by setup
     /// id: in the part whether those setups come before it, were deleted or
     /// moved after it since. The check's stock has it only while it
@@ -606,10 +664,18 @@ pub struct Run {
     /// The setups `earlier_cuts` was given for: one no longer in it was
     /// forgotten (New stock loaded).
     pub earlier_given: Vec<String>,
+    /// Of the setups of `earlier_cuts`, those of another project, whose
+    /// (`CutOwner`, LIO-607): their cuts are said as that project's.
+    pub earlier_elsewhere: Vec<CutOwner>,
     /// The ids of the project's setups, as `follow` last found them: a cut
-    /// in `earlier_cuts` by none of them is another project's, or a deleted
-    /// setup's (`earlier_elsewhere`, LIO-635).
+    /// in `earlier_cuts` by none of them, whose owner is not known, may be
+    /// another project's, or a deleted setup's (`earlier_not_here`,
+    /// LIO-635).
     pub(crate) project_setups: Vec<String>,
+    /// Of the setups of `earlier_cuts`, those kept as this project's though
+    /// it no longer has them: deleted since (`CutOwner`, LIO-607), not
+    /// another project's.
+    pub(crate) earlier_own: Vec<String>,
     /// A run following on the Pi the tool run its run ran when dropped
     /// (`App::run_pending`): what was cut before that tool run. Kept only
     /// once the follow holds (`follow_again`) and until this computer starts
@@ -638,8 +704,14 @@ pub struct Run {
     /// turning A runs with (`rotary_problems`), while that reference is the
     /// one kept with the centreline.
     pub length: Option<(String, f64, f64)>,
-    /// Z was touched off on the Control page since the last tool run started.
-    pub touched: bool,
+    /// Z touched off on the Control page since the last tool run started
+    /// (`z_touched`): it holds for its tool only (`touched`, LIO-619).
+    touched_for: Option<TouchedFor>,
+    /// A check of the setup has answered since it was picked.
+    answered: bool,
+    /// While the setup is checked again: the tool of the tool run the check
+    /// before found next (`check_again`), what a touch-off is for meanwhile.
+    rechecked_tool: Option<String>,
     /// How the last tool run ended (ok, the driver's message).
     pub outcome: Option<(bool, String)>,
     /// The stock after each of the setup's operations, by its index in the
@@ -1026,6 +1098,42 @@ pub struct CutHistory {
     /// none ran while it was away (LIO-595), whichever session sent it.
     #[serde(default)]
     pub sent: Vec<u64>,
+    /// Whose each setup in `cuts` is (`CutOwner`), so that another
+    /// project's cuts are said to be so (LIO-607). A setup with none, kept
+    /// by an AXIS CAM before it, is said as any setup the check does not
+    /// follow.
+    #[serde(default)]
+    pub owners: Vec<CutOwner>,
+    /// What the operator took as cut in each setup's run, by setup
+    /// (`App::run_declared`), as the session kept it: absent from a file
+    /// written before it was kept, which loads with none (LIO-611).
+    #[serde(default)]
+    pub declared: Vec<KeptDeclared>,
+}
+
+/// The project and names of a setup whose runs cut (`CutHistory::owners`),
+/// as they were when its cuts were last kept (LIO-607).
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CutOwner {
+    pub setup: String,
+    /// The project's identity (`Document::project_id`) and title.
+    pub project: String,
+    pub title: String,
+    /// The names of the setup's operations, by index.
+    pub ops: Vec<String>,
+}
+
+impl CutOwner {
+    /// Setup `si` of `doc`'s.
+    pub fn of(doc: &Document, si: usize) -> Self {
+        let s = &doc.setups[si];
+        Self {
+            setup: s.id.clone(),
+            project: doc.project_id.clone(),
+            title: doc.title.clone(),
+            ops: s.operations.iter().map(|o| o.name().to_string()).collect(),
+        }
+    }
 }
 
 /// How many of the tool runs sent a Pi `CutHistory::sent` keeps.
@@ -1298,9 +1406,12 @@ impl Run {
             away: None,
             declared_lost: false,
             declared_stale: false,
+            declared_from: None,
             earlier_cuts: vec![],
             earlier_given: vec![],
+            earlier_elsewhere: vec![],
             project_setups: doc.setups.iter().map(|s| s.id.clone()).collect(),
+            earlier_own: vec![],
             before_follow: None,
             running: None,
             xy: None,
@@ -1309,7 +1420,9 @@ impl Run {
             reference_a: None,
             last: None,
             length: None,
-            touched: false,
+            touched_for: None,
+            answered: false,
+            rechecked_tool: None,
             outcome: None,
             pictures: vec![],
             left: None,
@@ -1720,6 +1833,80 @@ impl Run {
         self.programs.as_deref()?.as_deref().ok()
     }
 
+    /// The tool (`tool_id`) of tool run `i`, as checked.
+    fn tool_of(&self, i: usize) -> Option<String> {
+        Some(self.checked()?.get(i)?.ops[0].tool_id.clone())
+    }
+
+    /// Z was touched off on the Control page since the last tool run
+    /// started, for the next tool run's tool: a touch-off holds for its
+    /// tool only (LIO-619).
+    pub fn touched(&self) -> bool {
+        let next = self.tool_of(self.next);
+        (self.touched_for.as_ref()).is_some_and(|t| next.is_some() && t.tool == next)
+    }
+
+    /// Z is touched off for the next tool run's tool: Set Z from
+    /// reference, Zero Z, Set Z, a probe or a touch-off.
+    pub fn z_touched(&mut self) {
+        let tool = (self.tool_of(self.next)).or_else(|| self.rechecked_tool.clone());
+        self.z_touched_for(tool);
+    }
+
+    /// The setup is checked again, as check `epoch`, keeping its progress:
+    /// a touch-off meanwhile is for the tool the check before found next.
+    pub fn check_again(&mut self, epoch: u64) {
+        self.keep_next_tool();
+        (self.epoch, self.programs, self.stale, self.recheck) = (epoch, None, false, false);
+    }
+
+    /// Keeps the next tool run's tool for touch-offs while the setup is
+    /// checked again (`rechecked_tool`).
+    fn keep_next_tool(&mut self) {
+        if let Some(tool) = self.tool_of(self.next) {
+            self.rechecked_tool = Some(tool);
+        }
+    }
+
+    /// Z is touched off for `tool` (None: not known, `TouchedFor::first`).
+    pub fn z_touched_for(&mut self, tool: Option<String>) {
+        let first = tool.is_none() && !self.answered;
+        self.touched_for = Some(TouchedFor {
+            tool,
+            first,
+            z: None,
+        });
+    }
+
+    /// The Z work offset the last touch-off left, once shown.
+    #[cfg(test)]
+    pub fn touched_z(&self) -> Option<f64> {
+        self.touched_for.as_ref()?.z
+    }
+
+    /// The machine shows everything sent, with Z work offset `z`: what a
+    /// touch-off not shown yet left.
+    pub fn touch_shown(&mut self, z: f64) {
+        if let Some(t) = &mut self.touched_for {
+            t.z.get_or_insert(z);
+        }
+    }
+
+    /// Whether what is taken as cut (`skips`, `cut_steps`) was taken as cut
+    /// from the plans and cutters a check found (`now`): each operation it
+    /// names has the print `from` gives it (`declared_from`, LIO-611).
+    fn declared_holds(&self, from: &[(usize, Option<u64>)], now: &[OpSteps]) -> bool {
+        let named = (self.skips.iter())
+            .filter(|s| s.1 == Skip::Cut)
+            .map(|s| s.0)
+            .chain(self.cut_steps.iter().map(|s| s.0));
+        named.into_iter().all(|oi| {
+            let was = from.iter().find(|p| p.0 == oi).and_then(|p| p.1);
+            let is = now.iter().find(|s| s.op == oi).map(OpSteps::declared_print);
+            was.is_some() && is == was
+        })
+    }
+
     /// A check's answer, the stock it left to picture and how long its tool
     /// runs take.
     pub fn checked_as(
@@ -1731,9 +1918,17 @@ impl Run {
         // A start at a step, or steps taken as cut, that the check refuses:
         // dropped, and the setup checked again from that operation's start,
         // so that it never stays without a start to pick (LIO-311).
+        // A check that had no part to check against, not loaded yet after
+        // AXIS CAM opened say, says nothing of what was given back as taken
+        // as cut: kept as it is, on disk too, for the check once the part is
+        // in, nothing set from it meanwhile (`declared_from`, LIO-611 review).
+        let no_part = |w: &String| w == PART_NOT_LOADED || w == NO_PART;
+        let waits_for_part = self.declared_from.is_some()
+            && (programs.as_ref().as_ref()).is_err_and(|why| why.first().is_some_and(no_part));
         if let Err(why) = programs.as_ref()
             && (self.start_step.is_some() || !self.cut_steps.is_empty())
             && why.first().is_none_or(|w| w != REMOVED)
+            && !waits_for_part
         {
             self.journal_note = Some(format!(
                 "The start at a step or the steps taken as cut could not be checked, so they are dropped and the operation starts at its first step: {} Pick another start in the Operations list if you like.",
@@ -1743,6 +1938,7 @@ impl Run {
             // Its steps taken as cut go: their material is not the check's.
             self.declared_lost |= !self.cut_steps.is_empty();
             self.cut_steps.clear();
+            self.keep_next_tool();
             (self.programs, self.recheck) = (None, true);
             // Checked otherwise, it is not the program sent.
             if self.follow.take().is_some() {
@@ -1752,6 +1948,26 @@ impl Run {
                 ))));
             }
             return;
+        }
+        // What was taken as cut, given back from before, holds only for the
+        // plans and cutters it was taken as cut from: changed or not known
+        // since, the project, the part or AXIS CAM changed, and it is
+        // dropped as a project edit drops it (LIO-611).
+        if programs.is_ok()
+            && let Some(from) = self.declared_from.take()
+            && !self.declared_holds(&from, left.as_ref().map_or(&[][..], |l| &l.steps[..]))
+        {
+            self.declared_lost = true;
+            if self.follow.is_some() {
+                // Followed as sent (`follow_again`), none kept as taken as cut.
+                self.declared_stale = true;
+            } else {
+                self.skips.retain(|s| s.1 != Skip::Cut);
+                self.cut_steps.clear();
+                self.keep_next_tool();
+                (self.programs, self.recheck) = (None, true);
+                return;
+            }
         }
         // Refused, the progress stays kept for the skip's undoing (`skip`).
         let keep = programs
@@ -1819,6 +2035,18 @@ impl Run {
             Some(f) => self.followed = Some(self.follow_again(f)),
             None => self.take_journal(),
         }
+        // A touch-off made before the setup's first check answered was for
+        // tool run 1's tool, when the run starts there; else for none
+        // known (LIO-619).
+        let start = (self.next == 0 && self.from == 0 && self.at_step().is_none())
+            .then(|| self.tool_of(0))
+            .flatten();
+        if let Some(t) = &mut self.touched_for
+            && std::mem::take(&mut t.first)
+        {
+            t.tool = start;
+        }
+        (self.answered, self.rechecked_tool) = (true, None);
     }
 
     /// Where a run of this setup stopped (`journal`), once it is checked:
@@ -2057,9 +2285,9 @@ impl Run {
                 xy,
                 zero,
                 last,
-                touched,
+                touched_for,
             } = r.before.clone();
-            (self.xy, self.zero, self.last, self.touched) = (xy, zero, last, touched);
+            (self.xy, self.zero, self.last, self.touched_for) = (xy, zero, last, touched_for);
         } else if let Some((op, s)) = stopping {
             // Stopped after a step, the tool at its clearance: lifted to the
             // clearance plane once the machine stands still.
@@ -2172,6 +2400,7 @@ impl Run {
         if next > 0 && next < count {
             // Nothing is started until the check answers with its program.
             if self.start_at_step(oi, next) {
+                self.keep_next_tool();
                 (self.recheck, self.programs) = (true, None);
             }
         } else {
@@ -2292,9 +2521,9 @@ impl Run {
             xy,
             zero,
             last,
-            touched,
+            touched_for,
         } = r.before;
-        (self.xy, self.zero, self.last, self.touched) = (xy, zero, last, touched);
+        (self.xy, self.zero, self.last, self.touched_for) = (xy, zero, last, touched_for);
         (self.stopping, self.stop_after) = (None, false);
         self.outcome = Some((false, why));
     }
@@ -2439,7 +2668,7 @@ impl Run {
                     c.place(&unset_ids(c), true, true)
                 ));
             }
-            if !self.tool_kept && !self.touched {
+            if !self.tool_kept && !self.touched() {
                 e.push(format!(
                     "Confirm {}'s Z for the start at {step}: Same tool, keep Z if it was not taken out since, or Set Z from reference.",
                     crate::model::tool_label(first.tool, &first.tool_name)
@@ -2464,7 +2693,7 @@ impl Run {
                         // Dropped by an edit: only a hand, or new stock,
                         // knows the surface (LIO-583 review).
                         _ if self.declared_lost && !later => format!(
-                            "This run starts at {}, and operations or steps taken as cut before the project changed are no longer taken as cut, so the check cannot tell the surface they left where the work zero is touched off: in the Work zero tab, set Z by hand on a surface whose height you know and press Keep this work zero, or press New stock loaded if the stock is new.",
+                            "This run starts at {}, and operations or steps taken as cut before the project changed may not all be taken as cut now, so the check cannot tell the surface they left where the work zero is touched off: in the Work zero tab, set Z by hand on a surface whose height you know and press Keep this work zero, or press New stock loaded if the stock is new.",
                             first.name
                         ),
                         // Nothing sets Z on the stock they left but a hand
@@ -2657,11 +2886,16 @@ impl Run {
                 ));
             }
         }
-        if let Some((tool, z)) = &self.last
-            && *tool != p.ops[0].tool_id
-            && !self.touched
-            && (s.work_offset[2] - z).abs() < 1e-6
-        {
+        // Z touched off for another tool since (another tool run picked,
+        // or its tool changed by an edit, LIO-619): that tool's Z, while
+        // the offset is the one it left.
+        let tool = &p.ops[0].tool_id;
+        let unchanged = |z: f64| (s.work_offset[2] - z).abs() < 1e-6;
+        let other = (self.touched_for.as_ref())
+            .filter(|t| t.tool.as_ref() != Some(tool))
+            .is_some_and(|t| t.z.is_none_or(unchanged));
+        let change = (self.last.as_ref()).is_some_and(|(t, z)| t != tool && unchanged(*z));
+        if !self.touched() && (other || change) {
             e.push(format!(
                 "Tool run {} uses {}: touch off its Z first (Set Z from reference, or Zero Z).",
                 self.next + 1,
@@ -2732,7 +2966,7 @@ impl Run {
                 xy: self.xy,
                 zero: self.zero.clone(),
                 last: self.last.clone(),
-                touched: self.touched,
+                touched_for: self.touched_for.clone(),
             },
             paths,
             tip,
@@ -2746,7 +2980,7 @@ impl Run {
             .get_or_insert((s.active_wcs, [s.work_offset[0], s.work_offset[1]]));
         self.zero.get_or_insert(zero);
         self.last = Some((tool, s.work_offset[2]));
-        self.touched = false;
+        self.touched_for = None;
         self.outcome = None;
         Some(Command::Job {
             name,
@@ -2938,28 +3172,161 @@ impl Run {
     /// moved after this one (`Left::earlier`). Its stock lacks what was cut
     /// (LIO-582 review).
     pub fn earlier_unfollowed(&self) -> bool {
-        self.unfollowed_setups().next().is_some()
+        self.unfollowed_earlier().next().is_some()
     }
 
-    /// The setups whose cuts make `earlier_unfollowed`, by id.
-    fn unfollowed_setups(&self) -> impl Iterator<Item = &str> {
+    /// The setups of `earlier_cuts` whose cuts the check does not follow
+    /// (`earlier_unfollowed`), with those cuts.
+    fn unfollowed_earlier(&self) -> impl Iterator<Item = &(String, Vec<CutInRun>)> {
         let earlier = self.left.as_ref().map_or(&[][..], |l| &l.earlier[..]);
-        (self.earlier_cuts.iter())
-            .filter(move |(id, cuts)| {
-                cuts.iter().any(|&(op, _, print)| {
-                    !(earlier.iter()).any(|(s, o, p)| s == id && *o == op && Some(*p) == print)
-                })
+        (self.earlier_cuts.iter()).filter(move |(id, cuts)| {
+            cuts.iter().any(|&(op, _, print)| {
+                !(earlier.iter()).any(|(s, o, p)| s == id && *o == op && Some(*p) == print)
             })
-            .map(|(id, _)| id.as_str())
+        })
     }
 
     /// Every cut that makes `earlier_unfollowed` is by a setup this project
-    /// does not have (`project_setups`): another project's, the computer
-    /// keeping one record for all of them (`App::run_cuts`), or one deleted
-    /// since. Said so, with New stock loaded as the way out (LIO-635).
-    pub fn earlier_elsewhere(&self) -> bool {
-        let mut ids = self.unfollowed_setups().peekable();
-        ids.peek().is_some() && ids.all(|id| !self.project_setups.iter().any(|s| s == id))
+    /// does not have (`project_setups`) nor is known to have had
+    /// (`earlier_own`): another project's, the computer keeping one record
+    /// for all of them (`App::run_cuts`), or one deleted since. Where whose
+    /// is known to be another project's, that is said instead
+    /// (`earlier_elsewhere`, LIO-607); the tablet file knows no owners, so
+    /// there it is said so, with New stock loaded on the computer as the
+    /// way out (LIO-635).
+    pub fn earlier_not_here(&self) -> bool {
+        let mut ids = self.unfollowed_earlier().map(|(id, _)| id).peekable();
+        ids.peek().is_some()
+            && ids.all(|id| !self.project_setups.contains(id) && !self.earlier_own.contains(id))
+    }
+
+    /// What another project's runs cut that the check does not follow
+    /// (`earlier_unfollowed`, `earlier_elsewhere`), said (LIO-607): None
+    /// when none did. With whether a setup of this project's, or one whose
+    /// project is not known, cut what it does not follow too.
+    fn earlier_elsewhere_said(&self) -> Option<(String, bool)> {
+        let (projects, own) = self.earlier_elsewhere_projects()?;
+        let which = (projects.iter())
+            .map(|(title, ops)| match (title.trim(), ops.is_empty()) {
+                ("", true) => "one with no name".to_string(),
+                ("", false) => format!("one with no name: {}", crate::post::listed(ops)),
+                (t, true) => format!("\"{t}\""),
+                (t, false) => format!("\"{t}\": {}", crate::post::listed(ops)),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let whose = match projects.len() {
+            1 => "another project's runs",
+            _ => "other projects' runs",
+        };
+        Some((
+            format!(
+                "{whose} cut stock on this machine earlier ({which}), which this project's check does not follow"
+            ),
+            own,
+        ))
+    }
+
+    /// The other projects whose runs cut what the check does not follow
+    /// (`earlier_unfollowed`, `earlier_elsewhere`), each its title and the
+    /// names of the operations that cut, and whether a setup of this
+    /// project's, or one whose project is not known, cut what it does not
+    /// follow too (LIO-607). None when no other project's did.
+    fn earlier_elsewhere_projects(&self) -> Option<(Vec<(&str, Vec<&str>)>, bool)> {
+        let mut projects: Vec<(&str, &str, Vec<&str>)> = vec![];
+        let mut own = false;
+        for (id, cuts) in self.unfollowed_earlier() {
+            let Some(o) = self.earlier_elsewhere.iter().find(|o| o.setup == *id) else {
+                own = true;
+                continue;
+            };
+            let i = match projects.iter().position(|p| p.0 == o.project) {
+                Some(i) => i,
+                None => {
+                    projects.push((&o.project, &o.title, vec![]));
+                    projects.len() - 1
+                }
+            };
+            for &(op, _, _) in cuts {
+                if let Some(name) = o.ops.get(op).filter(|n| !n.is_empty())
+                    && !projects[i].2.contains(&name.as_str())
+                {
+                    projects[i].2.push(name);
+                }
+            }
+        }
+        if projects.is_empty() {
+            return None;
+        }
+        let projects = projects.into_iter().map(|(_, t, ops)| (t, ops)).collect();
+        Some((projects, own))
+    }
+
+    /// Why the stock is not the check's where another setup's or another
+    /// project's run cut it (`earlier_unfollowed`), the start of a sentence
+    /// (LIO-607): None when only this project's setups did, said as
+    /// `EARLIER_UNFOLLOWED_WHY` is.
+    fn earlier_elsewhere_cause(&self) -> Option<String> {
+        let (said, own) = self.earlier_elsewhere_said()?;
+        Some(match own {
+            true => format!(
+                "Another setup's run cut this part earlier in a way the check does not follow, and {said}"
+            ),
+            false => format!("{}{}", said[..1].to_uppercase(), &said[1..]),
+        })
+    }
+
+    /// What the Work zero tab says of the cuts the check does not follow
+    /// (`earlier_unfollowed`), with New stock loaded: short, for why they
+    /// set no Z is said with the steps above it (`partway_blocked`); another
+    /// project's named (LIO-607).
+    pub fn earlier_unfollowed_note(&self) -> String {
+        const OWN: &str = "Another setup's run cut this part in a way the check does not follow";
+        let Some((projects, own)) = self.earlier_elsewhere_projects() else {
+            // Whose not known, but none of this project's (LIO-635).
+            if self.earlier_not_here() {
+                return "This computer's runs cut stock for a setup this project does not have: another project's, or one deleted since.".into();
+            }
+            return format!("{OWN}.");
+        };
+        let titles: Vec<String> = (projects.iter())
+            .map(|(t, _)| match t.trim() {
+                "" => "one with no name".to_string(),
+                t => format!("\"{t}\""),
+            })
+            .collect();
+        let titles = crate::post::listed(&titles);
+        match (own, projects.len()) {
+            (false, 1) => format!("Another project's runs ({titles}) may have cut this stock."),
+            (false, _) => format!("Other projects' runs ({titles}) may have cut this stock."),
+            (true, 1) => {
+                format!("{OWN}, and another project's runs ({titles}) may have cut it too.")
+            }
+            (true, _) => format!("{OWN}, and other projects' runs ({titles}) may have cut it too."),
+        }
+    }
+
+    /// Why a probe cannot find a work zero from a spot of a stock
+    /// `EARLIER_UNFOLLOWED` cut.
+    fn earlier_unfollowed_why(&self) -> String {
+        match self.earlier_elsewhere_cause() {
+            Some(cause) => format!("{cause}."),
+            None if self.earlier_not_here() => EARLIER_ELSEWHERE_WHY.into(),
+            None => EARLIER_UNFOLLOWED_WHY.into(),
+        }
+    }
+
+    /// Why a probe cannot find this work zero where `EARLIER_UNFOLLOWED`
+    /// cut (`Connection::cut_probe_blocked`).
+    pub fn earlier_unfollowed_probe(&self) -> String {
+        match self.earlier_elsewhere_cause() {
+            Some(cause) => format!(
+                "{cause}, so the check cannot tell the stock where a probe finds this work zero."
+            ),
+            // Whose not known, but none of this project's (LIO-635).
+            None if self.earlier_not_here() => "This computer's runs cut stock for a setup this project does not have, another project's or one deleted since: if that is the part held, they may have cut it where a probe finds this work zero. If new stock is held, press New stock loaded under Work zero.".into(),
+            None => "Another setup's run cut this part earlier in a way the check does not follow, where a probe finds this work zero.".into(),
+        }
     }
 
     /// The stock the start begins from is not the setup's own: the run
@@ -3020,6 +3387,27 @@ impl Run {
         (skips, self.cut_steps.clone())
     }
 
+    /// The print of the plan and cutter of each operation `declared` names
+    /// (`KeptDeclared::prints`): as given back, while no check has held it
+    /// since (`declared_from`), else the last check's (`OpSteps::declared_print`);
+    /// None when not known (LIO-611).
+    pub fn declared_prints(&self, (skips, steps): &Declared) -> Vec<(usize, Option<u64>)> {
+        let mut ops: Vec<usize> = (skips.iter().map(|s| s.0))
+            .chain(steps.iter().map(|s| s.0))
+            .collect();
+        ops.sort_unstable();
+        ops.dedup();
+        (ops.into_iter())
+            .map(|oi| {
+                let print = match &self.declared_from {
+                    Some(from) => from.iter().find(|p| p.0 == oi).and_then(|p| p.1),
+                    None => self.op_steps(oi).map(OpSteps::declared_print),
+                };
+                (oi, print)
+            })
+            .collect()
+    }
+
     /// New stock loaded: what this setup's runs and the other setups' cut
     /// this session is forgotten, and so is what the operator took as cut
     /// (`declared`), the setup to be checked again without it. Whether it
@@ -3028,7 +3416,7 @@ impl Run {
     pub fn new_stock(&mut self) -> bool {
         (self.cut_in_run, self.earlier_cuts) = (vec![], vec![]);
         (self.stock_unconfirmed, self.declared_lost) = (false, false);
-        self.declared_stale = false;
+        (self.declared_stale, self.declared_from) = (false, None);
         let (skips, steps) = self.declared();
         if skips.is_empty() && steps.is_empty() {
             return false;
@@ -3118,10 +3506,16 @@ impl Run {
             STOCK_UNCONFIRMED_BLOCKED.into()
         } else if partly.cut == [HISTORY_UNFOLLOWED] {
             HISTORY_UNFOLLOWED_BLOCKED.into()
-        } else if partly.cut == [EARLIER_UNFOLLOWED] && self.earlier_elsewhere() {
-            EARLIER_ELSEWHERE_BLOCKED.into()
         } else if partly.cut == [EARLIER_UNFOLLOWED] {
-            EARLIER_UNFOLLOWED_BLOCKED.into()
+            match self.earlier_elsewhere_cause() {
+                Some(cause) => format!(
+                    "{cause}, so the check cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero."
+                ),
+                // Whose not known, but none of this project's: the tablet
+                // file's case, which knows no owners (LIO-635).
+                None if self.earlier_not_here() => EARLIER_ELSEWHERE_BLOCKED.into(),
+                None => EARLIER_UNFOLLOWED_BLOCKED.into(),
+            }
         } else if partly.cut == [STEPS_UNFOLLOWED] {
             // Not a part of the stock: said as the reason it is (LIO-579).
             "The check does not follow the stock cut by the steps taken as cut, so it cannot tell the surface they left where the stock top is touched off.".into()
@@ -3390,16 +3784,12 @@ impl Run {
         // Another setup's run cut an operation the check does not simulate
         // so before this setup (LIO-582 review).
         if self.earlier_unfollowed() {
-            let why = match self.earlier_elsewhere() {
-                true => EARLIER_ELSEWHERE_WHY,
-                false => EARLIER_UNFOLLOWED_WHY,
-            };
             return Some(Cow::Owned(Partly {
                 cut: vec![EARLIER_UNFOLLOWED.into()],
                 surface: None,
                 top_cut: true,
                 probe_from: (before.probe_from.iter())
-                    .map(|(r, _)| (*r, Err(why.into())))
+                    .map(|(r, _)| (*r, Err(self.earlier_unfollowed_why())))
                     .collect(),
                 steps: vec![],
             }));
@@ -3589,7 +3979,7 @@ impl Run {
         // review).
         let (cut, steps) = self.declared();
         self.declared_lost |= !cut.is_empty() || !steps.is_empty();
-        self.declared_stale = false;
+        (self.declared_stale, self.declared_from) = (false, None);
         (self.skips, self.keep, self.menu) = (vec![], None, None);
         (self.cut_steps, self.start_step, self.picked) = (vec![], None, None);
     }
@@ -4177,11 +4567,25 @@ pub struct OpSteps {
     /// `fingerprint` with what the cutter takes away along the moves: its
     /// shape and sizes, and the A of each move (`cut_print`). What a run
     /// cut is the check's only while this is the same (`Run::cut_in_run`,
-    /// LIO-582 review); kept in memory only.
+    /// LIO-582 review). Kept on disk with what runs cut and what was taken
+    /// as cut (`CutHistory`, LIO-594, LIO-611).
     pub cut_print: u64,
 }
 
 impl OpSteps {
+    /// `cut_print` with how many steps the plan is split into: what was
+    /// taken as cut by step number holds only while both are the same, as
+    /// a journal holds only for as many steps (`Run::take_journal`), so that
+    /// an AXIS CAM that splits a plan otherwise never takes other cuts by
+    /// the old numbers (`KeptDeclared::prints`, LIO-611 review).
+    pub fn declared_print(&self) -> u64 {
+        let mut h = self.cut_print;
+        for b in (self.steps.len() as u64).to_le_bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
     /// What its steps are called: holes, levels when each cuts at one Z,
     /// else passes. A plan cut in passes (`Step::pass`) is named by them,
     /// each a visit of its holes (`label`).
@@ -4464,8 +4868,11 @@ fn op_steps(doc: &Document, si: usize, sims: &Sims) -> Vec<OpSteps> {
 /// the moves: its shape, radius (and form), flute length, the reach below
 /// its tip and its neck, a lathe plan's rings, and the A each move is at.
 /// A tool saved at another size, or an operation posed at another angle,
-/// cuts other stock along the same moves (LIO-582 review). Not kept on
-/// disk, so its words for the cutter (`Debug`) may change between builds.
+/// cuts other stock along the same moves (LIO-582 review). Kept on disk
+/// (`CutHistory`), its words for the cutter (`Debug`) may still change
+/// between builds: an AXIS CAM updated since then finds another print, and
+/// what was cut or taken as cut no longer counts as the check's, the safe
+/// side (LIO-611).
 fn cut_print(plan: &crate::simulation::Plan, tool: &str) -> u64 {
     let mut h = fingerprint(plan, tool);
     let mut eat = |w: u64| h = (h ^ w).wrapping_mul(0x100000001b3);
@@ -4705,6 +5112,10 @@ fn beneath(doc: &Document, si: usize, sims: &Sims, cut: &[usize]) -> Vec<(usize,
 
 pub(crate) const NO_PART: &str = "Import a part before running a setup. The example project's paths are illustrative and cannot be machined.";
 pub const REMOVED: &str = "This setup was removed from the project.";
+
+/// Why a run's check refused while the project's part is not loaded yet,
+/// after AXIS CAM opened say (`App::check_run`).
+pub(crate) const PART_NOT_LOADED: &str = "Load the imported part before running a setup.";
 
 /// The `sequence` results of setup `si`'s enabled operations, from a
 /// simulation of the job up to the end of that setup.
@@ -5891,7 +6302,7 @@ fn tablet_job_from(
             xy: None,
             zero: None,
             last: None,
-            touched: false,
+            touched_for: None,
         },
         paths: vec![],
         tip: [0.; 3],
@@ -8191,9 +8602,12 @@ pub(crate) mod tests {
             away: None,
             declared_lost: false,
             declared_stale: false,
+            declared_from: None,
             earlier_cuts: vec![],
             earlier_given: vec![],
+            earlier_elsewhere: vec![],
             project_setups: vec![],
+            earlier_own: vec![],
             before_follow: None,
             running: Some(Running {
                 index: 0,
@@ -8204,7 +8618,7 @@ pub(crate) mod tests {
                     xy: None,
                     zero: None,
                     last: None,
-                    touched: false,
+                    touched_for: None,
                 },
                 paths: vec![],
                 tip: [0.; 3],
@@ -8220,7 +8634,9 @@ pub(crate) mod tests {
             reference_a: None,
             last: None,
             length: None,
-            touched: false,
+            touched_for: None,
+            answered: false,
+            rechecked_tool: None,
             outcome: None,
             pictures: vec![],
             left: None,
@@ -8352,7 +8768,7 @@ pub(crate) mod tests {
                 xy: None,
                 zero: None,
                 last: None,
-                touched: false,
+                touched_for: None,
             },
             paths: vec![],
             tip: [0.; 3],
@@ -10202,7 +10618,7 @@ pub(crate) mod tests {
                     xy: None,
                     zero: None,
                     last: None,
-                    touched: false,
+                    touched_for: None,
                 },
                 paths: paths(blocks, [0.; 3]),
                 tip: [0.; 3],
@@ -10601,6 +11017,103 @@ pub(crate) mod tests {
         );
     }
 
+    /// LIO-607: another project's setups' cuts, kept with whose they are
+    /// (`CutOwner`), are said as that project's, its name and the
+    /// operations cut; a setup deleted from this project as any setup the
+    /// check does not follow; one kept with no owner (an older AXIS CAM's)
+    /// as maybe another project's (LIO-635).
+    #[test]
+    fn another_projects_cuts_are_said_as_its() {
+        let doc = crate::post::fixture::job().0;
+        let mut other = doc.clone();
+        other.project_id = crate::id();
+        other.title = "Bracket".into();
+        for s in &mut other.setups {
+            s.id = crate::id();
+        }
+        let mut third = other.clone();
+        third.project_id = crate::id();
+        third.title = "Lid".into();
+        third.setups[0].id = crate::id();
+        let (a, b) = (CutOwner::of(&other, 0), CutOwner::of(&third, 0));
+        let (face, pocket) = (a.ops[0].clone(), a.ops[1].clone());
+        // Of this project, but deleted since.
+        let mut gone = CutOwner::of(&doc, 0);
+        gone.setup = crate::id();
+        let owners = [a.clone(), b.clone(), gone.clone()];
+        let note = |cuts: &[(&str, &[usize])]| {
+            let mut run = Run::new(&doc, 0, 0);
+            run.earlier_cuts = (cuts.iter())
+                .map(|(id, ops)| {
+                    (
+                        id.to_string(),
+                        ops.iter().map(|&o| (o, None, None)).collect(),
+                    )
+                })
+                .collect();
+            crate::give_elsewhere(&owners, &doc, &mut run);
+            (run.earlier_unfollowed_why(), run.earlier_unfollowed_note())
+        };
+        // Why, said with the steps, and the note with New stock loaded.
+        assert_eq!(
+            note(&[(&a.setup, &[0, 1, 0, HISTORY_UNKNOWN])]),
+            (
+                format!(
+                    "Another project's runs cut stock on this machine earlier (\"Bracket\": {face} and {pocket}), which this project's check does not follow."
+                ),
+                "Another project's runs (\"Bracket\") may have cut this stock.".into()
+            )
+        );
+        assert_eq!(
+            note(&[(&a.setup, &[1]), (&b.setup, &[0])]),
+            (
+                format!(
+                    "Other projects' runs cut stock on this machine earlier (\"Bracket\": {pocket}; \"Lid\": {face}), which this project's check does not follow."
+                ),
+                "Other projects' runs (\"Bracket\" and \"Lid\") may have cut this stock.".into()
+            )
+        );
+        let generic = (
+            EARLIER_UNFOLLOWED_WHY.to_string(),
+            "Another setup's run cut this part in a way the check does not follow.".to_string(),
+        );
+        assert_eq!(note(&[(&gone.setup, &[0])]), generic);
+        // Kept with no owner, and not this project's: maybe another
+        // project's, said so (LIO-635).
+        assert_eq!(
+            note(&[("kept-with-no-owner", &[0])]),
+            (
+                EARLIER_ELSEWHERE_WHY.to_string(),
+                "This computer's runs cut stock for a setup this project does not have: another project's, or one deleted since.".to_string(),
+            )
+        );
+        assert_eq!(
+            note(&[(&gone.setup, &[0]), (&a.setup, &[0])]),
+            (
+                format!(
+                    "Another setup's run cut this part earlier in a way the check does not follow, and another project's runs cut stock on this machine earlier (\"Bracket\": {face}), which this project's check does not follow."
+                ),
+                "Another setup's run cut this part in a way the check does not follow, and another project's runs (\"Bracket\") may have cut it too.".into()
+            )
+        );
+        // A project with no name.
+        let mut nameless = a.clone();
+        (nameless.setup, nameless.title) = (crate::id(), " ".into());
+        let owners = [nameless.clone()];
+        let mut run = Run::new(&doc, 0, 0);
+        run.earlier_cuts = vec![(nameless.setup.clone(), vec![(0, None, None)])];
+        crate::give_elsewhere(&owners, &doc, &mut run);
+        assert_eq!(
+            run.earlier_unfollowed_note(),
+            "Another project's runs (one with no name) may have cut this stock."
+        );
+        // A history kept before owners were kept still reads.
+        let old =
+            r#"{"cuts":[["s",[[0,null,null]]]],"journals":[],"others_unknown":false,"sent":[]}"#;
+        let h: CutHistory = serde_json::from_str(old).unwrap();
+        assert!(h.owners.is_empty() && h.cuts.len() == 1);
+    }
+
     /// Setup 1 bores the ring from below, leaving a 0.5 mm roof, cut in a
     /// run this session; setup 2, flipped, faces the roof away (LIO-582
     /// review). While setup 1's bore is checked as it was cut, setup 2's
@@ -10677,7 +11190,7 @@ pub(crate) mod tests {
             // A setup deleted since is one this project does not have, as
             // another project's is (LIO-635).
             let gone = !(edited.setups.iter()).any(|s| s.id == doc.setups[0].id);
-            assert_eq!(run.earlier_elsewhere(), gone);
+            assert_eq!(run.earlier_not_here(), gone);
             assert_eq!(
                 why,
                 match gone {
@@ -11212,5 +11725,32 @@ pub(crate) mod tests {
             let config = MachineConfig::from_toml(&toml).unwrap();
             assert!(a_problems(&owners, &config).is_empty());
         }
+    }
+
+    /// LIO-611: a cuts.json written before what was taken as cut was kept
+    /// with it loads, with none taken as cut; one written now keeps it.
+    #[test]
+    fn an_older_cut_history_loads_with_nothing_taken_as_cut() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cuts.json");
+        let older =
+            r#"{"cuts":[["s1",[[0,null,7]]]],"journals":[],"others_unknown":false,"sent":[3]}"#;
+        std::fs::write(&path, older).unwrap();
+        let h = CutHistory::read(&path).unwrap().unwrap();
+        assert_eq!(h.cuts, [("s1".to_string(), vec![(0, None, Some(7))])]);
+        assert!(h.declared.is_empty());
+        let kept = KeptDeclared {
+            setup: "s1".into(),
+            skips: vec![(2, Skip::Cut)],
+            steps: vec![(1, vec![0, 3])],
+            lost: false,
+            prints: vec![(1, Some(11)), (2, None)],
+        };
+        let h = CutHistory {
+            declared: vec![kept],
+            ..h
+        };
+        h.write(&path).unwrap();
+        assert_eq!(CutHistory::read(&path).unwrap(), Some(h));
     }
 }
