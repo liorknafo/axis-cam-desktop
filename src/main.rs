@@ -1625,9 +1625,10 @@ pub struct App {
     /// machine disconnected) and given back when it is picked again, for the
     /// operator to say whether the same part is still there (LIO-582).
     run_cuts: Vec<(String, Vec<run::CutInRun>)>,
-    /// The setups of `run_cuts` kept across a disconnect from the machine,
-    /// by setup id, until the operator says whether anything else ran on
-    /// it meanwhile (`run::Run::away`, LIO-595).
+    /// The setups of `run_cuts`, or of `run_declared` (LIO-606), kept across
+    /// a disconnect from the machine, by setup id, until the operator says
+    /// whether anything else ran on it meanwhile (`run::Run::away`,
+    /// LIO-595).
     run_away: Vec<(String, run::Away)>,
     /// The tool runs the Pi showed that this session did not send and has
     /// answered for (`App::note_done_elsewhere`, LIO-596): seen while
@@ -4302,7 +4303,7 @@ impl App {
                 keep_away(&mut self.run_away, old);
                 keep_declared(&mut self.run_declared, old);
             }
-            mark_away(&mut self.run_away, &self.run_cuts, &c);
+            mark_away(&mut self.run_away, &self.run_cuts, &self.run_declared, &c);
             c.leaving("disconnected while it ran");
             self.pi_run = c.take_pi_run();
             self.status = match (&c.pi, &self.pi_run) {
@@ -12464,19 +12465,28 @@ fn keep_away(away: &mut Vec<(String, run::Away)>, run: &run::Run) {
     }
 }
 
-/// The machine of `c` disconnected: each setup whose runs cut this session
-/// (`cuts`) is kept in `away` (`App::run_away`), for anything may run on
-/// the machine meanwhile (LIO-595). One already in it keeps the tool runs
-/// the Pi had when it was first disconnected since, with those this
-/// computer sent since, so that one that ran while it was away still shows.
+/// The machine of `c` disconnected: each setup whose runs cut (`cuts`), or
+/// with operations or steps taken as cut this session (`declared`,
+/// LIO-606), is kept in `away` (`App::run_away`), for anything
+/// may run on the machine meanwhile (LIO-595). One already in it keeps the
+/// tool runs the Pi had when it was first disconnected since, with those
+/// this computer sent since, so that one that ran while it was away still
+/// shows.
 fn mark_away(
     away: &mut Vec<(String, run::Away)>,
     cuts: &[(String, Vec<run::CutInRun>)],
+    declared: &[run::KeptDeclared],
     c: &control::Connection,
 ) {
     let now = c.pi_tool_runs();
-    away.retain(|(id, _)| cuts.iter().any(|(c, _)| c == id));
-    for (id, _) in cuts {
+    let mut ids: Vec<&String> = vec![];
+    for id in (cuts.iter().map(|(id, _)| id)).chain(declared.iter().map(|k| &k.setup)) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    away.retain(|(id, _)| ids.contains(&id));
+    for id in ids {
         match away.iter_mut().find(|(a, _)| a == id) {
             Some((_, a)) => {
                 if let Some(seen) = &mut a.seen {
@@ -12488,20 +12498,25 @@ fn mark_away(
     }
 }
 
-/// Gives `run` its setup's entry of `away` (`App::run_away`): its cuts were
-/// kept across a disconnect, so the operator is asked whether it is the
-/// same part and whether anything else ran meanwhile (LIO-595). So is it
-/// when it has none, but has another setup's kept so (`earlier_cuts`),
-/// which the answer covers too (LIO-596); given after them and after
-/// whose they are (`give_elsewhere`). Not for another project's setup
-/// (`Run::earlier_elsewhere`): its cuts set no Z until New stock loaded
-/// whatever is answered, and are said as that project's (LIO-607). A
-/// setup deleted from this project is asked for: put back, its cuts are
-/// followed again (LIO-596 review).
+/// Gives `run` its setup's entry of `away` (`App::run_away`): its cuts, or
+/// what was taken as cut in it (LIO-606), were kept across a disconnect, so
+/// the operator is asked whether it is the same part and whether anything
+/// else ran meanwhile (LIO-595). So is it when it has none, but has another
+/// setup's kept so (`earlier_cuts`), which the answer covers too (LIO-596);
+/// given after them and after whose they are (`give_elsewhere`). Not for
+/// another project's setup (`Run::earlier_elsewhere`): its cuts set no Z
+/// until New stock loaded whatever is answered, and are said as that
+/// project's (LIO-607). A setup deleted from this project is asked for: put
+/// back, its cuts are followed again (LIO-596 review).
 fn give_away(away: &[(String, run::Away)], run: &mut run::Run) {
+    let (skips, steps) = run.declared();
+    let kept = !run.cuts_so_far().is_empty()
+        || !skips.is_empty()
+        || !steps.is_empty()
+        || run.declared_lost;
     let own = (away.iter())
         .find(|(id, _)| *id == run.setup_id)
-        .filter(|_| !run.cuts_so_far().is_empty());
+        .filter(|_| kept);
     let ours = |id: &String| !run.earlier_elsewhere.iter().any(|o| o.setup == *id);
     let earlier = || {
         away.iter().find(|(id, _)| {

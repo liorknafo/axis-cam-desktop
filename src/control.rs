@@ -4691,7 +4691,7 @@ impl Connection {
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::STOCK_UNCONFIRMED] =>
             {
-                Some("Earlier runs cut the stock, or took operations or steps of it as cut: say under Work zero whether it is the same part or new stock before a probe finds this work zero.".into())
+                Some("Earlier runs cut the stock, or operations or steps of it were taken as cut: say under Work zero whether it is the same part or new stock before a probe finds this work zero.".into())
             }
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::STEPS_UNFOLLOWED] =>

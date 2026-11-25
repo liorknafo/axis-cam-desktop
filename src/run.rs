@@ -29,18 +29,20 @@ pub enum Action {
     /// leaves (`Run::partway`): the one those operations were cut with, or
     /// one set by hand on a surface they left.
     KeepZero,
-    /// The part this setup's runs cut this session is still the one held
-    /// (`Run::stock_unconfirmed`), and nothing else has cut it since: what
-    /// they cut stays the stock's. Refused after a disconnect while the Pi
-    /// shows a tool run this computer did not send (`Run::away`, LIO-595).
+    /// The part this setup's runs cut, or with operations or steps of it
+    /// taken as cut, this session is still the one held
+    /// (`Run::stock_unconfirmed`), and nothing else has cut it since: that
+    /// stays the stock's. Refused after a disconnect while the Pi shows a
+    /// tool run this computer did not send (`Run::away`, LIO-595).
     SamePart,
-    /// The part this setup's runs cut this session is still the one held,
-    /// but after a disconnect (`Run::away`) something else may have cut it
-    /// meanwhile: what this setup's runs cut is unknown
-    /// (`Run::note_history_unknown`) until New stock loaded (LIO-595).
+    /// The part this setup's runs cut, or with operations or steps of it
+    /// taken as cut (LIO-606), this session is still the one held, but
+    /// after a disconnect (`Run::away`) something else may have cut it
+    /// meanwhile: what cut it is unknown (`Run::note_history_unknown`)
+    /// until New stock loaded (LIO-595).
     OtherRunsMayHaveCut,
-    /// New stock is held: what this setup's runs cut this session is
-    /// forgotten (`Run::stock_unconfirmed`).
+    /// New stock is held: what this setup's runs cut, and what was taken as
+    /// cut, this session is forgotten (`Run::stock_unconfirmed`).
     NewStock,
     CycleStart,
     Hold,
@@ -363,20 +365,19 @@ pub(crate) const LATER_UNFOLLOWED_WHY: &str = "Operations or steps after the sta
 /// What this setup's runs cut earlier, said as `Partly::cut`,
 /// while the operator has not said whether the same part is still held
 /// (`Run::stock_unconfirmed`).
-pub(crate) const STOCK_UNCONFIRMED: &str =
-    "stock earlier runs cut, or took as cut, which may or may not still be held";
+pub(crate) const STOCK_UNCONFIRMED: &str = "stock earlier runs cut, or with operations or steps of it taken as cut, which may or may not still be held";
 
 /// Why a probe cannot find a work zero from a spot while
 /// `Run::stock_unconfirmed`.
-const STOCK_UNCONFIRMED_WHY: &str = "Earlier runs cut the stock, or took operations or steps of it as cut: say under Work zero whether it is the same part or new stock.";
+const STOCK_UNCONFIRMED_WHY: &str = "Earlier runs cut the stock, or operations or steps of it were taken as cut: say under Work zero whether it is the same part or new stock.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed`.
-const STOCK_UNCONFIRMED_BLOCKED: &str = "Earlier runs cut the stock, or took operations or steps of it as cut: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
+const STOCK_UNCONFIRMED_BLOCKED: &str = "Earlier runs cut the stock, or operations or steps of it were taken as cut: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed` after a disconnect (`Run::away`, LIO-595).
-pub(crate) const STOCK_AWAY_BLOCKED: &str = "Earlier runs cut the stock, and the machine was disconnected or AXIS CAM closed since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile. The answer covers every setup.";
+pub(crate) const STOCK_AWAY_BLOCKED: &str = "Earlier runs cut the stock, or operations or steps of it were taken as cut, and the machine was disconnected or AXIS CAM closed since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile. The answer covers every setup.";
 
 /// What runs this computer did not follow may have cut, said as
 /// `Partly::cut` (`HISTORY_UNKNOWN` in `Run::cut_in_run`): another
@@ -644,9 +645,10 @@ pub struct Run {
     /// (`Action::SamePart`, `Action::NewStock`): nothing sets Z or probes
     /// until then (`partly`, LIO-582 review).
     pub stock_unconfirmed: bool,
-    /// `cut_in_run` was kept across a disconnect from the machine, while
-    /// which anything may have run on it (LIO-595): the operator is asked
-    /// too whether something else ran meanwhile (`Action::SamePart`,
+    /// `cut_in_run`, or what was taken as cut (`declared`, LIO-606), was
+    /// kept across a disconnect from the machine, while which anything may
+    /// have run on it (LIO-595): the operator is asked too whether
+    /// something else ran meanwhile (`Action::SamePart`,
     /// `Action::OtherRunsMayHaveCut`). Cleared once answered.
     pub away: Option<Away>,
     /// Operations or steps were taken as cut (`declared`) and dropped since:
@@ -2157,6 +2159,13 @@ impl Run {
             marked |= note_unknown_before(cuts);
         }
         marked
+    }
+
+    /// This computer saw this setup's runs cut it (`cut_in_run`), not
+    /// counting that runs it did not follow may have
+    /// (`history_unknown`).
+    pub fn cut_by_runs(&self) -> bool {
+        self.cut_in_run.iter().any(|c| c.0 != HISTORY_UNKNOWN)
     }
 
     /// Where a run of this setup stopped, found while it is open (the Pi
