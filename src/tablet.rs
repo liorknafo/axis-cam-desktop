@@ -758,7 +758,13 @@ mod tests {
         assert_ne!(version(), before);
         // Operations taken as cut (LIO-583): a new version too.
         let declared = Session {
-            declared: vec!["a".into()],
+            declared: vec![crate::run::KeptDeclared {
+                setup: "a".into(),
+                skips: vec![(0, crate::run::Skip::Cut)],
+                steps: vec![],
+                lost: false,
+                prints: vec![],
+            }],
             ..Session::default()
         };
         set_session_cuts(&state, declared);
