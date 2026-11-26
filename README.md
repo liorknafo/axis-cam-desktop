@@ -1423,8 +1423,16 @@ bar, at once when that machine is connected, or when you press
    touch-off holds for the tool of the tool run that was next when it was
    made: another tool run picked next, or one an edit gives another tool,
    waits for its own tool's touch-off while the Z work offset is still the
-   one the touch-off left (LIO-619). Picking another start, or the setup
-   checked again (a skip, an edit), forgets a touch-off made before as
+   one the touch-off left (LIO-619). Z set any other way on the Control
+   page (**Set** on Z, its **Zero** or **½**, a probe) holds the same way,
+   for the tool next then: it moves the Z work offset off the one the last
+   tool run started with, and another tool still waits. Z set otherwise
+   (typed in MDI as `G10 L20` or `G92`, or from the tablet) is no tool's
+   known Z: at a tool change, while the Z work offset is neither the one
+   the last tool run started with nor the one the last Z set here left,
+   the new tool waits for its touch-off, as on the tablet (LIO-630).
+   Picking another start, or the setup checked again (a skip, an edit),
+   forgets a touch-off made before as
    **Same tool, keep Z** is forgotten: a tool change waits for the
    touch-off again while the Z work offset is still the one that touch-off
    left, and a start at a step asks for its tool's Z again (LIO-618). It
