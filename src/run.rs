@@ -3650,7 +3650,7 @@ impl Run {
             if !cuts.iter().any(|c| c.0 == oi) {
                 let print = self.op_steps(oi).map(|s| s.cut_print);
                 let at = cuts.iter().position(|c| c.0 > oi).unwrap_or(cuts.len());
-                cuts.insert(at, (oi, None, print));
+                cuts.insert(at, (oi, None, print, print));
             }
         }
     }
@@ -3979,7 +3979,7 @@ impl Run {
             .map(|e| e.op)
             .min();
         first.is_some_and(|first| {
-            cuts.iter().all(|&(op, _, print)| {
+            cuts.iter().all(|&(op, _, print, _)| {
                 op > first
                     || (earlier.iter()).any(|e| e.setup == id && e.op == op && Some(e.cut) == print)
             })
@@ -3991,7 +3991,7 @@ impl Run {
     /// operation where it was first cut (`note_cut_in`).
     fn cut_out_of_order(&self, id: &str, cuts: &[CutInRun]) -> bool {
         let earlier = &self.simulated_earlier;
-        (cuts.iter().enumerate()).any(|(i, &(op, _, print))| {
+        (cuts.iter().enumerate()).any(|(i, &(op, _, print, _))| {
             let followed =
                 (earlier.iter()).any(|e| e.setup == id && e.op == op && Some(e.cut) == print);
             !followed && op != HISTORY_UNKNOWN && cuts[i + 1..].iter().any(|c| c.0 < op)
