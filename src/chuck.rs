@@ -690,7 +690,7 @@ mod tests {
     /// on the rotary machine's assumed unit.
     fn setup(extra: &[(&str, &str)]) -> Setup {
         let dir = tempfile::tempdir().unwrap();
-        let m = crate::control::rotary_machine(dir.path()).unwrap();
+        let m = crate::machine_profile::rotary_machine(dir.path()).unwrap();
         let mut s = Setup::new(m, "G54");
         for (k, v) in [
             ("stock_type", "Round bar"),

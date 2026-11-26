@@ -2456,7 +2456,7 @@ fn pin_holes(setup: &Setup, op: &Operation, tool: &Tool, mesh: &Mesh) -> Result<
     if !drill && get(&tool.p, "type") != "Flat end mill" {
         return Err("Choose a drill, or a flat end mill to mill them, for the pin holes.".into());
     }
-    let pins = match crate::control::pins_settings(&setup.machine.p) {
+    let pins = match crate::machine_profile::pins_settings(&setup.machine.p) {
         Ok(Some(pins)) => pins,
         Ok(None) => {
             return Err(format!(

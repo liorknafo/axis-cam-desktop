@@ -6522,7 +6522,7 @@ pub(crate) mod tests {
     #[test]
     fn layout_suggestion_reports_inherited_contact_as_well_as_clearance() {
         for stepped in [false, true] {
-            let (mut doc, mesh) = crate::guide::tests::squared_job();
+            let (mut doc, mesh) = crate::viewport::tests::guide_tests::squared_job();
             if stepped {
                 for (k, v) in [("y_min", "-5"), ("y_max", "5")] {
                     doc.setups[0].operations[0].p.insert(k.into(), v.into());
@@ -7862,7 +7862,7 @@ pub(crate) mod tests {
             ("cut-back-minus", [-80., -67., -50., 50., 0., -16.]),
             ("skim-plus", [69.9, 80., -50., 50., 0., -16.]),
         ] {
-            let (mut doc, mesh) = crate::guide::tests::after_a_cut(cut);
+            let (mut doc, mesh) = crate::viewport::tests::guide_tests::after_a_cut(cut);
             doc.file = Some(crate::model::ModelFile {
                 name: "squared.3mf".into(),
                 path: "squared.3mf".into(),
@@ -10830,5 +10830,75 @@ pub(crate) mod tests {
         });
         let thread = nth(&a, 0, |l| matches!(l, L::ThreadPass { .. }));
         shot(&mut a, "25-inside-thread-pass-2", thread + 1, 1);
+    }
+    mod manual_tests {
+        use crate::manual::SAFE_ABOVE;
+        use crate::model::num;
+
+        #[test]
+        fn a_drill_goes_from_hole_to_hole_over_the_clamps() {
+            // The manual job's Holes (`guide::tests::job`), held by 25 high toe
+            // clamps on its front and back (LIO-538): between holes the tip
+            // goes up 5 over their tops, not at the 15 over the stock its
+            // hidden clearance says, and nothing hits them.
+            let holes_plan = |clamps: Option<&str>| {
+                let (mut doc, mesh) = crate::guide::tests::job("No");
+                if let Some(clamps) = clamps {
+                    crate::guide::tests::on_clamps(&mut doc, clamps, "20");
+                }
+                let mut plans = vec![];
+                crate::simulation::sequence(&doc, &mesh, None, |_, oi, r| {
+                    plans.push((oi, r.unwrap().plan))
+                });
+                let plan = plans.into_iter().find(|(oi, _)| *oi == 2).unwrap().1;
+                (doc, mesh, plan)
+            };
+            // Its tip over every move across.
+            let across = |plan: &crate::simulation::Plan| {
+                (plan.moves.iter())
+                    .filter(|m| m.from[0] != m.to[0] || m.from[1] != m.to[1])
+                    .map(|m| m.from[2].min(m.to[2]))
+                    .fold(f32::INFINITY, f32::min)
+            };
+            let (doc, _, plan) = holes_plan(None);
+            assert_eq!(num(&doc.setups[0].operations[2].p, "clearance"), Some(15.));
+            assert!((across(&plan) - plan.stock.max[2] - 15.).abs() < 1e-3);
+            let (doc, mesh, plan) = holes_plan(Some("-Y:0;+Y:0"));
+            let boxes = doc
+                .holding_boxes(&doc.setups[0], crate::holding::Gripped::whole(plan.stock))
+                .unwrap();
+            let tops = boxes
+                .iter()
+                .map(|b| b.bounds.max[2])
+                .fold(f32::MIN, f32::max);
+            assert!((tops - plan.stock.max[2] - 25.).abs() < 1e-3);
+            assert!(
+                (across(&plan) - plan.stock.max[2] - 25. - SAFE_ABOVE).abs() < 1e-3,
+                "{}",
+                across(&plan)
+            );
+            let gap = crate::holding::gap(&doc.setups[0]).unwrap();
+            assert!(crate::holding::hits(&plan, &boxes, gap).is_empty());
+            // Its Holes page says so: up to Z 30.00 over the stock's top, the
+            // work zero, before X and Y move.
+            let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
+            let lifts = crate::steps::Lifts::of(&doc, &mesh, &guide);
+            let z = lifts.z(&doc, &guide, 2) + guide.zero[2] - plan.stock.max[2];
+            assert_eq!(format!("{z:.3}"), "30.000");
+            assert_eq!(lifts.holder(), "the clamps");
+            // The operation as saved keeps its own clearance.
+            assert_eq!(num(&doc.setups[0].operations[2].p, "clearance"), Some(15.));
+            // A clearance of its own above them is kept.
+            let mut doc = doc;
+            doc.setups[0].operations[2]
+                .p
+                .insert("clearance".into(), "40".into());
+            let mut plans = vec![];
+            crate::simulation::sequence(&doc, &mesh, None, |_, oi, r| {
+                plans.push((oi, r.unwrap().plan))
+            });
+            let plan = &plans.iter().find(|(oi, _)| *oi == 2).unwrap().1;
+            assert!((across(plan) - plan.stock.max[2] - 40.).abs() < 1e-3);
+        }
     }
 }

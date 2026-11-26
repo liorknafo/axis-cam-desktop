@@ -2,10 +2,13 @@
 //! programs, one per tool run; each lowered to the driver's actions when
 //! Cycle Start is pressed; the checks before Cycle Start; progress and the
 //! manual tool change between tool runs.
+use crate::air::step_clearance;
 use crate::control::Connection;
 use crate::mesh::Mesh;
 use crate::model::Document;
 use crate::post::{Block, Checked, Kind, OFFSETS, Partly, PostSettings, clearance_plane, extents};
+// What a setup's UC100 checks refuse is core (LIO-729): `post` holds it.
+pub(crate) use crate::post::{output_problems, plan_problems};
 use crate::simulation::{CutterShape, StockGrid};
 use std::sync::Arc;
 use uc100::controller::{Command, State};
@@ -6194,24 +6197,6 @@ pub fn plan_steps(plan: &crate::simulation::Plan) -> Vec<Step> {
         .collect()
 }
 
-/// The clearance a plan's steps start at (`plan_steps`): the highest Z it
-/// moves at from its first feed move on. Its way in may come from higher, as
-/// a chuck-held plan does from over what its jaws swing
-/// (`indexed::enter_held`), but it never rises there again, so steps by that
-/// height would be one: a bore at a time is the clearance it retracts to
-/// (LIO-555). The highest Z of all for a plan without a feed move. Air
-/// trimming's links between levels rise to it too (`air::relink`, LIO-565).
-pub(crate) fn step_clearance(plan: &crate::simulation::Plan) -> f32 {
-    use crate::simulation::Motion;
-    let moves = &plan.moves;
-    let first = (moves.iter())
-        .position(|m| m.motion == Motion::Feed)
-        .unwrap_or(0);
-    (moves[first..].iter())
-        .map(|m| m.from[2].max(m.to[2]))
-        .fold(f32::NEG_INFINITY, f32::max)
-}
-
 /// The steps of setup `si`'s operations that generated, from the check's
 /// simulations `sims` (`plan_steps`).
 fn op_steps(doc: &Document, si: usize, sims: &Sims) -> Vec<OpSteps> {
@@ -6799,79 +6784,6 @@ pub fn limits_unchecked(c: &Connection) -> Option<String> {
         ));
     }
     (!lines.is_empty()).then(|| lines.join(" "))
-}
-
-/// What the UC100 profile's `out`puts refuse in a tool run's `ops`: a
-/// spindle speed above its maximum, a counterclockwise spindle without a
-/// direction output, and coolant it has no output for.
-pub fn output_problems(out: &uc100::config::Outputs, ops: &[crate::post::OpState]) -> Vec<String> {
-    let mut e = vec![];
-    for o in ops {
-        if out.spindle_pwm.is_some() && o.rpm as f64 > out.spindle_max_rpm {
-            e.push(format!(
-                "{}: S{} is above the UC100 profile's {:.0} rpm.",
-                o.name,
-                o.rpm.round(),
-                out.spindle_max_rpm
-            ));
-        }
-        if !o.clockwise && out.spindle_dir.is_none() && out.spindle_ccw.is_none() {
-            e.push(format!("{}: the spindle turns counterclockwise, but the UC100 profile has no spindle direction output.", o.name));
-        }
-        for (on, pin, what) in [
-            (o.coolant.1, out.flood, "flood"),
-            (o.coolant.0, out.mist, "mist"),
-        ] {
-            if on && pin.is_none() {
-                e.push(format!("{}: uses {what} coolant, but the UC100 profile has no {what} output. Set its coolant to Off, or add the output to the profile.", o.name));
-            }
-        }
-    }
-    e
-}
-
-/// How the planner checks setup `si` of a UC100 machine, from the job's
-/// simulations `sims`: as a run checks it before Cycle Start, without the
-/// checks that need the connected machine (its work zero and position).
-pub(crate) fn plan_problems(
-    doc: &Document,
-    mesh: &Mesh,
-    si: usize,
-    sims: &[(usize, Result<crate::simulation::Simulation, String>)],
-) -> Result<(), Vec<String>> {
-    plan_held(doc, mesh, si, sims).map_err(|e| e.into_iter().map(|h| h.message).collect())
-}
-/// `plan_problems`, each problem with the operation it is about.
-pub(crate) fn plan_held(
-    doc: &Document,
-    mesh: &Mesh,
-    si: usize,
-    sims: &[(usize, Result<crate::simulation::Simulation, String>)],
-) -> Result<(), Vec<crate::post::Held>> {
-    use crate::post::Held;
-    if crate::manual::is_hand(&doc.setups[si].machine) {
-        return Ok(());
-    }
-    let programs =
-        crate::post::checked_held(doc, mesh, si, sims, PostSettings::for_uc100, false, &[])?;
-    let config = crate::control::profile(&doc.setups[si].machine).map_err(|e| {
-        vec![Held {
-            operation: None,
-            message: e,
-        }]
-    })?;
-    let e: Vec<Held> = (programs.iter())
-        .flat_map(|p| p.ops.iter().zip(&p.indexes))
-        .flat_map(|(op, oi)| {
-            output_problems(&config.outputs, std::slice::from_ref(op))
-                .into_iter()
-                .map(|message| Held {
-                    operation: Some(*oi),
-                    message,
-                })
-        })
-        .collect();
-    if e.is_empty() { Ok(()) } else { Err(e) }
 }
 
 /// The driver actions of a tool run's `program`: plan points become machine
@@ -14879,5 +14791,716 @@ pub(crate) mod tests {
         };
         h.write(&path).unwrap();
         assert_eq!(CutHistory::read(&path).unwrap(), Some(h));
+    }
+    mod chamfer_tests {
+        use crate::chamfer::tests::*;
+
+        #[test]
+        fn a_chamfer_milling_posts_for_linuxcnc_and_runs_on_the_uc100() {
+            let (mut doc, mesh) = crate::post::fixture::job();
+            let mut spot = mill("90", "0");
+            spot.p.insert("number".into(), "9".into());
+            let op = chamfer(
+                &spot,
+                &[
+                    ("chamfer_source", "Line"),
+                    ("from_x", "-5"),
+                    ("to_x", "5"),
+                    ("line_z", "0"),
+                    ("chamfer_size", "Tip depth"),
+                    ("tip_z", "-1"),
+                ],
+            );
+            doc.tools.push(spot);
+            doc.setups[0].operations = vec![op];
+            // LinuxCNC: down to the tip, then the level pass 1 mm off the line.
+            let job = crate::post::post_job(&doc, &mesh);
+            assert!(job.errors.is_empty(), "{:?}", job.errors);
+            let programs = job.setups[0].result.as_ref().unwrap();
+            let text = &programs[0].text;
+            assert!(text.contains("G1 Z-1.000"), "{text}");
+            assert!(
+                text.contains("X-5.000 Y1.000\nZ5.000\nG1 Z-1.000"),
+                "{text}"
+            );
+            assert!(text.contains("G1 Z-1.000 F75.0\nX5.000 F300.0"), "{text}");
+            // The UC100: its run checks pass and the tool run has the pass.
+            let dir = tempfile::tempdir().unwrap();
+            let profile = dir.path().join("template.toml");
+            std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+            // The template profile has no coolant outputs.
+            doc.setups[0].operations[0]
+                .p
+                .insert("coolant".into(), "Off".into());
+            let m = &mut doc.setups[0].machine;
+            m.p.insert("controller".into(), "UC100".into());
+            m.p.insert("uc100_profile".into(), profile.display().to_string());
+            let job = crate::post::post_job(&doc, &mesh);
+            assert!(
+                matches!(job.setups[0].run, Some(Ok(()))),
+                "{:?}",
+                job.setups[0].run
+            );
+            let runs = crate::run::programs(&doc, &mesh, 0).unwrap();
+            let level = (runs.iter().flat_map(|r| &r.blocks)).any(|b| {
+                matches!(b, crate::post::Block::Move { kind: crate::post::Kind::Feed, from, to, .. }
+                    if (from[2] - to[2]).abs() < 1e-6 && (to[0] - from[0]).abs() > 9.99)
+            });
+            assert!(level);
+        }
+    }
+    mod envelope_tests {
+        use crate::envelope::tests::*;
+        use crate::envelope::*;
+        use crate::mesh::Mesh;
+        use crate::model::Document;
+        use crate::model::HOLDER_LENGTH;
+        use crate::model::Machine;
+        use crate::simulation::Simulation;
+
+        fn simulated(doc: &Document, mesh: &Mesh) -> Vec<(usize, Result<Simulation, String>)> {
+            crate::run::simulated_for_tests(doc, mesh, 0)
+        }
+        #[test]
+        fn a_machine_without_the_figures_is_not_checked_and_a_bad_one_is_said() {
+            let (doc, mesh) = drilled(machine("", "", ""), Some("25"));
+            assert!(problems(&doc, &mesh, 0, &simulated(&doc, &mesh)).is_empty());
+            assert!(!Machine::new(3).p.contains_key("nose_to_table"));
+            assert!(issues(&machine("150", "120", "390")).is_empty());
+            assert!(issues(&machine("", "", "")).is_empty());
+            assert_eq!(
+                issues(&machine("0", "120", "390")),
+                ["Spindle nose to table at Z top must be greater than zero."]
+            );
+            assert_eq!(
+                issues(&machine("150", "abc", "390")),
+                ["Gantry clearance height must be greater than zero."]
+            );
+            assert_eq!(
+                issues(&machine("150", "120", "300")),
+                [
+                    "Gantry clearance width cannot be narrower than the 390 mm X travel the spindle crosses it over."
+                ]
+            );
+            let mut m = machine("150", "120", "390");
+            m.p.insert("nose_to_table_source".into(), "guess".into());
+            assert_eq!(
+                issues(&m),
+                ["Spindle nose to table at Z top: choose ASSUMED or Measured."]
+            );
+        }
+        #[test]
+        fn the_stack_up_is_the_vise_the_stock_and_the_tool_up_to_the_nose() {
+            // The fixture's stock is 98 mm along Y; the vise holds it by 8 mm.
+            let (doc, mesh) = drilled(machine("1000", "1000", "1000"), Some("25"));
+            let stack = Stack::of(&doc, &mesh, 0).unwrap();
+            let height = doc.setup_stock(0, Some(&mesh)).unwrap().dimensions()[2];
+            assert_eq!(stack.base, 25.);
+            assert!(!stack.base_assumed);
+            assert_eq!(stack.stock_top, 25. + height);
+            assert_eq!(stack.top, stack.stock_top);
+            // A frame Z is the stock's underside at the base, rising with it.
+            let stock = doc.setup_stock(0, Some(&mesh)).unwrap();
+            assert_eq!(stack.height(stock.min[2]), Some(25.));
+            assert_eq!(stack.height(stock.max[2]), Some(25. + height));
+            // Roomy: the job passes, and a library vise that gives no height
+            // is taken as the typical one, saying so.
+            assert!(problems(&doc, &mesh, 0, &simulated(&doc, &mesh)).is_empty());
+            let (doc, mesh) = drilled(machine("1000", "1000", "1000"), None);
+            let stack = Stack::of(&doc, &mesh, 0).unwrap();
+            assert_eq!((stack.base, stack.base_assumed), (VISE_BASE, true));
+            assert!(stack.what.contains("taken"), "{}", stack.what);
+            // Clamps and nothing stand on the table.
+            let mut none = doc.clone();
+            none.setups[0].p.insert("holding".into(), "None".into());
+            let stack = Stack::of(&none, &mesh, 0).unwrap();
+            assert_eq!((stack.base, stack.base_assumed), (0., false));
+            assert!(
+                stack.what.starts_with("on the table, the stock's "),
+                "{}",
+                stack.what
+            );
+        }
+        #[test]
+        fn a_part_taller_than_the_gantry_is_refused_naming_the_numbers() {
+            let (doc, mesh) = drilled(machine("1000", "50", "1000"), Some("25"));
+            let stack = Stack::of(&doc, &mesh, 0).unwrap();
+            let found = problems(&doc, &mesh, 0, &simulated(&doc, &mesh));
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].0, None);
+            let top = crate::envelope::mm(stack.top);
+            assert!(
+                found[0].1.contains(&format!(
+                    "the part doesn't fit under the gantry: needs {top} mm, has 50 mm."
+                )),
+                "{}",
+                found[0].1
+            );
+            // The same part under a gantry with the room passes, and one marked
+            // ASSUMED says so in the refusal.
+            let tall = stack.top + 1.;
+            let (roomy, _) = drilled(machine("1000", &tall.to_string(), "1000"), Some("25"));
+            assert!(problems(&roomy, &mesh, 0, &simulated(&roomy, &mesh)).is_empty());
+            let (mut doc, mesh) = drilled(machine("1000", "50", "1000"), Some("25"));
+            doc.setups[0]
+                .machine
+                .p
+                .insert("gantry_height_source".into(), ASSUMED.into());
+            let found = problems(&doc, &mesh, 0, &simulated(&doc, &mesh));
+            assert!(
+                found[0].1.contains("has 50 mm (ASSUMED, not measured"),
+                "{}",
+                found[0].1
+            );
+        }
+        #[test]
+        fn a_part_wider_than_the_gantry_is_refused() {
+            let (doc, mesh) = drilled(machine("1000", "1000", "10"), Some("25"));
+            let found = problems(&doc, &mesh, 0, &simulated(&doc, &mesh));
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(
+                found[0].1.contains("doesn't fit under the gantry: needs ")
+                    && found[0].1.contains(" mm across X, has 10 mm"),
+                "{}",
+                found[0].1
+            );
+        }
+        /// LIO-457: the gantry's width spans the axis across the table: Y on a
+        /// machine whose X runs front to back.
+        #[test]
+        fn the_gantry_width_is_across_the_table_whichever_axis_that_is() {
+            use crate::orient::{KEY, Orient};
+            // X 500 long, Y 200 across, the gantry 250 wide.
+            let mut m = machine("150", "120", "250");
+            m.p.insert("x".into(), "500".into());
+            m.p.insert("y".into(), "200".into());
+            for (o, issue) in [
+                ("Right", Some("the 500 mm X travel")),
+                ("Left", Some("the 500 mm X travel")),
+                ("Away from you", None),
+                ("Toward you", None),
+            ] {
+                m.p.insert(KEY.into(), o.into());
+                let found = issues(&m);
+                match issue {
+                    Some(words) => {
+                        assert!(found.iter().any(|e| e.contains(words)), "{o}: {found:?}")
+                    }
+                    None => assert!(found.is_empty(), "{o}: {found:?}"),
+                }
+            }
+            m.p.insert("x".into(), "200".into());
+            m.p.insert("y".into(), "500".into());
+            m.p.insert(KEY.into(), "Away from you".into());
+            assert!(
+                issues(&m).iter().any(|e| e.contains("the 500 mm Y travel")),
+                "{:?}",
+                issues(&m)
+            );
+            // A part that fits across one way and not the other: its reach
+            // across X and across Y, and a gantry between the two.
+            // The vise's jaws along X: wider across X than across Y.
+            let (mut doc, mesh) = drilled(machine("1000", "1000", "1000"), Some("25"));
+            doc.setups[0].p.insert("vise_axis".into(), "X".into());
+            let reach = |o: Orient| {
+                let mut d = doc.clone();
+                d.setups[0].machine.p.insert(KEY.into(), o.label().into());
+                let [lo, hi] = Stack::of(&d, &mesh, 0).unwrap().across.unwrap();
+                hi - lo
+            };
+            let (wx, wy) = (reach(Orient::Right), reach(Orient::Away));
+            assert!((wx - wy).abs() > 2., "{wx} {wy}");
+            assert_eq!(reach(Orient::Left), wx);
+            assert_eq!(reach(Orient::Toward), wy);
+            let limit = format!("{}", (wx + wy) / 2.);
+            for o in [Orient::Right, Orient::Left, Orient::Away, Orient::Toward] {
+                let (mut d, mesh) = drilled(machine("1000", "1000", &limit), Some("25"));
+                d.setups[0].p.insert("vise_axis".into(), "X".into());
+                d.setups[0].machine.p.insert(KEY.into(), o.label().into());
+                let found = problems(&d, &mesh, 0, &simulated(&d, &mesh));
+                let wide = if o.across() == 0 { wx > wy } else { wy > wx };
+                let axis = ["X", "Y"][o.across()];
+                assert_eq!(
+                    found
+                        .iter()
+                        .any(|(_, e)| e.contains(&format!(" mm across {axis}, has "))),
+                    wide,
+                    "{o:?}: {found:?}"
+                );
+                assert_eq!(found.len(), usize::from(wide), "{o:?}: {found:?}");
+            }
+        }
+        #[test]
+        fn a_tool_that_reaches_the_nose_is_refused_with_its_stick_out_and_holder() {
+            let (mut doc, mesh) = drilled(machine("1000", "1000", "1000"), Some("25"));
+            let sims = simulated(&doc, &mesh);
+            let op = &doc.setups[0].operations[sims[0].0];
+            let (stickout, id) = (
+                sims[0].1.as_ref().unwrap().plan.tool_length,
+                op.tool.clone(),
+            );
+            let tool = doc.tools.iter_mut().find(|t| t.id == id).unwrap();
+            tool.p.insert("holder_length".into(), "20".into());
+            let stack = Stack::of(&doc, &mesh, 0).unwrap();
+            let sim = sims[0].1.as_ref().unwrap();
+            let high = sim
+                .plan
+                .moves
+                .iter()
+                .flat_map(|m| [m.from[2], m.to[2]])
+                .filter_map(|z| stack.height(z))
+                .fold(stack.stock_top, f32::max);
+            let needs = high + stickout + 20.;
+            // A hair of room passes; a hair short is refused with the sum.
+            doc.setups[0]
+                .machine
+                .p
+                .insert("nose_to_table".into(), (needs + 0.1).to_string());
+            assert!(problems(&doc, &mesh, 0, &sims).is_empty());
+            doc.setups[0]
+                .machine
+                .p
+                .insert("nose_to_table".into(), (needs - 0.1).to_string());
+            let found = problems(&doc, &mesh, 0, &sims);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert_eq!(found[0].0, Some(sims[0].0));
+            let said = &found[0].1;
+            assert!(
+                said.contains(&format!(
+                    "the tool doesn't fit under the spindle: needs {} mm, has {} mm from the table",
+                    crate::envelope::mm(needs),
+                    crate::envelope::mm(needs - 0.1)
+                )),
+                "{said}"
+            );
+            assert!(
+                said.contains(&format!(
+                    "{} mm stick-out and 20 mm holder",
+                    crate::envelope::mm(stickout)
+                )),
+                "{said}"
+            );
+            assert!(!said.contains("is taken"), "{said}");
+            // A tool that gives no holder length is taken as the short default.
+            doc.tools
+                .iter_mut()
+                .find(|t| t.id == id)
+                .unwrap()
+                .p
+                .remove("holder_length");
+            let found = problems(&doc, &mesh, 0, &sims);
+            assert!(
+                found.is_empty() || found[0].1.contains("The holder's 10 mm length is taken"),
+                "{found:?}"
+            );
+        }
+        #[test]
+        fn a_tool_too_short_to_reach_down_is_refused_only_for_a_measured_nose_height() {
+            let (mut doc, mesh) = drilled(machine("150", "1000", "1000"), Some("25"));
+            // A long Z travel, so that the span of the job is inside it.
+            doc.setups[0].machine.p.insert("z".into(), "100".into());
+            let sims = simulated(&doc, &mesh);
+            // The drilling goes down through the stock to near the vise.
+            let stack = Stack::of(&doc, &mesh, 0).unwrap();
+            let sim = sims[0].1.as_ref().unwrap();
+            let tool = sim.plan.tool_length + HOLDER_LENGTH;
+            let low = sim
+                .plan
+                .moves
+                .iter()
+                .flat_map(|m| [m.from[2], m.to[2]])
+                .filter_map(|z| stack.height(z))
+                .fold(f32::INFINITY, f32::min);
+            let id = doc.setups[0].operations[sims[0].0].tool.clone();
+            doc.tools
+                .iter_mut()
+                .find(|t| t.id == id)
+                .unwrap()
+                .p
+                .remove("holder_length");
+            // The tip's lowest reach is `low` + 1 mm too high.
+            let nose = low + 1. + tool + 100.;
+            doc.setups[0]
+                .machine
+                .p
+                .insert("nose_to_table".into(), nose.to_string());
+            let found = problems(&doc, &mesh, 0, &sims);
+            assert!(found.is_empty(), "{found:?}");
+            doc.setups[0]
+                .machine
+                .p
+                .insert("nose_to_table_source".into(), ASSUMED.into());
+            assert!(problems(&doc, &mesh, 0, &sims).is_empty());
+            doc.setups[0]
+                .machine
+                .p
+                .insert("nose_to_table_source".into(), MEASURED.into());
+            let found = problems(&doc, &mesh, 0, &sims);
+            assert_eq!(found.len(), 1, "{found:?}");
+            assert!(
+                found[0]
+                    .1
+                    .contains("the tool can't reach down: the cut goes to"),
+                "{}",
+                found[0].1
+            );
+            assert!(found[0].1.contains("100 mm Z travel"), "{}", found[0].1);
+            // Lower by 2 mm: it reaches.
+            doc.setups[0]
+                .machine
+                .p
+                .insert("nose_to_table".into(), (nose - 2.).to_string());
+            assert!(problems(&doc, &mesh, 0, &sims).is_empty());
+        }
+        #[test]
+        fn export_run_and_the_plan_check_see_the_refusal() {
+            let (doc, mesh) = drilled(machine("1000", "50", "1000"), Some("25"));
+            let said = |messages: &[String]| {
+                messages
+                    .iter()
+                    .filter(|m| m.contains("doesn't fit under the gantry"))
+                    .count()
+            };
+            let posted = crate::post::post_job(&doc, &mesh);
+            assert_eq!(said(posted.setups[0].result.as_ref().unwrap_err()), 1);
+            assert_eq!(said(&crate::run::ready(&doc, &mesh, 0, 0).problems), 1);
+            // The same job on a gantry with the room is ready.
+            let (doc, mesh) = drilled(machine("1000", "1000", "1000"), Some("25"));
+            assert_eq!(said(&crate::run::ready(&doc, &mesh, 0, 0).problems), 0);
+            let posted = crate::post::post_job(&doc, &mesh);
+            let errors = posted.setups[0].result.clone().err().unwrap_or_default();
+            assert_eq!(said(&errors), 0);
+        }
+    }
+    mod indexed_tests {
+        use crate::indexed::tests::*;
+
+        #[test]
+        fn a_turn_of_a_below_the_swing_height_is_refused() {
+            use crate::model::POST_RETRACT;
+            // Setup 3 indexes to A90 as setup 2 left it: its plan has no index
+            // move, so the program turns A to A90 where its retract leaves the
+            // tool, since the A the machine is at when it starts is not known.
+            let (mut doc, mesh) = posting_bar_job(20., "100", "90");
+            let mut third = doc.setups[1].clone();
+            third.id = crate::model::id();
+            doc.setups.push(third);
+            doc.sync_stock_sources();
+            doc.sync_turns(Some(&mesh));
+            // Setup 3 starts at the angle setup 2 left, and comes down from
+            // above what A swings under the tool as an index move does
+            // (LIO-205): its program turns A at machine Z home over the first
+            // cut, and is exported. At the clearance plane, now over the bar
+            // and not the jaws (LIO-209), a program that starts with the tool
+            // wherever it was is refused, as on a 3-axis setup: it could arrive
+            // over the jaws below their reach.
+            for (mode, exported) in POST_RETRACT.iter().zip([true, false]) {
+                doc.setups[0]
+                    .machine
+                    .p
+                    .insert("post_retract".into(), (*mode).into());
+                doc.sync_indexed();
+                let posted = crate::post::post_job(&doc, &mesh);
+                for k in [1, 2] {
+                    let result = &posted.setups[k].result;
+                    match exported {
+                        true => assert!(result.is_ok(), "{mode}: {result:?}"),
+                        false => assert!(
+                            result.as_ref().is_err_and(|e| e
+                                .iter()
+                                .any(|e| e.contains("is not above the chuck jaw"))),
+                            "{mode}: {result:?}"
+                        ),
+                    }
+                }
+            }
+            // Its plans checked once the operation's clearance is raised to
+            // 40 mm put the swing above where its program turns A, the
+            // clearance plane: that turn is refused. At machine Z home it is not.
+            let sims = crate::run::simulated_for_tests(&doc, &mesh, 2);
+            let mut raised = doc.clone();
+            (raised.setups[2].operations[0].p).insert("clearance".into(), "40".into());
+            let below = "A turns to A 90° with the tool tip at Z";
+            for (mode, refused) in POST_RETRACT.iter().zip([false, true]) {
+                raised.setups[0]
+                    .machine
+                    .p
+                    .insert("post_retract".into(), (*mode).into());
+                raised.sync_indexed();
+                let found = crate::post::checked(
+                    &raised,
+                    &mesh,
+                    2,
+                    &sims,
+                    crate::post::PostSettings::from_machine,
+                )
+                .err()
+                .unwrap_or_default();
+                assert_eq!(
+                    found
+                        .iter()
+                        .any(|e| e.contains(below)
+                            && e.contains("where nothing A swings reaches it")),
+                    refused,
+                    "{mode}: {found:?}"
+                );
+            }
+        }
+        #[test]
+        fn a_plain_setup_in_the_chuck_comes_down_from_above_the_jaws() {
+            use crate::simulation::{Motion, prepare};
+            let (doc, mesh) = chuck_setup_1_job("90, 180");
+            // The kernel starts at the stock's -X -Y corner, in the jaws, at its
+            // clearance plane, below what they reach.
+            let mut fresh = doc.setups[0].clone();
+            fresh.p.insert("stock_source".into(), "fresh".into());
+            let op = &doc.setups[0].operations[0];
+            let kernel = crate::simulation::generate(&fresh, op, &doc.tools[0], &mesh).unwrap();
+            let stock = doc.setup_stock(0, Some(&mesh)).unwrap();
+            let rig = doc.chuck_rig(&doc.setups[0], stock).unwrap();
+            let corner = kernel.moves[0].from;
+            assert!(
+                corner[0] < rig.front && (corner[0] - stock.min[0]).abs() < 1.,
+                "{corner:?}"
+            );
+            // Both operations instead come down over their first cut from the
+            // swing height of setup 1's own clamping, with no A, clear of the
+            // jaws (LIO-206).
+            let swing = doc.swing(0, &mesh, 15.).unwrap();
+            let all = doc.swing(1, &mesh, 15.).unwrap();
+            assert_eq!((swing.what, swing.z), (all.what, all.z));
+            assert!(corner[2] < swing.z - 30., "{corner:?} {swing:?}");
+            let gap = crate::holding::gap(&doc.setups[0]).unwrap();
+            for oi in 0..2 {
+                let plan = prepare(&doc, &mesh, 0, oi).unwrap().plan;
+                let first = (plan.moves.iter())
+                    .position(|m| m.motion == Motion::Feed)
+                    .unwrap();
+                let (down, over) = (&plan.moves[..first], plan.moves[first].from);
+                assert_eq!(down.len(), 1, "{down:?}");
+                assert_eq!(down[0].motion, Motion::Rapid);
+                assert!(close(down[0].from, [over[0], over[1], swing.z]), "{down:?}");
+                assert!(close(down[0].to, over));
+                assert!(plan.moves.iter().all(|m| m.a.is_none()));
+                let tool = (plan.radius, plan.tool_length, plan.holder_radius);
+                assert!(
+                    rig.hits_at(0., &[(down[0].from, over)], tool, gap)
+                        .is_empty()
+                );
+                assert!((plan.duration - plan.moves.last().unwrap().end).abs() < 1e-3);
+            }
+            // Its workholding check finds nothing, and the job exports: setup
+            // 1 at A0 with no A word, and the indexed setup after it.
+            let sims = crate::run::simulated_for_tests(&doc, &mesh, 0);
+            let held = crate::post::held(&doc, &mesh, 0, &sims);
+            assert!(held.is_empty(), "{held:?}");
+            let posted = crate::post::post_job(&doc, &mesh);
+            for k in [0, 1] {
+                assert!(
+                    posted.setups[k].result.is_ok(),
+                    "{k}: {:?}",
+                    posted.setups[k].result
+                );
+            }
+            let program = &posted.setups[0].result.as_ref().unwrap()[0].text;
+            let code = program.lines().filter(|l| !l.starts_with('('));
+            assert!(code.clone().all(|l| !l.contains('A')), "{program}");
+            // Both headers say the chuck was checked, not a vise (LIO-210).
+            for k in [0, 1] {
+                let program = &posted.setups[k].result.as_ref().unwrap()[0].text;
+                assert!(
+                    program.contains("(Not checked: the table, the machine body and tool-change motion. The chuck, its jaws, the rotary head,")
+                        && !program.contains("Vise jaws"),
+                    "{program}"
+                );
+            }
+        }
+    }
+    mod rotary_check_tests {
+        use crate::indexed::tests::bar_job;
+        use crate::indexed::tests::contour;
+        use crate::indexed::tests::cutter;
+        use crate::indexed::tests::prism;
+        use crate::mesh::Mesh;
+        use crate::model::Document;
+        use crate::model::get;
+        use crate::rotary_check::tests::*;
+        use crate::rotary_check::*;
+
+        /// The 4-angle job the demo used to be: the part 20 mm out of the
+        /// chuck's jaws in a Ø40 bar `len` mm long, 20 mm of it in the jaws, a
+        /// contour at A 90, 180, 270 and 0° whose passes across the bar's ends go
+        /// `bottom` mm over the part's bottom, 10 mm under the A axis; and what
+        /// the rotary checks say of setup 2. Ready to post: the tool numbered and
+        /// the part's file given.
+        fn four_angles_on(len: f32, bottom: &str) -> (Document, Mesh, Vec<String>) {
+            let mesh = prism(30.);
+            let mut op = contour(&cutter("12"));
+            op.p.insert("bottom".into(), bottom.into());
+            let stickout = (len - 20.).to_string();
+            let mut doc = bar_job(&mesh, 20., &stickout, "-150", "90, 180, 270, 0", op);
+            doc.setups[0]
+                .p
+                .insert("stock_length".into(), len.to_string());
+            doc.tools[0].p.insert("number".into(), "1".into());
+            doc.file = Some(crate::model::ModelFile {
+                name: "bar.stl".into(),
+                path: "bar.stl".into(),
+                format: "STL".into(),
+                bytes: 0,
+                thickness: None,
+            });
+            doc.sync_stock_sources();
+            doc.sync_turns(Some(&mesh));
+            let sims = crate::run::simulated_for_tests(&doc, &mesh, 1);
+            let said = problems(&doc, &mesh, 1, &sims)
+                .into_iter()
+                .map(|(_, m)| m)
+                .collect();
+            (doc, mesh, said)
+        }
+        /// `four_angles_on` the 120 mm bar.
+        fn four_angles(bottom: &str) -> (Document, Mesh, Vec<String>) {
+            four_angles_on(120., bottom)
+        }
+        #[test]
+        fn a_contour_to_the_axis_that_cuts_the_part_off_the_bar_is_refused_where_it_does() {
+            // Each angle's passes across the bar's ends go to the A axis: after
+            // A 270° nothing joins the part to the bar on the axis, between the
+            // Ø12 cutter's edges at X-52.06 and X-40.06 (to the 1 mm cells).
+            // Said once, at the angle that parts it.
+            let (_, _, said) = four_angles("10");
+            assert_eq!(said, vec![PARTED.to_string()]);
+            // On a 250 mm bar the part and the 63 mm of bar beyond it, out to
+            // its free end.
+            let (_, _, said) = four_angles_on(250., "10");
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(
+                said[0].starts_with("Flats at A 270°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-75 to X-63, and nothing else joins the 68 × 40 × 40 mm piece of it (79878 mm³) from X-68 to X0"),
+                "{said:?}"
+            );
+        }
+        #[test]
+        fn a_contour_to_the_parts_bottom_leaves_a_fin_at_the_bars_end_that_is_refused() {
+            // To the part's bottom, 10 mm under the axis, as the demo job once
+            // did: already at A 90° the round corner of the passes at the bar's
+            // free end leaves a fin 3 × 3 mm across, 20 mm tall, on less than a
+            // millimetre of the bar. Under three voxels thick, the first check
+            // took it for a chip (LIO-211).
+            let (_, _, said) = four_angles("0");
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(
+                said[0].starts_with("Flats at A 90°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-10 to X-3, and nothing else joins the 20 × 3 × 3 mm piece of it (60 mm³) from X-3 to X0 to the bar the chuck holds"),
+                "{said:?}"
+            );
+        }
+        #[test]
+        fn a_web_too_thin_to_hold_is_refused_with_its_size_and_a_sound_one_passes() {
+            // 0.8 mm over the axis at all four angles leaves the part on a
+            // 1.6 mm square neck: it was seen, and passed. It is refused, on the
+            // 120 and the 250 mm bar, as soon as the cuts leave it under 3 mm
+            // across, with the square web the cut's force needs.
+            for len in [120., 250.] {
+                let (_, _, said) = four_angles_on(len, "10.8");
+                assert_eq!(said.len(), 1, "{len}: {said:?}");
+                let s = &said[0];
+                assert!(
+                    s.starts_with("Flats at A 270°, Contour: the web the cuts leave at X"),
+                    "{s}"
+                );
+                assert!(s.contains("2 mm across at its thinnest: a web under 3 mm across does not hold what is beyond it, and to hold the cut's 168 N"), "{s}");
+                assert!(s.contains("a square one about 13."), "{s}");
+            }
+            // 2 mm over it, a 4 mm square web: thick enough to be one, too thin
+            // to hold the cut on the part out of it: refused with the stresses.
+            let (_, _, said) = four_angles("12");
+            assert_eq!(
+                said,
+                vec!["Flats at A 270°, Contour: the web the cuts leave at X-48.5, between the bar the chuck holds and the 48.5 mm of it out to X0, is 92 mm² and 4.49 mm across at its thinnest: the cut's 168 N 48.5 mm out bends it at 215 N/mm² and its 4085 N·mm about A twist it at 42 N/mm², 227 N/mm² together, against the 70 N/mm² the stock (no material is chosen: taken as copper, the least of the metals) yields at (×0.3, under the ×2 wanted). It needs to be about 13.35 mm square. Leave a thicker web or take a lighter cut (the stock is checked in 1 mm cells); a part-off is not an operation yet.".to_string()]
+            );
+            // 7 mm over it, a 14 mm web (`on_the_bar`), holds on both bars.
+            for len in [120., 250.] {
+                let (_, _, said) = four_angles_on(len, "17");
+                assert!(said.is_empty(), "{len}: {said:?}");
+            }
+        }
+        #[test]
+        fn the_export_the_plan_check_and_the_run_refuse_a_cut_that_parts_the_bar() {
+            for (bottom, parts) in [("10", true), ("17", false)] {
+                let (mut doc, mesh, _) = four_angles(bottom);
+                let posted = crate::post::post_job(&doc, &mesh);
+                match parts {
+                    true => {
+                        let refused = posted.setups[1].result.as_ref().unwrap_err();
+                        assert!(refused.contains(&PARTED.to_string()), "{refused:?}");
+                    }
+                    false => assert!(
+                        posted.setups[1].result.is_ok(),
+                        "{:?}",
+                        posted.setups[1].result
+                    ),
+                }
+                crate::proposal::tests::aluminium(&mut doc);
+                doc.active = doc.setups[0].id.clone();
+                let report = crate::analysis::report(&doc, &mesh).unwrap();
+                let check = crate::plan_check::check_built(&doc, &mesh, &report);
+                let said = check.problems.iter().filter(|p| p.message == PARTED);
+                assert_eq!(said.count(), usize::from(parts), "{:?}", check.problems);
+                // A run's admission on a UC100 too, once: the machine with the
+                // CNC4030's UC100 profile.
+                let dir = tempfile::tempdir().unwrap();
+                let uc100 = crate::machine_profile::rotary_machine(dir.path()).unwrap();
+                for k in ["controller", "uc100_profile"] {
+                    let v = get(&uc100.p, k).to_string();
+                    doc.setups[0].machine.p.insert(k.into(), v);
+                }
+                doc.sync_indexed();
+                let ready = crate::run::ready(&doc, &mesh, 1, 0);
+                let said = ready.problems.iter().filter(|m| m.as_str() == PARTED);
+                assert_eq!(said.count(), usize::from(parts), "{:?}", ready.problems);
+            }
+        }
+        #[test]
+        fn a_cut_through_in_the_first_setup_in_the_chuck_is_refused_too() {
+            use crate::indexed::tests::on_the_bar;
+            // Setup 1, at A0 with no A, contours the part down to the bar's
+            // bottom: its passes across the bar's ends cut it through.
+            let mesh = prism(30.);
+            let mut doc = bar_job(&mesh, 20., "100", "-150", "90", on_the_bar(&cutter("12")));
+            let mut through = contour(&doc.tools[0]);
+            through.p.insert("bottom".into(), "-10".into());
+            doc.setups[0].operations = vec![through];
+            doc.sync_stock_sources();
+            doc.sync_turns(Some(&mesh));
+            let sims = crate::run::simulated_for_tests(&doc, &mesh, 0);
+            let said: Vec<String> = problems(&doc, &mesh, 0, &sims)
+                .into_iter()
+                .map(|(_, m)| m)
+                .collect();
+            let name = doc.setups[0].name();
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(
+                said[0].starts_with(&format!("{name} at A 0°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-52 to X-40, and nothing else joins the 40 × 30 × 20 mm piece of it (23040 mm³) from X-40 to X-10")),
+                "{said:?}"
+            );
+            doc.tools[0].p.insert("number".into(), "1".into());
+            doc.file = Some(crate::model::ModelFile {
+                name: "bar.stl".into(),
+                path: "bar.stl".into(),
+                format: "STL".into(),
+                bytes: 0,
+                thickness: None,
+            });
+            let posted = crate::post::post_job(&doc, &mesh);
+            let refused = posted.setups[0].result.as_ref().unwrap_err();
+            assert!(refused.contains(&said[0]), "{refused:?}");
+            // The same cut in a 3-axis setup, the stock in a vise: not this
+            // check's, unchanged.
+            doc.setups.truncate(1);
+            doc.setups[0].p.insert("holding".into(), "Vise".into());
+            let sims = crate::run::simulated_for_tests(&doc, &mesh, 0);
+            assert!(sims.iter().all(|(_, r)| r.is_ok()));
+            assert!(problems(&doc, &mesh, 0, &sims).is_empty());
+        }
     }
 }

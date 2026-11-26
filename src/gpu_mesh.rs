@@ -667,7 +667,7 @@ impl Gpu {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::stock_surface::Detail;
     use fidget::{shape::EzShape, vm::VmShape};
@@ -711,7 +711,7 @@ mod tests {
 
     /// How many sides of `mesh`'s triangles do not border exactly one other
     /// triangle: 0 when the surface is closed.
-    fn open_sides(mesh: &SurfaceMesh) -> usize {
+    pub(crate) fn open_sides(mesh: &SurfaceMesh) -> usize {
         let mut sides = std::collections::HashMap::new();
         for t in &mesh.triangles {
             for i in 0..3 {
@@ -723,7 +723,7 @@ mod tests {
     }
     /// The largest, 99th-percentile and median distance of the mesh's
     /// vertices from the surface, in mm: |field| over its slope.
-    fn off_surface(snapshot: &Snapshot, mesh: &SurfaceMesh) -> (f32, f32, f32) {
+    pub(crate) fn off_surface(snapshot: &Snapshot, mesh: &SurfaceMesh) -> (f32, f32, f32) {
         let vm = VmShape::from(snapshot.field());
         let tape = vm.ez_point_tape();
         let mut eval = VmShape::new_point_eval();
@@ -752,7 +752,7 @@ mod tests {
         };
         (errors.last().copied().unwrap_or(0.), at(0.99), at(0.5))
     }
-    fn frame(rotation: Option<(&str, &str)>) -> Frame {
+    pub(crate) fn frame(rotation: Option<(&str, &str)>) -> Frame {
         let mesh =
             crate::mesh::normalize(vec![[[0., 0., 0.], [20., 0., 0.], [0., 20., 10.]]]).unwrap();
         let mut setup = crate::model::Setup::new(crate::model::Machine::new(3), "G54");
@@ -772,7 +772,7 @@ mod tests {
             source: (0, 0),
         }
     }
-    fn block(cuts: Vec<Cut>, detail: Detail) -> Snapshot {
+    pub(crate) fn block(cuts: Vec<Cut>, detail: Detail) -> Snapshot {
         Snapshot {
             bounds: Bounds {
                 min: [-10., -10., 0.],
@@ -785,7 +785,7 @@ mod tests {
             bar_x: None,
         }
     }
-    fn gpu() -> Option<&'static Gpu> {
+    pub(crate) fn gpu() -> Option<&'static Gpu> {
         let gpu = shared();
         if gpu.is_none() {
             eprintln!("No GPU adapter: skipped.");
@@ -982,7 +982,7 @@ mod tests {
     }
 
     /// The zig-zag pocket of `rows` passes on each of `levels` levels.
-    fn pocket(rows: usize, levels: usize) -> crate::volume::Volume {
+    pub(crate) fn pocket(rows: usize, levels: usize) -> crate::volume::Volume {
         let f = frame(None);
         let bounds = Bounds {
             min: [-50., -50., 0.],
@@ -1016,118 +1016,5 @@ mod tests {
             }
         }
         v
-    }
-    fn write_png(path: &std::path::Path, volume: &crate::volume::Volume, mesh: &SurfaceMesh) {
-        let triangles: Vec<_> =
-            crate::viewport::stock_triangles(volume, mesh, volume.frame, None).collect();
-        let Some(iced::widget::image::Handle::Rgba {
-            width,
-            height,
-            pixels,
-            ..
-        }) = crate::viewport::stock_picture(&triangles, (800, 600))
-        else {
-            return;
-        };
-        let file = std::fs::File::create(path).unwrap();
-        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        encoder
-            .write_header()
-            .unwrap()
-            .write_image_data(&pixels)
-            .unwrap();
-    }
-
-    /// Times fidget against the GPU at each detail, on the example block's
-    /// whole job and on two zig-zag pockets, and draws both meshes to
-    /// `target/gpu_mesh/`. `cargo test --release gpu_mesh_timing -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn gpu_mesh_timing() {
-        let Some(gpu) = gpu() else { return };
-        eprintln!("GPU: {}", gpu.adapter);
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/gpu_mesh");
-        std::fs::create_dir_all(&dir).unwrap();
-        let (doc, mesh, report) = crate::proposal::tests::block();
-        let job =
-            crate::proposal::build(&doc, &mesh, &report, &crate::proposal::tests::good(&report))
-                .unwrap();
-        let si = job.setups.len() - 1;
-        let oi = (job.setups[si].operations.iter())
-            .rposition(|o| o.enabled)
-            .unwrap();
-        let mut sim = crate::simulation::prepare(&job, &mesh, si, oi).unwrap();
-        sim.seek(1.);
-        let cases = [
-            ("block", sim.volume.unwrap()),
-            ("pocket-1280", pocket(80, 8)),
-            ("pocket-10000", pocket(250, 20)),
-        ];
-        eprintln!(
-            "{:<13} {:>6} {:<8} | {:>8} {:>8} | {:>8} {:>6} {:>6} {:>6} {:>8} {:>13} {:>9} | {:>5} {:>6} {:>6} | {:>6} {:>6}",
-            "case",
-            "cuts",
-            "detail",
-            "fidget",
-            "tris",
-            "gpu",
-            "bin",
-            "run",
-            "read",
-            "tris",
-            "bricks",
-            "lists",
-            "open",
-            "worst",
-            "median",
-            "draw",
-            "draw"
-        );
-        for (name, volume) in &cases {
-            for detail in Detail::ALL {
-                let snapshot = Snapshot::of(volume, detail);
-                let cpu = snapshot.build_cpu().unwrap();
-                // The first run warms the GPU's caches; time the second.
-                gpu.mesh(&snapshot).unwrap();
-                let (surface, t) = gpu.mesh_timed(&snapshot).unwrap();
-                let (worst, _, median) = off_surface(&snapshot, &surface);
-                // What the 3D view pays a frame for each, at a window's size.
-                let draw = |surface: &SurfaceMesh| {
-                    let triangles: Vec<_> =
-                        crate::viewport::stock_triangles(volume, surface, volume.frame, None)
-                            .collect();
-                    let started = std::time::Instant::now();
-                    crate::viewport::stock_picture(&triangles, (1600, 1000));
-                    started.elapsed().as_secs_f64() * 1e3
-                };
-                eprintln!(
-                    "{:<13} {:>6} {:<8} | {:>6}ms {:>8} | {:>6.0}ms {:>4.0}ms {:>4.0}ms {:>4.0}ms {:>8} {:>6}/{:<6} {:>9} | {:>5} {:>6.3} {:>6.4} | {:>4.0}ms {:>4.0}ms",
-                    name,
-                    volume.cuts.len(),
-                    detail.to_string(),
-                    cpu.milliseconds,
-                    cpu.triangles.len(),
-                    t.total,
-                    t.bin,
-                    t.gpu,
-                    t.read,
-                    surface.triangles.len(),
-                    t.meshed,
-                    t.bricks,
-                    t.entries,
-                    open_sides(&surface),
-                    worst,
-                    median,
-                    draw(&cpu),
-                    draw(&surface),
-                );
-                if detail == Detail::Standard {
-                    write_png(&dir.join(format!("{name}-fidget.png")), volume, &cpu);
-                    write_png(&dir.join(format!("{name}-gpu.png")), volume, &surface);
-                }
-            }
-        }
     }
 }

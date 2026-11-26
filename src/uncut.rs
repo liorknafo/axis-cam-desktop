@@ -792,7 +792,7 @@ pub(crate) fn half_cut_face() -> (Mesh, Setup, [[f32; 3]; 3], Volume) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use crate::post::fixture;
     fn floor_under(height: f32, cut_height: Option<f32>) -> super::Uncut {
         let (mesh, setup, [a, _, _], mut stock) = super::half_cut_face();
@@ -1092,89 +1092,6 @@ mod tests {
         assert!(!cuts.left([50., 18., 38.]));
         assert!(!cuts.left([50., -19., 1.]));
     }
-    /// The faces of `mesh` that lie on a side of its box in setup 1: the
-    /// side across `axis` (2 for Z) at its high end for a positive `sign`.
-    fn outer(
-        mesh: &crate::mesh::Mesh,
-        setup1: &crate::model::Setup,
-        axis: usize,
-        sign: f32,
-    ) -> Vec<usize> {
-        let placement = crate::stock::Placement::new(mesh, Some(setup1));
-        let edge = if sign > 0. {
-            placement.bounds.max[axis]
-        } else {
-            placement.bounds.min[axis]
-        };
-        mesh.faces
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| {
-                f.points
-                    .iter()
-                    .all(|p| (placement.transform(*p)[axis] - edge).abs() < 0.01)
-            })
-            .map(|(i, _)| i)
-            .collect()
-    }
-    #[test]
-    fn faces_left_under_stock_are_found_until_a_later_setup_cuts_them() {
-        // Setup 1 faces the top: the top is cut, the bottom and the 2 mm of
-        // stock on the sides are not.
-        let (doc, mesh) = fixture::flipped_after(1);
-        let mut top_only = doc.clone();
-        top_only.setups.truncate(1);
-        let left = crate::leftover_stock(&top_only, &mesh, 0);
-        let uncut = left.uncut.unwrap().unwrap();
-        let setup1 = &doc.setups[0];
-        let (top, bottom, side) = (
-            outer(&mesh, setup1, 2, 1.),
-            outer(&mesh, setup1, 2, -1.),
-            outer(&mesh, setup1, 0, -1.),
-        );
-        assert!(!top.is_empty() && !bottom.is_empty() && !side.is_empty());
-        assert!(top.iter().all(|i| !uncut.faces[*i]), "the faced top is cut");
-        assert!(
-            bottom.iter().all(|i| uncut.faces[*i]),
-            "the bottom is under stock"
-        );
-        assert!(
-            side.iter().all(|i| uncut.faces[*i]),
-            "the -X side is under stock"
-        );
-        // The sides and the bottom, which the through holes join; the top's
-        // pocket, reached from the top.
-        let shell = &uncut.regions[0];
-        assert_eq!(
-            shell.from,
-            ["−X", "+X", "−Y", "+Y", "the bottom"],
-            "{shell:?}"
-        );
-        let pocket = uncut.regions[1].line();
-        assert!(
-            pocket.starts_with("5868 mm² reached from the top: X 16–88, Y 20–60, Z 28–40"),
-            "{pocket}"
-        );
-        assert!(uncut.share > 0.3 && uncut.share < 1., "{}", uncut.share);
-        // Setup 2, flipped, faces the bottom too.
-        let both = crate::leftover_stock(&doc, &mesh, 0)
-            .uncut
-            .unwrap()
-            .unwrap();
-        assert!(bottom.iter().all(|i| !both.faces[*i]), "the bottom is cut");
-        assert!(
-            side.iter().all(|i| both.faces[*i]),
-            "the sides are still under stock"
-        );
-        assert!(both.share < uncut.share);
-        // The through holes are no longer joined to the bottom: each is
-        // reached from either end.
-        let through = both
-            .regions
-            .iter()
-            .filter(|r| r.from == ["the bottom", "the top"]);
-        assert_eq!(through.count(), 4, "{:?}", both.regions);
-    }
     #[test]
     fn a_narrow_uncut_strip_in_a_large_flat_face_is_found() {
         // One 120 × 120 mm face (two triangles with edges up to 170 mm), the
@@ -1374,24 +1291,6 @@ mod tests {
             &mut huge,
         );
         assert_eq!(huge.len(), 1 << super::SPLITS);
-    }
-    #[test]
-    fn completeness_is_not_checked_without_a_cut_or_after_a_failure() {
-        let (mut doc, mesh) = fixture::job();
-        doc.setups[0].operations.clear();
-        let left = crate::leftover_stock(&doc, &mesh, 0);
-        assert_eq!(
-            left.uncut.unwrap().unwrap_err(),
-            "No operation has cut the stock yet."
-        );
-        let (mut doc, mesh) = fixture::job();
-        doc.setups[0].operations.truncate(1);
-        doc.setups[0].operations[0].tool = "gone".into();
-        let left = crate::leftover_stock(&doc, &mesh, 0);
-        let why = left.uncut.unwrap().unwrap_err();
-        // One short line: the operation's own check says what is wrong
-        // (LIO-425, was "Top / … could not be generated.").
-        assert!(why.starts_with("Completeness waits on Top / "), "{why}");
     }
     #[test]
     fn a_share_that_rounds_to_nothing_is_never_shown_as_0_percent() {

@@ -1361,14 +1361,19 @@ fn holes_of(moves: &[Move], zero: [f32; 3]) -> Vec<[f32; 3]> {
 }
 /// A setup's enabled operations as simulated: (operation index, plan) in
 /// order, the stock after each, and the stock before the first.
-struct Walked {
-    done: Vec<(usize, Plan)>,
+pub(crate) struct Walked {
+    pub(crate) done: Vec<(usize, Plan)>,
     afters: Vec<Volume>,
-    before: Volume,
+    pub(crate) before: Volume,
 }
 /// The operations of setup `si` simulated in order up to its last enabled
 /// one; `empty` when it has none.
-fn simulate(doc: &Document, mesh: &Mesh, si: usize, empty: &str) -> Result<Walked, String> {
+pub(crate) fn simulate(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    empty: &str,
+) -> Result<Walked, String> {
     let setup = doc.setups.get(si).ok_or("Choose a setup.")?;
     let last = (setup.operations.iter())
         .rposition(|o| o.enabled)
@@ -1449,10 +1454,10 @@ const EDGE_IN: f32 = 0.5;
 /// is under a clamp, those clamps (indexes into the clamps it was given):
 /// `at` is then where it would touch without them (LIO-458).
 #[derive(Debug, Clone, PartialEq)]
-struct Touch {
-    at: [f32; 3],
+pub(crate) struct Touch {
+    pub(crate) at: [f32; 3],
     round: bool,
-    under: Vec<usize>,
+    pub(crate) under: Vec<usize>,
 }
 /// Where across a face (the other of X and Y) an edge finder of radius `r`
 /// keeps its centre out of for each clamp of `clamps` (holding boxes, in
@@ -1462,7 +1467,7 @@ struct Touch {
 /// reaches above `z` over where the finder comes down `FINDER_OUT` out from
 /// where it touches and is fed in; `CLAMP_CLEAR` round it. The clamps are
 /// the probe check's (`post::in_the_way`), so that the two agree.
-fn keep_off(
+pub(crate) fn keep_off(
     clamps: &[crate::holding::HoldBox],
     k: usize,
     out: f32,
@@ -1506,7 +1511,7 @@ fn keep_off(
 /// height's material the heights under it are tried; with none clear, the
 /// first height's spot without them, and the clamps over it (`Touch`).
 #[allow(clippy::too_many_arguments)]
-fn contact(
+pub(crate) fn contact(
     before: &Volume,
     frame: crate::volume::Frame,
     stock: Bounds,
@@ -3329,7 +3334,7 @@ pub(crate) mod tests {
             })
             .collect()
     }
-    fn close(a: f32, b: f32) {
+    pub(crate) fn close(a: f32, b: f32) {
         assert!((a - b).abs() < 1e-3, "{a} != {b}");
     }
     /// The Pass steps' targets with their pass's number.
@@ -3377,86 +3382,9 @@ pub(crate) mod tests {
             full: false,
         })
     }
-    /// The reported three-setup sequence, without depending on a user file.
-    pub(crate) fn squared_job() -> (Document, Mesh) {
-        let bounds = Bounds {
-            min: [0.; 3],
-            max: [134., 88., 20.],
-        };
-        let tris = crate::viewport::box_triangles(bounds, [0.7; 3])
-            .into_iter()
-            .map(|(t, _)| t)
-            .collect();
-        let mesh = crate::mesh::normalize(tris).unwrap();
-        let mut doc = Document::default();
-        let machine = manual::defaults();
-        let mut tool = Tool::new("Square mill", "Flat end mill", "10");
-        for (k, v) in [
-            ("length", "25"),
-            ("stickout", "35"),
-            ("holder", "32"),
-            ("flutes", "3"),
-            ("machines", &machine.id),
-        ] {
-            tool.p.insert(k.into(), v.into());
-        }
-        let mut holder = crate::holding::starters()
-            .into_iter()
-            .find(|h| h.kind() == "Vise")
-            .unwrap();
-        holder.p.insert("machines".into(), machine.id.clone());
-        holder.p.insert("jaw_width".into(), "100".into());
-        doc.workholding = vec![holder.clone()];
-        doc.machines = vec![machine.clone()];
-        for (si, rx) in ["90", "-90", "0"].into_iter().enumerate() {
-            let mut setup = crate::model::Setup::new(machine.clone(), "G54");
-            for (k, v) in [
-                ("rx", rx),
-                ("origin", "Stock top center"),
-                ("holding", "Vise"),
-                ("holder", &holder.id),
-                ("vise_axis", "Y"),
-                ("vise_grip", if si == 2 { "8" } else { "30" }),
-                ("stock_left", "3"),
-                ("stock_right", "3"),
-                ("stock_front", "0"),
-                ("stock_back", "0"),
-                ("stock_top", "3"),
-                ("stock_bottom", "3"),
-            ] {
-                setup.p.insert(k.into(), v.into());
-            }
-            if si > 0 {
-                setup
-                    .p
-                    .insert("stock_source".into(), doc.setups[si - 1].id.clone());
-            }
-            let block = if si < 2 {
-                [-70., 70., -10., 10., 0., -3.]
-            } else {
-                [67., 90., -44., 44., 0., -20.]
-            };
-            setup.operations = vec![boxed(
-                "Square edge",
-                &tool.id,
-                block,
-                &[
-                    ("allowance", "0"),
-                    ("stepover", "40"),
-                    ("stepdown", "0.5"),
-                    ("rpm", "1600"),
-                    ("feed", "120"),
-                ],
-            )];
-            doc.setups.push(setup);
-        }
-        doc.tools = vec![tool];
-        doc.active = doc.setups[2].id.clone();
-        (doc, mesh)
-    }
     /// Check actual continuous sweeps on both finished planes, through the
     /// full blank thickness and length: no ledge within the 8 mm jaw band.
-    fn squared_acceptance(doc: &Document, mesh: &Mesh) {
+    pub(crate) fn squared_acceptance(doc: &Document, mesh: &Mesh) {
         for (si, expected) in [[140., 20., 94.], [140., 20., 91.], [140., 88., 20.]]
             .into_iter()
             .enumerate()
@@ -3517,38 +3445,6 @@ pub(crate) mod tests {
                 );
             }
         }
-    }
-    #[test]
-    fn squared_edges_regrip_on_finished_sides() {
-        let (doc, mesh) = squared_job();
-        squared_acceptance(&doc, &mesh);
-    }
-    #[test]
-    fn partially_squared_edge_still_rejects_a_stepped_jaw_contact() {
-        let (mut doc, mesh) = squared_job();
-        for (k, v) in [("y_min", "-5"), ("y_max", "5")] {
-            doc.setups[0].operations[0].p.insert(k.into(), v.into());
-        }
-        let w = simulate(&doc, &mesh, 2, "empty").unwrap();
-        let s = &doc.setups[2];
-        let f = crate::volume::Frame::new(s, &mesh);
-        let bands = crate::holding::Bands::new(&w.before, f, simulation::part_box(s, &mesh));
-        let held = crate::holding::held_by(&doc, s, w.done[0].1.stock, Some(&bands));
-        let issues = crate::holding::holdable(
-            2,
-            &crate::holding::layout(s).unwrap(),
-            doc.holder(get(&s.p, "holder")).unwrap(),
-            held,
-            Some(&crate::rest::Removed::new(&w.before, f)),
-            None,
-            &|_, _| String::new(),
-        );
-        assert!(
-            issues
-                .iter()
-                .any(|s| s.contains("removed the material the jaws grip")),
-            "{issues:?}"
-        );
     }
     #[test]
     #[ignore = "private saved-project acceptance: AXIS_REGRIP_FIXTURE"]
@@ -4861,290 +4757,13 @@ pub(crate) mod tests {
         close(at[1][0], 0.);
         close(far[1].unwrap().at[0], 0.);
     }
-    #[test]
-    fn a_thin_disc_under_its_clamps_is_not_touched_beside_them_in_the_air() {
-        // A Ø20 disc 0.3 thick, its rim faced, clamped 2 wide over the
-        // lines its front and back are touched on with a Ø1 finder: off
-        // them is air, so Y cannot be found.
-        let (mut doc, _) = job("No");
-        doc.setups.truncate(1);
-        doc.active = doc.setups[0].id.clone();
-        let bounds = Bounds {
-            min: [0.; 3],
-            max: [10., 8., 0.2],
-        };
-        let tris = (crate::viewport::box_triangles(bounds, [0.7; 3]).into_iter())
-            .map(|(t, _)| t)
-            .collect();
-        let mesh = crate::mesh::normalize(tris).unwrap();
-        let mut mill = Tool::new("Rim mill", "Flat end mill", "1");
-        for (k, v) in [
-            ("length", "25"),
-            ("stickout", "35"),
-            ("flutes", "3"),
-            ("machines", &doc.setups[0].machine.id),
-        ] {
-            mill.p.insert(k.into(), v.into());
-        }
-        let face = boxed(
-            "Face rim",
-            &mill.id,
-            [9., 10.1, -2., 2., 0., -0.1],
-            &[
-                ("allowance", "0"),
-                ("stepover", "40"),
-                ("stepdown", "0.1"),
-                ("rpm", "1000"),
-                ("feed", "100"),
-            ],
-        );
-        doc.tools.push(mill);
-        doc.setups[0].operations = vec![face];
-        for (k, v) in [
-            ("stock_type", "Round bar"),
-            ("stock_diameter", "20"),
-            ("stock_length", "0.3"),
-            ("origin", "Stock top center"),
-        ] {
-            doc.setups[0].p.insert(k.into(), v.into());
-        }
-        (doc.setups[0].machine.p).insert("edge_finder".into(), "1".into());
-        on_clamps(&mut doc, "-Y:0;+Y:0", "2");
-        let holder = doc.workholding.last_mut().unwrap();
-        for (k, v) in [("length", "6"), ("height", "2.5"), ("bite", "1.2")] {
-            holder.p.insert(k.into(), v.into());
-        }
-        let why = build(&doc, &mesh, 0).unwrap_err();
-        assert!(why.starts_with(UNDER_CLAMPS), "{why}");
-        // Clamped on X 6 off the lines, Y is touched on them, on the disc.
-        doc.setups[0].p.insert("clamps".into(), "-Y:6;+Y:-6".into());
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Zero { at, far, .. } = &guide.steps[1] else {
-            panic!()
-        };
-        for p in [at[1], far[1].unwrap().at] {
-            assert!(p[0].hypot(p[1]) <= 10.01, "{p:?}");
-        }
-    }
-    #[test]
-    fn a_narrow_flat_wall_an_earlier_cut_left_is_touched_beside_a_clamp() {
-        // The earlier setup cuts the +X side back 13 except Y 10 to 50: a
-        // flat wall at X 67 narrower than half the face, which the touch
-        // reads as a round. A 10 wide clamp over its middle: it is touched
-        // beside the clamp, where it is as flat.
-        let (mut doc, mesh) = after_a_cut([67., 80., -50., 10., 0., -100.]);
-        doc.setups.swap(0, 1);
-        on_clamps(&mut doc, "+X:27", "10");
-        doc.setups.swap(0, 1);
-        let walked = simulate(&doc, &mesh, 1, "").unwrap();
-        let frame = crate::volume::Frame::new(&doc.setups[1], &mesh);
-        let stock = walked.done[0].1.stock;
-        let clamps = doc.holding_boxes(&doc.setups[1], stock).unwrap();
-        let t = contact(
-            &walked.before,
-            frame,
-            stock,
-            0,
-            true,
-            f32::NEG_INFINITY,
-            &clamps,
-            5.,
-        )
-        .unwrap();
-        assert!(t.under.is_empty(), "{t:?}");
-        let off = keep_off(&clamps, 0, 1., t.at[0], t.at[2], 5.);
-        assert!(
-            off.iter()
-                .all(|&(_, a0, a1)| !(a0 < t.at[1] && t.at[1] < a1)),
-            "{t:?} {off:?}"
-        );
-        let rest = crate::rest::RestStock::new(&walked.before, frame);
-        let removed = rest.removed_in(stock);
-        let p = [t.at[0] - 0.2, t.at[1], t.at[2] - 0.2];
-        assert!(rest.in_stock(p) && !removed.at(p), "{t:?}");
-    }
-    /// `squared_job`'s manual setup twice (LIO-451): the first cuts the
-    /// Box `cut` (x_min, x_max, y_min, y_max, z_top, z_bottom, work) into
-    /// a fresh block, the second, with the zero at the top's centre, only
-    /// faces 0.5 off its other end, so that its Zero touches what the
-    /// first left.
-    pub(crate) fn after_a_cut(cut: [f32; 6]) -> (Document, Mesh) {
-        let (mut doc, mesh) = squared_job();
-        let mut first = doc.setups[2].clone();
-        first.id = "earlier".into();
-        for (k, v) in [
-            ("stock_source", "fresh"),
-            ("stock_top", "0"),
-            ("stock_bottom", "0"),
-            ("vise_grip", "6"),
-            ("name", "Earlier cut"),
-            ("origin", "Stock top center"),
-        ] {
-            first.p.insert(k.into(), v.into());
-        }
-        let fields = [
-            ("allowance", "0"),
-            ("stepover", "40"),
-            ("stepdown", "2"),
-            ("rpm", "1000"),
-            ("feed", "100"),
-        ];
-        first.operations = vec![boxed("Earlier cut", &doc.tools[0].id, cut, &fields)];
-        let mut later = first.duplicate("G54");
-        later.p.insert("name".into(), "Zero after it".into());
-        // Outside the part's 134, on the side away from the cut.
-        let side = if cut[0] > 0. {
-            [-80., -67.]
-        } else {
-            [67., 80.]
-        };
-        later.operations = vec![boxed(
-            "Face",
-            &doc.tools[0].id,
-            [side[0], side[1], -50., 50., 0., -0.5],
-            &fields,
-        )];
-        doc.active = later.id.clone();
-        doc.setups = vec![first, later];
-        (doc, mesh)
-    }
-    #[test]
-    fn a_halved_axis_is_never_touched_in_a_notch_an_earlier_setup_cut() {
-        // A notch 20 wide and 12 deep in the middle of the +X face's top;
-        // then also a slot 1.2 wide beside it, narrower than the pitch the
-        // face is sampled at, where the material's middle falls.
-        for slot in [false, true] {
-            let (mut doc, mesh) = after_a_cut([67., 80., -10., 10., 0., -12.]);
-            if slot {
-                let mut tool = doc.tools[0].clone();
-                tool.id = "slot-mill".into();
-                tool.p.insert("diameter".into(), "1.2".into());
-                doc.setups[0].operations.push(boxed(
-                    "Slot",
-                    &tool.id,
-                    [67., 80., 26.088522, 27.288522, 0., -12.],
-                    &[
-                        ("allowance", "0"),
-                        ("stepover", "40"),
-                        ("stepdown", "1"),
-                        ("rpm", "1000"),
-                        ("feed", "40"),
-                    ],
-                ));
-                doc.tools.push(tool);
-            }
-            let walked = simulate(&doc, &mesh, 1, "").unwrap();
-            let guide = build(&doc, &mesh, 1).unwrap();
-            let Step::Zero { far, touch, .. } = &guide.steps[1] else {
-                panic!("{:?}", guide.steps[1])
-            };
-            let f = far[0].unwrap();
-            // On the +X face, at the top, beside the notch, where there is
-            // material just inside it.
-            close(f.at[0], 70.);
-            close(f.at[2], 0.);
-            assert!(f.at[1].abs() > 10., "{f:?}");
-            let frame = crate::volume::Frame::new(&doc.setups[1], &mesh);
-            let rest = crate::rest::RestStock::new(&walked.before, frame);
-            let removed = rest.removed_in(walked.done[0].1.stock);
-            let mut p: [f32; 3] = std::array::from_fn(|k| f.at[k] + guide.zero[k]);
-            (p[0], p[2]) = (p[0] - 0.2, p[2] - 0.2);
-            assert!(
-                rest.in_stock(p) && !removed.at(p),
-                "slot {slot}: {f:?} {p:?}"
-            );
-            if slot {
-                assert!(!(26.08..=27.29).contains(&f.at[1]), "{f:?}");
-            }
-            // Both faces whole: half the reading.
-            close(f.reads, 150.);
-            close(touch[0], 75.);
-        }
-    }
-    #[test]
-    fn halved_touches_not_either_side_of_the_zero_alike_say_how_far_from_half() {
-        // The +X face cut back 3 mm for 16 mm down, into the jaws: the
-        // finder touches it at 67, the −X face at −70; the DRO reads 147
-        // and is set to 72, half less 1.5. Mirrored on −X, half plus 1.5.
-        for (cut, near, far_x, set) in [
-            ([67., 80., -50., 50., 0., -16.], -70., 67., 72.),
-            ([-80., -67., -50., 50., 0., -16.], -67., 70., 75.),
-        ] {
-            let (doc, mesh) = after_a_cut(cut);
-            let guide = build(&doc, &mesh, 1).unwrap();
-            let zero = &guide.steps[1];
-            let Step::Zero { at, far, touch, .. } = zero else {
-                panic!("{zero:?}")
-            };
-            let f = far[0].unwrap();
-            close(at[0][0], near);
-            close(f.at[0], far_x);
-            close(f.reads, 147.);
-            close(touch[0], set);
-            // The DRO reads 0 at the zero with the faces where touched.
-            close(dro_at_zero(zero, 0, [near, far_x]), 0.);
-        }
-    }
-    #[test]
-    fn a_face_an_earlier_cut_skimmed_less_than_the_samples_depth_is_touched_where_it_is() {
-        // Each of the four faces skimmed 0.1 mm for 16 mm down by the
-        // earlier setup: the finder touches it 0.1 in, the DRO reads 0.1
-        // less, and the + face is set to half less or plus 0.05, so that
-        // 0 stays on the plan's zero, where the later steps count from.
-        // 3 mm of stock on every side of the part, so that a skim misses it.
-        let margined = |(mut doc, mesh): (Document, Mesh)| {
-            for setup in &mut doc.setups {
-                for side in ["stock_front", "stock_back"] {
-                    setup.p.insert(side.into(), "3".into());
-                }
-            }
-            (doc, mesh)
-        };
-        let (doc, mesh) = margined(after_a_cut([67., 80., -10., 10., 0., -12.]));
-        let guide = build(&doc, &mesh, 1).unwrap();
-        let Step::Hold { stock, .. } = &guide.steps[0] else {
-            panic!()
-        };
-        let (half_x, half_y) = (stock.max[0], stock.max[1]);
-        for (k, plus) in [(0, true), (0, false), (1, true), (1, false)] {
-            let half = [half_x, half_y][k];
-            let mut cut = [-80., 80., -60., 60., 0., -16.];
-            let (lo, hi) = (2 * k, 2 * k + 1);
-            if plus {
-                cut[lo] = half - 0.1;
-            } else {
-                cut[hi] = -half + 0.1;
-            }
-            let (doc, mesh) = margined(after_a_cut(cut));
-            let guide = build(&doc, &mesh, 1).unwrap();
-            let zero = &guide.steps[1];
-            let Step::Zero { at, far, touch, .. } = zero else {
-                panic!("{zero:?}")
-            };
-            let f = far[k].unwrap();
-            let faces = if plus {
-                [-half, half - 0.1]
-            } else {
-                [-half + 0.1, half]
-            };
-            let said = format!("axis {k} plus {plus}: {zero:?}");
-            assert!((at[k][k] - faces[0]).abs() < 0.006, "{said}");
-            assert!((f.at[k] - faces[1]).abs() < 0.006, "{said}");
-            assert!((f.reads - (2. * half - 0.1 + 10.)).abs() < 0.011, "{said}");
-            let off = touch[k] - f.reads / 2.;
-            let want = if plus { -0.05 } else { 0.05 };
-            assert!((off - want).abs() < 0.006, "{said}");
-            // The DRO reads 0 at the zero with the faces where they are.
-            assert!(dro_at_zero(zero, k, faces).abs() < 0.006, "{said}");
-        }
-    }
     /// What a DRO shows at the work zero after the Zero step's touches on
     /// axis `k` (X or Y) of `zero`, for a blank whose faces are where
     /// `faces` (work coordinates) say, which may differ from the
     /// drawing's: the edge finder's centre stands a radius outside each
     /// face touched, the axis is set as the step says, and the reading
     /// at the work zero is what the DRO then shows there.
-    fn dro_at_zero(zero: &Step, k: usize, faces: [f32; 2]) -> f32 {
+    pub(crate) fn dro_at_zero(zero: &Step, k: usize, faces: [f32; 2]) -> f32 {
         let Step::Zero {
             approach,
             touch,
@@ -5821,7 +5440,7 @@ pub(crate) mod tests {
         }
         out
     }
-    fn reads(dial: &Dial, turns: u32, reading: f32) {
+    pub(crate) fn reads(dial: &Dial, turns: u32, reading: f32) {
         let (t, r) = dial
             .reading
             .clone()

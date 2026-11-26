@@ -702,7 +702,7 @@ impl Machine {
             e.push("Choose the machine's UC100 profile file.".into())
         }
         e.extend(
-            crate::control::pins_settings(&self.p)
+            crate::machine_profile::pins_settings(&self.p)
                 .err()
                 .unwrap_or_default(),
         );
@@ -2769,7 +2769,7 @@ impl Setup {
         nonnegative(&self.p, "clearance", &mut e);
         e.extend(crate::indexed::issues(self));
         // The machine's own issues say what is wrong with the pins.
-        if crate::control::pins_settings(&self.machine.p).is_ok() {
+        if crate::machine_profile::pins_settings(&self.machine.p).is_ok() {
             e.extend(crate::post::pins_issue(self));
         }
         e
@@ -4025,7 +4025,7 @@ impl Document {
                 .iter()
                 .any(|k| get(&x.p, k) != get(&m.p, k))
         }) {
-            m.p.remove(crate::control::CENTRE_MARK);
+            m.p.remove(crate::machine_profile::CENTRE_MARK);
             m.p.remove(CENTRE_REF);
         }
         if let Some(x) = saved {
@@ -4798,6 +4798,24 @@ fn a_model_path_that_is_not_utf8_survives_a_save_and_load() {
     let back: ModelFile = serde_json::from_str(&json).unwrap();
     assert_eq!(back.path, path);
 }
+
+/// Whether a click on a wall of the part picks its whole hole in `op`: a
+/// Pocket, an Adaptive clearing, a Contour, a Drill of the part's holes
+/// (not of the pins'), and an Internal groove's bore (a boss's wall it
+/// picks as a face).
+pub(crate) fn picks_holes(op: &Operation) -> bool {
+    matches!(
+        op.strategy,
+        Strategy::Pocket | Strategy::Adaptive | Strategy::Contour | Strategy::Groove
+    ) || (op.strategy == Strategy::Drill && !op.drills_pin_holes())
+}
+/// Whether a click on the part picks the whole smooth face it lands on in
+/// `op` (`mesh::Mesh::region_of`), a curved one included: Parallel and
+/// Waterline finishing.
+pub(crate) fn picks_faces(op: &Operation) -> bool {
+    matches!(op.strategy, Strategy::Parallel | Strategy::Waterline)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7070,7 +7088,7 @@ mod tests {
     }
 }
 #[cfg(test)]
-mod manual_setups {
+pub(crate) mod manual_setups {
     use super::*;
     fn with_manual() -> Document {
         let mut d = Document::sample();
@@ -7511,7 +7529,7 @@ mod manual_setups {
     }
 
     /// The lathe tool of each type, by its type's name.
-    fn lathe_tools() -> Vec<Tool> {
+    pub(crate) fn lathe_tools() -> Vec<Tool> {
         crate::lathe::TOOLS
             .iter()
             .map(|kind| Tool::lathe(kind, kind))
@@ -7911,44 +7929,6 @@ mod manual_setups {
         );
     }
     #[test]
-    fn a_turn_needs_the_tool_type_of_its_kind() {
-        let tools = lathe_tools();
-        let m = crate::lathe::defaults();
-        for kind in crate::lathe::TURN_KINDS {
-            let needed = crate::lathe::tool_for(kind).unwrap();
-            for tool in &tools {
-                let mut op = Operation::new(Strategy::Turn, tool.id.clone());
-                op.set_turn_kind(kind);
-                // The tool-dependent numbers fit the default of each kind.
-                let issues = op.issues(&m, &tools, &[]);
-                let message = format!("Choose a {} for the {kind} turn.", needed.to_lowercase());
-                assert_eq!(
-                    issues.contains(&message),
-                    !crate::lathe::takes(kind, get(&tool.p, "type")),
-                    "{kind} with {}: {issues:?}",
-                    tool.name()
-                );
-            }
-        }
-        assert_eq!(
-            crate::ui::issue_tab("Choose a boring bar for the Bore turn."),
-            Some("Tool")
-        );
-        // A mill tool is no tool for a Turn, and a Turn without a tool says so.
-        let mill = Tool::new("End mill", "Flat end mill", "6");
-        let op = Operation::new(Strategy::Turn, mill.id.clone());
-        let issues = op.issues(&m, &[mill], &[]);
-        assert!(
-            issues.contains(&"Choose a turning tool for the Outside turn.".to_string()),
-            "{issues:?}"
-        );
-        let op = Operation::new(Strategy::Turn, "gone".into());
-        assert!(
-            op.issues(&m, &[], &[])
-                .contains(&"Choose a tool from the library.".to_string())
-        );
-    }
-    #[test]
     fn a_bore_enters_with_a_bar_that_fits_and_reaches() {
         let (m, mut tools, mut op) = turn_of("Bore");
         // Ø12 is the smallest the default bar enters.
@@ -8102,68 +8082,12 @@ mod manual_setups {
                 .any(|i| i.starts_with("Spindle speed is above the machine's limit"))
         );
     }
-    fn lathe_drill() -> (Machine, Vec<Tool>, Operation) {
+    pub(crate) fn lathe_drill() -> (Machine, Vec<Tool>, Operation) {
         let m = crate::lathe::defaults();
         let mut drill = Tool::new("Drill 8", "Drill", "8");
         drill.p.insert("machines".into(), m.id.clone());
         let op = Operation::for_machine(Strategy::Drill, drill.id.clone(), &m);
         (m, vec![drill], op)
-    }
-    #[test]
-    fn a_drill_on_a_lathe_goes_in_on_the_centre_to_a_depth() {
-        let (m, tools, op) = lathe_drill();
-        assert!(op.on_centre(&m) && !op.on_centre(&Machine::new(3)));
-        assert!(op.geometry.is_empty());
-        assert_eq!(get(&op.p, "depth"), "20");
-        // Snapped to a gear of the lathe.
-        assert!(num(&op.p, "rpm").is_some_and(|rpm| crate::manual::on_gear(&m, rpm)));
-        assert_eq!(op.issues(&m, &tools, &[]), Vec::<String>::new());
-        assert_eq!(op.tabs(&m), vec!["Tool", "Drill", "Cycle"]);
-        // No selection is asked of it, and none is taken.
-        let mut selected = op.clone();
-        selected.geometry = vec![5];
-        assert_eq!(
-            selected.issues(&m, &tools, &[]),
-            vec![crate::lathe::DRILL_ON_CENTRE.to_string()]
-        );
-        let mut picked = op.clone();
-        picked.surfaces = Some(crate::surface::Selection {
-            mesh_fingerprint: "x".into(),
-            ids: vec![3],
-        });
-        assert_eq!(
-            picked.issues(&m, &tools, &[]),
-            vec![crate::lathe::DRILL_ON_CENTRE.to_string()]
-        );
-        assert_eq!(
-            crate::ui::issue_tab(crate::lathe::DRILL_ON_CENTRE),
-            Some("Drill")
-        );
-        // The depth is a positive number that the drill's flutes cover.
-        for depth in ["0", "-5", "", "deep"] {
-            let mut bad = op.clone();
-            bad.p.insert("depth".into(), depth.into());
-            assert_eq!(
-                bad.issues(&m, &tools, &[]),
-                vec!["depth must be greater than zero.".to_string()],
-                "{depth:?}"
-            );
-        }
-        let mut deep = op.clone();
-        deep.p.insert("depth".into(), "26".into());
-        assert_eq!(
-            deep.issues(&m, &tools, &[]),
-            vec!["depth is deeper than Drill 8's flutes, 25 mm.".to_string()]
-        );
-        deep.p.insert("depth".into(), "25".into());
-        assert!(deep.issues(&m, &tools, &[]).is_empty());
-        // The drill must list the lathe: a CNC drill is not on it.
-        let mut elsewhere = tools.clone();
-        elsewhere[0].p.remove("machines");
-        assert_eq!(
-            op.issues(&m, &elsewhere, &[]),
-            vec!["Drill 8 is not on Manual Lathe.".to_string()]
-        );
     }
     #[test]
     fn a_drill_off_the_lathe_keeps_selecting_holes() {

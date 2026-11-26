@@ -942,7 +942,7 @@ pub(crate) fn gouge_problem(
     })
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         mesh,
@@ -953,7 +953,7 @@ mod tests {
     };
     const TAN30: f32 = 0.577_350_3;
     /// A chamfer mill of `angle`°, `flat` mm across its tip, Ø6.
-    fn mill(angle: &str, flat: &str) -> Tool {
+    pub(crate) fn mill(angle: &str, flat: &str) -> Tool {
         let mut t = Tool::new("Spot drill", "Chamfer mill", "6");
         for (k, v) in [
             ("tip_angle", angle),
@@ -965,7 +965,7 @@ mod tests {
         }
         t
     }
-    fn chamfer(tool: &Tool, fields: &[(&str, &str)]) -> Operation {
+    pub(crate) fn chamfer(tool: &Tool, fields: &[(&str, &str)]) -> Operation {
         let mut op = Operation::new(Strategy::Chamfer, tool.id.clone());
         for (k, v) in fields {
             op.p.insert((*k).into(), (*v).into());
@@ -1638,59 +1638,6 @@ mod tests {
         ] {
             assert!(fields.get(k).is_some(), "{k}");
         }
-    }
-    #[test]
-    fn a_chamfer_milling_posts_for_linuxcnc_and_runs_on_the_uc100() {
-        let (mut doc, mesh) = crate::post::fixture::job();
-        let mut spot = mill("90", "0");
-        spot.p.insert("number".into(), "9".into());
-        let op = chamfer(
-            &spot,
-            &[
-                ("chamfer_source", "Line"),
-                ("from_x", "-5"),
-                ("to_x", "5"),
-                ("line_z", "0"),
-                ("chamfer_size", "Tip depth"),
-                ("tip_z", "-1"),
-            ],
-        );
-        doc.tools.push(spot);
-        doc.setups[0].operations = vec![op];
-        // LinuxCNC: down to the tip, then the level pass 1 mm off the line.
-        let job = crate::post::post_job(&doc, &mesh);
-        assert!(job.errors.is_empty(), "{:?}", job.errors);
-        let programs = job.setups[0].result.as_ref().unwrap();
-        let text = &programs[0].text;
-        assert!(text.contains("G1 Z-1.000"), "{text}");
-        assert!(
-            text.contains("X-5.000 Y1.000\nZ5.000\nG1 Z-1.000"),
-            "{text}"
-        );
-        assert!(text.contains("G1 Z-1.000 F75.0\nX5.000 F300.0"), "{text}");
-        // The UC100: its run checks pass and the tool run has the pass.
-        let dir = tempfile::tempdir().unwrap();
-        let profile = dir.path().join("template.toml");
-        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
-        // The template profile has no coolant outputs.
-        doc.setups[0].operations[0]
-            .p
-            .insert("coolant".into(), "Off".into());
-        let m = &mut doc.setups[0].machine;
-        m.p.insert("controller".into(), "UC100".into());
-        m.p.insert("uc100_profile".into(), profile.display().to_string());
-        let job = crate::post::post_job(&doc, &mesh);
-        assert!(
-            matches!(job.setups[0].run, Some(Ok(()))),
-            "{:?}",
-            job.setups[0].run
-        );
-        let runs = crate::run::programs(&doc, &mesh, 0).unwrap();
-        let level = (runs.iter().flat_map(|r| &r.blocks)).any(|b| {
-            matches!(b, crate::post::Block::Move { kind: crate::post::Kind::Feed, from, to, .. }
-                if (from[2] - to[2]).abs() < 1e-6 && (to[0] - from[0]).abs() > 9.99)
-        });
-        assert!(level);
     }
     #[test]
     fn a_held_chamfer_holds_its_paths_force_and_plunges_no_faster() {

@@ -90,10 +90,10 @@ pub fn at_angle(a: Option<f32>) -> String {
     a.map_or(String::new(), |a| format!(" at A{}°", degrees(a)))
 }
 /// Whether `op`, of `setup`, picks holes (a Drill, a Pocket, a Contour,
-/// `crate::picks_holes`) in an indexed setup of several A angles: then each
+/// `crate::model::picks_holes`) in an indexed setup of several A angles: then each
 /// angle cuts the holes it turns up (`holes_by_angle`).
 pub fn holes_at_angles(op: &crate::model::Operation, setup: &Setup) -> bool {
-    crate::picks_holes(op)
+    crate::model::picks_holes(op)
         && op.surfaces.is_some()
         && is_indexed(setup)
         && angles(setup).is_ok_and(|a| a.len() > 1)
@@ -915,7 +915,7 @@ impl Document {
             frame,
             zero,
             machine_zero,
-            measured: self.centre_mark(&clamped.machine) == crate::control::MEASURED,
+            measured: self.centre_mark(&clamped.machine) == crate::machine_profile::MEASURED,
         })
     }
     /// The rotary unit of machine `m`: its A centreline as the Control page
@@ -923,7 +923,7 @@ impl Document {
     /// else the setup's copy's.
     pub fn rotary_unit(&self, m: &Machine) -> Option<crate::model::RotaryUnit> {
         let mut unit = m.rotary_unit()?;
-        if self.centre_mark(m) == crate::control::MEASURED
+        if self.centre_mark(m) == crate::machine_profile::MEASURED
             && let Some(library) = self
                 .machines
                 .iter()
@@ -940,7 +940,7 @@ impl Document {
     /// from the setup's copy of the machine.
     pub fn centre_mark<'a>(&'a self, m: &'a Machine) -> &'a str {
         let library = self.machines.iter().find(|x| x.id == m.id).unwrap_or(m);
-        get(&library.p, crate::control::CENTRE_MARK).trim()
+        get(&library.p, crate::machine_profile::CENTRE_MARK).trim()
     }
     /// What is wrong with setup `si` being indexed that the setup alone
     /// does not tell (`Setup::issues` tells the rest).
@@ -968,7 +968,7 @@ impl Document {
             ];
         }
         match self.centre_mark(&s.machine) {
-            crate::control::MEASURED => vec![],
+            crate::machine_profile::MEASURED => vec![],
             "" => vec![
                 "The A centreline is assumed, not measured: probe it on the Control page (Rotary A) before trusting where A turns the stock.".into(),
             ],
@@ -1563,7 +1563,7 @@ pub(crate) mod tests {
         doc.sync_turns(Some(&mesh));
         (doc, mesh)
     }
-    fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+    pub(crate) fn close(a: [f32; 3], b: [f32; 3]) -> bool {
         (0..3).all(|k| (a[k] - b[k]).abs() < 1e-3)
     }
 
@@ -1763,8 +1763,8 @@ pub(crate) mod tests {
         let id = doc.setups[0].machine.id.clone();
         let mut library = doc.setups[0].machine.clone();
         library.p.insert(
-            crate::control::CENTRE_MARK.into(),
-            crate::control::MEASURED.into(),
+            crate::machine_profile::CENTRE_MARK.into(),
+            crate::machine_profile::MEASURED.into(),
         );
         doc.machines = vec![library];
         assert!(doc.index_warnings(1).is_empty());
@@ -1772,7 +1772,7 @@ pub(crate) mod tests {
         doc.sync_turns(Some(&mesh));
         assert!(doc.at_angle(1, 90., &mesh).unwrap().measured);
         doc.machines[0].p.insert(
-            crate::control::CENTRE_MARK.into(),
+            crate::machine_profile::CENTRE_MARK.into(),
             "stale after an E-stop".into(),
         );
         assert_eq!(doc.machines[0].id, id);
@@ -2529,8 +2529,8 @@ pub(crate) mod tests {
         let mut library = doc.setups[0].machine.clone();
         library.p.insert("a_centre_z".into(), "-150".into());
         library.p.insert(
-            crate::control::CENTRE_MARK.into(),
-            crate::control::MEASURED.into(),
+            crate::machine_profile::CENTRE_MARK.into(),
+            crate::machine_profile::MEASURED.into(),
         );
         doc.machines = vec![library];
         assert_eq!(get(&doc.setups[1].machine.p, "a_centre_z"), "-40");
@@ -2541,7 +2541,7 @@ pub(crate) mod tests {
         assert!((over.machine_z - (-150. + 20. + 15.)).abs() < 1e-3);
         // Gone stale, it is not trusted: the setup's copy is used again.
         doc.machines[0].p.insert(
-            crate::control::CENTRE_MARK.into(),
+            crate::machine_profile::CENTRE_MARK.into(),
             "stale after an E-stop".into(),
         );
         assert!(doc.swing(1, &mesh, 15.).is_err());
@@ -2688,76 +2688,6 @@ pub(crate) mod tests {
         (doc, mesh)
     }
     #[test]
-    fn a_turn_of_a_below_the_swing_height_is_refused() {
-        use crate::model::POST_RETRACT;
-        // Setup 3 indexes to A90 as setup 2 left it: its plan has no index
-        // move, so the program turns A to A90 where its retract leaves the
-        // tool, since the A the machine is at when it starts is not known.
-        let (mut doc, mesh) = posting_bar_job(20., "100", "90");
-        let mut third = doc.setups[1].clone();
-        third.id = crate::model::id();
-        doc.setups.push(third);
-        doc.sync_stock_sources();
-        doc.sync_turns(Some(&mesh));
-        // Setup 3 starts at the angle setup 2 left, and comes down from
-        // above what A swings under the tool as an index move does
-        // (LIO-205): its program turns A at machine Z home over the first
-        // cut, and is exported. At the clearance plane, now over the bar
-        // and not the jaws (LIO-209), a program that starts with the tool
-        // wherever it was is refused, as on a 3-axis setup: it could arrive
-        // over the jaws below their reach.
-        for (mode, exported) in POST_RETRACT.iter().zip([true, false]) {
-            doc.setups[0]
-                .machine
-                .p
-                .insert("post_retract".into(), (*mode).into());
-            doc.sync_indexed();
-            let posted = crate::post::post_job(&doc, &mesh);
-            for k in [1, 2] {
-                let result = &posted.setups[k].result;
-                match exported {
-                    true => assert!(result.is_ok(), "{mode}: {result:?}"),
-                    false => assert!(
-                        result.as_ref().is_err_and(|e| e
-                            .iter()
-                            .any(|e| e.contains("is not above the chuck jaw"))),
-                        "{mode}: {result:?}"
-                    ),
-                }
-            }
-        }
-        // Its plans checked once the operation's clearance is raised to
-        // 40 mm put the swing above where its program turns A, the
-        // clearance plane: that turn is refused. At machine Z home it is not.
-        let sims = crate::run::simulated_for_tests(&doc, &mesh, 2);
-        let mut raised = doc.clone();
-        (raised.setups[2].operations[0].p).insert("clearance".into(), "40".into());
-        let below = "A turns to A 90° with the tool tip at Z";
-        for (mode, refused) in POST_RETRACT.iter().zip([false, true]) {
-            raised.setups[0]
-                .machine
-                .p
-                .insert("post_retract".into(), (*mode).into());
-            raised.sync_indexed();
-            let found = crate::post::checked(
-                &raised,
-                &mesh,
-                2,
-                &sims,
-                crate::post::PostSettings::from_machine,
-            )
-            .err()
-            .unwrap_or_default();
-            assert_eq!(
-                found
-                    .iter()
-                    .any(|e| e.contains(below) && e.contains("where nothing A swings reaches it")),
-                refused,
-                "{mode}: {found:?}"
-            );
-        }
-    }
-    #[test]
     fn each_angles_cuts_are_checked_against_the_jaws_at_that_angle() {
         // The part 20 mm from the jaws, cut to 2 mm over the axis: round it
         // the holder comes within their gap at the angles it is cut at.
@@ -2901,75 +2831,6 @@ pub(crate) mod tests {
         doc.sync_stock_sources();
         doc.sync_turns(Some(&mesh));
         (doc, mesh)
-    }
-    #[test]
-    fn a_plain_setup_in_the_chuck_comes_down_from_above_the_jaws() {
-        use crate::simulation::{Motion, prepare};
-        let (doc, mesh) = chuck_setup_1_job("90, 180");
-        // The kernel starts at the stock's -X -Y corner, in the jaws, at its
-        // clearance plane, below what they reach.
-        let mut fresh = doc.setups[0].clone();
-        fresh.p.insert("stock_source".into(), "fresh".into());
-        let op = &doc.setups[0].operations[0];
-        let kernel = crate::simulation::generate(&fresh, op, &doc.tools[0], &mesh).unwrap();
-        let stock = doc.setup_stock(0, Some(&mesh)).unwrap();
-        let rig = doc.chuck_rig(&doc.setups[0], stock).unwrap();
-        let corner = kernel.moves[0].from;
-        assert!(
-            corner[0] < rig.front && (corner[0] - stock.min[0]).abs() < 1.,
-            "{corner:?}"
-        );
-        // Both operations instead come down over their first cut from the
-        // swing height of setup 1's own clamping, with no A, clear of the
-        // jaws (LIO-206).
-        let swing = doc.swing(0, &mesh, 15.).unwrap();
-        let all = doc.swing(1, &mesh, 15.).unwrap();
-        assert_eq!((swing.what, swing.z), (all.what, all.z));
-        assert!(corner[2] < swing.z - 30., "{corner:?} {swing:?}");
-        let gap = crate::holding::gap(&doc.setups[0]).unwrap();
-        for oi in 0..2 {
-            let plan = prepare(&doc, &mesh, 0, oi).unwrap().plan;
-            let first = (plan.moves.iter())
-                .position(|m| m.motion == Motion::Feed)
-                .unwrap();
-            let (down, over) = (&plan.moves[..first], plan.moves[first].from);
-            assert_eq!(down.len(), 1, "{down:?}");
-            assert_eq!(down[0].motion, Motion::Rapid);
-            assert!(close(down[0].from, [over[0], over[1], swing.z]), "{down:?}");
-            assert!(close(down[0].to, over));
-            assert!(plan.moves.iter().all(|m| m.a.is_none()));
-            let tool = (plan.radius, plan.tool_length, plan.holder_radius);
-            assert!(
-                rig.hits_at(0., &[(down[0].from, over)], tool, gap)
-                    .is_empty()
-            );
-            assert!((plan.duration - plan.moves.last().unwrap().end).abs() < 1e-3);
-        }
-        // Its workholding check finds nothing, and the job exports: setup
-        // 1 at A0 with no A word, and the indexed setup after it.
-        let sims = crate::run::simulated_for_tests(&doc, &mesh, 0);
-        let held = crate::post::held(&doc, &mesh, 0, &sims);
-        assert!(held.is_empty(), "{held:?}");
-        let posted = crate::post::post_job(&doc, &mesh);
-        for k in [0, 1] {
-            assert!(
-                posted.setups[k].result.is_ok(),
-                "{k}: {:?}",
-                posted.setups[k].result
-            );
-        }
-        let program = &posted.setups[0].result.as_ref().unwrap()[0].text;
-        let code = program.lines().filter(|l| !l.starts_with('('));
-        assert!(code.clone().all(|l| !l.contains('A')), "{program}");
-        // Both headers say the chuck was checked, not a vise (LIO-210).
-        for k in [0, 1] {
-            let program = &posted.setups[k].result.as_ref().unwrap()[0].text;
-            assert!(
-                program.contains("(Not checked: the table, the machine body and tool-change motion. The chuck, its jaws, the rotary head,")
-                    && !program.contains("Vise jaws"),
-                "{program}"
-            );
-        }
     }
     #[test]
     fn a_plain_setup_in_the_chuck_at_the_assumed_centreline_enters_from_the_top_of_the_z_travel() {
