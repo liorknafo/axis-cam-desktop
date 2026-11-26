@@ -747,6 +747,20 @@ mod tests {
         assert_eq!(session_cuts(&state), cut(None));
         set_session_cuts(&state, cut(Some(2)));
         assert_ne!(version(), once);
+        // Whose the setup that cut is (LIO-638): kept, and a new version
+        // once it changes, its file saying the cuts as that project's.
+        let mut owned = cut(Some(2));
+        owned.owners = vec![crate::run::CutOwner {
+            setup: "a".into(),
+            project: "p".into(),
+            title: "Bracket".into(),
+            ops: vec!["Face".into()],
+        }];
+        let unowned = version();
+        set_session_cuts(&state, owned.clone());
+        assert_eq!(session_cuts(&state), owned);
+        assert_eq!(shared_with(&state).1, owned);
+        assert_ne!(version(), unowned);
         // What runs cut was lost (LIO-594): a new version too.
         set_session_cuts(
             &state,

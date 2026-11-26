@@ -518,7 +518,7 @@ impl EarlierUnfollowed {
 
     /// `said` as the tablet file says it (`FOR_TABLET`, LIO-590): cut on
     /// the computer before the file was made.
-    fn said_on_tablet(self) -> String {
+    pub(crate) fn said_on_tablet(self) -> String {
         const BEFORE: &str = "before this tablet file was made";
         match self {
             Self::Changed(i) => format!(
@@ -658,12 +658,15 @@ pub type SessionCuts = [(String, Vec<CutInRun>)];
 /// makes a setup with none kept cut by runs no session here knows of, and
 /// what the operator took as cut in each setup's run (`App::run_declared`,
 /// LIO-583), the run picked now's included: a later setup takes an
-/// operation marked Already cut as cut while it is so (LIO-603).
+/// operation marked Already cut as cut while it is so (LIO-603); and whose
+/// each setup of `cuts` is (`App::cut_owners`), so that another project's
+/// cuts are said as that project's, named (LIO-638).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Session {
     pub cuts: Vec<(String, Vec<CutInRun>)>,
     pub lost: bool,
     pub declared: Vec<KeptDeclared>,
+    pub owners: Vec<CutOwner>,
 }
 
 impl Run {
@@ -674,8 +677,11 @@ impl Run {
     /// not the setup's own and the part held is not known to be that one
     /// (`stock_unconfirmed`), as on the Run panel once picked again
     /// (LIO-583), which the tablet cannot answer: no Z from the stock top.
-    pub fn given(&mut self, session: &Session) {
+    /// Whose the setups not `doc`'s are, as the Run panel's pick has it
+    /// (`give_elsewhere`, LIO-638).
+    pub fn given(&mut self, session: &Session, doc: &Document) {
         self.picked_in(&session.cuts, session.lost, &session.declared);
+        give_elsewhere(&session.owners, doc, self);
         if session.declared.iter().any(|k| k.setup == self.setup_id) {
             if self.cut_in_run.is_empty() {
                 self.note_history_unknown();
@@ -1446,6 +1452,23 @@ impl CutOwner {
             ops: s.operations.iter().map(|o| o.name().to_string()).collect(),
         }
     }
+}
+
+/// Gives `run` whose the setups of its `earlier_cuts` that are another
+/// project's are (`owners`, `App::cut_owners`; `Run::earlier_elsewhere`),
+/// so that their cuts are said as that project's (LIO-607). One `doc` has,
+/// or one deleted from it (`Run::earlier_own`), is this project's; one
+/// with no owner kept, of a project not known (`Run::earlier_not_here`,
+/// LIO-635). Only what is said goes by it: what the check follows does not.
+pub fn give_elsewhere(owners: &[CutOwner], doc: &Document, run: &mut Run) {
+    let gone = (run.earlier_cuts.iter())
+        .filter(|(id, _)| !doc.setups.iter().any(|s| s.id == *id))
+        .filter_map(|(id, _)| owners.iter().find(|o| o.setup == *id));
+    let (own, elsewhere): (Vec<&CutOwner>, Vec<&CutOwner>) =
+        gone.partition(|o| o.project == doc.project_id);
+    run.earlier_elsewhere = elsewhere.into_iter().cloned().collect();
+    // Deleted from it since: not another project's (LIO-635).
+    run.earlier_own = own.into_iter().map(|o| o.setup.clone()).collect();
 }
 
 /// How many of the tool runs sent a Pi `CutHistory::sent` keeps.
@@ -3924,10 +3947,28 @@ impl Run {
         }
     }
 
-    /// `why`, from the Run panel, as the tablet file says it: this
-    /// project's setup's cut not followed by its case (LIO-599), else as
-    /// `FOR_TABLET` has it.
+    /// `why`, from the Run panel, as the tablet file says it: another
+    /// project's cuts as that project's, named (`earlier_cause`, LIO-638),
+    /// this project's setup's cut not followed by its case (LIO-599), else
+    /// as `FOR_TABLET` has it. Each matched exactly: only the words change,
+    /// never whether it is refused.
     fn for_tablet(&self, why: String) -> String {
+        if self.elsewhere_unfollowed()
+            && let Some(cause) = self.earlier_cause(true)
+        {
+            if why == self.earlier_unfollowed_blocked() {
+                return format!(
+                    "{cause}, so the computer cannot tell the surface where the stock top is touched off.{}",
+                    new_stock_on_the_computer!()
+                );
+            }
+            if why == self.earlier_unfollowed_why() {
+                return format!(
+                    "{cause}, so the computer does not know what they cut here.{}",
+                    new_stock_on_the_computer!()
+                );
+            }
+        }
         match self.earlier_unfollowed_how() {
             Some(h) if why == h.blocked() => h.tablet_blocked(),
             Some(h) if why == h.why() => h.tablet_why(),
@@ -3958,9 +3999,9 @@ impl Run {
     /// (`earlier_own`): another project's, the computer keeping one record
     /// for all of them (`App::run_cuts`), or one deleted since. Where whose
     /// is known to be another project's, that is said instead
-    /// (`earlier_elsewhere`, LIO-607); the tablet file knows no owners, so
-    /// there it is said so, with New stock loaded on the computer as the
-    /// way out (LIO-635).
+    /// (`earlier_elsewhere`, LIO-607, in the tablet file too, LIO-638); with
+    /// no owner kept, it is said so, with New stock loaded on the computer
+    /// as the tablet's way out (LIO-635).
     pub fn earlier_not_here(&self) -> bool {
         let mut ids = self.unfollowed_earlier().map(|(id, _)| id).peekable();
         ids.peek().is_some()
@@ -4039,8 +4080,10 @@ impl Run {
     /// What another project's runs cut that the check does not follow
     /// (`earlier_unfollowed`, `earlier_elsewhere`), said (LIO-607): None
     /// when none did. With whether a setup of this project's, or one whose
-    /// project is not known, cut what it does not follow too.
-    fn earlier_elsewhere_said(&self) -> Option<(String, bool)> {
+    /// project is not known, cut what it does not follow too. In the
+    /// tablet file's words when `tablet` (LIO-638): those runs were the
+    /// computer's, before the file was made.
+    fn earlier_elsewhere_said(&self, tablet: bool) -> Option<(String, bool)> {
         let (projects, own) = self.earlier_elsewhere_projects()?;
         let which = (projects.iter())
             .map(|(title, ops)| match (title.trim(), ops.is_empty()) {
@@ -4056,9 +4099,14 @@ impl Run {
             _ => "other projects' runs",
         };
         Some((
-            format!(
-                "{whose} cut stock on this machine earlier ({which}), which this project's check does not follow"
-            ),
+            match tablet {
+                false => format!(
+                    "{whose} cut stock on this machine earlier ({which}), which this project's check does not follow"
+                ),
+                true => format!(
+                    "{whose} on the computer cut stock on the machine before this tablet file was made ({which}), which this project's plan does not follow"
+                ),
+            },
             own,
         ))
     }
@@ -4103,16 +4151,28 @@ impl Run {
     /// this project's setup by its case (`earlier_unfollowed_how`,
     /// LIO-599), another project's by its name (LIO-607), or both. None
     /// when only setups whose project is not known did (`earlier_not_here`).
-    fn earlier_cause(&self) -> Option<String> {
+    /// In the tablet file's words when `tablet` (LIO-638).
+    fn earlier_cause(&self, tablet: bool) -> Option<String> {
         let how = self.earlier_unfollowed_how();
-        Some(match (how, self.earlier_elsewhere_said()) {
-            (Some(how), Some((said, _))) => format!("{}, and {said}", how.said()),
-            (None, Some((said, true))) => {
+        let said = self.earlier_elsewhere_said(tablet);
+        Some(match (how, said, tablet) {
+            (Some(how), Some((said, _)), false) => format!("{}, and {said}", how.said()),
+            // The tablet's case says "before this tablet file was made"
+            // itself (LIO-638 review).
+            (Some(how), Some((said, _)), true) => format!(
+                "{}, and {}",
+                how.said_on_tablet(),
+                said.replacen(" before this tablet file was made", " too", 1)
+            ),
+            (None, Some((said, true)), false) => {
                 format!("{}, and {said}", EarlierUnfollowed::Unknown.said())
             }
-            (None, Some((said, false))) => format!("{}{}", said[..1].to_uppercase(), &said[1..]),
-            (Some(how), None) => how.said(),
-            (None, None) => return None,
+            // One sentence, "does not follow" once (LIO-638 review).
+            (None, Some((said, true)), true) => format!("Another setup's run and {said}"),
+            (None, Some((said, false)), _) => format!("{}{}", said[..1].to_uppercase(), &said[1..]),
+            (Some(how), None, false) => how.said(),
+            (Some(how), None, true) => how.said_on_tablet(),
+            (None, None, _) => return None,
         })
     }
 
@@ -4125,7 +4185,7 @@ impl Run {
     /// Why Zero Z on the stock top and Probe Z cannot set Z where
     /// `EARLIER_UNFOLLOWED` cut (`partway_blocked`).
     fn earlier_unfollowed_blocked(&self) -> String {
-        match (self.earlier_cause(), self.elsewhere_unfollowed()) {
+        match (self.earlier_cause(false), self.elsewhere_unfollowed()) {
             (Some(cause), true) => format!(
                 "{cause}, so the check cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero."
             ),
@@ -4133,7 +4193,7 @@ impl Run {
                 .unwrap_or(EarlierUnfollowed::Unknown)
                 .blocked(),
             // Whose not known, but none of this project's: the tablet
-            // file's case, which knows no owners (LIO-635).
+            // file's case with no owner kept (LIO-635).
             (None, _) => EARLIER_ELSEWHERE_BLOCKED.into(),
         }
     }
@@ -4184,7 +4244,7 @@ impl Run {
         if let Some(said) = self.earlier_uncut_said() {
             return format!("{said}, so it does not know what is left here.");
         }
-        match (self.earlier_cause(), self.elsewhere_unfollowed()) {
+        match (self.earlier_cause(false), self.elsewhere_unfollowed()) {
             (Some(cause), true) => format!("{cause}."),
             (Some(_), false) => (self.earlier_unfollowed_how())
                 .unwrap_or(EarlierUnfollowed::Unknown)
@@ -4202,7 +4262,7 @@ impl Run {
         if let Some(said) = self.earlier_uncut_said() {
             return format!("{said}, where a probe finds this work zero.");
         }
-        match (self.earlier_cause(), self.elsewhere_unfollowed()) {
+        match (self.earlier_cause(false), self.elsewhere_unfollowed()) {
             (Some(cause), true) => format!(
                 "{cause}, so the check cannot tell the stock where a probe finds this work zero."
             ),
@@ -6980,7 +7040,7 @@ pub fn tablet_runs(
     // setup picked with this session's cuts (LIO-590); the jobs are the
     // plan's alone.
     let mut started = Run::new(doc, si, 0);
-    started.given(session);
+    started.given(session, doc);
     started.checked_as(all.clone(), Some(left), None);
     // Its programs are made for an earlier setup's operation cut whole that
     // the computer's runs did not certainly cut so: the tablet's Cycle
@@ -7362,7 +7422,7 @@ fn tablet_step_job(
     // check puts Cycle Start at the step's operation (`keep`), so the start
     // is the run's (`at_step`). One it would not be at is said as none.
     let mut started = Run::new(doc, si, 0);
-    started.given(session);
+    started.given(session, doc);
     started.start_step = Some((oi, n));
     started.keep = Some((vec![], Some(oi)));
     started.checked_as(all.clone(), Some(left), None);
@@ -11578,6 +11638,7 @@ pub(crate) mod tests {
                 cuts: vec![(doc.setups[0].id.clone(), vec![cut])],
                 lost: false,
                 declared: vec![],
+                owners: vec![],
             };
             tablet_runs(&doc, Ok(&mesh), 1, &session)
         };
@@ -12723,7 +12784,7 @@ pub(crate) mod tests {
                     )
                 })
                 .collect();
-            crate::give_elsewhere(&owners, &doc, &mut run);
+            give_elsewhere(&owners, &doc, &mut run);
             (run.earlier_unfollowed_why(), run.earlier_unfollowed_note())
         };
         // Why, said with the steps, and the note with New stock loaded.
@@ -12777,7 +12838,7 @@ pub(crate) mod tests {
         let owners = [nameless.clone()];
         let mut run = Run::new(&doc, 0, 0);
         run.earlier_cuts = vec![(nameless.setup.clone(), vec![(0, None, None, None)])];
-        crate::give_elsewhere(&owners, &doc, &mut run);
+        give_elsewhere(&owners, &doc, &mut run);
         assert_eq!(
             run.earlier_unfollowed_note(),
             "Another project's runs (one with no name) may have cut this stock."
@@ -13227,6 +13288,153 @@ pub(crate) mod tests {
         assert_eq!(setup_in(&doc, 1, &other), setup(&doc, 1, &[]));
     }
 
+    /// LIO-638: project A ("Bracket") bores the ring in a run; project B,
+    /// the same part and plan, is opened and saved for the tablet with what
+    /// the computer's runs cut and whose they are (`Session::owners`). Every
+    /// work zero of B's file says the bore as A's, named, in the tablet's
+    /// words, with the way out on the computer (LIO-635), and nothing
+    /// disabled, deleted or moved; and refuses Z and every probe spot
+    /// exactly as with the owners not known. A's own file is the same with
+    /// them or not.
+    #[test]
+    fn a_tablet_file_says_another_projects_cuts_as_its() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (mut a, _) = tablet_fixture(&profile);
+        let (path, mesh, [mill, small]) = ring(dir.path());
+        let mut first = ring_setup(&a, "G54", "1", "1");
+        let top = ring_top(&mesh, &first, true);
+        first.operations = vec![ring_bore(&mill, top, "0.5")];
+        let mut flipped = ring_setup(&a, "G55", "1", "1");
+        flipped.p.insert("rx".into(), "180".into());
+        let top = ring_top(&mesh, &flipped, false);
+        flipped.operations = vec![ring_face(&mill, top.clone()), ring_face(&small, top)];
+        a.active = flipped.id.clone();
+        a.setups = vec![first, flipped];
+        a.tools = vec![mill, small];
+        if let Some(f) = &mut a.file {
+            (f.path, f.name, f.format) = (path, "ring.stl".into(), "stl".into());
+        }
+        a.title = "Bracket".into();
+        let mut b = a.clone();
+        (b.project_id, b.title) = (crate::id(), "Lid".into());
+        for s in &mut b.setups {
+            s.id = crate::id();
+        }
+        let bore = a.setups[0].operations[0].name().to_string();
+        let (c, l) = check(&a, &mesh, 0);
+        let mut run = Run::new(&a, 0, 0);
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        run.note_cut(0, None);
+        let cuts = vec![(a.setups[0].id.clone(), run.cut_in_run.clone())];
+        let with = Session {
+            cuts: cuts.clone(),
+            owners: vec![CutOwner::of(&a, 0)],
+            ..Session::default()
+        };
+        let without = Session {
+            cuts,
+            ..Session::default()
+        };
+        let setup_in = |doc: &Document, si: usize, session: &Session| {
+            let runs = crate::bundle::runs(doc, Ok(&mesh), session);
+            let s = (runs.setups.into_iter()).find(|s| s.setup_id == doc.setups[si].id);
+            let s = s.unwrap();
+            assert!(s.problems.is_empty(), "{:?}", s.problems);
+            s
+        };
+        let zeros = |s: &TabletSetup| -> Vec<TabletZero> {
+            let all: Vec<Option<TabletZero>> = (s.tool_runs.iter())
+                .flat_map(|r| {
+                    let starts = r.starts.iter().map(|t| t.zero.clone());
+                    let steps = r.step_starts.iter().map(|t| t.zero.clone());
+                    std::iter::once(r.zero.clone()).chain(starts).chain(steps)
+                })
+                .collect();
+            assert!(
+                !all.is_empty() && all.iter().all(Option::is_some),
+                "{all:?}"
+            );
+            all.into_iter().flatten().collect()
+        };
+        let way_out = new_stock_on_the_computer!();
+        // B's two setups, with the owners and without: refused alike, said
+        // as `blocked` and `why` say.
+        let said = |session: &Session, plain: &Session, blocked: &str, why: &str| {
+            for si in 0..2 {
+                let said = zeros(&setup_in(&b, si, session));
+                let generic = zeros(&setup_in(&b, si, plain));
+                assert_eq!(said.len(), generic.len());
+                for (z, g) in said.into_iter().zip(generic) {
+                    // Refused as before: no Z, every spot refused, the
+                    // stock said the same.
+                    assert_eq!((z.set_z, g.set_z), (None, None));
+                    assert_eq!(
+                        (&z.cut, z.top_cut, z.top, &z.spot),
+                        (&g.cut, g.top_cut, g.top, &g.spot)
+                    );
+                    assert!(g.blocked.is_some());
+                    assert_eq!(z.blocked.as_deref(), Some(blocked));
+                    assert_eq!(z.probe_from.len(), g.probe_from.len());
+                    assert!(!z.probe_from.is_empty());
+                    for (spot, gs) in z.probe_from.iter().zip(&g.probe_from) {
+                        assert_eq!((&spot.x, &spot.y), (&gs.x, &gs.y));
+                        assert!(gs.problem.is_some());
+                        assert_eq!(spot.problem.as_deref(), Some(why));
+                    }
+                }
+            }
+            for text in [blocked, why] {
+                for only in [
+                    "Same part",
+                    "under Work zero",
+                    "this computer",
+                    "disabled",
+                    "deleted",
+                    "moved",
+                ] {
+                    assert!(!text.contains(only), "{only:?} in {text}");
+                }
+                assert!(text.contains("\"Bracket\""), "{text}");
+                assert!(text.ends_with(way_out), "{text}");
+                assert_eq!(text.matches("does not follow").count(), 1, "{text}");
+            }
+        };
+        let cause = format!(
+            "another project's runs on the computer cut stock on the machine before this tablet file was made (\"Bracket\": {bore}), which this project's plan does not follow"
+        );
+        let capital = format!("A{}", &cause[1..]);
+        said(
+            &with,
+            &without,
+            &format!(
+                "{capital}, so the computer cannot tell the surface where the stock top is touched off.{way_out}"
+            ),
+            &format!("{capital}, so the computer does not know what they cut here.{way_out}"),
+        );
+        // With a cut kept with no owner too: one sentence.
+        let (mut both, mut plain) = (with.clone(), without.clone());
+        let mut unknown = both.cuts[0].clone();
+        unknown.0 = "kept-with-no-owner".into();
+        both.cuts.push(unknown.clone());
+        plain.cuts.push(unknown);
+        said(
+            &both,
+            &plain,
+            &format!(
+                "Another setup's run and {cause}, so the computer cannot tell the surface where the stock top is touched off.{way_out}"
+            ),
+            &format!(
+                "Another setup's run and {cause}, so the computer does not know what they cut here.{way_out}"
+            ),
+        );
+        // A's own file: its setups' cuts are its own, said as before.
+        for si in 0..2 {
+            assert_eq!(setup_in(&a, si, &with), setup_in(&a, si, &without));
+        }
+    }
+
     /// LIO-635: the computer keeps one record of what runs cut for all its
     /// projects, so a cut by another project's setup, or one deleted since,
     /// reaches every project it shares: a setup this project does not have.
@@ -13299,7 +13507,7 @@ pub(crate) mod tests {
         // The Run panel says it in its own words: New stock loaded is there.
         for si in 0..2 {
             let mut run = Run::new(&doc, si, 0);
-            run.given(&elsewhere);
+            run.given(&elsewhere, &doc);
             let (c, l) = check(&doc, &mesh, si);
             run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
             assert!(run.on_cut_stock() && run.touch_off().is_none());
@@ -13614,6 +13822,7 @@ pub(crate) mod tests {
                 cuts,
                 lost: false,
                 declared,
+                owners: vec![],
             };
             tablet_runs(&doc, Ok(&mesh), 1, &session)
         };
@@ -13711,6 +13920,7 @@ pub(crate) mod tests {
                 cuts: cuts.clone(),
                 lost: false,
                 declared: mine,
+                owners: vec![],
             };
             // The tablet file has no tool runs for it then (LIO-602).
             let s = tablet_runs(&doc, Ok(&mesh), 1, &session);

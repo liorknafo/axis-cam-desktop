@@ -14246,9 +14246,9 @@ flood = { pin = 8 }
     /// LIO-635: a project's tool run on the simulated machine, and another
     /// project on the same part (its own id, title and setup id) shared to
     /// the tablet. The tablet file made with what the computer's runs cut
-    /// (`App::session_cuts`), as the Wi-Fi share packs it, knows no owners:
-    /// it refuses every start's Z and probe spots, saying the cut may be
-    /// another project's and how to clear it on the computer. There, that
+    /// (`App::session_cuts`), as the Wi-Fi share packs it, knows whose the
+    /// cut is (LIO-638): it refuses every start's Z and probe spots, naming
+    /// the project that cut and how to clear it on the computer. There, that
     /// project opened names the project that cut (LIO-607). New stock
     /// loaded on the computer, the file is the plan's alone again.
     #[test]
@@ -14283,6 +14283,7 @@ flood = { pin = 8 }
             .iter()
             .find(|(id, _)| *id == a.doc.setups[0].id);
         assert!(cut.is_some_and(|(_, c)| !c.is_empty()), "{session:?}");
+        let title = a.doc.title.clone();
         let cut = file(&session);
         assert_eq!(cut.setups.len(), 1);
         let s = &cut.setups[0];
@@ -14302,9 +14303,9 @@ flood = { pin = 8 }
             assert_eq!(z.set_z, None);
             let blocked = z.blocked.unwrap();
             assert!(
-                blocked.starts_with(
-                    "Runs on the computer cut stock for a setup this project does not have, another project's or one deleted since"
-                ) && blocked.ends_with(
+                blocked.starts_with(&format!(
+                    "Another project's runs on the computer cut stock on the machine before this tablet file was made (\"{title}\": "
+                )) && blocked.ends_with(
                     "If new stock is held, press New stock loaded on the computer (Control page, Work zero tab, the machine connected and a setup of this project picked in the run bar), then Sync projects here, or save the project for the tablet again."
                 ),
                 "{blocked}"
@@ -14312,7 +14313,7 @@ flood = { pin = 8 }
             assert!(!z.probe_from.is_empty());
             for spot in &z.probe_from {
                 let why = spot.problem.as_deref().unwrap();
-                assert!(why.contains("another project's"), "{why}");
+                assert!(why.contains(&format!("\"{title}\"")), "{why}");
             }
         }
         // The other project opened on the computer, which knows whose the
@@ -14635,6 +14636,23 @@ flood = { pin = 8 }
                 note,
                 "Another project's runs (\"Project A\") may have cut this stock."
             );
+            // Saved for the tablet, as Save for tablet and the Wi-Fi share
+            // make it (`App::session_cuts`), its work zero says so too, in
+            // the tablet's words, and sets no Z (LIO-638).
+            let mesh = b.imported_mesh.as_ref().expect("the part");
+            let runs = crate::bundle::runs(&b.doc, Ok(mesh), &b.session_cuts());
+            let zero = (runs.setups[0].tool_runs[0].zero.clone()).expect("a zero");
+            assert_eq!(zero.set_z, None);
+            let blocked = zero.blocked.unwrap_or_default();
+            assert!(
+                blocked.starts_with(&format!(
+                    "Another project's runs on the computer cut stock on the machine before this tablet file was made (\"Project A\": {face}"
+                )),
+                "{blocked}"
+            );
+            assert!(!blocked.contains("under Work zero"), "{blocked}");
+            assert!(!zero.probe_from.is_empty());
+            assert!(zero.probe_from.iter().all(|s| s.problem.is_some()));
         };
         asked(&mut a);
         let _ = a.update(Message::Disconnect);

@@ -4139,7 +4139,7 @@ impl App {
             }
         }
         if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
-            give_elsewhere(&self.cut_owners, &self.doc, r);
+            run::give_elsewhere(&self.cut_owners, &self.doc, r);
         }
         for k in theirs.journals.iter() {
             if !base.journals.contains(k) && !self.cut_journals.contains(k) {
@@ -5119,7 +5119,7 @@ impl App {
             following.note_history_unknown();
         }
         give_earlier_cuts(&self.run_cuts, &self.run_declared, &mut following);
-        give_elsewhere(&self.cut_owners, &self.doc, &mut following);
+        run::give_elsewhere(&self.cut_owners, &self.doc, &mut following);
         // Kept across a disconnect: was anything else run meanwhile?
         give_away(&self.run_away, &mut following);
         c.run = Some(following);
@@ -7018,6 +7018,9 @@ impl App {
             keep_declared(&mut declared, r);
         }
         run::Session {
+            // Whose each is, another project's said so in the file
+            // (LIO-638).
+            owners: owners_of(&cuts, &self.doc, &self.cut_owners),
             cuts,
             lost: self.others_unknown,
             declared,
@@ -9444,7 +9447,7 @@ impl App {
                     r.declared_from = Some(k.prints.clone());
                 }
                 let skipped = !r.skips.is_empty();
-                give_elsewhere(&self.cut_owners, &self.doc, &mut r);
+                run::give_elsewhere(&self.cut_owners, &self.doc, &mut r);
                 give_away(&self.run_away, &mut r);
                 c.run = Some(r);
                 // A spot picked to probe from was for the setup before.
@@ -12784,23 +12787,6 @@ fn owners_of(
             },
         )
         .collect()
-}
-
-/// Gives `run` whose the setups of its `earlier_cuts` that are another
-/// project's are (`owners`, `App::cut_owners`; `run::Run::earlier_elsewhere`),
-/// so that their cuts are said as that project's (LIO-607). One `doc` has,
-/// or one deleted from it (`run::Run::earlier_own`), is this project's; one
-/// with no owner kept, of a project not known (`run::Run::earlier_not_here`,
-/// LIO-635).
-fn give_elsewhere(owners: &[run::CutOwner], doc: &Document, run: &mut run::Run) {
-    let gone = (run.earlier_cuts.iter())
-        .filter(|(id, _)| !doc.setups.iter().any(|s| s.id == *id))
-        .filter_map(|(id, _)| owners.iter().find(|o| o.setup == *id));
-    let (own, elsewhere): (Vec<&run::CutOwner>, Vec<&run::CutOwner>) =
-        gone.partition(|o| o.project == doc.project_id);
-    run.earlier_elsewhere = elsewhere.into_iter().cloned().collect();
-    // Deleted from it since: not another project's (LIO-635).
-    run.earlier_own = own.into_iter().map(|o| o.setup.clone()).collect();
 }
 
 /// Notes in `pending` (`App::run_pending`) the tool run `run` runs as it is
