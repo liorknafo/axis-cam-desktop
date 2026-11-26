@@ -2587,17 +2587,28 @@ struct Press {
     epoch: u64,
 }
 
-/// A Z set for the run's tool from the reference or by probe, sent and not
-/// yet shown applied: the tool counts as touched off (`Run::touched`,
-/// `Run::zeroed`) only once the machine shows it (`Connection::z_set_check`,
-/// LIO-627).
+/// A Z set for the run's tool from the reference, by probe, or by a work
+/// zero button, sent and not yet shown applied: the tool counts as touched
+/// off (`Run::touched`, and `Run::zeroed` for one that sets the work zero)
+/// only once the machine shows it (`Connection::z_set_check`, LIO-627,
+/// LIO-628).
 struct ZSet {
-    /// What set it, for what is said if it does not take: Set Z from
-    /// reference, or a probe.
+    /// What set it, for what is said if it does not take.
     by: ZBy,
-    /// The Z work offset the machine shows once it has applied it: the
-    /// machine Z it was sent at less the work Z sent.
-    offset: f64,
+    /// The work offsets (axis, offset) the machine shows once it has
+    /// applied it: the machine position it was sent at less the work
+    /// position sent. Z, and X and Y too for one that sets the work zero.
+    offsets: Vec<(usize, f64)>,
+    /// It sets the work zero (`Run::zeroed`) as well as the tool's Z.
+    zeroes: bool,
+    /// The tool's length found on the A reference (`Run::length`), kept,
+    /// and its tool touched off, once the machine shows the Z it sets
+    /// (LIO-628).
+    length: Option<(String, f64, f64)>,
+    /// Pressed before the setup's first check answered: its tool is the
+    /// one that check finds (`z_set_answered`), as LIO-619 has a touch-off
+    /// made then (LIO-628 review).
+    early: bool,
     /// The run it is for (`Run::epoch`) and the tool run of its start
     /// (`Run::next`): a start in another tool run picked meanwhile is not
     /// touched off by it. Another operation of the same tool run is: its
@@ -2613,11 +2624,11 @@ struct ZSet {
     then: Option<String>,
 }
 
-/// How near the Z work offset a `ZSet` sets the machine's must be for it to
-/// show it applied, mm, at the least: the driver works it out from its
+/// How near the work offsets a `ZSet` sets the machine's must be for it to
+/// show them applied, mm, at the least: the driver works them out from its
 /// planner's position, which at rest is the motors' (`machine_pos`), so
 /// only rounding parts them. Paused in a program they may be a motor step
-/// apart, which is allowed too (`z_set_check`, LIO-628 review).
+/// of the axis apart, which is allowed too (`z_set_check`, LIO-628 review).
 const Z_SHOWN: f64 = 1e-4;
 
 /// The run (`Run::epoch`), tool run (`Run::next`) and tool
@@ -2625,10 +2636,13 @@ const Z_SHOWN: f64 = 1e-4;
 type ZKey = (u64, usize, Option<String>);
 
 /// What sent a `ZSet`.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 enum ZBy {
     Reference,
     Probe,
+    /// A work zero button, by its label: Zero on Z, ½ on Z, Set Z, Zero
+    /// all, or the setup's touch-off (LIO-628).
+    Button(String),
 }
 
 /// A running driver controller for one machine.
@@ -2692,8 +2706,8 @@ pub struct Connection {
     /// when the link fails while it crosses.
     #[cfg(test)]
     pub lose_next_job: bool,
-    /// Tests: the next Z set from the reference or by probe never reaches
-    /// the machine: handed to the link and lost on the way (true: a
+    /// Tests: the next Z set from the reference, by probe or by a work
+    /// zero button (LIO-628) never reaches the machine: handed to the link and lost on the way (true: a
     /// command that changes nothing goes in its place), or not taken by
     /// the link at all (false).
     #[cfg(test)]
@@ -3903,30 +3917,25 @@ impl Connection {
             Action::JogAngle(step) => self.jog_angle = step,
             Action::JogSpeed(percent) => self.jog_speed = percent.clamp(1., 100.),
             Action::WorkZero(axis) if self.manual() => {
-                if let (Some(run), None | Some(2)) = (&mut self.run, axis) {
-                    run.z_touched();
-                }
                 let axes = axis.map_or(0..6, |a| a..a + 1);
-                for a in axes.filter(|&a| self.axis(a)) {
-                    self.send(Command::SetWork { axis: a, value: 0. });
-                }
+                let sets: Vec<(usize, f64)> =
+                    axes.filter(|&a| self.axis(a)).map(|a| (a, 0.)).collect();
+                let label = match axis {
+                    None => "Zero all".into(),
+                    Some(a) => format!("Zero on {}", AXIS_NAMES[a]),
+                };
+                self.send_work_by(ZBy::Button(label), &sets, false, None);
             }
             Action::WorkHalf(a) if self.manual() && self.axis(a) => {
-                if let (Some(run), 2) = (&mut self.run, a) {
-                    run.z_touched();
-                }
-                self.send(Command::SetWork {
-                    axis: a,
-                    value: self.snapshot.work_pos[a] / 2.,
-                });
+                let value = self.snapshot.work_pos[a] / 2.;
+                let label = format!("½ on {}", AXIS_NAMES[a]);
+                self.send_work_by(ZBy::Button(label), &[(a, value)], false, None);
             }
             Action::WorkText(a, text) if a < 6 => self.presets[a] = text,
             Action::WorkSet(a) if self.manual() && self.axis(a) => {
                 if let Some(value) = self.preset(a) {
-                    if let (Some(run), 2) = (&mut self.run, a) {
-                        run.z_touched();
-                    }
-                    self.send(Command::SetWork { axis: a, value });
+                    let label = format!("Set {}", AXIS_NAMES[a]);
+                    self.send_work_by(ZBy::Button(label), &[(a, value)], false, None);
                 }
             }
             Action::MoveTo(on) => self.move_to = on,
@@ -4030,16 +4039,19 @@ impl Connection {
                     let pins = self.run_program().is_ok_and(|p| p.pins.is_some());
                     // Started, X and Y are kept as well (LIO-582 review).
                     let partway = self.run.as_ref().is_some_and(|r| r.on_cut_stock());
-                    for (a, value) in work.into_iter().enumerate() {
-                        if (pins || partway) && a < 2 {
-                            continue;
-                        }
-                        self.send(Command::SetWork { axis: a, value });
-                    }
-                    if let Some(run) = &mut self.run {
-                        run.z_touched();
-                        run.zeroed = true;
-                    }
+                    let z_only = pins || partway;
+                    let sets: Vec<(usize, f64)> = (work.into_iter().enumerate())
+                        .filter(|(a, _)| !(z_only && *a < 2))
+                        .collect();
+                    // The button as the Work zero tab names it.
+                    let label = if z_only {
+                        format!("Set Z{}", crate::post::exact_mm(work[2] as f32))
+                    } else {
+                        crate::ui::touch_label(work)
+                    };
+                    // Touched off, and the work zero set, once the machine
+                    // shows it (`z_set_check`, LIO-628).
+                    self.send_work_by(ZBy::Button(label), &sets, true, None);
                 }
             }
             Action::ToSimZero if self.run_program().is_ok() => {
@@ -4342,10 +4354,36 @@ impl Connection {
         value: f64,
         then: Option<String>,
     ) -> bool {
-        let offset = self.snapshot.machine_pos[2] - value;
-        // Whatever was said of an earlier one is over.
+        self.send_work_set(run, by, &[(2, value)], true, None, then)
+    }
+
+    /// Sends the work positions `sets` (axis, value), Z among them, for
+    /// `run`'s tool, set by `by` with the machine still, as `send_z_set`
+    /// does Z alone: the tool counts as touched off, and the work zero set
+    /// too where `zeroes`, only once the machine shows them all applied
+    /// (`z_set_check`); `length`, the tool's length found on the A
+    /// reference, is kept then too. Whether it waits (LIO-628).
+    fn send_work_set(
+        &mut self,
+        run: Option<&mut crate::run::Run>,
+        by: ZBy,
+        sets: &[(usize, f64)],
+        zeroes: bool,
+        length: Option<(String, f64, f64)>,
+        then: Option<String>,
+    ) -> bool {
+        // The machine shows Z applied, and X and Y too for a work zero:
+        // what the tool's touch-off and the work zero go by.
+        let offsets: Vec<(usize, f64)> = (sets.iter())
+            .filter(|(a, _)| *a == 2 || (zeroes && *a < 2))
+            .map(|&(a, value)| (a, self.snapshot.machine_pos[a] - value))
+            .collect();
+        // A work zero, not Z alone: said as such (`z_not_set`).
+        let several = offsets.len() > 1;
+        // Whatever was said of an earlier one is over, a probe's line that
+        // it waits too.
         self.z_said = None;
-        self.z_set = None;
+        self.drop_z_set();
         #[cfg(test)]
         let lost = self.lose_next_z.take();
         #[cfg(not(test))]
@@ -4358,13 +4396,21 @@ impl Connection {
                 mist: self.snapshot.mist,
             }),
             Some(false) => false,
-            None => self.driver.send(Command::SetWork { axis: 2, value }),
+            // Each sent while the link takes them: one it refuses refuses
+            // the press.
+            None => (sets.iter())
+                .all(|&(axis, value)| self.driver.send(Command::SetWork { axis, value })),
         };
         let mut tool = None;
+        let mut early = false;
         let key = run.map(|run| {
             run.hold_touch();
-            (run.zeroed, run.tool_kept) = (false, false);
+            run.tool_kept = false;
+            if zeroes {
+                run.zeroed = false;
+            }
             tool = run.next_tool();
+            early = run.unanswered();
             (run.epoch, run.next, tool.clone())
         });
         if sent {
@@ -4374,7 +4420,10 @@ impl Connection {
             };
             self.z_set = Some(ZSet {
                 by,
-                offset,
+                offsets,
+                zeroes,
+                length,
+                early,
                 epoch,
                 next,
                 tool,
@@ -4395,23 +4444,56 @@ impl Connection {
                     .to_string()
             })
             .unwrap_or_else(|| "the link to the Pi is not answering".into());
-        self.z_not_set(by, key, &format!("was not sent ({why})"));
+        self.z_not_set(by, several, key, &format!("was not sent ({why})"));
         false
+    }
+
+    /// The work positions `sets` (axis, value) a work zero button or a
+    /// probe (`by`) sets: one that sets Z, with a run, touches its tool off
+    /// (and sets the work zero where `zeroes`) only once the machine shows
+    /// it (`send_work_set`, LIO-628): whether it waits. None for one sent
+    /// as it is, which sets no Z or has no run.
+    fn send_work_by(
+        &mut self,
+        by: ZBy,
+        sets: &[(usize, f64)],
+        zeroes: bool,
+        then: Option<String>,
+    ) -> Option<bool> {
+        if self.run.is_none() || !sets.iter().any(|(a, _)| *a == 2) {
+            for &(axis, value) in sets {
+                self.send(Command::SetWork { axis, value });
+            }
+            return None;
+        }
+        let mut run = self.run.take();
+        let waits = self.send_work_set(run.as_mut(), by, sets, zeroes, None, then);
+        self.run = run;
+        Some(waits)
     }
 
     /// Says that the Z set by `by` for the run and tool run `key` (None: no
     /// run) did not take (`how`): nothing changed, and how to set it
-    /// again.
-    fn z_not_set(&mut self, by: ZBy, key: Option<ZKey>, how: &str) {
-        let said = match by {
+    /// again. `several`: it set the work zero, not Z alone (LIO-628).
+    fn z_not_set(&mut self, by: ZBy, several: bool, key: Option<ZKey>, how: &str) {
+        let said = match &by {
             ZBy::Reference => format!(
                 "Set Z from reference {how}, so the tool does not count as touched off: touch it on the reference again and press Set Z from reference."
+            ),
+            ZBy::Probe if several => format!(
+                "The work zero the probe found {how}, so it is not set and the tool does not count as touched off: probe again."
             ),
             ZBy::Probe => {
                 format!(
                     "The work Z the probe found {how}, so the tool does not count as touched off: probe again."
                 )
             }
+            ZBy::Button(label) if several => format!(
+                "{label} {how}, so the work zero is not set and the tool does not count as touched off: press {label} again."
+            ),
+            ZBy::Button(label) => format!(
+                "{label} {how}, so the tool does not count as touched off: press {label} again."
+            ),
         };
         if by == ZBy::Probe {
             self.probed = Some((false, said.clone()));
@@ -4454,19 +4536,42 @@ impl Connection {
         let Some(z) = self.z_set.take() else {
             return;
         };
-        let step = (self.config.axes.get(2))
-            .map_or(0., |a| 1. / a.steps_per_unit)
-            .max(Z_SHOWN);
-        let applied = (self.snapshot.work_offset[2] - z.offset).abs() <= step;
+        // Within a motor step of each axis (LIO-628 review).
+        let step = |a: usize| {
+            (self.config.axes.get(a))
+                .map_or(0., |x| 1. / x.steps_per_unit)
+                .max(Z_SHOWN)
+        };
+        let applied = (z.offsets.iter())
+            .all(|&(a, offset)| (self.snapshot.work_offset[a] - offset).abs() <= step(a));
         let current = self.run.as_ref().is_some_and(|r| r.next == z.next);
+        // On the A reference, the tool whose length it found; pressed
+        // before the first check answered, the tool that check found
+        // (`z_set_answered`, LIO-628).
+        let tool = match (&z.length, z.early) {
+            (Some(length), _) => Some(Some(length.0.clone())),
+            (None, true) => Some(z.tool.clone()),
+            (None, false) => None,
+        };
         match (applied, &mut self.run) {
             (true, Some(run)) if current => {
-                run.z_touched();
-                run.zeroed = true;
+                match tool {
+                    Some(tool) => run.z_touched_for(tool),
+                    None => run.z_touched(),
+                }
+                if let Some(length) = &z.length {
+                    run.length = Some(length.clone());
+                }
+                run.zeroed |= z.zeroes;
             }
             // Another tool run picked meanwhile: the offset is the tool's it
             // was pressed for, which holds for no other (LIO-627 review).
-            (true, Some(run)) => run.z_touched_for(z.tool.clone()),
+            (true, Some(run)) => {
+                run.z_touched_for(tool.unwrap_or_else(|| z.tool.clone()));
+                if let Some(length) = &z.length {
+                    run.length = Some(length.clone());
+                }
+            }
             _ => {}
         }
         if applied {
@@ -4475,8 +4580,10 @@ impl Connection {
             }
         } else {
             let machine = self.machine_name();
+            let several = z.offsets.len() > 1;
             self.z_not_set(
                 z.by,
+                several,
                 // Held for the tool run and tool it was pressed for,
                 // whichever is picked now (`z_failed`, LIO-627 review).
                 Some((z.epoch, z.next, z.tool.clone())),
@@ -4504,6 +4611,24 @@ impl Connection {
         }
     }
 
+    /// The setup's first check answered: a Z set on its way pressed before
+    /// it is for the tool it finds, tool run 1's when the run starts there,
+    /// else none known, as a touch-off made then (`Run::checked_as`,
+    /// LIO-628 review). Taken now, not when the machine shows it, so a
+    /// start picked or a check again meanwhile does not change it.
+    pub fn z_set_answered(&mut self) {
+        let Some(run) = self.run.as_ref() else {
+            return;
+        };
+        if let Some(z) = self
+            .z_set
+            .as_mut()
+            .filter(|z| z.early && z.epoch == run.epoch)
+        {
+            z.tool = run.first_touch_tool();
+        }
+    }
+
     /// What the machine is called in what is said of what it applied.
     pub fn machine_name(&self) -> &'static str {
         if self.pi.is_some() {
@@ -4513,10 +4638,11 @@ impl Connection {
         }
     }
 
-    /// The Z set waiting for `run`'s tool is Set Z from reference: the
-    /// reference rows say it waits (a probe's says it itself).
-    pub fn z_set_by_reference_waits(&self, run: &crate::run::Run) -> bool {
-        self.z_set_waits(run) && self.z_set.as_ref().is_some_and(|z| z.by == ZBy::Reference)
+    /// The Z set waiting for `run`'s tool is Set Z from reference's or a
+    /// work zero button's: the Tool change, Start and Work zero tabs say it
+    /// waits (a probe's says it itself, LIO-628).
+    pub fn z_set_noted_waits(&self, run: &crate::run::Run) -> bool {
+        self.z_set_waits(run) && self.z_set.as_ref().is_some_and(|z| z.by != ZBy::Probe)
     }
 
     /// A Z set from the reference or by probe for `run`'s tool waits for
@@ -4524,6 +4650,19 @@ impl Connection {
     /// and waits for it (LIO-627).
     pub fn z_set_waits(&self, run: &crate::run::Run) -> bool {
         (self.z_set.as_ref()).is_some_and(|z| z.epoch == run.epoch && z.next == run.next)
+    }
+
+    /// The Z set for `run`'s tool waiting (`z_set_waits`) sets the work
+    /// zero too (`Run::zeroed`), not only the tool's Z (LIO-628).
+    pub fn z_set_zeroes(&self, run: &crate::run::Run) -> bool {
+        self.z_set_waits(run) && self.z_set.as_ref().is_some_and(|z| z.zeroes)
+    }
+
+    /// Tests: a Z set waits for the machine to show it, for whichever
+    /// tool run.
+    #[cfg(test)]
+    pub fn z_set_pending(&self) -> bool {
+        self.z_set.is_some()
     }
 
     /// What is said of a Z set from the reference or by probe for `run`
@@ -4544,11 +4683,12 @@ impl Connection {
             .map(|(_, _, said)| said.as_str())
     }
 
-    /// `z_failed` of Set Z from reference: the reference rows say it (a
-    /// probe's is said with the probe, `probed`).
+    /// `z_failed` of Set Z from reference or a work zero button: the Tool
+    /// change, Start and Work zero tabs say it (a probe's is said with the
+    /// probe, `probed`; LIO-628).
     pub fn z_said(&self, run: &crate::run::Run) -> Option<&str> {
-        let by = self.z_said.as_ref().map(|z| z.1);
-        self.z_failed(run).filter(|_| by == Some(ZBy::Reference))
+        let probe = self.z_said.as_ref().is_some_and(|z| z.1 == ZBy::Probe);
+        self.z_failed(run).filter(|_| !probe)
     }
 
     /// Tests: the waiting press was pressed `by` earlier.
@@ -4854,24 +4994,33 @@ impl Connection {
                 // surface the probe's tip found at `reference`.
                 let longer = trip - plate - reference;
                 let offset = on_centre + longer;
-                self.send(Command::SetWork {
-                    axis: 2,
-                    value: now - offset,
-                });
                 let tool = (self.run.as_ref())
                     .and_then(|r| r.checked()?.get(i))
                     .map(|p| (p.ops[0].tool_id.clone(), p.ops[0].tool));
-                if let (Some(run), Some((id, _))) = (&mut self.run, &tool) {
-                    run.length = Some((id.clone(), longer, reference));
-                    run.z_touched_for(Some(id.clone()));
-                    run.zeroed = true;
-                }
-                format!(
+                let set = format!(
                     "Work Z set on the A centreline for T{}: its tip is {:.3} mm {} the probe's (Z offset {offset:.3}).",
-                    tool.map_or(0, |t| t.1),
+                    tool.as_ref().map_or(0, |t| t.1),
                     longer.abs(),
                     if longer >= 0. { "under" } else { "over" },
-                )
+                );
+                // The tool touched off, its length kept, and "Work Z set"
+                // said, once the machine shows the Z (`z_set_check`,
+                // LIO-628).
+                let length = (tool.as_ref()).map(|(id, _)| (id.clone(), longer, reference));
+                let mut run = self.run.take();
+                let ours = run.as_mut().filter(|_| length.is_some());
+                let then = format!("Contact at machine Z {trip:.3}. {set}");
+                let value = now - offset;
+                let waits =
+                    self.send_work_set(ours, ZBy::Probe, &[(2, value)], true, length, Some(then));
+                self.run = run;
+                match waits {
+                    true => format!(
+                        "Work Z sent: it is set once {} shows it.",
+                        self.machine_name()
+                    ),
+                    false => set,
+                }
             }
             Touch::WorkZ(at) | Touch::FromReference(at) => {
                 let set = match p.plate {
@@ -5554,16 +5703,25 @@ impl Connection {
         match r.purpose {
             Purpose::Work => {
                 let back: Vec<Vec6> = r.last().into_iter().map(|p| self.inside(p)).collect();
-                for &a in r.feature.axes() {
-                    self.send(Command::SetWork {
-                        axis: a,
-                        value: now[a] - w[a],
-                    });
-                }
-                if let (Some(run), Feature::Top) = (&mut self.run, r.feature) {
-                    run.z_touched();
-                }
-                self.probed = Some((true, r.found()));
+                let sets: Vec<(usize, f64)> = (r.feature.axes().iter())
+                    .map(|&a| (a, now[a] - w[a]))
+                    .collect();
+                // The top touches the run's tool off, and what it found is
+                // said, once the machine shows its Z (`z_set_check`,
+                // LIO-628).
+                let found = r.found();
+                let waits = match r.feature {
+                    Feature::Top => {
+                        self.send_work_by(ZBy::Probe, &sets, false, Some(found.clone()))
+                    }
+                    _ => {
+                        for &(axis, value) in &sets {
+                            self.send(Command::SetWork { axis, value });
+                        }
+                        None
+                    }
+                };
+                self.probe_sent(waits, "Work Z", found);
                 let moves = moves_from(now, &back);
                 if !moves.is_empty() {
                     self.send(job(&format!("Probe {}", r.feature.label(r.orient)), moves));
@@ -6315,20 +6473,35 @@ impl Connection {
         }
         let (w, _) = e.zero();
         let now = self.snapshot.machine_pos;
-        for a in 0..3 {
-            self.send(Command::SetWork {
-                axis: a,
-                value: now[a] - w[a],
-            });
-        }
-        if let Some(run) = &mut self.run {
-            run.z_touched();
-            run.zeroed = true;
-        }
+        // The run's tool touched off, its work zero set, and what was found
+        // said, once the machine shows them (`z_set_check`, LIO-628).
+        let sets: Vec<(usize, f64)> = (0..3).map(|a| (a, now[a] - w[a])).collect();
+        let found = e.found();
+        let waits = self.send_work_by(ZBy::Probe, &sets, true, Some(found.clone()));
+        self.probe_sent(waits, "Work zero", found);
         let mut up = e.from;
         up[2] = e.high(w);
         self.send(job(e.name(), moves_from(now, &[e.from, up])));
-        self.probed = Some((true, e.found()));
+    }
+
+    /// What a probe that set `what` (Work Z, Work zero) says as it is sent
+    /// (`send_work_by`): what it `found`, or that the machine is to show it
+    /// first, said then; one the link did not take has said so already
+    /// (`z_not_set`, LIO-628).
+    fn probe_sent(&mut self, waits: Option<bool>, what: &str, found: String) {
+        match waits {
+            None => self.probed = Some((true, found)),
+            Some(true) => {
+                self.probed = Some((
+                    true,
+                    format!(
+                        "{what} sent: it is set once {} shows it.",
+                        self.machine_name()
+                    ),
+                ))
+            }
+            Some(false) => {}
+        }
     }
 
     /// An axis of the profile. The driver panics on an index of 6 or more,
@@ -8055,6 +8228,17 @@ spindle_max_rpm = 24000
             assert!(c.snapshot.machine_pos[3].abs() < 0.03);
         }
     }
+    /// Refreshes until no Z set for the run's tool waits for the
+    /// controller to show it (`Connection::z_set_waits`, LIO-628).
+    fn z_settled(c: &mut Connection) {
+        let cap = Instant::now() + Duration::from_secs(10);
+        while (c.run.as_ref()).is_some_and(|r| c.z_set_waits(r)) {
+            assert!(Instant::now() < cap, "the Z set still waits");
+            std::thread::sleep(Duration::from_millis(10));
+            c.refresh();
+        }
+    }
+
     /// Runs `c` until the probe straight down under way has ended and the
     /// machine is Idle again, its lift done: whether it touched, and what
     /// it said.
@@ -8062,8 +8246,12 @@ spindle_max_rpm = 24000
         let cap = Instant::now() + Duration::from_secs(30);
         loop {
             c.refresh();
+            // What it found is said once the machine shows the work Z it
+            // sets (LIO-628).
+            let waits = (c.run.as_ref()).is_some_and(|r| c.z_set_waits(r));
             if c.probing.is_none()
                 && c.snapshot.state == Some(State::Idle)
+                && !waits
                 && let Some(said) = c.probed.clone()
             {
                 wait(c, 300);
@@ -8221,9 +8409,43 @@ spindle_max_rpm = 24000
             c.sim_gauge.as_mut().unwrap().max[2] += plate;
             rapid_a(&mut c, [40.5, 40., -185. + longer, 0.]);
             assert!(c.a_reference(&doc).is_ok(), "{:?}", c.a_reference(&doc));
+            // Its work Z lost on its way, or not taken by the link: no
+            // length kept, nothing touched off, and said (LIO-628).
+            for (lost, said) in [
+                (
+                    true,
+                    "The work Z the probe found did not reach the controller, or the controller did not apply it, so the tool does not count as touched off: probe again.",
+                ),
+                (
+                    false,
+                    "The work Z the probe found was not sent (the link to the Pi is not answering), so the tool does not count as touched off: probe again.",
+                ),
+            ] {
+                c.lose_next_z = Some(lost);
+                c.run_act(R::ProbeCentreReference, &doc);
+                probe_ended(&mut c);
+                z_settled(&mut c);
+                assert_eq!(c.probed, Some((false, said.into())));
+                let run = c.run.as_ref().unwrap();
+                assert!(run.length.is_none() && !run.touched() && !run.zeroed);
+                assert!((c.snapshot.work_offset[2] - on_centre[1]).abs() < 1e-6);
+                // Cycle Start held back by it, and by the touch-off.
+                let problems = run.problems(&c, &doc);
+                assert!(
+                    problems.iter().any(|p| p == said)
+                        && problems
+                            .iter()
+                            .any(|p| p
+                                .contains("is not touched off on the A centreline's Z reference")),
+                    "{problems:?}"
+                );
+                rapid_a(&mut c, [40.5, 40., -185. + longer, 0.]);
+            }
             c.run_act(R::ProbeCentreReference, &doc);
             let (ok, said) = probe_ended(&mut c);
             assert!(ok, "{said}");
+            z_settled(&mut c);
+            assert!(c.run.as_ref().unwrap().touched());
             let (id, d, from) = c.run.as_ref().unwrap().length.clone().unwrap();
             assert!((from - at[2]).abs() < 1e-3, "{from} {at:?}");
             assert!(
