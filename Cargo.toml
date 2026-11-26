@@ -69,6 +69,18 @@ debug = true
 [profile.dev.package.uc100-remote]
 debug = true
 
+# Tests build axis-cam itself at opt-level 1 (LIO-729): the slow tests are
+# its own toolpath, simulation and posting code, which ran unoptimised. The
+# full suite took 16.8 min instead of 40 (smoke 4.6 min instead of 11.6).
+# The cost: a one-line rebuild of the test binary takes 21-24 s instead of
+# 7 and peaks at 6.3 GB instead of 3.9, and a cold `cargo test --no-run`
+# takes 136 s instead of 87, its largest compiler reaching about 10 GB
+# instead of 7.3. `cargo build` and `cargo run`
+# (the dev profile) stay at opt-level 0. Debug assertions and overflow
+# checks stay on.
+[profile.test.package.axis-cam]
+opt-level = 1
+
 [target.'cfg(unix)'.dev-dependencies]
 # Asks each of the test process's open files what it is (`fstat`), with no
 # duplicate or close (`mcp::runner`'s tests); already in the tree.
