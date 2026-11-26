@@ -14083,21 +14083,25 @@ flood = { pin = 8 }
         answer_skips(&mut a, 0);
         assert_eq!(run_of(&a).at_step(), Some((0, 1)));
         assert_eq!(z(&a), Some(-2.));
-        // The same stop in the journals of the other ways to the machine
-        // (its USB and its Pi), and another setup's: New stock ends this
-        // setup's in each, and leaves the other setup's (LIO-634 review).
+        // The same stop in the real machine's journal (by USB), kept known:
+        // New stock in the simulator, whose stock is the computer's only,
+        // leaves it, and its copy kept (LIO-634 review).
         let uc = dir.path().join("uc100");
         let id = a.doc.setups[0].machine.id.clone();
-        let file = |kind: &str| uc.join(format!("{id}{kind}-journal.json"));
-        journal.write(&file("")).unwrap();
-        let mut other = journal.clone();
-        other.setup = "another setup".into();
-        other.write(&file("-pi")).unwrap();
+        let usb = uc.join(format!("{id}-journal.json"));
+        journal.write(&usb).unwrap();
+        let kept = crate::run::KeptJournal {
+            setup: journal.setup.clone(),
+            file: format!("{id}-journal.json"),
+            text: std::fs::read_to_string(&usb).unwrap(),
+        };
+        a.cut_journals.push(kept.clone());
         new_stock(&mut a);
         assert!(conn(&a).journal().is_none());
-        assert_eq!(crate::run::Journal::read(&file("")), None);
-        assert_eq!(crate::run::Journal::read(&file("-pi")), Some(other));
-        std::fs::remove_file(file("-pi")).unwrap();
+        assert_eq!(crate::run::Journal::read(&usb), Some(journal.clone()));
+        assert!(a.cut_journals.contains(&kept), "{:?}", a.cut_journals);
+        std::fs::remove_file(&usb).unwrap();
+        a.cut_journals.retain(|k| *k != kept);
         let _ = a.update(Message::Disconnect);
         // Opened again: no start where it stopped, and nothing unknown.
         let mut b = reopen(a, dir.path());
@@ -14201,6 +14205,63 @@ flood = { pin = 8 }
         assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
         assert_eq!(z(&k), Some(0.));
         let _ = k.update(Message::Disconnect);
+    }
+
+    /// LIO-634 review: on the real machine, through its Pi, New stock
+    /// loaded ends the setup's stop journal of the Pi and of the machine by
+    /// USB, the same table, and their copies kept; the simulator's, whose
+    /// stock is the computer's only, stays, and so does another setup's.
+    #[test]
+    fn new_stock_on_the_machine_ends_its_journals_of_the_same_table_only() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let files = conn(&a).table_journals();
+        let uc = files[0].parent().unwrap().to_path_buf();
+        let id = a.doc.setups[0].machine.id.clone();
+        let name = |kind: &str| format!("{id}{kind}-journal.json");
+        assert_eq!(conn(&a).journal_name(), name("-pi"));
+        assert_eq!(files, [uc.join(name("-pi")), uc.join(name(""))]);
+        let stop = |setup: &str| crate::run::Journal {
+            project: String::new(),
+            setup: setup.into(),
+            setup_name: String::new(),
+            op: 0,
+            op_name: "Face".into(),
+            steps: 2,
+            step: Some(0),
+            wcs: 0,
+            offset: [0.; 6],
+            tool: String::new(),
+            tool_label: String::new(),
+            time: 1,
+            fingerprint: 0,
+            why: "Stop after step".into(),
+        };
+        let setup = a.doc.setups[0].id.clone();
+        let mut kept = vec![];
+        for kind in ["-pi", "", "-simulated"] {
+            let f = uc.join(name(kind));
+            stop(&setup).write(&f).unwrap();
+            kept.push(crate::run::KeptJournal {
+                setup: setup.clone(),
+                file: name(kind),
+                text: std::fs::read_to_string(&f).unwrap(),
+            });
+        }
+        a.cut_journals.extend(kept.iter().cloned());
+        let other = uc.join("another-journal.json");
+        stop("another setup").write(&other).unwrap();
+        let _ = a.update(Message::Run(R::NewStock));
+        let read = |kind: &str| crate::run::Journal::read(&uc.join(name(kind)));
+        assert_eq!((read("-pi"), read("")), (None, None));
+        assert_eq!(read("-simulated"), Some(stop(&setup)));
+        assert!(crate::run::Journal::read(&other).is_some());
+        assert_eq!(a.cut_journals, [kept[2].clone()]);
+        let _ = a.update(Message::Disconnect);
     }
 
     /// LIO-634: the Face and the Pocket's tool run cut to its end, so the

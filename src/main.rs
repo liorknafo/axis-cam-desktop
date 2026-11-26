@@ -9607,7 +9607,11 @@ impl App {
                     // is not taken as known (`run::disown`), so a run picked
                     // from it sets no Z from the check's stock.
                     if new_stock && let Some(r) = &c.run {
-                        self.cut_journals.retain(|k| k.setup != r.setup_id);
+                        let files: Vec<String> = (c.table_journals().iter())
+                            .filter_map(|f| Some(f.file_name()?.to_string_lossy().into_owned()))
+                            .collect();
+                        (self.cut_journals)
+                            .retain(|k| k.setup != r.setup_id || !files.contains(&k.file));
                     }
                     // Said for the part after a disconnect: it answers for
                     // every setup's record (LIO-596).

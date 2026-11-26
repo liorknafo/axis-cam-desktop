@@ -4196,18 +4196,10 @@ impl Connection {
                 // run ends, whatever the start now, even one the operator
                 // picked: AXIS CAM opened again starts there no more, on
                 // stock it never cut (LIO-634 review). So in the journal of
-                // each way to the machine (its own, the Pi's, the
-                // simulator's): the stock is the same table's.
-                let mut files = vec![self.journal.clone()];
-                if let Some(dir) = self.journal.parent() {
-                    for kind in ["", "-simulated", "-pi"] {
-                        let f = dir.join(format!("{}{kind}-journal.json", self.machine_id));
-                        if !files.contains(&f) {
-                            files.push(f);
-                        }
-                    }
-                }
-                for f in files {
+                // each way to the same table (`table_journals`): by USB and
+                // by the Pi, not the simulator's, whose stock is not the
+                // table's, nor the other way round.
+                for f in self.table_journals() {
                     if crate::run::Journal::read(&f).is_some_and(|j| j.setup == run.setup_id) {
                         // One that stays is not this session's: not known.
                         if std::fs::remove_file(&f).is_err() {
@@ -6942,6 +6934,28 @@ impl Connection {
         let (data, own) = crate::run::read_own(&self.journal)?;
         let j = serde_json::from_slice(&data).ok()?;
         Some((j, String::from_utf8(data).ok()?, own))
+    }
+
+    /// The journals of the ways to the table this connection's stock is on
+    /// (LIO-634 review): the machine's own by USB and by its Pi, which
+    /// drive the same UC100 and so cut the same stock; the simulator's
+    /// alone for a simulated connection, whose stock is the computer's
+    /// only. This connection's journal is the first.
+    pub fn table_journals(&self) -> Vec<std::path::PathBuf> {
+        let mut files = vec![self.journal.clone()];
+        let name = |kind: &str| format!("{}{kind}-journal.json", self.machine_id);
+        let simulated = self.journal_name() == name("-simulated");
+        if let Some(dir) = self.journal.parent()
+            && !simulated
+        {
+            for kind in ["", "-pi"] {
+                let f = dir.join(name(kind));
+                if !files.contains(&f) {
+                    files.push(f);
+                }
+            }
+        }
+        files
     }
 
     /// The name of the file the journal is kept in, which tells this
