@@ -4195,11 +4195,28 @@ impl Connection {
                 // Where a run of it stopped is over, as when its last tool
                 // run ends, whatever the start now, even one the operator
                 // picked: AXIS CAM opened again starts there no more, on
-                // stock it never cut (LIO-634 review).
-                if crate::run::Journal::read(&self.journal).is_some_and(|j| j.setup == run.setup_id)
-                {
-                    let _ = std::fs::remove_file(&self.journal);
-                    self.journal_changes += 1;
+                // stock it never cut (LIO-634 review). So in the journal of
+                // each way to the machine (its own, the Pi's, the
+                // simulator's): the stock is the same table's.
+                let mut files = vec![self.journal.clone()];
+                if let Some(dir) = self.journal.parent() {
+                    for kind in ["", "-simulated", "-pi"] {
+                        let f = dir.join(format!("{}{kind}-journal.json", self.machine_id));
+                        if !files.contains(&f) {
+                            files.push(f);
+                        }
+                    }
+                }
+                for f in files {
+                    if crate::run::Journal::read(&f).is_some_and(|j| j.setup == run.setup_id) {
+                        // One that stays is not this session's: not known.
+                        if std::fs::remove_file(&f).is_err() {
+                            crate::run::disown(&f);
+                        }
+                        if f == self.journal {
+                            self.journal_changes += 1;
+                        }
+                    }
                 }
                 run.away = None;
             }

@@ -9600,12 +9600,15 @@ impl App {
                     let new_stock = matches!(action, run::Action::NewStock)
                         && !c.probing()
                         && (c.run.as_ref()).is_some_and(|r| r.running.is_none());
-                    // New stock loaded ends the setup's journal there
-                    // (`Connection::run_act`, LIO-634): `keep_cut_history`
-                    // drops the copy kept of it. One that could not be
-                    // removed is not taken as known, so a run picked from it
-                    // sets no Z from the check's stock.
                     c.run_act(action.clone(), &self.doc);
+                    // New stock loaded ends the setup's journals, of each way
+                    // to the machine (`Connection::run_act`, LIO-634): the
+                    // copies kept of them go. One that could not be removed
+                    // is not taken as known (`run::disown`), so a run picked
+                    // from it sets no Z from the check's stock.
+                    if new_stock && let Some(r) = &c.run {
+                        self.cut_journals.retain(|k| k.setup != r.setup_id);
+                    }
                     // Said for the part after a disconnect: it answers for
                     // every setup's record (LIO-596).
                     if away && c.run.as_ref().is_some_and(|r| r.away.is_none()) {

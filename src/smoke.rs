@@ -14083,8 +14083,21 @@ flood = { pin = 8 }
         answer_skips(&mut a, 0);
         assert_eq!(run_of(&a).at_step(), Some((0, 1)));
         assert_eq!(z(&a), Some(-2.));
+        // The same stop in the journals of the other ways to the machine
+        // (its USB and its Pi), and another setup's: New stock ends this
+        // setup's in each, and leaves the other setup's (LIO-634 review).
+        let uc = dir.path().join("uc100");
+        let id = a.doc.setups[0].machine.id.clone();
+        let file = |kind: &str| uc.join(format!("{id}{kind}-journal.json"));
+        journal.write(&file("")).unwrap();
+        let mut other = journal.clone();
+        other.setup = "another setup".into();
+        other.write(&file("-pi")).unwrap();
         new_stock(&mut a);
         assert!(conn(&a).journal().is_none());
+        assert_eq!(crate::run::Journal::read(&file("")), None);
+        assert_eq!(crate::run::Journal::read(&file("-pi")), Some(other));
+        std::fs::remove_file(file("-pi")).unwrap();
         let _ = a.update(Message::Disconnect);
         // Opened again: no start where it stopped, and nothing unknown.
         let mut b = reopen(a, dir.path());

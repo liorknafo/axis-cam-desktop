@@ -11657,6 +11657,9 @@ fn stock_question<'a>(
 ) -> Option<iced::widget::Column<'a, Message>> {
     use crate::run::Action as R;
     let running = run.running.is_some();
+    // New stock loaded waits for a probe begun for the old start (LIO-634
+    // review), as `Connection::run_act` does.
+    let probing = c.probing();
     // Only taken as cut: this computer saw none of its runs cut, and the
     // mark that runs it did not follow may have (`history_unknown`) is not
     // the whole story either, for something is taken as cut, or was and
@@ -11697,7 +11700,7 @@ fn stock_question<'a>(
                 ),
                 small(
                     "New stock loaded",
-                    (!running).then_some(Message::Run(R::NewStock)),
+                    (!running && !probing).then_some(Message::Run(R::NewStock)),
                     false,
                 ),
             ]
@@ -11739,7 +11742,7 @@ fn stock_question<'a>(
                     ),
                     small(
                         "New stock loaded",
-                        (!running).then_some(Message::Run(R::NewStock)),
+                        (!running && !probing).then_some(Message::Run(R::NewStock)),
                         false,
                     ),
                 ]
@@ -11757,7 +11760,7 @@ fn stock_question<'a>(
                 text(HISTORY_ASKED).size(12),
                 small(
                     "New stock loaded",
-                    (!running).then_some(Message::Run(R::NewStock)),
+                    (!running && !probing).then_some(Message::Run(R::NewStock)),
                     false,
                 ),
             ]
@@ -11794,7 +11797,7 @@ fn stock_question<'a>(
                 text(said).size(12),
                 small(
                     "New stock loaded",
-                    (!running).then_some(Message::Run(R::NewStock)),
+                    (!running && !probing).then_some(Message::Run(R::NewStock)),
                     false,
                 ),
             ]
@@ -11810,7 +11813,7 @@ fn stock_question<'a>(
                     .size(12),
                 small(
                     "New stock loaded",
-                    (!running).then_some(Message::Run(R::NewStock)),
+                    (!running && !probing).then_some(Message::Run(R::NewStock)),
                     false,
                 ),
             ]

@@ -1640,6 +1640,13 @@ pub fn read_own(path: &std::path::Path) -> Option<(Vec<u8>, bool)> {
     Some((data, own))
 }
 
+/// The file at `path` is taken as this session's no more (`read_own`):
+/// a journal New stock loaded could not remove, which is then not known
+/// (`App::journal_known`, LIO-634 review).
+pub fn disown(path: &std::path::Path) {
+    OWN_FILES.with(|o| o.borrow_mut().retain(|(p, _)| p != path));
+}
+
 /// Tests: AXIS CAM closed, so the files it wrote are another session's to
 /// the one opened next.
 #[cfg(test)]
