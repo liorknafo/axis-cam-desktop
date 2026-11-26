@@ -15749,6 +15749,209 @@ flood = { pin = 8 }
         );
     }
 
+    /// The Face skipped as cut, so the run starts at the Pocket, the first
+    /// operation it sends (LIO-633): New stock loaded drops the skip, and
+    /// the start goes back to the Face, so Zero Z on the stock top sets Z on
+    /// the stock top, not on the Face's floor. A start the operator picked
+    /// (Start here on the Pocket or the Contour) stays where it is.
+    #[test]
+    fn new_stock_takes_a_start_past_operations_skipped_as_cut_back_to_the_first() {
+        use crate::run::{Action as R, Skip};
+        let dir = tempfile::tempdir().unwrap();
+        let z = |a: &App| conn(a).touch_off().map(|(_, w)| w[2]);
+        let start = |a: &App| {
+            let run = run_of(a);
+            run.checked().unwrap()[run.next].indexes[run.from]
+        };
+        let mut a = ops_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(z(&a), Some(0.));
+        assert!(skip(&mut a, 0, Some(Skip::Cut)));
+        assert_eq!(sent(&a), [vec![1, 2], vec![3]]);
+        assert_eq!(start(&a), 1);
+        let floor = z(&a).unwrap();
+        assert!(floor < -1., "{floor}");
+        // Picked again, the skip given back: the question, then New stock.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).start_picked.is_none());
+        assert_eq!(
+            (start(&a), run_of(&a).skips.clone()),
+            (1, vec![(0, Skip::Cut)])
+        );
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert!(run.skips.is_empty() && !run.stock_unconfirmed);
+        assert_eq!(sent(&a), [vec![0, 1, 2], vec![3]]);
+        assert_eq!((run.next, run.from, start(&a)), (0, 0, 0));
+        assert!(!run.partway() && !run.asks_zero(), "{:?}", problems(&a));
+        assert_eq!(z(&a), Some(0.));
+        a.page = Page::Control;
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let texts = crate::ui::probe::texts(a.view(), iced::Size::new(1440., 2400.)).join("\n");
+        assert!(!texts.contains("taking Face as cut"), "{texts}");
+        // The same in this session, without picking the setup again.
+        assert!(skip(&mut a, 0, Some(Skip::Cut)));
+        assert_eq!(start(&a), 1);
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        assert_eq!((run_of(&a).next, run_of(&a).from), (0, 0));
+        assert_eq!((start(&a), z(&a)), (0, Some(0.)));
+        // Start here on the Contour after the skip: the operator's start,
+        // kept, the Face and the Pocket before it taken as cut.
+        assert!(skip(&mut a, 0, Some(Skip::Cut)));
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        assert_eq!(start(&a), 2);
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).skips.is_empty());
+        assert_eq!(start(&a), 2);
+        assert!(run_of(&a).partway() && run_of(&a).asks_zero());
+        // Start here on the Pocket, then the Face skipped as cut: the
+        // Pocket is the first operation sent, but the operator picked it.
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        assert_eq!(start(&a), 1);
+        assert!(skip(&mut a, 0, Some(Skip::Cut)));
+        assert_eq!((run_of(&a).next, run_of(&a).from, start(&a)), (0, 0, 1));
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).skips.is_empty());
+        assert_eq!((run_of(&a).next, run_of(&a).from, start(&a)), (0, 1, 1));
+        assert!(run_of(&a).partway() && run_of(&a).asks_zero());
+        assert_eq!(z(&a), Some(floor));
+        // Start here on the Contour, then the Contour skipped as cut: the
+        // start moved on to the Drill only for the skip, and goes back to
+        // the Contour, the operator's pick, with what Zero Z offered there.
+        let _ = a.update(Message::Run(R::From(0, 2)));
+        assert_eq!(start(&a), 2);
+        let at_contour = z(&a);
+        assert!(skip(&mut a, 2, Some(Skip::Cut)));
+        assert_eq!((run_of(&a).next, run_of(&a).from, start(&a)), (1, 0, 3));
+        assert_ne!(z(&a), at_contour);
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).skips.is_empty());
+        assert_eq!((run_of(&a).next, run_of(&a).from, start(&a)), (0, 2, 2));
+        assert_eq!(z(&a), at_contour);
+        // Start at the Pocket's level 2, then the Pocket skipped as cut:
+        // back to that very step.
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 1)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((1, 1)));
+        assert!(skip(&mut a, 1, Some(Skip::Cut)));
+        assert_eq!((start(&a), run_of(&a).at_step()), (2, None));
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        assert!(run_of(&a).skips.is_empty());
+        assert_eq!((start(&a), run_of(&a).at_step()), (1, Some((1, 1))));
+    }
+
+    /// The Face's tool run done in this run, then the Drill after it
+    /// skipped as cut, so the run starts at the Parallel (LIO-633): New
+    /// stock loaded takes the start back to the Drill, the first operation
+    /// after the tool run done, not to the Parallel the skip moved it to.
+    #[test]
+    fn new_stock_takes_a_start_past_a_skip_after_a_tool_run_done_back_to_the_skip() {
+        use crate::run::{Action as R, Skip};
+        let dir = tempfile::tempdir().unwrap();
+        // Face, Drill, Parallel and Pocket: a tool run each, none merged
+        // when the Drill is skipped.
+        let mut a = run_app_of(dir.path(), FAST, &[0, 3, 4, 1]);
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert_eq!(sent(&a), [vec![0], vec![1], vec![2], vec![3]]);
+        {
+            let run = a.control.as_mut().unwrap().run.as_mut().unwrap();
+            (run.done[0], run.next, run.from) = (true, 1, 0);
+        }
+        assert!(skip(&mut a, 1, Some(Skip::Cut)));
+        assert_eq!(sent(&a), [vec![0], vec![2], vec![3]]);
+        assert_eq!(
+            (run_of(&a).done.clone(), run_of(&a).next),
+            (vec![true, false, false], 1)
+        );
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        let run = run_of(&a);
+        assert!(run.skips.is_empty());
+        assert_eq!(sent(&a), [vec![0], vec![1], vec![2], vec![3]]);
+        assert_eq!(
+            (run.done.clone(), run.next, run.from),
+            (vec![true, false, false, false], 1, 0)
+        );
+    }
+
+    /// The Drill's tool run done first (Start here on it), then the Face
+    /// skipped as cut, so the run starts at the Pocket (LIO-633 review): New
+    /// stock loaded takes the start back to the Face, the operator's pick or
+    /// the first operation of no tool run done, and Zero Z sets Z on the
+    /// stock top. The Drill, the last operation, skipped as cut after the
+    /// other tool run is done leaves no start; New stock loaded gives it
+    /// back, at the Drill.
+    #[test]
+    fn new_stock_takes_a_start_back_past_a_later_tool_run_done() {
+        use crate::run::{Action as R, Skip};
+        let z = |a: &App| conn(a).touch_off().map(|(_, w)| w[2]);
+        let start = |a: &App| {
+            let run = run_of(a);
+            (run.checked().unwrap().get(run.next)).and_then(|p| p.indexes.get(run.from).copied())
+        };
+        let new_stock = |a: &mut App| {
+            let _ = a.update(Message::Run(R::NewStock));
+            let _ = a.update(Message::Tick);
+            answer_skips(a, 0);
+        };
+        let fresh = |dir: &std::path::Path, done: usize| {
+            let mut a = ops_app(dir);
+            zeroed(&mut a);
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(&mut a, 0);
+            assert_eq!(sent(&a), [vec![0, 1, 2], vec![3]]);
+            let run = a.control.as_mut().unwrap().run.as_mut().unwrap();
+            run.done[done] = true;
+            a
+        };
+        for pick in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = fresh(dir.path(), 1);
+            if pick {
+                let _ = a.update(Message::Run(R::Next(0)));
+                assert_eq!(run_of(&a).start_picked, Some((0, 0)));
+            }
+            assert!(skip(&mut a, 0, Some(Skip::Cut)));
+            assert_eq!(start(&a), Some(1), "{pick}");
+            new_stock(&mut a);
+            assert!(run_of(&a).skips.is_empty());
+            assert_eq!(sent(&a), [vec![0, 1, 2], vec![3]]);
+            assert_eq!((start(&a), z(&a)), (Some(0), Some(0.)), "{pick}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh(dir.path(), 0);
+        {
+            let run = a.control.as_mut().unwrap().run.as_mut().unwrap();
+            (run.next, run.from) = (1, 0);
+        }
+        assert!(skip(&mut a, 3, Some(Skip::Cut)));
+        assert_eq!((sent(&a), start(&a)), (vec![vec![0, 1, 2]], None));
+        new_stock(&mut a);
+        assert!(run_of(&a).skips.is_empty());
+        assert_eq!(sent(&a), [vec![0, 1, 2], vec![3]]);
+        assert_eq!((run_of(&a).next, start(&a)), (1, Some(3)));
+    }
+
     /// A run from the setup's start with the Drilling's first hole taken as
     /// cut (LIO-621): the steps name only what sets Z there, Z by hand and
     /// Keep this work zero, and once a reference is recorded, Set Z from
