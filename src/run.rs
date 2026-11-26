@@ -4562,6 +4562,8 @@ impl Run {
                 at.is_none_or(|a| self.start_picked != Some(a))
                     && (to.is_some()
                         || !done.is_empty()
+                        // No start left: the skips moved it past the end.
+                        || at.is_none() && !skips.is_empty()
                         || at.is_some_and(|(s, n)| {
                             (self.next, self.from) != (0, 0)
                                 || n > 0

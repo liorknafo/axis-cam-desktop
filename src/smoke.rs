@@ -16286,7 +16286,8 @@ flood = { pin = 8 }
     /// the first operation of no tool run done, and Zero Z sets Z on the
     /// stock top. The Drill, the last operation, skipped as cut after the
     /// other tool run is done leaves no start; New stock loaded gives it
-    /// back, at the Drill.
+    /// back, at the Face, the tool run done on the old stock not done on
+    /// the new (LIO-634).
     #[test]
     fn new_stock_takes_a_start_back_past_a_later_tool_run_done() {
         use crate::run::{Action as R, Skip};
@@ -16335,7 +16336,9 @@ flood = { pin = 8 }
         new_stock(&mut a);
         assert!(run_of(&a).skips.is_empty());
         assert_eq!(sent(&a), [vec![0, 1, 2], vec![3]]);
-        assert_eq!((run_of(&a).next, start(&a)), (1, Some(3)));
+        assert_eq!((run_of(&a).next, start(&a)), (0, Some(0)));
+        assert!(run_of(&a).done.iter().all(|d| !d));
+        assert_eq!(z(&a), Some(0.));
     }
 
     /// A run from the setup's start with the Drilling's first hole taken as
