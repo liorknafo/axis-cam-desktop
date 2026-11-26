@@ -2238,6 +2238,23 @@ impl Run {
         }
     }
 
+    /// At a tool change, Z was set since otherwise than by a Z set on the
+    /// Control page (MDI, the tablet, LIO-630): the Z work offset is
+    /// neither the one the last tool run started with nor the one the last
+    /// Z set here left, so whose Z it is is not known, and the new tool
+    /// waits for its own, as on the tablet (LIO-648). None while a Z set
+    /// is on its way: Cycle Start waits for the machine to show it.
+    pub fn z_elsewhere(&self, c: &Connection) -> bool {
+        if self.tool_change().is_none() {
+            return false;
+        }
+        let offset = c.snapshot.work_offset[2];
+        let unchanged = |z: f64| (offset - z).abs() < 1e-6;
+        (self.last.as_ref()).is_some_and(|(_, z)| !unchanged(*z))
+            && !c.z_set_waits(self)
+            && !(self.touched_for.as_ref()).is_some_and(|t| t.z.is_none_or(unchanged))
+    }
+
     /// The start a Z set is pressed for (`forget_touch`): another picked
     /// since, or the setup checked again, it counts for none (LIO-618).
     pub fn starts(&self) -> u64 {
@@ -3386,7 +3403,7 @@ impl Run {
         let forgotten = (self.last.as_ref()).is_some_and(|(t, _)| t != tool)
             && (self.touched_for.as_ref())
                 .is_some_and(|t| !t.for_start && t.z.is_none_or(unchanged));
-        if !touched && (other || change || forgotten) {
+        if self.z_elsewhere(c) || !touched && (other || change || forgotten) {
             e.push(format!(
                 "Tool run {} uses {}: touch off its Z first (Set Z from reference, or Zero Z).",
                 self.next + 1,
@@ -11910,7 +11927,9 @@ pub(crate) mod tests {
         let mut change = fresh();
         change.last = Some((tools[0].clone(), offset - 5.));
         change.start_at(1, 0);
-        assert!(!says(&change, touch), "{:?}", change.problems(&c, &doc));
+        // The offset moved since the end mill's tool run, by no Z set
+        // here: whose Z it is is not known, so it waits (LIO-630).
+        assert!(says(&change, touch), "{:?}", change.problems(&c, &doc));
         set_z(&mut change);
         assert!(change.touched() && !says(&change, touch));
         change.check_again(0);
@@ -11931,7 +11950,8 @@ pub(crate) mod tests {
     /// in; tool run 2 picked then waits for T2's Z, though the offset is
     /// no longer the last tool run's. The other way round, Z set with T2
     /// for tool run 2, then tool run 1 picked, waits for T1's. Z set with
-    /// the new tool for its own start lets Cycle Start go.
+    /// the new tool for its own start lets Cycle Start go. Z set otherwise
+    /// (MDI, the tablet) is no tool's known Z: at a tool change it waits.
     #[test]
     fn a_z_set_with_one_tool_is_not_another_tools_after_the_offset_moved() {
         let dir = tempfile::tempdir().unwrap();
@@ -12004,6 +12024,41 @@ pub(crate) mod tests {
             run.start_at(0, 0);
             assert!(says(&run, &wait(0)), "{last}: {:?}", problems(&run));
         }
+        // Z set otherwise since (MDI, the tablet): the offset neither the
+        // last tool run's nor the one the last Z set here left, so whose
+        // Z it is is not known; at a tool change the new tool waits for
+        // its own (LIO-630, as the tablet's LIO-648).
+        let mut moved = crate::control::Connection::open(&m, dir.path()).unwrap();
+        moved.snapshot.work_offset[2] = offset + 1.;
+        let says_at = |run: &Run, c: &Connection, what: &str| {
+            (run.problems(c, &doc).iter()).any(|p| p.contains(what))
+        };
+        let mut run = fresh(0);
+        run.start_at(1, 0);
+        assert!(run.z_elsewhere(&moved));
+        assert!(
+            says_at(&run, &moved, &wait(1)),
+            "{:?}",
+            run.problems(&moved, &doc)
+        );
+        // T2's Z set, then moved otherwise: it waits again; back to the
+        // one T2's left, it goes.
+        set_z(&mut run);
+        assert!(run.touched() && !says_at(&run, &c, touch));
+        assert!(
+            says_at(&run, &moved, &wait(1)),
+            "{:?}",
+            run.problems(&moved, &doc)
+        );
+        // The same tool next: no tool change, nothing asked.
+        let mut run = fresh(1);
+        run.start_at(1, 0);
+        assert!(!run.z_elsewhere(&moved));
+        assert!(
+            !says_at(&run, &moved, touch),
+            "{:?}",
+            run.problems(&moved, &doc)
+        );
     }
 
     /// What this run's tool runs cut (`cut_in_run`, LIO-582 review): Face

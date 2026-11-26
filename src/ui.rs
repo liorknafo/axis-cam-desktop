@@ -11314,7 +11314,8 @@ fn tool_change_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Eleme
         .and_then(|i| programs.get(i))
         .map(|q| crate::model::tool_label(q.ops[0].tool, &q.ops[0].tool_name));
     let recorded = run.reference.is_some();
-    let touched = run.touched();
+    // Z set elsewhere since is not the new tool's (LIO-630).
+    let touched = run.touched() && !run.z_elsewhere(c);
     let mut col = column![
         row![
             chip("TOOL CHANGE", Color::from_rgb8(209, 139, 22)),
