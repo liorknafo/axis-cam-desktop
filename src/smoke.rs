@@ -14264,6 +14264,109 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
     }
 
+    /// LIO-634 review: New stock loaded where this setup's stop journal
+    /// cannot be removed (its folder read-only). The run goes back to the
+    /// Face all the same; the journal that stays is not this session's,
+    /// and no copy of it is kept, so picked again, or with AXIS CAM opened
+    /// again, its history is not known and nothing sets Z on pass 1's floor.
+    #[test]
+    fn new_stock_takes_a_journal_it_cannot_remove_as_not_known() {
+        use crate::run::Action as R;
+        use std::os::unix::fs::PermissionsExt;
+        let z = |a: &App| conn(a).touch_off().map(|(_, w)| w[2]);
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = two_pass_app(dir.path());
+        let journal = stop_after(&mut a, 0, 0);
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        let _ = a.update(Message::Tick);
+        let file = conn(&a).table_journals()[0].clone();
+        let uc = file.parent().unwrap().to_path_buf();
+        assert_eq!(conn(&a).journal_own().map(|j| j.1), Some(true));
+        let mode = |m: u32| std::fs::set_permissions(&uc, std::fs::Permissions::from_mode(m));
+        mode(0o555).unwrap();
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        mode(0o755).unwrap();
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        assert_eq!(conn(&a).journal(), Some(journal));
+        assert_eq!(conn(&a).journal_own().map(|j| j.1), Some(false));
+        assert!(a.cut_journals.is_empty(), "{:?}", a.cut_journals);
+        let run = run_of(&a);
+        assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
+        assert_eq!(z(&a), Some(0.));
+        // Picked again: the journal that stayed is not known.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(!run_of(&a).journal_own && run_of(&a).history_unknown());
+        assert_eq!(z(&a), None);
+        let _ = a.update(Message::Disconnect);
+        let mut b = reopen(a, dir.path());
+        zeroed(&mut b);
+        let _ = b.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut b, 0);
+        assert!(run_of(&b).history_unknown());
+        assert_eq!(z(&b), None);
+        let _ = b.update(Message::Disconnect);
+    }
+
+    /// As `new_stock_takes_a_journal_it_cannot_remove_as_not_known`, on the
+    /// Pi: the Pi's and the USB's journals that stay are not this
+    /// session's, nor kept; the simulator's, not the same table, stays as
+    /// it was (LIO-634 review).
+    #[test]
+    fn new_stock_on_the_machine_takes_journals_it_cannot_remove_as_not_known() {
+        use crate::run::Action as R;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, _server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let uc = conn(&a).table_journals()[0].parent().unwrap().to_path_buf();
+        let id = a.doc.setups[0].machine.id.clone();
+        let name = |kind: &str| format!("{id}{kind}-journal.json");
+        let setup = a.doc.setups[0].id.clone();
+        let stop = crate::run::Journal {
+            project: String::new(),
+            setup: setup.clone(),
+            setup_name: String::new(),
+            op: 0,
+            op_name: "Face".into(),
+            steps: 2,
+            step: Some(0),
+            wcs: 0,
+            offset: [0.; 6],
+            tool: String::new(),
+            tool_label: String::new(),
+            time: 1,
+            fingerprint: 0,
+            why: "Stop after step".into(),
+        };
+        for kind in ["-pi", "", "-simulated"] {
+            let f = uc.join(name(kind));
+            stop.write_own(&f).unwrap();
+            a.cut_journals.push(crate::run::KeptJournal {
+                setup: setup.clone(),
+                file: name(kind),
+                text: std::fs::read_to_string(&f).unwrap(),
+            });
+        }
+        let mode = |m: u32| std::fs::set_permissions(&uc, std::fs::Permissions::from_mode(m));
+        mode(0o555).unwrap();
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        mode(0o755).unwrap();
+        let _ = a.update(Message::Tick);
+        let own = |kind: &str| crate::run::Journal::read_own(&uc.join(name(kind))).map(|j| j.1);
+        assert_eq!((own("-pi"), own("")), (Some(false), Some(false)));
+        assert_eq!(own("-simulated"), Some(true));
+        let kept: Vec<&str> = a.cut_journals.iter().map(|k| k.file.as_str()).collect();
+        assert_eq!(kept, [name("-simulated")]);
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// LIO-634: the Face and the Pocket's tool run cut to its end, so the
     /// start is the Drilling's tool run. New stock loaded takes it back to
     /// the Face, with no tool run done, so Zero Z on the stock top sets Z
