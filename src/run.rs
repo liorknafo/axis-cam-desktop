@@ -812,7 +812,7 @@ pub(crate) fn note_unknown_before(cuts: &mut Vec<CutInRun>) -> bool {
 const TOUCH_OFF_UNKNOWN: &str =
     ", so it cannot tell the surface where the stock top is touched off.";
 const RAPIDS_THROUGH: &str =
-    ", so this setup's programs, made for them cut, could send rapids through the material left.";
+    ", so this setup's programs, made for {them} cut, could send rapids through the material left.";
 
 /// What this run's own tool runs cut, said as `Partly::cut`, when the
 /// check's stock before the start does not have it: one runs, or one at or
@@ -3825,6 +3825,7 @@ impl Run {
             true => ["it", "it", "was", "is"],
             false => ["they", "them", "were", "are"],
         };
+        let so = so.replace("{them}", them);
         let its = match (one, self.earlier_uncut_setups()) {
             (true, _) => "its setup",
             (_, 1) => "their setup",
@@ -4244,8 +4245,35 @@ impl Run {
             NotKnown,
             Changed,
         }
-        if self.earlier_uncut_said().is_some() {
-            return self.earlier_uncut_ways(tablet, RAPIDS_THROUGH);
+        let uncut = self.earlier_uncut();
+        if !uncut.is_empty() {
+            if let Some(why) = self.earlier_uncut_ways(tablet, RAPIDS_THROUGH) {
+                return Some(why);
+            }
+            // Said otherwise for the touch-off, with another project's runs
+            // or ones the check does not follow (`earlier_uncut_said`
+            // None): still made for them cut (LIO-602 review).
+            let [they, them, were] = match uncut.len() {
+                1 => ["it", "it", "was"],
+                _ => ["they", "them", "were"],
+            };
+            let said = format!(
+                "{} {were} not cut, though the runs of {} cut this part, and this setup's programs are made for {them} cut: their rapids could go through the material left.",
+                uncut.join(", "),
+                match uncut.len() {
+                    1 => "its setup",
+                    _ => "their setups",
+                }
+            );
+            return Some(match tablet {
+                false => format!(
+                    "{said} Cut {them} first, mark {them} Already cut if {they} {were} cut before, or disable {them}. If new stock is held, press New stock loaded under Work zero."
+                ),
+                true => format!(
+                    "{said} On the computer, cut {them} first, mark {them} Already cut if {they} {were} cut before, or disable {them}; then Sync projects here, or save the project for the tablet again.{}",
+                    new_stock_on_the_computer!()
+                ),
+            });
         }
         let earlier = &self.simulated_earlier;
         let (id, op, why) = (self.earlier_cuts.iter()).find_map(|(id, cuts)| {
@@ -13323,6 +13351,30 @@ pub(crate) mod tests {
         let mut stopped = one(&[]);
         ran(&mut stopped, 0, 0);
         refused(setup_2(&stopped), &["Finish face (Top)"]);
+        // Cycle Start waits for it, its programs made for it cut, the
+        // number said as it is (LIO-602); so it does with another
+        // project's cuts on the record too, which the touch-off says
+        // instead (LIO-602 review).
+        let run = setup_2(&stopped);
+        let why = run.earlier_not_whole(&doc).unwrap();
+        assert!(
+            why.starts_with("Finish face (Top) was not cut")
+                && why.contains("made for it cut, could send rapids through"),
+            "{why}"
+        );
+        let mut foreign = setup_2(&stopped);
+        foreign.earlier_cuts.push((
+            "another project's setup".into(),
+            vec![(0, None, Some(1), Some(1))],
+        ));
+        assert_eq!(foreign.earlier_uncut(), ["Finish face (Top)"]);
+        assert!(foreign.earlier_uncut_said().is_none());
+        let why = foreign.earlier_not_whole(&doc).unwrap();
+        assert!(
+            why.starts_with("Finish face (Top) was not cut")
+                && why.contains("made for it cut: their rapids could go through"),
+            "{why}"
+        );
         // What setup 1's runs cut lost (`note_lost_cuts`, LIO-594), alone
         // or beside the face's cut (another session's journal): cut by runs
         // no session here knows of, so nothing is called not cut, and Z is
