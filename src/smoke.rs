@@ -12577,6 +12577,148 @@ flood = { pin = 8 }
         assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), Some(-2.));
     }
 
+    /// Setup 1 the fixture's Face, setup 2 its Pocket (a copy of setup 1,
+    /// after it), and setup 1's Face cut to its end on the simulated UC100
+    /// this session, the machine Idle again (LIO-626).
+    fn setup_1_cut(dir: &std::path::Path) -> App {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let mut a = run_app_of(dir, FAST, &[0, 1]);
+        let _ = a.update(Message::DuplicateSetup);
+        assert_eq!(a.doc.setups.len(), 2);
+        a.doc.setups[0].operations.truncate(1);
+        a.doc.setups[1].operations.remove(0);
+        a.page = Page::Control;
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 60., "setup 1's end", |r| {
+            r.running.is_none() && r.done.iter().all(|d| *d)
+        });
+        assert_eq!(run_of(&a).outcome.as_ref().map(|o| o.0), Some(true));
+        let cut: Vec<_> = run_of(&a).cut_in_run.iter().map(|c| (c.0, c.1)).collect();
+        assert_eq!(cut, [(0, None)], "the Face, all of it");
+        // The machine still: the pictures wait for it (`App::locked`).
+        tick_until(&mut a, 5., "Idle", |s| s.state == Some(State::Idle));
+        a
+    }
+
+    /// The app's own check of setup 2 (`App::check_run`) answered with the
+    /// stock it leaves, which the app goes on to picture (`picture_run`);
+    /// `strip` drops what is pictured. The answer's epoch.
+    fn answer_setup_2(a: &mut App, strip: bool) -> u64 {
+        use std::sync::Arc;
+        let epoch = run_of(a).epoch;
+        let (skips, steps) = (run_of(a).skips.clone(), run_of(a).all_cut());
+        let (programs, left) =
+            crate::run::check_steps(&a.doc, a.part_mesh().unwrap(), 1, &skips, &steps);
+        let left = match strip {
+            true => crate::run::Left {
+                after: vec![],
+                last: None,
+                ..left
+            },
+            false => left,
+        };
+        let times = crate::run::Times::checked(&programs, &conn(a).config);
+        let _ = a.update(Message::RunCheckedStock(
+            epoch,
+            Arc::new(programs),
+            Arc::new(left),
+            times,
+        ));
+        assert!(
+            run_of(a).checked().is_some(),
+            "{:?}",
+            run_of(a).programs.as_deref().map(|p| p.as_ref().err())
+        );
+        epoch
+    }
+
+    /// What the Work zero tab offers to press, at 1440 × 900.
+    fn work_zero_clicks(a: &mut App) -> Vec<Message> {
+        let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        crate::ui::probe::clicks(a.view(), iced::Size::new(1440., 900.))
+    }
+
+    /// Setup 1's Face cut this session (`setup_1_cut`), then setup 2 picked
+    /// and checked through the app's own check, whose stock the app goes
+    /// on to picture at once (`App::picture_run`, LIO-626). Its check
+    /// simulates setup 1's Face as it was cut, so setup 2 zeroes Z on the
+    /// stock top that Face left: while its pictures are drawn, once they
+    /// are, and from a check with no stock to picture, never "Another
+    /// setup's run cut this part … the check does not follow" with only
+    /// New stock loaded offered. Disabled since, setup 1's Face still
+    /// blocks setup 2's touch-off, pictured or not.
+    #[test]
+    fn a_later_setups_touch_off_holds_once_its_check_is_pictured() {
+        use crate::control::Action as M;
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = setup_1_cut(dir.path());
+        // Setup 2 picked: given what setup 1 cut.
+        let _ = a.update(Message::Run(R::Setup(1)));
+        assert_eq!(run_of(&a).setup, 1);
+        assert!(!run_of(&a).earlier_cuts.is_empty());
+        assert!(!run_of(&a).stock_unconfirmed && run_of(&a).away.is_none());
+        let touches_off = |a: &mut App, z: Option<f64>, when: &str| {
+            let r = run_of(a);
+            assert!(!r.earlier_unfollowed(), "{when}");
+            assert_eq!(conn(a).partway_blocked(), None, "{when}");
+            let at = conn(a).touch_off().map(|(_, w)| w[2]);
+            assert!(at.is_some(), "{when}: no touch-off");
+            if let Some(z) = z {
+                assert_eq!(at, Some(z), "{when}");
+            }
+            let clicks = work_zero_clicks(a);
+            assert!(
+                clicks
+                    .iter()
+                    .any(|m| matches!(m, Message::Machine(M::TouchOff))),
+                "{when}: {clicks:?}"
+            );
+            at.unwrap()
+        };
+        // The check's stock taken in hand by the pictures at once: setup 2
+        // still zeroes Z on its stock top, the Face's floor, where the
+        // check carves setup 1's Face as it was cut.
+        let epoch = answer_setup_2(&mut a, false);
+        assert_eq!(a.picture_job, Some(epoch), "the pictures are drawn");
+        assert!(run_of(&a).left.is_none());
+        let z = touches_off(&mut a, Some(0.), "while pictured");
+        let _ = a.update(Message::RunPictures(epoch, vec![]));
+        assert!(a.picture_job.is_none());
+        touches_off(&mut a, Some(z), "once pictured");
+        // Checked again with no stock to picture (`Run::checked_as` keeps
+        // none): the same.
+        let _ = a.update(Message::Run(R::Check));
+        answer_setup_2(&mut a, true);
+        assert!(run_of(&a).left.is_none() && a.picture_job.is_none());
+        touches_off(&mut a, Some(z), "nothing to picture");
+        // Setup 1's Face disabled since: setup 2's check no longer has it,
+        // and nothing sets Z, pictured or not.
+        a.doc.setups[0].operations[0].enabled = false;
+        for strip in [true, false] {
+            let _ = a.update(Message::Run(R::Check));
+            let epoch = answer_setup_2(&mut a, strip);
+            assert!(run_of(&a).earlier_unfollowed(), "strip {strip}");
+            assert!(conn(&a).touch_off().is_none(), "strip {strip}");
+            let why = conn(&a).partway_blocked().unwrap();
+            assert!(
+                why.starts_with("Another setup's run cut this part"),
+                "{why}"
+            );
+            if !strip {
+                let _ = a.update(Message::RunPictures(epoch, vec![]));
+                assert!(run_of(&a).earlier_unfollowed());
+                assert!(conn(&a).touch_off().is_none());
+            }
+        }
+    }
+
     /// Connected again to the Pi after a disconnect, but its link not live
     /// yet (its lists of tool runs not heard on this connection): Same part
     /// with nothing else run is refused and says it waits for them, so an
