@@ -6328,6 +6328,235 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
     }
 
+    /// What `other`, in control, does on the Pi of `server` while this
+    /// computer's link is down (LIO-597): no tool run, so the Pi's tool-run
+    /// lists show nothing new.
+    #[derive(Clone, Copy, Debug)]
+    enum Unlisted {
+        /// A jog step down 1 mm: into the stock, on a part.
+        Jog,
+        /// A plain job, sent as a `Command::Job` with no tool-run number: on
+        /// a part, a pass that cuts deeper.
+        Job,
+    }
+
+    fn another_computers_unlisted_move(
+        other: &uc100_remote::RemoteController,
+        server: &uc100_remote::Server,
+        what: Unlisted,
+    ) {
+        use uc100::controller::Command;
+        use uc100::gcode::{Action as Do, Located};
+        let before = server.snapshot().unwrap();
+        let z = before.machine_pos[2];
+        let lists = |o: &uc100_remote::RemoteController| {
+            let l = o.link();
+            (
+                l.tool_run_ends.iter().map(|e| e.id).collect::<Vec<_>>(),
+                l.tool_run_going,
+            )
+        };
+        let listed = lists(other);
+        let sent = match what {
+            Unlisted::Jog => other.send(Command::JogStep {
+                axis: 2,
+                distance: -1.0,
+                feed: 600.0,
+            }),
+            Unlisted::Job => {
+                let mut down = before.machine_pos;
+                down[2] -= 1.0;
+                other.send(Command::Job {
+                    name: "Laptop's plain job".into(),
+                    actions: std::sync::Arc::new(vec![Located {
+                        line: 1,
+                        action: Do::Move {
+                            target: down,
+                            feed: Some(600.0),
+                        },
+                    }]),
+                })
+            }
+        };
+        assert!(sent, "{what:?} not sent: {:?}", other.link().notes);
+        let mut deadline = Deadline::new(10.);
+        loop {
+            let s = server.snapshot().unwrap();
+            if (s.machine_pos[2] - (z - 1.0)).abs() < 1e-3
+                && s.state == Some(uc100::controller::State::Idle)
+            {
+                break;
+            }
+            assert!(deadline.within(&s), "the other's {what:?}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Nothing new in the Pi's tool-run lists.
+        assert_eq!(lists(other), listed);
+    }
+
+    /// The Face stopped after pass 1 on the Pi, the link drops, and another
+    /// computer takes control, jogs Z down into the stock or sends a plain
+    /// job, and gives control up, all before the link is back (LIO-597).
+    /// The Pi's tool-run lists show nothing new, and this computer never
+    /// sees the other in control; yet the Pi's count of control takes does.
+    /// The start at pass 2 must not set Z on pass 1's floor.
+    fn an_unlisted_move_while_the_pi_link_was_down(what: Unlisted) {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server, relay) = face_stopped_on_the_pi_after_pass_1(dir.path());
+        drop_the_link(&mut a, &relay);
+        let other = another_computer_in_control(dir.path(), &server);
+        another_computers_unlisted_move(&other, &server, what);
+        other.shutdown();
+        link_back(&mut a, &relay, true);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < end {
+            let _ = a.update(Message::Tick);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        let z = conn(&a).touch_off().map(|(_, w)| w[2]);
+        assert_eq!(
+            z, None,
+            "{what:?}: Set Z offered from this session's record alone"
+        );
+        assert!(conn(&a).partway_blocked().is_some());
+        assert!(run_of(&a).history_unknown(), "{:?}", run_of(&a).cut_in_run);
+        let note = conn(&a).pi_note.clone().unwrap_or_default();
+        assert!(note.contains("Another computer held control"), "{note}");
+        let _ = a.update(Message::Disconnect);
+    }
+
+    #[test]
+    fn a_jog_another_computer_made_while_the_pi_link_was_down_makes_the_cut_record_unknown() {
+        an_unlisted_move_while_the_pi_link_was_down(Unlisted::Jog);
+    }
+
+    #[test]
+    fn a_plain_job_another_computer_ran_while_the_pi_link_was_down_makes_the_cut_record_unknown() {
+        an_unlisted_move_while_the_pi_link_was_down(Unlisted::Job);
+    }
+
+    /// The Face stopped after pass 1 on the Pi, then this computer
+    /// disconnects, AXIS CAM closed meanwhile (`closed`) or kept open; while
+    /// away, another computer jogs Z into the stock (`other`) or nothing
+    /// else happens (LIO-597). Connected again, the setup picked and called
+    /// the same part, nothing else ran (no tool run of another's shows):
+    /// the start at pass 2 sets Z on pass 1's floor only when nothing else
+    /// ran. The Pi's start and count of control takes outlive AXIS CAM
+    /// closed, kept with what its runs cut (`run::CutHistory::pi_control`).
+    fn away_then_back(closed: bool, other: bool) {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server, _relay) = face_stopped_on_the_pi_after_pass_1(dir.path());
+        let _ = a.update(Message::Disconnect);
+        if closed {
+            a = reopen(a, dir.path());
+        }
+        if other {
+            let o = another_computer_in_control(dir.path(), &server);
+            another_computers_unlisted_move(&o, &server, Unlisted::Jog);
+            o.shutdown();
+        }
+        let _ = a.update(Message::Connect);
+        // The Pi keeps the machine as it was: Idle, its position kept.
+        pi_live(&mut a, true, "the link live");
+        let mut deadline = Deadline::new(10.);
+        while !conn(&a).in_control() || conn(&a).snapshot.state != Some(State::Idle) {
+            let _ = a.update(Message::Tick);
+            assert!(deadline.within(&conn(&a).snapshot), "control, Idle");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = a.update(Message::Tick);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        assert_eq!(conn(&a).same_part_refused(), None);
+        let _ = a.update(Message::Run(R::SamePart));
+        assert!(!run_of(&a).stock_unconfirmed);
+        let z = conn(&a).touch_off().map(|(_, w)| w[2]);
+        if other {
+            assert_eq!(
+                z, None,
+                "closed {closed}: Set Z offered after another computer's jog"
+            );
+            assert!(run_of(&a).history_unknown(), "{:?}", run_of(&a).cut_in_run);
+            let note = conn(&a).pi_note.clone().unwrap_or_default();
+            assert!(note.contains("Another computer held control"), "{note}");
+        } else {
+            assert_eq!(z, Some(-2.), "closed {closed}: nothing else ran");
+        }
+        let _ = a.update(Message::Disconnect);
+    }
+
+    #[test]
+    fn a_jog_another_computer_made_while_this_one_was_disconnected_makes_the_cut_record_unknown() {
+        away_then_back(false, true);
+    }
+
+    #[test]
+    fn a_jog_another_computer_made_while_axis_cam_was_closed_makes_the_cut_record_unknown() {
+        away_then_back(true, true);
+    }
+
+    #[test]
+    fn axis_cam_closed_and_opened_again_with_nothing_else_run_keeps_the_cut_record() {
+        away_then_back(true, false);
+    }
+
+    /// Stops the Pi of `server` and starts it again on the same address and
+    /// data (its pairings and profile): as a Pi restarted, its tool-run
+    /// lists empty (LIO-597).
+    fn restart_the_pi(dir: &std::path::Path, server: uc100_remote::Server) -> uc100_remote::Server {
+        let listen = server.addr();
+        server.shutdown();
+        uc100_remote::Server::start(uc100_remote::ServerOptions {
+            data: dir.join("pi"),
+            listen,
+            link_lost: uc100_remote::server::LINK_LOST,
+            decoding: None,
+        })
+        .unwrap()
+    }
+
+    /// The Face stopped after pass 1 on the Pi, the link drops, another
+    /// computer runs a tool run, and the Pi restarts, all while this
+    /// computer is away (LIO-597): the Pi's tool-run lists come back empty.
+    /// Back, the machine reset and its position kept, the start at pass 2
+    /// must not set Z on pass 1's floor: the Pi's new start says it
+    /// restarted, and what ran before is not known.
+    #[test]
+    fn a_pi_restart_while_the_link_was_down_makes_the_cut_record_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server, relay) = face_stopped_on_the_pi_after_pass_1(dir.path());
+        drop_the_link(&mut a, &relay);
+        let other = another_computer_in_control(dir.path(), &server);
+        another_computers_tool_run(&other, &server, 99);
+        other.shutdown();
+        let server = restart_the_pi(dir.path(), server);
+        link_back(&mut a, &relay, true);
+        let _ = a.update(Message::MachineReset);
+        tick_until(&mut a, 5., "Idle after Reset", |s| {
+            s.state == Some(uc100::controller::State::Idle)
+        });
+        let _ = a.update(Message::Machine(crate::control::Action::KeepPosition));
+        tick_until(&mut a, 3., "machine position kept", |s| {
+            s.referenced[..3].iter().all(|r| *r)
+        });
+        assert!(conn(&a).link.as_ref().unwrap().tool_run_ends.is_empty());
+        assert_eq!(run_of(&a).at_step(), Some((0, 1)));
+        let z = conn(&a).touch_off().map(|(_, w)| w[2]);
+        assert_eq!(z, None, "Set Z offered from this session's record alone");
+        assert!(run_of(&a).history_unknown(), "{:?}", run_of(&a).cut_in_run);
+        let note = conn(&a).pi_note.clone().unwrap_or_default();
+        assert!(note.contains("The Pi restarted"), "{note}");
+        let _ = a.update(Message::Disconnect);
+        server.shutdown();
+    }
+
     /// A tool run lost on the way to the Pi (the link failed as it
     /// crossed): it never runs and no outcome comes, so after a few seconds
     /// with the link live it is put back, nothing having moved, and Cycle

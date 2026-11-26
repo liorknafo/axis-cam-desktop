@@ -2879,6 +2879,16 @@ thread_local! {
     static SENT_TOOL_RUNS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(vec![]) };
 }
 
+/// What happened on the Pi while this computer was not looking
+/// (`Connection::pi_control_since`, LIO-597).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PiSince {
+    /// It restarted: what ran on it before, it no longer shows.
+    Restarted,
+    /// Another computer was given control.
+    OtherTookControl,
+}
+
 /// The numbers of the tool runs this session sent a Pi, with the one AXIS
 /// CAM here last sent before it opened again (its `PiPending`): none of
 /// them ran while it was away (`Connection::same_part_refused`, LIO-595),
@@ -6657,6 +6667,40 @@ impl Connection {
             _ => None,
         };
         (runs, holder)
+    }
+
+    /// What the Pi's start and count of control takes (`Link::boot`,
+    /// `Link::takes`) say happened since they were last heard (`seen`,
+    /// updated to them), the link dropped and back or not (LIO-597): the Pi
+    /// restarted, which empties its tool-run lists; or another computer was
+    /// given control, which may have jogged or run a plain job, however
+    /// briefly and whatever its tool-run lists show. This computer's own
+    /// take is the one that left it in control (taking it again from its
+    /// own older connection is one take too); any more are another's.
+    /// Nothing when it is not a Pi, or before the Pi first said who
+    /// controls the machine.
+    pub fn pi_control_since(&self, seen: &mut Option<(u64, u64)>) -> Option<PiSince> {
+        let link = self.link.as_ref()?;
+        let now = (link.boot?, link.takes);
+        let mine = u64::from(link.state == uc100_remote::LinkState::Controlling);
+        let since = match *seen {
+            Some((boot, _)) if boot != now.0 => Some(PiSince::Restarted),
+            Some((_, takes)) if now.1.saturating_sub(takes) > mine => {
+                Some(PiSince::OtherTookControl)
+            }
+            _ => None,
+        };
+        *seen = Some(now);
+        since
+    }
+
+    /// The link to the Pi is live and the Pi has said its start and count
+    /// of control takes (`pi_control_since`): what this computer heard of
+    /// them is current.
+    pub fn pi_heard(&self) -> bool {
+        self.link
+            .as_ref()
+            .is_some_and(|l| l.live && l.boot.is_some())
     }
 
     /// The journal of where a run stopped on this machine, if any.
