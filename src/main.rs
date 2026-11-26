@@ -5023,7 +5023,7 @@ impl App {
                 match r.earlier_cuts.iter_mut().find(|(e, _)| *e == id) {
                     Some((_, cuts)) => marked |= run::note_unknown_before(cuts),
                     None => {
-                        let cuts = vec![(run::HISTORY_UNKNOWN, None, None)];
+                        let cuts = vec![(run::HISTORY_UNKNOWN, None, None, None)];
                         r.earlier_cuts.push((id.clone(), cuts));
                     }
                 }
@@ -12590,7 +12590,10 @@ fn cut_history_path(state_path: &std::path::Path) -> PathBuf {
 /// knows of (`run::HISTORY_UNKNOWN`), until New stock loaded for it.
 fn note_lost_cuts(cuts: &mut Vec<(String, Vec<run::CutInRun>)>, lost: bool, id: &str) {
     if lost && !cuts.iter().any(|(s, _)| s == id) {
-        cuts.push((id.to_owned(), vec![(run::HISTORY_UNKNOWN, None, None)]));
+        cuts.push((
+            id.to_owned(),
+            vec![(run::HISTORY_UNKNOWN, None, None, None)],
+        ));
     }
 }
 

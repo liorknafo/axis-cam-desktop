@@ -689,8 +689,12 @@ impl Run {
 /// the setup), all of it (None) or its steps before the one given, and the
 /// print of the plan and cutter it cut (`OpSteps::cut_print`). Steps before
 /// one are a bound: the last of them may be cut only in part, after a stop
-/// in it, and `MAY_HAVE_CUT_ALL` is anywhere up to all of it.
-pub type CutInRun = (usize, Option<usize>, Option<u64>);
+/// in it, and `MAY_HAVE_CUT_ALL` is anywhere up to all of it. Last, the
+/// print of the plan it was last cut whole with (None steps): the stock has
+/// at least that cut, whatever else cut it, so a later setup's programs,
+/// made for it cut so, find no more material than they were made for
+/// (`Run::earlier_not_whole`, LIO-602).
+pub type CutInRun = (usize, Option<usize>, Option<u64>, Option<u64>);
 
 /// `CutInRun`'s steps of an operation a tool run that did not finish ran,
 /// with nothing to tell how far: stopped where the run cannot place it, or
@@ -707,6 +711,19 @@ pub(crate) fn note_cut_in(
     steps: Option<usize>,
     print: Option<u64>,
 ) {
+    note_cut_whole(cuts, oi, steps, print, print.filter(|_| steps.is_none()));
+}
+
+/// `note_cut_in`, with the plan it was certainly cut whole with, `whole`,
+/// given: a record's own, merged into another (`Run::cuts_if_started`),
+/// keeps what it says (LIO-602 review).
+fn note_cut_whole(
+    cuts: &mut Vec<CutInRun>,
+    oi: usize,
+    steps: Option<usize>,
+    print: Option<u64>,
+    whole: Option<u64>,
+) {
     match cuts.iter_mut().find(|c| c.0 == oi) {
         Some(c) => {
             c.1 = match (c.1, steps) {
@@ -715,9 +732,38 @@ pub(crate) fn note_cut_in(
             };
             // Cut from two plans: neither is all it cut.
             c.2 = c.2.filter(|&p| print == Some(p));
+            // More cuts after one whole take only more away (LIO-602).
+            c.3 = whole.or(c.3);
         }
-        None => cuts.push((oi, steps, print)),
+        None => cuts.push((oi, steps, print, whole)),
     }
+}
+
+/// `CutHistory::cuts` as kept on disk: each cut as `CutInRun`, or as it was
+/// kept before the plan last cut whole was (LIO-602), which counts as not
+/// known: before LIO-601 a tool run stopped where it was not placed was
+/// noted as whole too.
+fn kept_cuts<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<(String, Vec<CutInRun>)>, D::Error> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Kept {
+        Now(usize, Option<usize>, Option<u64>, Option<u64>),
+        Before(usize, Option<usize>, Option<u64>),
+    }
+    let kept: Vec<(String, Vec<Kept>)> = serde::Deserialize::deserialize(d)?;
+    Ok((kept.into_iter())
+        .map(|(id, cuts)| {
+            let cuts = (cuts.into_iter())
+                .map(|c| match c {
+                    Kept::Now(oi, steps, print, whole) => (oi, steps, print, whole),
+                    Kept::Before(oi, steps, print) => (oi, steps, print, None),
+                })
+                .collect();
+            (id, cuts)
+        })
+        .collect())
 }
 
 /// Takes into `into`, a setup's record of what runs cut here, `theirs`,
@@ -736,7 +782,7 @@ pub(crate) fn take_kept_cuts(
         *into = theirs.to_vec();
         return;
     }
-    for &(oi, steps, print) in theirs {
+    for &(oi, steps, print, whole) in theirs {
         match into.iter_mut().find(|c| c.0 == oi) {
             Some(c) => {
                 c.1 = match (c.1, steps) {
@@ -745,8 +791,11 @@ pub(crate) fn take_kept_cuts(
                     _ => MAY_HAVE_CUT_ALL,
                 };
                 c.2 = c.2.filter(|&p| print == Some(p));
+                // Which plan cut it whole last is known only where both
+                // agree (LIO-602).
+                c.3 = c.3.filter(|&w| whole == Some(w));
             }
-            None => into.push((oi, steps, print)),
+            None => into.push((oi, steps, print, whole)),
         }
     }
 }
@@ -769,6 +818,14 @@ pub(crate) fn note_unknown_before(cuts: &mut Vec<CutInRun>) -> bool {
     note_cut_in(cuts, HISTORY_UNKNOWN, None, None);
     true
 }
+
+/// What follows from operations of earlier setups not cut
+/// (`Run::earlier_uncut_ways`): for Zero Z and Probe Z, and for Cycle Start
+/// (LIO-602).
+const TOUCH_OFF_UNKNOWN: &str =
+    ", so it cannot tell the surface where the stock top is touched off.";
+const RAPIDS_THROUGH: &str =
+    ", so this setup's programs, made for {them} cut, could send rapids through the material left.";
 
 /// What this run's own tool runs cut, said as `Partly::cut`, when the
 /// check's stock before the start does not have it: one runs, or one at or
@@ -1315,6 +1372,7 @@ pub struct CutHistory {
     /// By setup id, what its runs cut (`Run::cut_in_run`). Kept empty for
     /// a setup whose runs cut nothing since New stock loaded only while
     /// `others_unknown`.
+    #[serde(deserialize_with = "kept_cuts")]
     pub cuts: Vec<(String, Vec<CutInRun>)>,
     /// The journals of where runs stopped as the sessions that kept `cuts`
     /// wrote them (`KeptJournal`).
@@ -3046,6 +3104,9 @@ impl Run {
         if self.stale {
             e.push("The project changed since the setup was checked. Check it again.".into());
         }
+        if let Some(why) = self.earlier_not_whole(doc) {
+            e.push(why);
+        }
         let from = self.from.min(p.ops.len() - 1);
         let blocks = match p.from(from) {
             Ok(blocks) => Some(blocks),
@@ -3544,8 +3605,8 @@ impl Run {
     pub fn cuts_if_started(&self) -> Vec<CutInRun> {
         let mut cuts = self.cuts_so_far();
         let started = self.cuts_with(self.next, self.from, &[]);
-        for (oi, steps, print) in started {
-            note_cut_in(&mut cuts, oi, steps, print);
+        for (oi, steps, print, whole) in started {
+            note_cut_whole(&mut cuts, oi, steps, print, whole);
         }
         cuts
     }
@@ -3602,7 +3663,7 @@ impl Run {
             if !cuts.iter().any(|c| c.0 == oi) {
                 let print = self.op_steps(oi).map(|s| s.cut_print);
                 let at = cuts.iter().position(|c| c.0 > oi).unwrap_or(cuts.len());
-                cuts.insert(at, (oi, None, print));
+                cuts.insert(at, (oi, None, print, print));
             }
         }
     }
@@ -3618,7 +3679,7 @@ impl Run {
             (self.checked().into_iter().flatten()).any(|p| p.indexes.contains(&op))
                 || (self.skips.iter()).any(|s| s.0 == op && s.1 == Skip::Cut)
         };
-        (self.cut_in_run.iter()).any(|&(op, steps, print)| {
+        (self.cut_in_run.iter()).any(|&(op, steps, print, _)| {
             op > start
                 || op == start && steps.is_none_or(|m| m > step)
                 || !simulated(op)
@@ -3639,7 +3700,7 @@ impl Run {
             .iter()
             .find(|(id, _)| *id == self.setup_id)
             .map(|(_, c)| c.clone());
-        let own = own.or_else(|| lost.then(|| vec![(HISTORY_UNKNOWN, None, None)]));
+        let own = own.or_else(|| lost.then(|| vec![(HISTORY_UNKNOWN, None, None, None)]));
         if let Some(own) = own.filter(|c| !c.is_empty()) {
             self.cut_in_run = own;
             self.stock_unconfirmed = true;
@@ -3763,12 +3824,13 @@ impl Run {
     /// them, which the check then simulates them without, or New stock
     /// loaded, clears it (LIO-603 review).
     fn earlier_uncut_blocked(&self) -> Option<String> {
-        self.earlier_uncut_ways(false)
+        self.earlier_uncut_ways(false, TOUCH_OFF_UNKNOWN)
     }
 
     /// `earlier_uncut_blocked` in the tablet file's words (LIO-603
-    /// review): the ways out are the computer's, then a new sync.
-    fn earlier_uncut_ways(&self, tablet: bool) -> Option<String> {
+    /// review): the ways out are the computer's, then a new sync. `so` is
+    /// what follows from them: `TOUCH_OFF_UNKNOWN`, or `RAPIDS_THROUGH`.
+    fn earlier_uncut_ways(&self, tablet: bool, so: &str) -> Option<String> {
         let said = self.earlier_uncut_said()?;
         let also = self.unfollowed_earlier().next().is_some();
         let one = self.earlier_uncut().len() == 1;
@@ -3776,6 +3838,7 @@ impl Run {
             true => ["it", "it", "was", "is"],
             false => ["they", "them", "were", "are"],
         };
+        let so = so.replace("{them}", them);
         let its = match (one, self.earlier_uncut_setups()) {
             (true, _) => "its setup",
             (_, 1) => "their setup",
@@ -3785,21 +3848,21 @@ impl Run {
             let then = "then Sync projects here, or save the project for the tablet again.";
             return Some(match also {
                 false => format!(
-                    "{said}, so it cannot tell the surface where the stock top is touched off. On the computer, cut {them} first (pick {its}), mark {them} Already cut there if {they} {were} cut before, or disable {them} if {they} {are} not to be cut; {then}{}",
+                    "{said}{so} On the computer, cut {them} first (pick {its}), mark {them} Already cut there if {they} {were} cut before, or disable {them} if {they} {are} not to be cut; {then}{}",
                     new_stock_on_the_computer!()
                 ),
                 true => format!(
-                    "{said}, so it cannot tell the surface where the stock top is touched off. If {they} {are} not to be cut, disable {them} in {its} on the computer, which then follows what was cut; {then}{}",
+                    "{said}{so} If {they} {are} not to be cut, disable {them} in {its} on the computer, which then follows what was cut; {then}{}",
                     new_stock_on_the_computer!()
                 ),
             });
         }
         Some(match also {
             false => format!(
-                "{said}, so it cannot tell the surface where the stock top is touched off. Cut {them} first: pick {its}. If {they} {were} cut before, mark {them} Already cut there; if {they} {are} not to be cut, disable {them}. If new stock is held, press New stock loaded under Work zero."
+                "{said}{so} Cut {them} first: pick {its}. If {they} {were} cut before, mark {them} Already cut there; if {they} {are} not to be cut, disable {them}. If new stock is held, press New stock loaded under Work zero."
             ),
             true => format!(
-                "{said}, so it cannot tell the surface where the stock top is touched off. If {they} {are} not to be cut, disable {them} in {its}: the check then follows what was cut. If new stock is held, press New stock loaded under Work zero."
+                "{said}{so} If {they} {are} not to be cut, disable {them} in {its}: the check then follows what was cut. If new stock is held, press New stock loaded under Work zero."
             ),
         })
     }
@@ -3815,7 +3878,7 @@ impl Run {
                 .filter(|e| e.setup == *id)
                 .map(|e| e.op)
                 .min();
-            cuts.iter().all(|&(op, _, print)| {
+            cuts.iter().all(|&(op, _, print, _)| {
                 let followed =
                     (earlier.iter()).any(|e| e.setup == *id && e.op == op && Some(e.cut) == print);
                 followed || first.is_some_and(|f| op > f)
@@ -3829,7 +3892,9 @@ impl Run {
     fn tablet_blocked(&self) -> Option<String> {
         let blocked = self.partway_blocked()?;
         match self.earlier_uncut_blocked() {
-            Some(computer) if computer == blocked => self.earlier_uncut_ways(true),
+            Some(computer) if computer == blocked => {
+                self.earlier_uncut_ways(true, TOUCH_OFF_UNKNOWN)
+            }
             _ => Some(self.for_tablet(blocked)),
         }
     }
@@ -3857,7 +3922,7 @@ impl Run {
     fn unfollowed_earlier(&self) -> impl Iterator<Item = &(String, Vec<CutInRun>)> {
         let earlier = &self.simulated_earlier;
         (self.earlier_cuts.iter()).filter(move |(id, cuts)| {
-            cuts.iter().any(|&(op, _, print)| {
+            cuts.iter().any(|&(op, _, print, _)| {
                 !(earlier.iter()).any(|e| e.setup == *id && e.op == op && Some(e.cut) == print)
             })
         })
@@ -3927,7 +3992,7 @@ impl Run {
             .map(|e| e.op)
             .min();
         first.is_some_and(|first| {
-            cuts.iter().all(|&(op, _, print)| {
+            cuts.iter().all(|&(op, _, print, _)| {
                 op > first
                     || (earlier.iter()).any(|e| e.setup == id && e.op == op && Some(e.cut) == print)
             })
@@ -3939,7 +4004,7 @@ impl Run {
     /// operation where it was first cut (`note_cut_in`).
     fn cut_out_of_order(&self, id: &str, cuts: &[CutInRun]) -> bool {
         let earlier = &self.simulated_earlier;
-        (cuts.iter().enumerate()).any(|(i, &(op, _, print))| {
+        (cuts.iter().enumerate()).any(|(i, &(op, _, print, _))| {
             let followed =
                 (earlier.iter()).any(|e| e.setup == id && e.op == op && Some(e.cut) == print);
             !followed && op != HISTORY_UNKNOWN && cuts[i + 1..].iter().any(|c| c.0 < op)
@@ -3993,7 +4058,7 @@ impl Run {
                     projects.len() - 1
                 }
             };
-            for &(op, _, _) in cuts {
+            for &(op, _, _, _) in cuts {
                 if let Some(name) = o.ops.get(op).filter(|n| !n.is_empty())
                     && !projects[i].2.contains(&name.as_str())
                 {
@@ -4166,6 +4231,125 @@ impl Run {
     /// Its reasons say so.
     pub fn earlier_partway(&self) -> bool {
         self.earlier_unfinished() && !self.earlier_unsimulated() && self.earlier_uncut().is_empty()
+    }
+
+    /// Why Cycle Start waits because the check cuts, before this setup, an
+    /// operation another setup's runs cut earlier (`earlier_cuts`) but not
+    /// certainly whole with the plan and cutter it has now (`Left::earlier`,
+    /// `CutInRun`): stopped partway, stopped where it is not known, or cut
+    /// from another plan. The programs are made for the stock the check
+    /// leaves, their rapids and links just clear of it: over what the real
+    /// cut left, they could go through material (LIO-602). None when none
+    /// is: one the check leaves out (disabled, or its setup deleted or
+    /// moved after this one) leaves the check more stock than the part has,
+    /// which no rapid runs into, and so do cuts after one certainly whole.
+    /// Nor where an earlier setup's runs cut this part but neither cut nor
+    /// took as cut an operation it simulates (`earlier_uncut`, LIO-603):
+    /// its material left, the programs made for it gone.
+    pub fn earlier_not_whole(&self, doc: &Document) -> Option<String> {
+        self.earlier_not_whole_for(doc, false)
+    }
+
+    /// `earlier_not_whole`, said for the tablet file (`tablet`), which has no
+    /// New stock loaded and was made after those runs (`for_tablet`).
+    fn earlier_not_whole_for(&self, doc: &Document, tablet: bool) -> Option<String> {
+        enum Why {
+            Partway,
+            NotKnown,
+            Changed,
+        }
+        let uncut = self.earlier_uncut();
+        if !uncut.is_empty() {
+            if let Some(why) = self.earlier_uncut_ways(tablet, RAPIDS_THROUGH) {
+                return Some(why);
+            }
+            // Said otherwise for the touch-off, with another project's runs
+            // or ones the check does not follow (`earlier_uncut_said`
+            // None): still made for them cut (LIO-602 review).
+            let [they, them, were] = match uncut.len() {
+                1 => ["it", "it", "was"],
+                _ => ["they", "them", "were"],
+            };
+            let its = match (uncut.len(), self.earlier_uncut_setups()) {
+                (1, _) => "its setup",
+                (_, 1) => "their setup",
+                _ => "their setups",
+            };
+            let said = format!(
+                "{} {were} not cut, though the runs of {its} cut this part, and this setup's programs are made for {them} cut: their rapids could go through the material left.",
+                uncut.join(", "),
+            );
+            return Some(match tablet {
+                false => format!(
+                    "{said} Cut {them} first (pick {its}), mark {them} Already cut there if {they} {were} cut before, or disable {them}. If new stock is held, press New stock loaded under Work zero."
+                ),
+                true => format!(
+                    "{said} On the computer, cut {them} first (pick {its}), mark {them} Already cut there if {they} {were} cut before, or disable {them}; then Sync projects here, or save the project for the tablet again.{}",
+                    new_stock_on_the_computer!()
+                ),
+            });
+        }
+        let earlier = &self.simulated_earlier;
+        let (id, op, why) = (self.earlier_cuts.iter()).find_map(|(id, cuts)| {
+            cuts.iter().find_map(|&(op, steps, print, whole)| {
+                let p = &earlier.iter().find(|e| e.setup == *id && e.op == op)?.cut;
+                let why = match (print == Some(*p), steps) {
+                    _ if whole == Some(*p) => return None,
+                    (true, MAY_HAVE_CUT_ALL) => Why::NotKnown,
+                    (true, Some(_)) => Why::Partway,
+                    // Kept before the plan cut whole was (`kept_cuts`).
+                    (true, None) => Why::NotKnown,
+                    (false, _) => Why::Changed,
+                };
+                Some((id, op, why))
+            })
+        })?;
+        let setup = doc.setups.iter().find(|s| s.id == *id)?;
+        let name = setup.name();
+        let op_name = (setup.operations.get(op)).map_or("an operation", |o| o.name());
+        let (run, then) = match tablet {
+            false => (format!("{name}'s run"), ""),
+            true => (
+                format!("{name}'s run on the computer"),
+                " before this tablet file was made",
+            ),
+        };
+        // The ways out: on the computer, for the tablet, then a new sync;
+        // the tablet's own runs never reach the computer (LIO-602 review).
+        let first = |what: &str| match tablet {
+            false => format!(
+                "{what} first, in {name}'s run. If new stock is held, press New stock loaded under Work zero."
+            ),
+            true => format!(
+                "On the computer, {}{} first, in {name}'s run, then Sync projects here, or save the project for the tablet again.{}",
+                what[..1].to_lowercase(),
+                &what[1..],
+                new_stock_on_the_computer!()
+            ),
+        };
+        Some(match why {
+            Why::Partway => format!(
+                "{run} stopped partway through {op_name}{then}, and this setup's programs are made for the stock with {op_name} cut whole: their rapids could go through the material it left. {}",
+                match tablet {
+                    false => format!(
+                        "Finish it first: pick {name}, which resumes it where it stopped. If new stock is held, press New stock loaded under Work zero."
+                    ),
+                    true => first(&format!("Finish {op_name}")),
+                }
+            ),
+            Why::NotKnown => format!(
+                "{run} of {op_name} stopped where it is not known{then}, so it may have cut only part of it, and this setup's programs are made for the stock with {op_name} cut whole: their rapids could go through what it left. {}",
+                first(&format!("Cut {op_name} whole"))
+            ),
+            Why::Changed => format!(
+                "{name}'s {op_name} changed since {}cut it{then}, and this setup's programs are made for the stock its plan leaves now: their rapids could go through material that cut left. {}",
+                match tablet {
+                    false => "its run ".to_string(),
+                    true => "its run on the computer ".to_string(),
+                },
+                first(&format!("Cut {op_name} whole again"))
+            ),
+        })
     }
 
     /// The stock the start begins from is not the setup's own: the run
@@ -6728,6 +6912,10 @@ pub fn tablet_runs(
     let mut started = Run::new(doc, si, 0);
     started.given(session);
     started.checked_as(all.clone(), Some(left), None);
+    // Its programs are made for an earlier setup's operation cut whole that
+    // the computer's runs did not certainly cut so: the tablet's Cycle
+    // Start refuses them as the Run panel's waits (LIO-602).
+    let uncut = started.earlier_not_whole_for(doc, true);
     let orient = crate::orient::Orient::of(&setup.machine);
     // The setup's start's, on the stock earlier setups left (LIO-584).
     let inherited = crate::model::get(&setup.p, "stock_source") != "fresh";
@@ -6744,6 +6932,10 @@ pub fn tablet_runs(
         }
     };
     out.work_offset = programs.first().map_or(String::new(), |p| p.offset.clone());
+    if let Some(why) = uncut {
+        out.problems = vec![why];
+        return out;
+    }
     let count = programs.len();
     for (i, p) in programs.iter().enumerate() {
         let start = match p.chuck {
@@ -11133,6 +11325,216 @@ pub(crate) mod tests {
         setup
     }
 
+    /// Setup 1 faces 10 mm off the fixture block's stock top in 1 mm
+    /// levels; setup 2, held the same way, pockets, contours and drills it
+    /// (LIO-602). Setup 2's programs are made from a simulation
+    /// that cuts setup 1's face whole: stopped after its first level, 9 mm
+    /// of the stock top is still there, and setup 2's rapids, which clear
+    /// the check's stock, go through it. So setup 2's Cycle Start waits
+    /// while setup 1's runs did not certainly cut the face whole with the
+    /// plan it has now: stopped partway, stopped where it is not known, or
+    /// cut from another plan. Not once a tool run of it ends done, nor for a
+    /// face the check leaves out (disabled since), which no rapid runs into.
+    #[test]
+    fn a_later_setup_waits_for_an_earlier_operation_cut_partway_or_changed() {
+        let (mut doc, mesh) = crate::post::fixture::job();
+        // On the UC100 the Run panel drives.
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let machine = tablet_fixture(&profile).0.setups[0].machine.clone();
+        doc.machines = vec![machine.clone()];
+        let mut first = doc.setups[0].clone();
+        first.machine = machine;
+        first.p.insert("stock_top".into(), "10".into());
+        let mut second = crate::model::Setup::new(first.machine.clone(), "G55");
+        second.p = first.p.clone();
+        second.p.insert("name".into(), "Top again".into());
+        // Its Pocket, Contour and Drill.
+        second.operations = first.operations[1..4].to_vec();
+        first.operations.truncate(1);
+        first.operations[0].p.insert("stepdown".into(), "1".into());
+        doc.setups = vec![first, second];
+        doc.sync_stock_sources();
+        // Setup 1's face, its levels its steps.
+        let sims = simulated(&doc, &mesh, 0);
+        let steps = op_steps(&doc, 0, &sims);
+        let face_steps = steps.iter().find(|s| s.op == 0).unwrap();
+        let levels = &face_steps.steps;
+        assert_eq!(levels.len(), 10);
+        let face = sims[0].1.as_ref().unwrap();
+        // The stock it leaves stopped after its first level.
+        let mut real = face.initial_volume.clone().unwrap();
+        let plan = &face.plan;
+        for m in (plan.moves[levels[0].moves.clone()].iter())
+            .filter(|m| m.motion == crate::simulation::Motion::Feed)
+        {
+            let frame = face.frame_at(m.a).unwrap();
+            let (r, flute) = (plan.cut_radius(), plan.flute_length);
+            real.cut(m.from, m.to, r, flute, plan.shape, frame, face.source);
+        }
+        // Setup 2's programs are made for the face cut whole.
+        let (programs, left) = check(&doc, &mesh, 1);
+        assert!(programs.is_ok(), "{:?}", programs.err());
+        let checked = (Arc::new(programs), Arc::new(left));
+        let mut through = 0;
+        for (oi, sim) in simulated(&doc, &mesh, 1) {
+            let sim = sim.unwrap();
+            // Each rapid against the stock as it is then: the check's, and
+            // the real one, both cut by the feeds before it.
+            let mut checked = sim.initial_volume.clone().unwrap();
+            let plan = &sim.plan;
+            let (r, flute) = (plan.cut_radius(), plan.flute_length);
+            for m in &plan.moves {
+                let frame = sim.frame_at(m.a).unwrap();
+                match m.motion {
+                    crate::simulation::Motion::Feed => {
+                        for v in [&mut checked, &mut real] {
+                            v.cut(m.from, m.to, r, flute, plan.shape, frame, sim.source);
+                        }
+                    }
+                    crate::simulation::Motion::Rapid => {
+                        // Its rapids clear the stock the check has.
+                        assert!(
+                            !checked.touches(m.from, m.to, r, flute, plan.shape, frame),
+                            "{oi} {m:?}"
+                        );
+                        if real.touches(m.from, m.to, r, flute, plan.shape, frame) {
+                            through += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Over the face stopped after a level, they go through the stock.
+        assert!(through > 10, "{through}");
+        // Setup 2's run, given what setup 1's run cut this session.
+        type Checks = (Arc<Result<Vec<Checked>, Vec<String>>>, Arc<Left>);
+        let setup_2 = |doc: &Document, checked: &Checks, cut: CutInRun| {
+            let mut run = Run::new(doc, 1, 0);
+            crate::give_earlier_cuts(&[(doc.setups[0].id.clone(), vec![cut])], &[], &mut run);
+            run.checked_as(checked.0.clone(), Some(checked.1.clone()), None);
+            assert!(run.checked().is_some(), "{:?}", run.programs);
+            // Its stock pictured, as `App::picture_run` takes it (LIO-602
+            // review): what the check simulated before it is still known.
+            assert!(run.left.take().is_some());
+            run
+        };
+        let print = Some(face_steps.cut_print);
+        let wait = |cut: CutInRun| setup_2(&doc, &checked, cut).earlier_not_whole(&doc);
+        // What setup 1's runs cut, as its tool runs' outcomes note it.
+        let (c, l) = check(&doc, &mesh, 0);
+        let first: Checks = (Arc::new(c), Arc::new(l));
+        let noted = |notes: &[Option<usize>]| {
+            let mut one = Run::new(&doc, 0, 0);
+            one.checked_as(first.0.clone(), Some(first.1.clone()), None);
+            for &cut in notes {
+                one.note_cut(0, cut);
+            }
+            assert_eq!(one.cut_in_run.len(), 1);
+            one.cut_in_run[0]
+        };
+        // Cut whole (a tool run that ended done, or stopped after the last
+        // step, LIO-601): nothing waits.
+        assert_eq!(wait(noted(&[None])), None);
+        // Stopped after level 1, or in a level, its last too (a bound):
+        // Cycle Start waits, until a resume cuts the rest.
+        for n in [1, levels.len()] {
+            let why = wait(noted(&[Some(n)])).unwrap();
+            assert!(
+                why.starts_with("Top's run stopped partway through Facing,")
+                    && why.contains("Finish it first: pick Top"),
+                "{why}"
+            );
+            assert_eq!(wait(noted(&[Some(n), None])), None);
+        }
+        // Stopped where it is not known, or dropped while it ran: all of it
+        // may be cut, or only some (`MAY_HAVE_CUT_ALL`).
+        let why = wait(noted(&[MAY_HAVE_CUT_ALL])).unwrap();
+        assert!(
+            why.starts_with("Top's run of Facing stopped where it is not known")
+                && why.contains("Cut Facing whole first, in Top's run"),
+            "{why}"
+        );
+        // Cut whole before, then stopped partway: at least the whole cut.
+        assert_eq!(wait(noted(&[None, Some(1)])), None);
+        // Cut whole from another plan or cutter, or from two: it waits,
+        // until it is cut whole again with the plan it has now.
+        let other = print.map(|p| p ^ 1);
+        for cut in [(0, None, other, other), (0, None, None, None)] {
+            let why = wait(cut).unwrap();
+            assert!(
+                why.starts_with("Top's Facing changed since its run cut it")
+                    && why.contains("Cut Facing whole again first, in Top's run"),
+                "{why}"
+            );
+        }
+        let mut cuts = vec![(0, None, other, other)];
+        note_cut_in(&mut cuts, 0, None, print);
+        assert_eq!(cuts, [(0, None, None, print)]);
+        assert_eq!(wait(cuts[0]), None);
+        // What is kept on disk from before this was noted is not known whole.
+        let kept: CutHistory = serde_json::from_str(
+            r#"{"cuts":[["a",[[0,null,7],[1,2,null]]],["b",[[0,null,7,7]]]]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            kept.cuts,
+            [
+                (
+                    "a".to_string(),
+                    vec![(0, None, Some(7), None), (1, Some(2), None, None)]
+                ),
+                ("b".to_string(), vec![(0, None, Some(7), Some(7))]),
+            ]
+        );
+        let back: CutHistory =
+            serde_json::from_str(&serde_json::to_string(&kept).unwrap()).unwrap();
+        assert_eq!(back, kept);
+        // Such a cut kept as the next tool run starts (`cuts_if_started`)
+        // is still not known whole: that tool run may stop partway too.
+        let mut again = Run::new(&doc, 0, 0);
+        again.checked_as(first.0.clone(), Some(first.1.clone()), None);
+        again.cut_in_run = vec![(0, None, print, None)];
+        let kept = again.cuts_if_started();
+        assert_eq!(kept[0].3, None, "{kept:?}");
+        assert!(wait(kept[0]).is_some());
+        // The tablet file refuses setup 2 as the Run panel waits, in its
+        // own words, and lists it again once the face is cut whole.
+        let tablet = |cut: CutInRun| {
+            let session = Session {
+                cuts: vec![(doc.setups[0].id.clone(), vec![cut])],
+                lost: false,
+                declared: vec![],
+            };
+            tablet_runs(&doc, Ok(&mesh), 1, &session)
+        };
+        let refused = tablet(noted(&[Some(1)]));
+        assert!(refused.tool_runs.is_empty());
+        assert_eq!(
+            refused.problems,
+            [format!(
+                "Top's run on the computer stopped partway through Facing before this tablet file was made, and this setup's programs are made for the stock with Facing cut whole: their rapids could go through the material it left. On the computer, finish Facing first, in Top's run, then Sync projects here, or save the project for the tablet again.{}",
+                new_stock_on_the_computer!()
+            )]
+        );
+        let listed = tablet(noted(&[Some(1), None]));
+        assert!(listed.problems.is_empty() && !listed.tool_runs.is_empty());
+        // Disabled since: the check leaves more stock than the part has,
+        // which no rapid runs into (Zero Z waits for it, LIO-582 review).
+        let mut disabled = doc.clone();
+        disabled.setups[0].operations[0].enabled = false;
+        let (c, l) = check(&disabled, &mesh, 1);
+        let run = setup_2(
+            &disabled,
+            &(Arc::new(c), Arc::new(l)),
+            (0, Some(1), print, None),
+        );
+        assert!(run.earlier_unfollowed());
+        assert_eq!(run.earlier_not_whole(&disabled), None);
+    }
+
     /// A bore milled through the stock, then a face with another tool (LIO-582
     /// review): a start at the face, in the second tool run, finds no floor
     /// at the stock top's centre, where the bore went through, so neither
@@ -11546,7 +11948,7 @@ pub(crate) mod tests {
             let print = |oi: usize| run.op_steps(oi).map(|s| s.cut_print);
             assert_eq!(
                 run.cut_in_run,
-                [(0, None, print(0)), (1, Some(2), print(1))]
+                [(0, None, print(0), print(0)), (1, Some(2), print(1), None)]
             );
             assert!(print(0).is_some() && print(1).is_some());
             if n > 0 {
@@ -12127,7 +12529,7 @@ pub(crate) mod tests {
                 .map(|(id, ops)| {
                     (
                         id.to_string(),
-                        ops.iter().map(|&o| (o, None, None)).collect(),
+                        ops.iter().map(|&o| (o, None, None, None)).collect(),
                     )
                 })
                 .collect();
@@ -12184,7 +12586,7 @@ pub(crate) mod tests {
         (nameless.setup, nameless.title) = (crate::id(), " ".into());
         let owners = [nameless.clone()];
         let mut run = Run::new(&doc, 0, 0);
-        run.earlier_cuts = vec![(nameless.setup.clone(), vec![(0, None, None)])];
+        run.earlier_cuts = vec![(nameless.setup.clone(), vec![(0, None, None, None)])];
         crate::give_elsewhere(&owners, &doc, &mut run);
         assert_eq!(
             run.earlier_unfollowed_note(),
@@ -12313,7 +12715,7 @@ pub(crate) mod tests {
         let mut run = at_level_2(&doc);
         assert!(run.note_cut_elsewhere(), "{:?}", run.earlier_cuts);
         assert!(!run.note_cut_elsewhere(), "noted once");
-        assert_eq!(run.cut_in_run, [(HISTORY_UNKNOWN, None, None)]);
+        assert_eq!(run.cut_in_run, [(HISTORY_UNKNOWN, None, None, None)]);
         let unknown = |run: &Run| run.partly().is_some_and(|p| p.cut == [HISTORY_UNFOLLOWED]);
         let said = |run: &Run| {
             let why = run.partway_blocked().unwrap();
@@ -12963,13 +13365,37 @@ pub(crate) mod tests {
         let mut stopped = one(&[]);
         ran(&mut stopped, 0, 0);
         refused(setup_2(&stopped), &["Finish face (Top)"]);
+        // Cycle Start waits for it, its programs made for it cut, the
+        // number said as it is (LIO-602); so it does with another
+        // project's cuts on the record too, which the touch-off says
+        // instead (LIO-602 review).
+        let run = setup_2(&stopped);
+        let why = run.earlier_not_whole(&doc).unwrap();
+        assert!(
+            why.starts_with("Finish face (Top) was not cut")
+                && why.contains("made for it cut, could send rapids through"),
+            "{why}"
+        );
+        let mut foreign = setup_2(&stopped);
+        foreign.earlier_cuts.push((
+            "another project's setup".into(),
+            vec![(0, None, Some(1), Some(1))],
+        ));
+        assert_eq!(foreign.earlier_uncut(), ["Finish face (Top)"]);
+        assert!(foreign.earlier_uncut_said().is_none());
+        let why = foreign.earlier_not_whole(&doc).unwrap();
+        assert!(
+            why.starts_with("Finish face (Top) was not cut")
+                && why.contains("made for it cut: their rapids could go through"),
+            "{why}"
+        );
         // What setup 1's runs cut lost (`note_lost_cuts`, LIO-594), alone
         // or beside the face's cut (another session's journal): cut by runs
         // no session here knows of, so nothing is called not cut, and Z is
         // still refused, as runs not followed (LIO-596, LIO-603 review).
         let (cuts, _) = drop(&stopped);
         let face = cuts[0].1.clone();
-        let unknown = (HISTORY_UNKNOWN, None, None);
+        let unknown = (HISTORY_UNKNOWN, None, None, None);
         for lost in [vec![unknown], [face, vec![unknown]].concat()] {
             let session = vec![(doc.setups[0].id.clone(), lost)];
             let mut run = Run::new(&doc, 1, 0);
@@ -12988,22 +13414,29 @@ pub(crate) mod tests {
                 assert!(!run.earlier_unfollowed_probe().contains("not cut"));
             }
         }
-        // The tablet file too (`tablet_runs`, LIO-590): setup 2's start
-        // sets no Z, the finish named; a full run's does.
-        let tablet_zero = |one: &Run| {
+        // The tablet file too (`tablet_runs`, LIO-590): its programs, made
+        // for the finish cut, could rapid through its material, so setup 2
+        // has no tool runs there, the finish named (LIO-602); a full run's
+        // start sets Z.
+        let tablet = |one: &Run| {
             let (cuts, declared) = drop(one);
             let session = Session {
                 cuts,
                 lost: false,
                 declared,
             };
-            tablet_runs(&doc, Ok(&mesh), 1, &session).tool_runs[0]
-                .zero
-                .clone()
+            tablet_runs(&doc, Ok(&mesh), 1, &session)
         };
-        let zero = tablet_zero(&stopped).expect("the refusal");
-        assert_eq!(zero.set_z, None);
-        let blocked = zero.blocked.unwrap_or_default();
+        let tablet_zero = |one: &Run| tablet(one).tool_runs[0].zero.clone();
+        let tablet_refused = |one: &Run| {
+            let s = tablet(one);
+            assert!(s.tool_runs.is_empty(), "{:?}", s.problems);
+            assert_eq!(s.problems.len(), 1);
+            let why = s.problems[0].clone();
+            assert!(why.contains("could send rapids through"), "{why}");
+            why
+        };
+        let blocked = tablet_refused(&stopped);
         assert!(
             blocked.starts_with("Finish face (Top) was not cut"),
             "{blocked}"
@@ -13024,8 +13457,7 @@ pub(crate) mod tests {
         for_the_tablet(&blocked);
         assert!(blocked.contains("Already cut"), "{blocked}");
         // The face left: only disabling it, on the computer.
-        let zero = tablet_zero(&face_left).expect("the refusal");
-        let blocked = zero.blocked.unwrap_or_default();
+        let blocked = tablet_refused(&face_left);
         assert!(blocked.starts_with("Face (Top) was not cut"), "{blocked}");
         for_the_tablet(&blocked);
         assert!(
@@ -13090,10 +13522,10 @@ pub(crate) mod tests {
                 lost: false,
                 declared: mine,
             };
-            let zero = tablet_runs(&doc, Ok(&mesh), 1, &session).tool_runs[0]
-                .zero
-                .clone();
-            let blocked = zero.and_then(|z| z.blocked).unwrap_or_default();
+            // The tablet file has no tool runs for it then (LIO-602).
+            let s = tablet_runs(&doc, Ok(&mesh), 1, &session);
+            assert!(s.tool_runs.is_empty());
+            let blocked = s.problems.concat();
             assert!(
                 blocked.starts_with("Finish face (Top) was not cut"),
                 "{blocked}"
@@ -13456,30 +13888,27 @@ pub(crate) mod tests {
                 }
             }
             // The tablet file made with this session's cuts (LIO-590)
-            // refuses setup 2's start, and its second bore's, as the Run
-            // panel does, in its own words.
+            // has no tool runs for setup 2: made for the face cut whole,
+            // their rapids could go through what it left, so it refuses
+            // them as the Run panel's Cycle Start waits, in its own words
+            // (LIO-602).
             let cuts = Session {
                 cuts: session(cut),
                 ..Session::default()
             };
             let runs = tablet_runs(&doc, Ok(&mesh), 1, &cuts);
-            assert!(runs.problems.is_empty(), "{:?}", runs.problems);
-            let zeros: Vec<TabletZero> = (runs.tool_runs.iter())
-                .flat_map(|r| std::iter::once(&r.zero).chain(r.starts.iter().map(|t| &t.zero)))
-                .flatten()
-                .cloned()
-                .collect();
-            assert!(runs.tool_runs[0].zero.is_some() && zeros.len() >= 2);
-            for z in zeros {
-                assert_eq!(z.set_z, None);
-                let blocked = for_tablet(EARLIER_PARTWAY_BLOCKED.into());
-                assert_eq!(z.blocked.as_deref(), Some(&blocked[..]));
-                assert!(!z.probe_from.is_empty());
-                for spot in &z.probe_from {
-                    let why = for_tablet(EARLIER_PARTWAY_WHY.into());
-                    assert_eq!(spot.problem.as_deref(), Some(&why[..]));
-                }
-            }
+            assert!(runs.tool_runs.is_empty());
+            let why = runs.problems.concat();
+            let how = match cut {
+                MAY_HAVE_CUT_ALL => "stopped where it is not known",
+                _ => "stopped partway through",
+            };
+            assert!(
+                why.contains(how)
+                    && why.contains("their rapids could go through")
+                    && why.contains("On the computer,"),
+                "{why}"
+            );
         }
         // Its plan changed since as well: the reason is that, which
         // finishing the face does not clear.
@@ -13537,18 +13966,25 @@ pub(crate) mod tests {
     /// be either, so neither: up to all of it.
     #[test]
     fn another_axis_cams_cuts_never_make_a_partway_one_whole() {
-        let base = vec![(0, None, Some(1))];
-        let theirs = [(0, Some(2), Some(1))];
+        let base = vec![(0, None, Some(1), Some(1))];
+        let theirs = [(0, Some(2), Some(1), None)];
         let mut unchanged = base.clone();
         take_kept_cuts(&mut unchanged, Some(&base), &theirs);
         assert_eq!(unchanged, theirs);
-        let mut both = vec![(0, None, Some(1)), (1, None, Some(2))];
+        // Neither is whole then, so no plan is known cut whole (LIO-602).
+        let mut both = vec![(0, None, Some(1), Some(1)), (1, None, Some(2), Some(2))];
         take_kept_cuts(&mut both, Some(&base), &theirs);
-        assert_eq!(both, [(0, MAY_HAVE_CUT_ALL, Some(1)), (1, None, Some(2))]);
-        let mut partway = vec![(0, Some(1), Some(1))];
-        take_kept_cuts(&mut partway, None, &[(0, None, Some(1))]);
-        assert_eq!(partway, [(0, MAY_HAVE_CUT_ALL, Some(1))]);
-        let mut deeper = vec![(0, Some(1), Some(1))];
+        assert_eq!(
+            both,
+            [
+                (0, MAY_HAVE_CUT_ALL, Some(1), None),
+                (1, None, Some(2), Some(2))
+            ]
+        );
+        let mut partway = vec![(0, Some(1), Some(1), None)];
+        take_kept_cuts(&mut partway, None, &[(0, None, Some(1), Some(1))]);
+        assert_eq!(partway, [(0, MAY_HAVE_CUT_ALL, Some(1), None)]);
+        let mut deeper = vec![(0, Some(1), Some(1), None)];
         take_kept_cuts(&mut deeper, None, &theirs);
         assert_eq!(deeper, theirs);
     }
@@ -13770,7 +14206,7 @@ pub(crate) mod tests {
             r#"{"cuts":[["s1",[[0,null,7]]]],"journals":[],"others_unknown":false,"sent":[3]}"#;
         std::fs::write(&path, older).unwrap();
         let h = CutHistory::read(&path).unwrap().unwrap();
-        assert_eq!(h.cuts, [("s1".to_string(), vec![(0, None, Some(7))])]);
+        assert_eq!(h.cuts, [("s1".to_string(), vec![(0, None, Some(7), None)])]);
         assert!(h.declared.is_empty());
         let kept = KeptDeclared {
             setup: "s1".into(),
