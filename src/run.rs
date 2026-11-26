@@ -1042,6 +1042,13 @@ pub struct Run {
     /// after 0: the steps before it are taken as cut, and its operation is
     /// the start (`next`, `from`).
     pub start_step: Option<(usize, usize)>,
+    /// The start the operator picked (Start here, Next on a tool run, Start
+    /// at a step: `pick_start`, `start_step`): its operation (index in the
+    /// setup) and step (0: the operation's start). Not one the run came to
+    /// by itself: the first operation sent, past those skipped, or where a
+    /// run stopped. New stock loaded keeps only such a start (`new_stock`,
+    /// LIO-633).
+    pub start_picked: Option<(usize, usize)>,
     /// The operation whose steps are unfolded under its row.
     pub open: Option<usize>,
     /// The steps picked, of an operation: the first and last picked.
@@ -1746,6 +1753,7 @@ impl Run {
             steps: vec![],
             cut_steps: vec![],
             start_step: None,
+            start_picked: None,
             open: None,
             picked: None,
             tool_kept: false,
@@ -4456,7 +4464,10 @@ impl Run {
     /// this session is forgotten, and so is what the operator took as cut
     /// (`declared`), the setup to be checked again without it. Whether it
     /// changed what was taken as cut, and the setup is checked again,
-    /// keeping where Cycle Start starts (`recheck`).
+    /// keeping where Cycle Start starts (`recheck`), unless operations
+    /// skipped as cut moved it there: it then goes back to the start the
+    /// operator picked, or else to the first operation after the tool runs
+    /// done in this run (LIO-633).
     pub fn new_stock(&mut self) -> bool {
         (self.cut_in_run, self.earlier_cuts) = (vec![], vec![]);
         self.earlier_taken.clear();
@@ -4467,7 +4478,29 @@ impl Run {
             return false;
         }
         if let Some(programs) = self.checked() {
-            self.keep = Some(self.progress_kept(programs));
+            let (done, start) = self.progress_kept(programs);
+            // Where the run would start but for the skips: the start the
+            // operator picked, or else the first operation after the tool
+            // runs done in this run. Operations skipped as cut from there
+            // to the start moved it on, and go now: kept there, they would
+            // be before the start, so taken as cut all the same, and Zero Z
+            // on the stock top would set Z on their floor on stock that is
+            // new (LIO-633). It goes back there. A start at a step it did
+            // not come to by a pick (where a run stopped) is LIO-634's.
+            let after_done = |oi: usize| done.iter().all(|&d| oi > d);
+            let picked = (self.start_picked)
+                .filter(|&(p, _)| after_done(p) && start.is_some_and(|s| p <= s));
+            let base = picked.map_or_else(|| done.iter().max().map_or(0, |d| d + 1), |p| p.0);
+            let back = start.is_some_and(|s| {
+                self.at_step().is_none_or(|a| Some(a) == picked)
+                    && skips.iter().any(|&(oi, _)| oi >= base && oi < s)
+            });
+            if back {
+                // A pick at a step is that step again.
+                self.start_step = picked.filter(|p| p.1 > 0);
+                self.resumed = None;
+            }
+            self.keep = Some((done, if back { Some(base) } else { start }));
         }
         self.skips.retain(|s| s.1 != Skip::Cut);
         self.cut_steps.clear();
@@ -4773,7 +4806,12 @@ impl Run {
         let Some((oi, n, _)) = self.picked else {
             return false;
         };
-        self.start_at_step(oi, n)
+        let changed = self.start_at_step(oi, n);
+        // The operator's own start, which New stock loaded keeps (LIO-633).
+        if self.checked().is_some() && self.running.is_none() {
+            self.start_picked = Some((oi, n));
+        }
+        changed
     }
 
     /// `start_step` at step `n` of operation `oi` (index in the setup).
@@ -5032,6 +5070,21 @@ impl Run {
         // edit may have changed, and their plans may cut otherwise now: no
         // longer taken as cut (`lose_declared`, LIO-603 review).
         self.earlier_taken.clear();
+        // The edit may number the operations otherwise.
+        self.start_picked = None;
+    }
+
+    /// Start here, or Next on a tool run: `start_at`, the start then the
+    /// operator's own (`start_picked`), which New stock loaded keeps
+    /// (LIO-633).
+    pub fn pick_start(&mut self, i: usize, k: usize) {
+        self.start_at(i, k);
+        if self.running.is_none()
+            && (self.next, self.from) == (i, k)
+            && let Some(oi) = (self.checked()).and_then(|c| c.get(i)?.indexes.get(k).copied())
+        {
+            self.start_picked = Some((oi, 0));
+        }
     }
 
     /// Makes operation `k` of tool run `i` the one Cycle Start starts at:
@@ -9753,6 +9806,7 @@ pub(crate) mod tests {
             steps: vec![],
             cut_steps: vec![],
             start_step: None,
+            start_picked: None,
             open: None,
             picked: None,
             tool_kept: false,
