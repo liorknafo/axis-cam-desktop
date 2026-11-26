@@ -12131,6 +12131,164 @@ flood = { pin = 8 }
         }
     }
 
+    /// A start partway into a tool run follows its operations by id: an
+    /// operation duplicated in an earlier tool run numbers them otherwise,
+    /// and the start stays on the Pocket. A real change after it moves the
+    /// start, and says so (LIO-636 review).
+    #[test]
+    fn a_start_partway_follows_its_operations_when_an_earlier_one_is_duplicated() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        // The Drill first: tool runs [Drill], [Face, Pocket, Contour].
+        let mut a = run_app_of(dir.path(), FAST, &[3, 0, 1, 2]);
+        zeroed(&mut a);
+        a.page = Page::Control;
+        check_run(&mut a, 0);
+        answer_skips(&mut a, 0);
+        let names = |a: &App, i: usize| -> Vec<String> {
+            (run_of(a).checked().unwrap()[i].ops.iter())
+                .map(|o| o.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&a, 1), ["Face", "Pocket", "Contour · outside"]);
+        let _ = a.update(Message::Run(R::From(1, 1)));
+        let start = |a: &App| (run_of(a).next, run_of(a).from);
+        let edited = |a: &mut App| {
+            a.last_edit -= crate::EDIT_PAUSE * 2;
+            let _ = a.update(Message::Tick);
+            assert!(run_of(a).programs.is_none());
+            answer_skips(a, 0);
+        };
+        // The Drill duplicated: every later operation's index goes up one.
+        a.selected = Some(0);
+        let _ = a.update(Message::DuplicateOp);
+        edited(&mut a);
+        assert_eq!(run_of(&a).checked().unwrap()[1].indexes, [2, 3, 4]);
+        assert_eq!(start(&a), (1, 1));
+        assert!(run_of(&a).start_moved().is_none());
+        // The Contour turned off: the start moves to the Face, and says so.
+        a.doc.setups[0].operations[4].enabled = false;
+        let _ = a.update(Message::Title("Edited".into()));
+        edited(&mut a);
+        assert_eq!(start(&a), (1, 0));
+        assert_eq!(
+            run_of(&a).start_moved().as_deref(),
+            Some(
+                "The start was at Pocket, but the operations of its tool run have changed since, so Cycle Start now starts at Face, the first operation of tool run 2. Pick the start again in the Operations list if the operations before it are cut."
+            )
+        );
+        // The copy removed: the Face is index 1 again, still not the Pocket
+        // picked, so the note stays.
+        a.selected = Some(1);
+        let _ = a.update(Message::RemoveOp);
+        edited(&mut a);
+        assert_eq!(run_of(&a).checked().unwrap()[1].indexes, [1, 2]);
+        assert_eq!(start(&a), (1, 0));
+        assert!(run_of(&a).start_moved().is_some());
+    }
+
+    /// A start picked partway into a tool run (the Pocket, after the Face)
+    /// stays on its operation through Check again, Set coolant to Off and
+    /// the check after an edit, while its tool run has the same operations:
+    /// Cycle Start does not cut the Face again. When they change, the start
+    /// moves to the tool run's first operation and says so (LIO-636).
+    #[test]
+    fn check_again_keeps_a_start_partway_into_a_tool_run() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = ops_app(dir.path());
+        // The Facing asks for mist, which the profile has no output for.
+        a.doc.setups[0].operations[0]
+            .p
+            .insert("coolant".into(), "Mist".into());
+        zeroed(&mut a);
+        a.page = Page::Control;
+        check_run(&mut a, 0);
+        let names: Vec<String> = (run_of(&a).checked().unwrap()[0].ops.iter())
+            .map(|o| o.name.clone())
+            .collect();
+        assert_eq!(names, ["Face", "Pocket", "Contour · outside"]);
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        let start = |a: &App| (run_of(a).next, run_of(a).from);
+        let kept = |a: &App| {
+            assert_eq!(start(a), (0, 1));
+            assert!(run_of(a).start_moved().is_none());
+        };
+        kept(&a);
+        // Check again.
+        let _ = a.update(Message::Run(R::Check));
+        assert!(run_of(&a).programs.is_none());
+        answer_skips(&mut a, 0);
+        kept(&a);
+        // Set coolant to Off, on the Face before the start.
+        let _ = a.view();
+        assert_eq!(run_of(&a).coolant_off(conn(&a), &a.doc), [0]);
+        let _ = a.update(Message::Run(R::CoolantOff));
+        assert!(run_of(&a).programs.is_none());
+        answer_skips(&mut a, 0);
+        kept(&a);
+        // An edit elsewhere, checked again once the edits pause.
+        let _ = a.update(Message::Title("Edited".into()));
+        assert!(run_of(&a).stale);
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        assert!(!run_of(&a).stale && run_of(&a).programs.is_none());
+        answer_skips(&mut a, 0);
+        kept(&a);
+        // A check refused in between (the project briefly did not check):
+        // the start stays for the next check that passes.
+        let _ = a.update(Message::Run(R::Check));
+        let epoch = run_of(&a).epoch;
+        let refused = vec!["Load the imported part before running.".to_string()];
+        let _ = a.update(Message::RunChecked(
+            epoch,
+            std::sync::Arc::new(Err(refused)),
+        ));
+        assert!(run_of(&a).checked().is_none());
+        assert_eq!(start(&a), (0, 1));
+        let _ = a.update(Message::Run(R::Check));
+        answer_skips(&mut a, 0);
+        kept(&a);
+        // The Contour turned off: the tool run's operations changed, so the
+        // start moves to the Face, and says so.
+        a.doc.setups[0].operations[2].enabled = false;
+        let _ = a.update(Message::Title("Edited again".into()));
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        assert!(run_of(&a).programs.is_none());
+        answer_skips(&mut a, 0);
+        assert_eq!(start(&a), (0, 0));
+        let moved = "The start was at Pocket, but the operations of its tool run have changed since, so Cycle Start now starts at Face, the first operation of tool run 1. Pick the start again in the Operations list if the operations before it are cut.";
+        assert_eq!(run_of(&a).start_moved().as_deref(), Some(moved));
+        // Shown until a start is picked, over Check again and further edits
+        // that leave the start at the Face: the Contour back on.
+        let _ = a.update(Message::Run(R::Check));
+        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).start_moved().as_deref(), Some(moved));
+        let edit = |a: &mut App, on: bool, op: usize| {
+            a.doc.setups[0].operations[op].enabled = on;
+            let _ = a.update(Message::Title(format!("Edited {op} {on}")));
+            a.last_edit -= crate::EDIT_PAUSE * 2;
+            let _ = a.update(Message::Tick);
+            answer_skips(a, 0);
+        };
+        edit(&mut a, true, 2);
+        assert_eq!(start(&a), (0, 0));
+        assert_eq!(run_of(&a).start_moved().as_deref(), Some(moved));
+        // The Face turned off: the tool run starts at the Pocket picked, so
+        // nothing is said; on again, the start is at the Face once more.
+        edit(&mut a, false, 0);
+        assert_eq!(start(&a), (0, 0));
+        assert_eq!(run_of(&a).checked().unwrap()[0].ops[0].name, "Pocket");
+        assert!(run_of(&a).start_moved().is_none());
+        edit(&mut a, true, 0);
+        assert_eq!(start(&a), (0, 0));
+        assert_eq!(run_of(&a).start_moved().as_deref(), Some(moved));
+        // A start picked: nothing more is said.
+        let _ = a.update(Message::Run(R::From(0, 1)));
+        kept(&a);
+    }
+
     /// A run started at the Pocket, the second operation of tool run 1,
     /// after the Facing was cut: nothing of the Facing is sent, the program
     /// starts safely (Z up alone, the Pocket's spindle speed and coolant,

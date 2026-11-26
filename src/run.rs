@@ -1105,6 +1105,18 @@ pub struct Run {
     /// the rows are made from its programs once checked
     /// (`layout_with_skips`).
     pub rows_from_skips: bool,
+    /// The last check's answer that passed, kept while the next check runs
+    /// (`programs` is None then) and over a refused one: what the next
+    /// check that passes compares the start's tool run with (`checked_as`,
+    /// LIO-636).
+    last_passed: Option<Arc<Result<Vec<Checked>, Vec<String>>>>,
+    /// Its operations by id (`Left::ops`; empty when it gave none).
+    last_passed_ops: Vec<String>,
+    /// A check moved a start partway into a tool run back to its first
+    /// operation, its operations having changed: the operation that was
+    /// picked (`op_key`, name), until a start is picked or Cycle Start
+    /// sends a tool run (`start_moved`).
+    start_moved: Option<(String, String)>,
 }
 
 /// What a tool run sent to the Pi was sent from (`Run::follow_record`),
@@ -1802,6 +1814,9 @@ impl Run {
             followed: None,
             cut_note: None,
             rows_from_skips: false,
+            last_passed: None,
+            last_passed_ops: vec![],
+            start_moved: None,
         }
     }
 
@@ -2411,22 +2426,51 @@ impl Run {
                     })
                 })
                 .unwrap_or((new.len(), 0));
-        } else {
+            // The start is the skip's now.
+            self.start_moved = None;
+        } else if let Ok(new) = programs.as_ref() {
             // The start stays on its operation only when its tool run still
             // has the same operations; the work zero is set for it again.
-            let ops = |p: Option<&Checked>| p.map(|p| (p.indexes.clone(), p.ops.clone()));
-            let before = ops(self.checked().and_then(|c| c.get(self.next)));
-            let count = programs.as_ref().as_ref().map_or(0, Vec::len);
-            if self.done.len() != count {
-                self.done = vec![false; count];
+            // They are compared with the last check that passed: Check again
+            // drops `programs` before it asks, and a refused check in
+            // between leaves the start and the progress as they were
+            // (LIO-636). Coolant set to Off leaves them the same operations,
+            // and an edit elsewhere that numbers them otherwise (Duplicate,
+            // Remove, Move up of an operation before them) too: they are
+            // known by id, where both checks gave them (LIO-636 review).
+            let ids_now = left.as_ref().map_or(&[][..], |l| &l.ops[..]);
+            let by_id = !ids_now.is_empty() && !self.last_passed_ops.is_empty();
+            let ops = |p: Option<&Checked>, ids: &[String]| {
+                p.map(|p| {
+                    let ops = (p.ops.iter()).map(|o| crate::post::OpState {
+                        coolant: (false, false),
+                        ..o.clone()
+                    });
+                    let ids = match by_id {
+                        true => ids,
+                        false => &[][..],
+                    };
+                    let keys = (p.indexes.iter()).map(|&oi| op_key(ids, oi));
+                    (keys.collect::<Vec<_>>(), ops.collect::<Vec<_>>())
+                })
+            };
+            let last = (self.last_passed.as_deref()).and_then(|a| a.as_deref().ok());
+            let was = last.and_then(|c| c.get(self.next));
+            let before = ops(was, &self.last_passed_ops);
+            if self.done.len() != new.len() {
+                self.done = vec![false; new.len()];
                 self.next = 0;
             }
-            let after = ops(programs
-                .as_ref()
-                .as_ref()
-                .ok()
-                .and_then(|c| c.get(self.next)));
+            let now = new.get(self.next);
+            let after = ops(now, ids_now);
             if before.is_none() || before != after {
+                // A start partway that moves says so (LIO-636). One moved
+                // before stays moved from the operation picked then.
+                if let Some(was) = was.filter(|_| self.from > 0) {
+                    self.start_moved = (was.indexes.get(self.from))
+                        .zip(was.ops.get(self.from))
+                        .map(|(&oi, o)| (op_key(&self.last_passed_ops, oi), o.name.clone()));
+                }
                 self.from = 0;
             }
         }
@@ -2446,6 +2490,10 @@ impl Run {
             self.start_step = None;
         }
         (self.zeroed, self.tool_kept, self.recheck) = (false, false, false);
+        if programs.is_ok() {
+            self.last_passed = Some(programs.clone());
+            self.last_passed_ops = left.as_ref().map_or_else(Vec::new, |l| l.ops.clone());
+        }
         self.programs = Some(programs);
         self.before = left
             .as_ref()
@@ -3527,7 +3575,7 @@ impl Run {
         self.zero.get_or_insert(zero);
         self.last = Some((tool, s.work_offset[2]));
         self.touched_for = None;
-        self.outcome = None;
+        (self.outcome, self.start_moved) = (None, None);
         Some(Command::Job {
             name,
             actions: Arc::new(actions),
@@ -4940,11 +4988,28 @@ impl Run {
         let done: Vec<usize> = done.into_iter().filter(|&o| o < oi).collect();
         self.start_step = start;
         (self.keep, self.picked, self.carving) = (Some((done, Some(oi))), None, None);
-        (self.zeroed, self.tool_kept) = (false, false);
+        (self.zeroed, self.tool_kept, self.start_moved) = (false, false, None);
         // A Z set before is asked for again, as the tool's Z kept is
         // (LIO-618).
         self.forget_touch();
         true
+    }
+
+    /// What the Run panel says of a start a check moved back to its tool
+    /// run's first operation (`checked_as`, LIO-636): where it was picked,
+    /// and where Cycle Start starts now. Nothing while the start is at the
+    /// operation picked, its tool run's first now.
+    pub fn start_moved(&self) -> Option<String> {
+        let (key, picked) = self.start_moved.as_ref()?;
+        let p = self.checked()?.get(self.next).filter(|_| self.from == 0)?;
+        let first = (p.indexes.first()).map(|&oi| op_key(&self.last_passed_ops, oi));
+        (first.as_ref() != Some(key)).then(|| {
+            format!(
+                "The start was at {picked}, but the operations of its tool run have changed since, so Cycle Start now starts at {}, the first operation of tool run {}. Pick the start again in the Operations list if the operations before it are cut.",
+                p.ops[0].name,
+                self.next + 1
+            )
+        })
     }
 
     /// What a run that starts partway finds of the work zero (`partway`,
@@ -5212,7 +5277,7 @@ impl Run {
                 (self.keep, self.recheck) = (Some((done, start)), true);
             }
             (self.next, self.from) = (i, k);
-            self.zeroed = false;
+            (self.zeroed, self.start_moved) = (false, None);
             // A Z set before is forgotten: Cycle Start waits for this
             // start's, at a tool change or a start at a step (LIO-618).
             self.forget_touch();
@@ -6421,8 +6486,17 @@ fn simulated_with(doc: &Document, mesh: &Mesh, si: usize) -> (Sims, Left) {
             steps: vec![],
             earlier,
             plan: doc.setups.iter().map(|s| s.id.clone()).collect(),
+            ops: (doc.setups[si].operations.iter())
+                .map(|o| o.id.clone())
+                .collect(),
         },
     )
+}
+
+/// Operation `oi` (index in the setup) of a check whose operations are
+/// `ids` (`Left::ops`): by its id, or by its index when the check gave none.
+fn op_key(ids: &[String], oi: usize) -> String {
+    ids.get(oi).cloned().unwrap_or_else(|| format!("#{oi}"))
 }
 
 /// The stock a run's check leaves after each operation of its setup, for
@@ -6454,6 +6528,10 @@ pub struct Left {
     /// The plan's setups by id, in order, as checked: where a setup whose
     /// cut this does not have is now (`Run::earlier_unfollowed_how`).
     pub plan: Vec<String>,
+    /// The setup's operations by id, in order, as checked: what a start
+    /// follows over an edit that numbers them otherwise (`Run::checked_as`,
+    /// LIO-636 review).
+    pub ops: Vec<String>,
 }
 
 /// An operation of a setup before a run's the check simulated (`Left::earlier`).
@@ -9933,6 +10011,9 @@ pub(crate) mod tests {
             followed: None,
             cut_note: None,
             rows_from_skips: false,
+            last_passed: None,
+            last_passed_ops: vec![],
+            start_moved: None,
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
         assert_eq!((op, block), (0, 2));
