@@ -12156,7 +12156,7 @@ flood = { pin = 8 }
         let start = |a: &App| (run_of(a).next, run_of(a).from);
         let kept = |a: &App| {
             assert_eq!(start(a), (0, 1));
-            assert!(run_of(a).start_moved.is_none());
+            assert!(run_of(a).start_moved().is_none());
         };
         kept(&a);
         // Check again.
@@ -12202,25 +12202,33 @@ flood = { pin = 8 }
         assert!(run_of(&a).programs.is_none());
         answer_skips(&mut a, 0);
         assert_eq!(start(&a), (0, 0));
-        assert_eq!(
-            run_of(&a).start_moved.as_deref(),
-            Some(
-                "The start was at Pocket, but the operations of its tool run have changed since, so Cycle Start now starts at Face, the first operation of tool run 1. Pick the start again in the Operations list if the operations before it are cut."
-            )
-        );
-        // Shown until a start is picked.
+        let moved = "The start was at Pocket, but the operations of its tool run have changed since, so Cycle Start now starts at Face, the first operation of tool run 1. Pick the start again in the Operations list if the operations before it are cut.";
+        assert_eq!(run_of(&a).start_moved().as_deref(), Some(moved));
+        // Shown until a start is picked, over Check again and further edits
+        // that leave the start at the Face: the Contour back on.
         let _ = a.update(Message::Run(R::Check));
         answer_skips(&mut a, 0);
-        assert!(run_of(&a).start_moved.is_some());
-        // Or until the start moves again: the Contour back on, the tool run
-        // changes once more, and the note of the Pocket no longer holds.
-        a.doc.setups[0].operations[2].enabled = true;
-        let _ = a.update(Message::Title("Edited once more".into()));
-        a.last_edit -= crate::EDIT_PAUSE * 2;
-        let _ = a.update(Message::Tick);
-        answer_skips(&mut a, 0);
+        assert_eq!(run_of(&a).start_moved().as_deref(), Some(moved));
+        let edit = |a: &mut App, on: bool, op: usize| {
+            a.doc.setups[0].operations[op].enabled = on;
+            let _ = a.update(Message::Title(format!("Edited {op} {on}")));
+            a.last_edit -= crate::EDIT_PAUSE * 2;
+            let _ = a.update(Message::Tick);
+            answer_skips(a, 0);
+        };
+        edit(&mut a, true, 2);
         assert_eq!(start(&a), (0, 0));
-        assert!(run_of(&a).start_moved.is_none());
+        assert_eq!(run_of(&a).start_moved().as_deref(), Some(moved));
+        // The Face turned off: the tool run starts at the Pocket picked, so
+        // nothing is said; on again, the start is at the Face once more.
+        edit(&mut a, false, 0);
+        assert_eq!(start(&a), (0, 0));
+        assert_eq!(run_of(&a).checked().unwrap()[0].ops[0].name, "Pocket");
+        assert!(run_of(&a).start_moved().is_none());
+        edit(&mut a, true, 0);
+        assert_eq!(start(&a), (0, 0));
+        assert_eq!(run_of(&a).start_moved().as_deref(), Some(moved));
+        // A start picked: nothing more is said.
         let _ = a.update(Message::Run(R::From(0, 1)));
         kept(&a);
     }

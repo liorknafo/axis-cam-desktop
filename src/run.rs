@@ -1111,9 +1111,10 @@ pub struct Run {
     /// LIO-636).
     last_passed: Option<Arc<Result<Vec<Checked>, Vec<String>>>>,
     /// A check moved a start partway into a tool run back to its first
-    /// operation, its operations having changed: what it says, until a
-    /// start is picked or Cycle Start sends a tool run.
-    pub start_moved: Option<String>,
+    /// operation, its operations having changed: the operation that was
+    /// picked (index in the setup, name), until a start is picked or Cycle
+    /// Start sends a tool run (`start_moved`).
+    start_moved: Option<(usize, String)>,
 }
 
 /// What a tool run sent to the Pi was sent from (`Run::follow_record`),
@@ -2450,19 +2451,13 @@ impl Run {
             let now = new.get(self.next);
             let after = ops(now);
             if before.is_none() || before != after {
-                // A start partway that moves says so (LIO-636); a note of
-                // an earlier move no longer tells where it starts.
-                self.start_moved = (was.filter(|_| self.from > 0))
-                    .zip(now)
-                    .and_then(|(was, now)| Some((was.ops.get(self.from)?, now)))
-                    .map(|(picked, now)| {
-                        format!(
-                            "The start was at {}, but the operations of its tool run have changed since, so Cycle Start now starts at {}, the first operation of tool run {}. Pick the start again in the Operations list if the operations before it are cut.",
-                            picked.name,
-                            now.ops[0].name,
-                            self.next + 1
-                        )
-                    });
+                // A start partway that moves says so (LIO-636). One moved
+                // before stays moved from the operation picked then.
+                if let Some(was) = was.filter(|_| self.from > 0) {
+                    self.start_moved = (was.indexes.get(self.from))
+                        .zip(was.ops.get(self.from))
+                        .map(|(&oi, o)| (oi, o.name.clone()));
+                }
                 self.from = 0;
             }
         }
@@ -4984,6 +4979,22 @@ impl Run {
         // (LIO-618).
         self.forget_touch();
         true
+    }
+
+    /// What the Run panel says of a start a check moved back to its tool
+    /// run's first operation (`checked_as`, LIO-636): where it was picked,
+    /// and where Cycle Start starts now. Nothing while the start is at the
+    /// operation picked, its tool run's first now.
+    pub fn start_moved(&self) -> Option<String> {
+        let (oi, picked) = self.start_moved.as_ref()?;
+        let p = self.checked()?.get(self.next).filter(|_| self.from == 0)?;
+        (p.indexes.first() != Some(oi)).then(|| {
+            format!(
+                "The start was at {picked}, but the operations of its tool run have changed since, so Cycle Start now starts at {}, the first operation of tool run {}. Pick the start again in the Operations list if the operations before it are cut.",
+                p.ops[0].name,
+                self.next + 1
+            )
+        })
     }
 
     /// What a run that starts partway finds of the work zero (`partway`,
