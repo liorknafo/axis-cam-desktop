@@ -6079,6 +6079,16 @@ flood = { pin = 8 }
     /// said as taken as cut, not as its runs' cut (LIO-596 review).
     #[test]
     fn a_level_undone_before_the_answer_is_said_as_taken_as_cut_beside_another_setups_cuts() {
+        // Another setup's cuts, or its record already unknown.
+        for record in [
+            vec![(0, None, Some(1))],
+            vec![(crate::run::HISTORY_UNKNOWN, None, None)],
+        ] {
+            a_level_undone_beside(record);
+        }
+    }
+
+    fn a_level_undone_beside(record: Vec<crate::run::CutInRun>) {
         use crate::run::Action as R;
         let dir = tempfile::tempdir().unwrap();
         let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 3]);
@@ -6093,7 +6103,7 @@ flood = { pin = 8 }
         let other = second.id.clone();
         a.doc.setups.push(second);
         zeroed(&mut a);
-        a.run_cuts.push((other, vec![(0, None, Some(1))]));
+        a.run_cuts.push((other, record));
         let take_pass_1 = |a: &mut App, cut: bool| {
             let _ = a.update(Message::Run(R::Steps(Some(0))));
             let _ = a.update(Message::Run(R::PickStep(0, 0)));

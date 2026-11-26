@@ -11637,7 +11637,12 @@ fn stock_question<'a>(
         let (skips, steps) = run.declared();
         let taken = !skips.is_empty() || !steps.is_empty() || run.declared_lost;
         let inherited = run.away.is_some() && (run.earlier_cuts.iter()).any(|(_, c)| !c.is_empty());
-        !run.cut_by_runs() && (taken || (!run.history_unknown() && !inherited))
+        // Without a disconnect, its own record's unknown mark only.
+        let unknown = match run.away {
+            Some(_) => run.history_unknown(),
+            None => (run.cut_in_run.iter()).any(|c| c.0 == crate::run::HISTORY_UNKNOWN),
+        };
+        !run.cut_by_runs() && (taken || (!unknown && !inherited))
     };
     // This setup's runs cut a part earlier, this session or before AXIS
     // CAM was last closed (LIO-594): is it still the one held? Asked on a row of its own, so the work zero's
