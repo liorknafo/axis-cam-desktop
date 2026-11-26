@@ -12456,7 +12456,7 @@ pub(crate) mod tests {
         // What setup 1's runs cut lost (`note_lost_cuts`, LIO-594), alone
         // or beside the face's cut (another session's journal): cut by runs
         // no session here knows of, so nothing is called not cut, and Z is
-        // still refused (LIO-603 review).
+        // still refused, as runs not followed (LIO-596, LIO-603 review).
         let (cuts, _) = drop(&stopped);
         let face = cuts[0].1.clone();
         let unknown = (HISTORY_UNKNOWN, None, None);
@@ -12470,11 +12470,9 @@ pub(crate) mod tests {
             for (next, from) in [(0, 0), (1, 0)] {
                 run.start_at(next, from);
                 assert!(run.touch_off().is_none());
+                // Said as runs not followed (LIO-596), every setup's.
                 let why = run.partway_blocked().unwrap();
-                assert!(
-                    why.starts_with("Another setup's run cut this part"),
-                    "{why}"
-                );
+                assert_eq!(why, HISTORY_UNFOLLOWED_BLOCKED);
                 assert!(!why.contains("not cut"), "{why}");
                 assert!(!run.earlier_unfollowed_note().contains("not cut"));
                 assert!(!run.earlier_unfollowed_probe().contains("not cut"));
