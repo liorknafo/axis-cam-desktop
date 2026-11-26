@@ -11194,6 +11194,9 @@ fn reference_rows<'a>(
         .vertical_spacing(6)
     ]
     .spacing(6);
+    if let Some(note) = z_set_note(c, run) {
+        col = col.push(note);
+    }
     if c.config.inputs.probe.is_some() {
         let probe = c.probe_blocked().is_none() && !running;
         col = col.push(
@@ -11225,6 +11228,26 @@ fn reference_rows<'a>(
         col = col.push(hint("Reference", why, fit.chars(90)));
     }
     col
+}
+/// Set Z from reference or a probe's work Z on its way to the machine, or
+/// Set Z from reference that did not take: the tool is not touched off
+/// until the machine shows it (LIO-627).
+fn z_set_note<'a>(
+    c: &crate::control::Connection,
+    run: &crate::run::Run,
+) -> Option<Element<'a, Message>> {
+    if c.z_set_by_reference_waits(run) {
+        return Some(
+            text(format!(
+                "Work Z sent: the tool counts as touched off once {} shows it.",
+                c.machine_name()
+            ))
+            .size(12)
+            .into(),
+        );
+    }
+    let said = c.z_said(run)?;
+    Some(text(said.to_string()).size(12).color(AMBER).into())
 }
 /// Touch off on the A reference, for a next tool run that turns A: its
 /// tool touched off on the Z reference the probe touched with the A
@@ -11576,6 +11599,10 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
         .spacing(6)
     ]
     .spacing(6);
+    let three = match z_set_note(c, run) {
+        Some(note) => three.push(note),
+        None => three,
+    };
     col = col.push(step_box(3, kept, run.zeroed && !kept, three));
     // 4. What Cycle Start does.
     let over = (p.from(run.from).ok().into_iter().flatten()).find_map(|b| match b {
