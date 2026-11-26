@@ -711,6 +711,19 @@ pub(crate) fn note_cut_in(
     steps: Option<usize>,
     print: Option<u64>,
 ) {
+    note_cut_whole(cuts, oi, steps, print, print.filter(|_| steps.is_none()));
+}
+
+/// `note_cut_in`, with the plan it was certainly cut whole with, `whole`,
+/// given: a record's own, merged into another (`Run::cuts_if_started`),
+/// keeps what it says (LIO-602 review).
+fn note_cut_whole(
+    cuts: &mut Vec<CutInRun>,
+    oi: usize,
+    steps: Option<usize>,
+    print: Option<u64>,
+    whole: Option<u64>,
+) {
     match cuts.iter_mut().find(|c| c.0 == oi) {
         Some(c) => {
             c.1 = match (c.1, steps) {
@@ -720,9 +733,9 @@ pub(crate) fn note_cut_in(
             // Cut from two plans: neither is all it cut.
             c.2 = c.2.filter(|&p| print == Some(p));
             // More cuts after one whole take only more away (LIO-602).
-            c.3 = print.filter(|_| steps.is_none()).or(c.3);
+            c.3 = whole.or(c.3);
         }
-        None => cuts.push((oi, steps, print, print.filter(|_| steps.is_none()))),
+        None => cuts.push((oi, steps, print, whole)),
     }
 }
 
@@ -3592,8 +3605,8 @@ impl Run {
     pub fn cuts_if_started(&self) -> Vec<CutInRun> {
         let mut cuts = self.cuts_so_far();
         let started = self.cuts_with(self.next, self.from, &[]);
-        for (oi, steps, print, _) in started {
-            note_cut_in(&mut cuts, oi, steps, print);
+        for (oi, steps, print, whole) in started {
+            note_cut_whole(&mut cuts, oi, steps, print, whole);
         }
         cuts
     }
@@ -4257,8 +4270,9 @@ impl Run {
                 1 => ["it", "it", "was"],
                 _ => ["they", "them", "were"],
             };
-            let its = match uncut.len() {
-                1 => "its setup",
+            let its = match (uncut.len(), self.earlier_uncut_setups()) {
+                (1, _) => "its setup",
+                (_, 1) => "their setup",
                 _ => "their setups",
             };
             let said = format!(
@@ -11478,6 +11492,14 @@ pub(crate) mod tests {
         let back: CutHistory =
             serde_json::from_str(&serde_json::to_string(&kept).unwrap()).unwrap();
         assert_eq!(back, kept);
+        // Such a cut kept as the next tool run starts (`cuts_if_started`)
+        // is still not known whole: that tool run may stop partway too.
+        let mut again = Run::new(&doc, 0, 0);
+        again.checked_as(first.0.clone(), Some(first.1.clone()), None);
+        again.cut_in_run = vec![(0, None, print, None)];
+        let kept = again.cuts_if_started();
+        assert_eq!(kept[0].3, None, "{kept:?}");
+        assert!(wait(kept[0]).is_some());
         // The tablet file refuses setup 2 as the Run panel waits, in its
         // own words, and lists it again once the face is cut whole.
         let tablet = |cut: CutInRun| {
