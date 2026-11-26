@@ -8361,7 +8361,9 @@ flood = { pin = 8 }
         // The operation before the Drill's tool run, which it started at,
         // taken as cut (LIO-603).
         let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
-        assert_eq!(cut, [(1, crate::run::MAY_HAVE_CUT_ALL), (0, None)]);
+        // Taken as cut ahead of the tool run's own, in the setup's order
+        // (LIO-599 review).
+        assert_eq!(cut, [(0, None), (1, crate::run::MAY_HAVE_CUT_ALL)]);
         if run_of(&a).programs.is_none() {
             answer_skips(&mut a, 0);
         }
@@ -8402,7 +8404,9 @@ flood = { pin = 8 }
         let _ = a.update(Message::MachineEStop);
         run_until(&mut a, 5.0, "the E-stop", |r| r.running.is_none());
         let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
-        assert_eq!(cut, [(1, crate::run::MAY_HAVE_CUT_ALL), (0, None)]);
+        // Taken as cut ahead of the tool run's own, in the setup's order
+        // (LIO-599 review).
+        assert_eq!(cut, [(0, None), (1, crate::run::MAY_HAVE_CUT_ALL)]);
         let _ = a.update(Message::Disconnect);
     }
 
@@ -8465,8 +8469,10 @@ flood = { pin = 8 }
         // stood on hole 2's line, which hole 2's last retract goes along
         // too, after which hole 3 may have begun. The operation before the
         // tool run, which it started at, is taken as cut (LIO-603).
+        // Taken as cut ahead of the tool run's own, in the setup's order
+        // (LIO-599 review).
         let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
-        assert!(matches!(cut[..], [(1, Some(2 | 3)), (0, None)]), "{cut:?}");
+        assert!(matches!(cut[..], [(0, None), (1, Some(2 | 3))]), "{cut:?}");
         let journal = a.control.as_ref().unwrap().journal().expect("the journal");
         assert_eq!((journal.op, journal.step), (1, Some(0)), "{journal:?}");
         assert!(journal.why.contains("E-stop"), "{}", journal.why);
@@ -12706,9 +12712,12 @@ flood = { pin = 8 }
             let epoch = answer_setup_2(&mut a, strip);
             assert!(run_of(&a).earlier_unfollowed(), "strip {strip}");
             assert!(conn(&a).touch_off().is_none(), "strip {strip}");
+            // Said by its case: setup 1's operation disabled (LIO-599).
             let why = conn(&a).partway_blocked().unwrap();
             assert!(
-                why.starts_with("Another setup's run cut this part"),
+                why.starts_with(
+                    "Setup 1's run cut this part with an operation disabled, changed or deleted since"
+                ),
                 "{why}"
             );
             if !strip {
@@ -14226,6 +14235,199 @@ flood = { pin = 8 }
             "{session:?}"
         );
         assert_eq!(file(&session), plan);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// Picks setup `si`, answers its check as the app does, its stock
+    /// pictured (which takes `Run::left`), starts its first tool run and
+    /// stops it: the run has cut.
+    fn cut_setup(a: &mut App, dir: &std::path::Path, si: usize) {
+        use crate::run::Action as R;
+        let _ = a.update(Message::Run(R::Setup(si)));
+        let check = stock_check(a, si);
+        answer_stock(a, dir, check);
+        assert!(problems(a).is_empty(), "{:?}", problems(a));
+        cycle_start(a);
+        tick_until(a, 20., "running", |s| {
+            s.state == Some(uc100::controller::State::Run)
+        });
+        let _ = a.update(Message::Run(R::Stop));
+        run_until(a, 30., "the stop", |r| r.running.is_none());
+        settle_cut(a);
+    }
+
+    /// `cut_setup`, its first tool run run to its end: nothing of it left
+    /// unfinished (LIO-601).
+    fn cut_setup_whole(a: &mut App, dir: &std::path::Path, si: usize) {
+        use crate::run::Action as R;
+        let _ = a.update(Message::Run(R::Setup(si)));
+        let check = stock_check(a, si);
+        answer_stock(a, dir, check);
+        assert!(problems(a).is_empty(), "{:?}", problems(a));
+        cycle_start(a);
+        run_until(a, 60., "tool run 1 done", |r| r.done[0]);
+        settle_cut(a);
+    }
+
+    /// After a tool run of `cut_setup`: it cut, and the machine is idle.
+    fn settle_cut(a: &mut App) {
+        assert!(!run_of(a).cut_in_run.is_empty());
+        // Settled: no picture is made, nor MDI taken, while it stops.
+        tick_until(a, 20., "idle", |s| {
+            s.state == Some(uc100::controller::State::Idle)
+        });
+    }
+
+    /// Picks setup `si` and answers its check as the app does, its stock
+    /// pictured. A check asked again meanwhile (a load-slowed tick, say) is
+    /// answered too, as `App::check_run` would.
+    fn pick_pictured(a: &mut App, dir: &std::path::Path, si: usize) {
+        use crate::run::Action as R;
+        let _ = a.update(Message::Run(R::Setup(si)));
+        for _ in 0..5 {
+            let check = stock_check(a, si);
+            answer_stock(a, dir, check);
+            let r = run_of(a);
+            if r.checked().is_some() && r.left.is_none() && !r.pictures.is_empty() {
+                return;
+            }
+        }
+        // Pictured: the check's stock is gone from the run.
+        let r = run_of(a);
+        panic!(
+            "not pictured: left {} pictures {} checked {} problems {:?}",
+            r.left.is_some(),
+            r.pictures.len(),
+            r.checked().is_some(),
+            problems(a)
+        );
+    }
+
+    /// A job of two setups, the second a copy of the first that only
+    /// drills, so it checks whether or not the first faced.
+    fn two_setups_app(dir: &std::path::Path) -> App {
+        let mut a = run_app(dir);
+        let _ = a.update(Message::DuplicateSetup);
+        assert_eq!(a.doc.setups.len(), 2);
+        a.doc.setups[1].operations.remove(0);
+        a.page = Page::Control;
+        zeroed(&mut a);
+        a
+    }
+
+    /// LIO-599: nothing edited, setup 2 cut before setup 1. Setup 1, its
+    /// check pictured, says setup 2 comes after it but cut first, on Zero Z
+    /// and the Work zero tab, not a change to look for.
+    #[test]
+    fn a_later_setup_cut_first_is_said_so() {
+        use crate::control::Action as M;
+        use crate::run::EarlierUnfollowed;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = two_setups_app(dir.path());
+        let _ = a.update(Message::Machine(M::Wcs(1)));
+        tick_until(&mut a, 20., "G55", |s| s.active_wcs == 1);
+        let _ = a.update(Message::Machine(M::WorkZero(None)));
+        tick_until(&mut a, 20., "work zero", |s| {
+            s.active_wcs == 1 && s.work_pos[..3].iter().all(|v| v.abs() < 1e-6)
+        });
+        cut_setup(&mut a, dir.path(), 1);
+        let _ = a.update(Message::Machine(M::Wcs(0)));
+        tick_until(&mut a, 20., "G54", |s| s.active_wcs == 0);
+        pick_pictured(&mut a, dir.path(), 0);
+        let run = run_of(&a);
+        let how = EarlierUnfollowed::After(1);
+        assert_eq!(run.earlier_unfollowed_how(), Some(how));
+        assert_eq!(
+            run.partway_blocked().as_deref(),
+            Some(
+                "Setup 2 comes after this one but its run cut this part first, so the check cannot tell the surface where the stock top is touched off. If new stock is held, press New stock loaded under Work zero."
+            )
+        );
+        assert_eq!(
+            how.said_whole(),
+            "Setup 2 comes after this one but its run cut this part first."
+        );
+        assert_eq!(conn(&a).touch_off(), None);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// LIO-599 review: setup 1 cut, then setup 2 picked. Its check,
+    /// pictured, follows setup 1's cut: nothing is said of it, and the Work
+    /// zero tab asks for no new stock. Setup 1's operations its run did not
+    /// get to are disabled, so that none is left uncut (LIO-603), and its
+    /// tool run runs to its end, none left unfinished (LIO-601).
+    #[test]
+    fn an_earlier_setup_cut_in_order_is_followed_after_the_pictures() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = two_setups_app(dir.path());
+        cut_setup_whole(&mut a, dir.path(), 0);
+        let cut: Vec<usize> = run_of(&a).cut_in_run.iter().map(|c| c.0).collect();
+        for (oi, op) in a.doc.setups[0].operations.iter_mut().enumerate() {
+            op.enabled &= cut.contains(&oi);
+        }
+        pick_pictured(&mut a, dir.path(), 1);
+        let run = run_of(&a);
+        assert!(!run.earlier_cuts.is_empty());
+        assert_eq!(run.earlier_unfollowed_how(), None);
+        assert!(!run.earlier_unfollowed());
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// LIO-599 review: setup 1 cut, then the cut history lost (another
+    /// AXIS CAM found it unreadable, LIO-594), setup 2 picked and Same part
+    /// pressed. Nothing was disabled or changed: no setup is named, and Zero
+    /// Z says runs this computer did not follow may have cut the stock
+    /// (LIO-596).
+    #[test]
+    fn an_earlier_setups_cut_with_the_history_lost_names_no_change() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = two_setups_app(dir.path());
+        cut_setup(&mut a, dir.path(), 0);
+        assert!(a.note_history_lost());
+        pick_pictured(&mut a, dir.path(), 1);
+        let _ = a.update(Message::Run(R::SamePart));
+        let run = run_of(&a);
+        let why = run.partway_blocked().unwrap();
+        assert!(
+            why.starts_with("Runs this computer did not follow may have cut the stock"),
+            "{why}"
+        );
+        assert!(
+            !why.contains("Setup 1") && !why.contains("disabled"),
+            "{why}"
+        );
+        assert_eq!(conn(&a).touch_off(), None);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// LIO-599 review: a setup cut, then the project opened again with that
+    /// setup gone and one of its own in its place: the same project, so the
+    /// cut one is known as this project's, deleted since (LIO-607, LIO-635),
+    /// and its run says so.
+    #[test]
+    fn a_setup_deleted_since_is_said_deleted() {
+        use crate::run::EarlierUnfollowed;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        a.page = Page::Control;
+        zeroed(&mut a);
+        cut_setup(&mut a, dir.path(), 0);
+        let mesh = a.imported_mesh.clone();
+        let mut other = a.doc.clone();
+        other.setups[0].id = crate::id();
+        a.replace_document(other, None);
+        a.imported_mesh = mesh;
+        a.page = Page::Control;
+        pick_pictured(&mut a, dir.path(), 0);
+        let run = run_of(&a);
+        let how = EarlierUnfollowed::Deleted;
+        assert_eq!(run.earlier_unfollowed_how(), Some(how));
+        assert_eq!(run.partway_blocked(), Some(how.blocked()));
+        assert_eq!(
+            run.earlier_unfollowed_note(),
+            "A setup deleted since cut this part."
+        );
         let _ = a.update(Message::Disconnect);
     }
 
