@@ -58,6 +58,17 @@ opt-level = 2
 [profile.dev.package.fidget-mesh]
 opt-level = 2
 
+# Dependencies without debug info: a fifth smaller target/ (5.2 GB, from 6.4
+# GB after a cold `cargo test --no-run`), and as fast to build and link
+# (LIO-729). The UC100 driver and uc100-server keep theirs: the smoke tests
+# run them, and a backtrace through them keeps each frame's file and line.
+[profile.dev.package."*"]
+debug = false
+[profile.dev.package.uc100]
+debug = true
+[profile.dev.package.uc100-remote]
+debug = true
+
 [target.'cfg(unix)'.dev-dependencies]
 # Asks each of the test process's open files what it is (`fstat`), with no
 # duplicate or close (`mcp::runner`'s tests); already in the tree.
