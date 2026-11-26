@@ -13451,6 +13451,23 @@ pub(crate) mod tests {
                 assert!(why.contains("\"Bracket\""), "{why}");
             }
         }
+        // A setup of B's own, deleted since, kept with its owner: said as
+        // B's deleted setup, not as maybe another project's (LIO-599).
+        let mut gone = CutOwner::of(&b, 0);
+        gone.setup = crate::id();
+        let deleted = Session {
+            cuts: vec![(gone.setup.clone(), with.cuts[0].1.clone())],
+            owners: vec![gone],
+            ..Session::default()
+        };
+        for z in zeros(&setup_in(&b, 1, &deleted)) {
+            assert_eq!(z.set_z, None);
+            assert_eq!(z.blocked, Some(EarlierUnfollowed::Deleted.tablet_blocked()));
+            assert!(!z.probe_from.is_empty());
+            for spot in &z.probe_from {
+                assert_eq!(spot.problem, Some(EarlierUnfollowed::Deleted.tablet_why()));
+            }
+        }
         // A's own file: its setups' cuts are its own, said as before.
         for si in 0..2 {
             assert_eq!(setup_in(&a, si, &with), setup_in(&a, si, &without));
