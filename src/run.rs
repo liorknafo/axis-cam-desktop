@@ -4466,8 +4466,8 @@ impl Run {
     /// changed what was taken as cut, and the setup is checked again,
     /// keeping where Cycle Start starts (`recheck`), unless operations
     /// skipped as cut moved it there: it then goes back to the start the
-    /// operator picked, or else to the first operation after the tool runs
-    /// done in this run (LIO-633).
+    /// operator picked, unless its tool run is done, or else to the first
+    /// operation of no tool run done in this run (LIO-633).
     pub fn new_stock(&mut self) -> bool {
         (self.cut_in_run, self.earlier_cuts) = (vec![], vec![]);
         self.earlier_taken.clear();
