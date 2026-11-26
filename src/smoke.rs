@@ -12131,6 +12131,62 @@ flood = { pin = 8 }
         }
     }
 
+    /// A start partway into a tool run follows its operations by id: an
+    /// operation duplicated in an earlier tool run numbers them otherwise,
+    /// and the start stays on the Pocket. A real change after it moves the
+    /// start, and says so (LIO-636 review).
+    #[test]
+    fn a_start_partway_follows_its_operations_when_an_earlier_one_is_duplicated() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        // The Drill first: tool runs [Drill], [Face, Pocket, Contour].
+        let mut a = run_app_of(dir.path(), FAST, &[3, 0, 1, 2]);
+        zeroed(&mut a);
+        a.page = Page::Control;
+        check_run(&mut a, 0);
+        answer_skips(&mut a, 0);
+        let names = |a: &App, i: usize| -> Vec<String> {
+            (run_of(a).checked().unwrap()[i].ops.iter())
+                .map(|o| o.name.clone())
+                .collect()
+        };
+        assert_eq!(names(&a, 1), ["Face", "Pocket", "Contour · outside"]);
+        let _ = a.update(Message::Run(R::From(1, 1)));
+        let start = |a: &App| (run_of(a).next, run_of(a).from);
+        let edited = |a: &mut App| {
+            a.last_edit -= crate::EDIT_PAUSE * 2;
+            let _ = a.update(Message::Tick);
+            assert!(run_of(a).programs.is_none());
+            answer_skips(a, 0);
+        };
+        // The Drill duplicated: every later operation's index goes up one.
+        a.selected = Some(0);
+        let _ = a.update(Message::DuplicateOp);
+        edited(&mut a);
+        assert_eq!(run_of(&a).checked().unwrap()[1].indexes, [2, 3, 4]);
+        assert_eq!(start(&a), (1, 1));
+        assert!(run_of(&a).start_moved().is_none());
+        // The Contour turned off: the start moves to the Face, and says so.
+        a.doc.setups[0].operations[4].enabled = false;
+        let _ = a.update(Message::Title("Edited".into()));
+        edited(&mut a);
+        assert_eq!(start(&a), (1, 0));
+        assert_eq!(
+            run_of(&a).start_moved().as_deref(),
+            Some(
+                "The start was at Pocket, but the operations of its tool run have changed since, so Cycle Start now starts at Face, the first operation of tool run 2. Pick the start again in the Operations list if the operations before it are cut."
+            )
+        );
+        // The copy removed: the Face is index 1 again, still not the Pocket
+        // picked, so the note stays.
+        a.selected = Some(1);
+        let _ = a.update(Message::RemoveOp);
+        edited(&mut a);
+        assert_eq!(run_of(&a).checked().unwrap()[1].indexes, [1, 2]);
+        assert_eq!(start(&a), (1, 0));
+        assert!(run_of(&a).start_moved().is_some());
+    }
+
     /// A start picked partway into a tool run (the Pocket, after the Face)
     /// stays on its operation through Check again, Set coolant to Off and
     /// the check after an edit, while its tool run has the same operations:
