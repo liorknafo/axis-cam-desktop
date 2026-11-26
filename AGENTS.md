@@ -7,8 +7,8 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
 
 - **Never set `CARGO_INCREMENTAL=0`**: not on a command line, in the
   environment or in a Cargo config. `axis-cam` is one crate of about 270,000
-  lines, so without incremental compilation every change compiles all of it
-  again. Measured on the Mac (LIO-729): after a one-line change in
+  lines of code, so without incremental compilation every change compiles
+  all of it again. Measured on the Mac (LIO-729): after a one-line change in
   `src/control.rs`, `cargo test --bin axis-cam --no-run` took 43 s with
   `CARGO_INCREMENTAL=0` and 7 s without it, and the compiler's memory peaked
   at 7.0 GB against 3.9 GB. Switching to it also compiles the crate whole
