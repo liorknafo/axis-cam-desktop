@@ -2450,17 +2450,19 @@ impl Run {
             let now = new.get(self.next);
             let after = ops(now);
             if before.is_none() || before != after {
-                // A start partway that moves says so (LIO-636).
-                if let (Some(was), Some(now)) = (was.filter(|_| self.from > 0), now)
-                    && let Some(picked) = was.ops.get(self.from)
-                {
-                    self.start_moved = Some(format!(
-                        "The start was at {}, but the operations of its tool run have changed since, so Cycle Start now starts at {}, the first operation of tool run {}. Pick the start again in the Operations list if the operations before it are cut.",
-                        picked.name,
-                        now.ops[0].name,
-                        self.next + 1
-                    ));
-                }
+                // A start partway that moves says so (LIO-636); a note of
+                // an earlier move no longer tells where it starts.
+                self.start_moved = (was.filter(|_| self.from > 0))
+                    .zip(now)
+                    .and_then(|(was, now)| Some((was.ops.get(self.from)?, now)))
+                    .map(|(picked, now)| {
+                        format!(
+                            "The start was at {}, but the operations of its tool run have changed since, so Cycle Start now starts at {}, the first operation of tool run {}. Pick the start again in the Operations list if the operations before it are cut.",
+                            picked.name,
+                            now.ops[0].name,
+                            self.next + 1
+                        )
+                    });
                 self.from = 0;
             }
         }

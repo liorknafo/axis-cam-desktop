@@ -12212,6 +12212,15 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::Check));
         answer_skips(&mut a, 0);
         assert!(run_of(&a).start_moved.is_some());
+        // Or until the start moves again: the Contour back on, the tool run
+        // changes once more, and the note of the Pocket no longer holds.
+        a.doc.setups[0].operations[2].enabled = true;
+        let _ = a.update(Message::Title("Edited once more".into()));
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        assert_eq!(start(&a), (0, 0));
+        assert!(run_of(&a).start_moved.is_none());
         let _ = a.update(Message::Run(R::From(0, 1)));
         kept(&a);
     }
