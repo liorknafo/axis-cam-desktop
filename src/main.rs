@@ -9601,9 +9601,10 @@ impl App {
                         && !c.probing()
                         && (c.run.as_ref()).is_some_and(|r| r.running.is_none());
                     c.run_act(action.clone(), &self.doc);
-                    // New stock loaded ends the setup's journals, of each way
-                    // to the machine (`Connection::run_act`, LIO-634): the
-                    // copies kept of them go. One that could not be removed
+                    // New stock loaded ends the setup's journals of the same
+                    // table (`Connection::table_journals`: by USB and by the
+                    // Pi, or the simulator's alone, LIO-634): the copies kept
+                    // of them go. One that could not be removed
                     // is not taken as known (`run::disown`), so a run picked
                     // from it sets no Z from the check's stock.
                     if new_stock && let Some(r) = &c.run {
