@@ -4129,12 +4129,8 @@ impl App {
                 None => {}
             }
         }
-        if let Some(r) = live.filter(|r| earlier && r.earlier_unfollowed()) {
-            grew = true;
-            if r.running.is_none() {
-                r.zeroed = false;
-            }
-        }
+        // Whether the check follows them is asked once the other setups'
+        // marks are taken in too, below (LIO-603 review).
         // Whose their setups are, but for this project's, which it says
         // itself (LIO-607).
         for o in &theirs.owners {
@@ -4154,43 +4150,25 @@ impl App {
                 self.cut_journals.push(k.clone());
             }
         }
-        // What it took as cut and changed (LIO-611): taken in where this one
-        // has not changed it since; where both have, or the run's setup,
-        // whose own is the run's, it is dropped, as a project edit drops it:
-        // nothing sets Z until New stock loaded. What it forgot (New stock
-        // loaded there) stays here, the safe side.
-        let mut live = self.control.as_mut().and_then(|c| c.run.as_mut());
-        for k in &theirs.declared {
-            let before = base.declared.iter().find(|b| b.setup == k.setup);
-            if before == Some(k) {
-                continue;
-            }
-            if let Some(r) = live.as_deref_mut().filter(|r| r.setup_id == k.setup) {
-                if !r.declared_lost {
-                    r.declared_lost = true;
-                    grew = true;
-                    if r.running.is_none() {
-                        r.zeroed = false;
-                    }
-                }
-                continue;
-            }
-            let mine = self.run_declared.iter().position(|m| m.setup == k.setup);
-            match mine {
-                Some(i) if self.run_declared[i] == *k => {}
-                Some(i) if before == Some(&self.run_declared[i]) => {
-                    self.run_declared[i] = k.clone()
-                }
-                None if before.is_none() => self.run_declared.push(k.clone()),
-                _ => {
-                    self.run_declared.retain(|m| m.setup != k.setup);
-                    self.run_declared.push(run::KeptDeclared {
-                        setup: k.setup.clone(),
-                        skips: vec![],
-                        steps: vec![],
-                        lost: true,
-                        prints: vec![],
-                    });
+        // What it took as cut and changed, or forgot (`take_in_declared`).
+        let live = self.control.as_mut().and_then(|c| c.run.as_mut());
+        grew |= take_in_declared(
+            &base.declared,
+            &theirs.declared,
+            &mut self.run_declared,
+            live,
+        );
+        // The run's marks of the other setups go by what is kept now: one
+        // the other AXIS CAM undid or lost no longer counts, and the run's
+        // work zero is set again where that leaves an operation not cut
+        // (LIO-603 review), or the other setups' cuts taken in above are
+        // ones the check does not follow (`Run::earlier_unfollowed`).
+        if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
+            let retaken = retake_marks(&self.run_declared, r);
+            if retaken || earlier && r.earlier_unfollowed() {
+                grew = true;
+                if r.running.is_none() {
+                    r.zeroed = false;
                 }
             }
         }
@@ -5144,7 +5122,7 @@ impl App {
             // setup's runs cut before it is not known (LIO-586 review).
             following.note_history_unknown();
         }
-        give_earlier_cuts(&self.run_cuts, &mut following);
+        give_earlier_cuts(&self.run_cuts, &self.run_declared, &mut following);
         give_elsewhere(&self.cut_owners, &self.doc, &mut following);
         // Kept across a disconnect: was anything else run meanwhile?
         give_away(&self.run_away, &mut following);
@@ -7046,7 +7024,7 @@ impl App {
         run::Session {
             cuts,
             lost: self.others_unknown,
-            declared: declared.into_iter().map(|k| k.setup).collect(),
+            declared,
         }
     }
     fn update_turn(&mut self, message: Message) -> Task<Message> {
@@ -9249,6 +9227,12 @@ impl App {
                             // was anything else run meanwhile (LIO-595)?
                             if let Some(r) = c.run.as_mut() {
                                 give_away(&self.run_away, r);
+                                // The other setups' marks as kept now: one
+                                // another AXIS CAM undid meanwhile no longer
+                                // counts (LIO-603 review).
+                                if retake_marks(&self.run_declared, r) && r.running.is_none() {
+                                    r.zeroed = false;
+                                }
                             }
                         }
                         self.status = format!("Connecting to {}…", m.name());
@@ -9447,7 +9431,7 @@ impl App {
                 // last closed (LIO-594), until the operator says whether
                 // the same part is still there (LIO-582 review).
                 note_lost_cuts(&mut self.run_cuts, self.others_unknown, &id);
-                r.picked_in(&self.run_cuts, self.others_unknown);
+                r.picked_in(&self.run_cuts, self.others_unknown, &self.run_declared);
                 if journal_gone {
                     r.note_history_unknown();
                 }
@@ -12674,12 +12658,116 @@ fn lose_declared(declared: &mut [run::KeptDeclared]) {
 /// `run::Run::earlier_cuts`): before it, deleted since or moved after it,
 /// their cuts are in the part, and the check must simulate them as they
 /// were cut before it to be the part's stock (LIO-582 review).
-fn give_earlier_cuts(cuts: &[(String, Vec<run::CutInRun>)], run: &mut run::Run) {
+///
+/// With them, the operations each other setup's run marked Already cut as
+/// it was dropped (`declared`, `App::run_declared`), unless a project edit
+/// lost them since, with the print of each as marked: those are taken as
+/// cut while marked so, for that plan (`run::Run::earlier_taken`, LIO-603).
+fn give_earlier_cuts(
+    cuts: &[(String, Vec<run::CutInRun>)],
+    declared: &[run::KeptDeclared],
+    run: &mut run::Run,
+) {
     run.earlier_cuts = (cuts.iter())
         .filter(|(id, _)| *id != run.setup_id)
         .cloned()
         .collect();
     run.earlier_given = run.earlier_cuts.iter().map(|(id, _)| id.clone()).collect();
+    give_earlier_taken(declared, run);
+}
+
+/// Takes into `mine` (`App::run_declared`) what another AXIS CAM on the
+/// folder took as cut, `theirs`, against what the file held when this one
+/// last read it, `base` (LIO-611): taken in where this one has not changed
+/// it since; where both have, or the live run's setup (`live`), whose own
+/// is the run's, it is dropped, as a project edit drops it: nothing sets Z
+/// until New stock loaded. One it no longer has (unmarked there, or New
+/// stock loaded) is dropped so too, not kept as marked: a later setup
+/// takes an operation marked Already cut as cut (`run::Run::earlier_taken`,
+/// LIO-603 review), and the setup's own run, its material maybe gone,
+/// still sets no Z. Whether the live run's work zero is to be set again.
+fn take_in_declared(
+    base: &[run::KeptDeclared],
+    theirs: &[run::KeptDeclared],
+    mine: &mut Vec<run::KeptDeclared>,
+    mut live: Option<&mut run::Run>,
+) -> bool {
+    let mut grew = false;
+    let dropped = |setup: &str| run::KeptDeclared {
+        setup: setup.to_string(),
+        skips: vec![],
+        steps: vec![],
+        lost: true,
+        prints: vec![],
+    };
+    let gone = (base.iter()).filter(|b| !theirs.iter().any(|k| k.setup == b.setup));
+    let changed = (theirs.iter())
+        .map(|k| (k.setup.as_str(), Some(k)))
+        .chain(gone.map(|b| (b.setup.as_str(), None)));
+    for (setup, k) in changed {
+        let before = base.iter().find(|b| b.setup == setup);
+        if before == k {
+            continue;
+        }
+        if let Some(r) = live.as_deref_mut().filter(|r| r.setup_id == setup) {
+            if !r.declared_lost {
+                r.declared_lost = true;
+                grew = true;
+                if r.running.is_none() {
+                    r.zeroed = false;
+                }
+            }
+            continue;
+        }
+        let at = mine.iter().position(|m| m.setup == setup);
+        let Some(k) = k else {
+            // Forgotten there: dropped here, marks and all.
+            if let Some(i) = at
+                && (!mine[i].skips.is_empty() || !mine[i].steps.is_empty())
+            {
+                mine[i] = dropped(setup);
+            }
+            continue;
+        };
+        match at {
+            Some(i) if mine[i] == *k => {}
+            Some(i) if before == Some(&mine[i]) => mine[i] = k.clone(),
+            None if before.is_none() => mine.push(k.clone()),
+            _ => {
+                mine.retain(|m| m.setup != setup);
+                mine.push(dropped(setup));
+            }
+        }
+    }
+    grew
+}
+
+/// Gives `run` the other setups' marks as kept now (`declared`,
+/// `give_earlier_taken`), another AXIS CAM's taken in: whether that leaves
+/// an operation not cut it did not have (`run::Run::earlier_uncut`), so
+/// that its work zero is set again (LIO-603 review).
+fn retake_marks(declared: &[run::KeptDeclared], run: &mut run::Run) -> bool {
+    let before: Vec<String> = run.earlier_uncut().into_iter().map(String::from).collect();
+    give_earlier_taken(declared, run);
+    run.earlier_uncut()
+        .iter()
+        .any(|n| !before.iter().any(|b| b == n))
+}
+
+/// Gives `run` the operations each other setup's run marked Already cut
+/// (`declared`, `App::run_declared`), each with the print it holds for
+/// (`run::Run::earlier_taken`, LIO-603).
+fn give_earlier_taken(declared: &[run::KeptDeclared], run: &mut run::Run) {
+    run.earlier_taken = (declared.iter())
+        .filter(|k| k.setup != run.setup_id)
+        .map(|k| {
+            let marked = (k.skips.iter()).filter(|s| s.1 == run::Skip::Cut).map(|s| {
+                let print = k.prints.iter().find(|p| p.0 == s.0).and_then(|p| p.1);
+                (s.0, print)
+            });
+            (k.setup.clone(), marked.collect())
+        })
+        .collect();
 }
 
 /// Whose each setup of `cuts` is (`run::CutHistory::owners`, LIO-607):

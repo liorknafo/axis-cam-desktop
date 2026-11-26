@@ -8357,8 +8357,10 @@ flood = { pin = 8 }
         });
         let _ = a.update(Message::MachineEStop);
         run_until(&mut a, 10.0, "the E-stop", |r| r.running.is_none());
+        // The operation before the Drill's tool run, which it started at,
+        // taken as cut (LIO-603).
         let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
-        assert_eq!(cut, [(1, None)]);
+        assert_eq!(cut, [(1, None), (0, None)]);
         if run_of(&a).programs.is_none() {
             answer_skips(&mut a, 0);
         }
@@ -8399,7 +8401,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::MachineEStop);
         run_until(&mut a, 5.0, "the E-stop", |r| r.running.is_none());
         let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
-        assert_eq!(cut, [(1, None)]);
+        assert_eq!(cut, [(1, None), (0, None)]);
         let _ = a.update(Message::Disconnect);
     }
 
@@ -8460,9 +8462,10 @@ flood = { pin = 8 }
         // Cut, for the starts after it: holes 1 and 2, by where the tool
         // stood as the outcome came (LIO-586 review); hole 3 too when it
         // stood on hole 2's line, which hole 2's last retract goes along
-        // too, after which hole 3 may have begun.
+        // too, after which hole 3 may have begun. The operation before the
+        // tool run, which it started at, is taken as cut (LIO-603).
         let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
-        assert!(matches!(cut[..], [(1, Some(2 | 3))]), "{cut:?}");
+        assert!(matches!(cut[..], [(1, Some(2 | 3)), (0, None)]), "{cut:?}");
         let journal = a.control.as_ref().unwrap().journal().expect("the journal");
         assert_eq!((journal.op, journal.step), (1, Some(0)), "{journal:?}");
         assert!(journal.why.contains("E-stop"), "{}", journal.why);
