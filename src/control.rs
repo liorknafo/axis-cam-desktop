@@ -2587,6 +2587,50 @@ struct Press {
     epoch: u64,
 }
 
+/// A Z set for the run's tool from the reference or by probe, sent and not
+/// yet shown applied: the tool counts as touched off (`Run::touched`,
+/// `Run::zeroed`) only once the machine shows it (`Connection::z_set_check`,
+/// LIO-627).
+struct ZSet {
+    /// What set it, for what is said if it does not take: Set Z from
+    /// reference, or a probe.
+    by: ZBy,
+    /// The Z work offset the machine shows once it has applied it: the
+    /// machine Z it was sent at less the work Z sent.
+    offset: f64,
+    /// The run it is for (`Run::epoch`) and the tool run of its start
+    /// (`Run::next`): a start in another tool run picked meanwhile is not
+    /// touched off by it. Another operation of the same tool run is: its
+    /// tool is the same, and a check again may move the start to the tool
+    /// run's first (LIO-627 review).
+    epoch: u64,
+    next: usize,
+    /// The tool it is pressed for (`Run::next_tool`): once shown applied
+    /// with another tool run picked meanwhile, it is that tool's Z, which
+    /// holds for no other (LIO-627 review).
+    tool: Option<String>,
+    /// What a probe says once it is shown (`Connection::probed`).
+    then: Option<String>,
+}
+
+/// How near the Z work offset a `ZSet` sets the machine's must be for it to
+/// show it applied, mm, at the least: the driver works it out from its
+/// planner's position, which at rest is the motors' (`machine_pos`), so
+/// only rounding parts them. Paused in a program they may be a motor step
+/// apart, which is allowed too (`z_set_check`, LIO-628 review).
+const Z_SHOWN: f64 = 1e-4;
+
+/// The run (`Run::epoch`), tool run (`Run::next`) and tool
+/// (`Run::next_tool`) a Z set is for.
+type ZKey = (u64, usize, Option<String>);
+
+/// What sent a `ZSet`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ZBy {
+    Reference,
+    Probe,
+}
+
 /// A running driver controller for one machine.
 /// A machine position declaration sent and not yet in the driver's log
 /// (`Connection::declaring`).
@@ -2648,6 +2692,12 @@ pub struct Connection {
     /// when the link fails while it crosses.
     #[cfg(test)]
     pub lose_next_job: bool,
+    /// Tests: the next Z set from the reference or by probe never reaches
+    /// the machine: handed to the link and lost on the way (true: a
+    /// command that changes nothing goes in its place), or not taken by
+    /// the link at all (false).
+    #[cfg(test)]
+    pub lose_next_z: Option<bool>,
     /// Tests: the next tool run goes to the Pi as made from this snapshot,
     /// not from `snapshot`.
     #[cfg(test)]
@@ -2666,6 +2716,16 @@ pub struct Connection {
     /// A Cycle Start press waiting for the machine to show everything this
     /// computer sent before it (`cycle_pending`, LIO-562).
     press: Option<Press>,
+    /// A Z set for the run's tool waiting for the machine to show it
+    /// applied (`z_set_check`, LIO-627).
+    z_set: Option<ZSet>,
+    /// A Z set from the reference or by probe that did not take, for the
+    /// run of that epoch (`Run::epoch`), the tool run of its start
+    /// (`Run::next`, as `ZSet::next`) and its tool (`ZSet::tool`), by
+    /// what, and what is said of it: what holds Cycle Start back, and the
+    /// Tool change tab says, until the tool is touched off (`z_failed`,
+    /// LIO-627).
+    z_said: Option<(ZKey, ZBy, String)>,
     /// Machine positions still to declare (axis, value), sent one at a time
     /// (`declaring`): the driver drops a second `SetMachine` until it has
     /// re-read the position.
@@ -3011,11 +3071,15 @@ impl Connection {
             #[cfg(test)]
             lose_next_job: false,
             #[cfg(test)]
+            lose_next_z: None,
+            #[cfg(test)]
             made_from: None,
             stop_sent: None,
             snapshot: Snapshot::default(),
             ack: None,
             press: None,
+            z_set: None,
+            z_said: None,
             declare: VecDeque::new(),
             declaring: None,
             held: None,
@@ -3564,6 +3628,9 @@ impl Connection {
         self.watch_job();
         self.follow_stop_after();
         let outcome = self.run_outcome();
+        // A Z set for the run's tool on its way, once the machine shows it
+        // (LIO-627).
+        self.z_set_check();
         let remote = self.pi.is_some();
         // Where the tool stopped, for what a stop in a step cut (`Run::reach`):
         // the local driver's position as its outcome comes, the machine
@@ -4119,11 +4186,11 @@ impl Connection {
             R::RecordReference if self.manual() => {
                 run.record_reference(self, self.snapshot.work_pos[2])
             }
+            // The tool counts as touched off once the machine shows it
+            // (`z_set_check`, LIO-627).
             R::ZFromReference if self.manual() && run.reference_a_problem(self).is_none() => {
                 if let Some(z) = run.reference {
-                    self.send(Command::SetWork { axis: 2, value: z });
-                    run.z_touched();
-                    run.zeroed = true;
+                    self.send_z_set(Some(&mut run), ZBy::Reference, z, None);
                 }
             }
             R::ProbeReference => self.start_probe(Touch::Reference),
@@ -4150,6 +4217,9 @@ impl Connection {
     /// never a start later by surprise), when another setup is picked or
     /// the setup is checked again (`Run::epoch`), or after `PRESS_WAIT`.
     pub fn cycle_pending(&mut self, doc: &crate::model::Document) {
+        // A Z set on its way is settled first: the press waits for it, and
+        // its problems are the run's once it did not take (LIO-627).
+        self.z_set_check();
         let Some(press) = self.press.take() else {
             return;
         };
@@ -4180,7 +4250,7 @@ impl Connection {
                 "Cycle Start did not start the tool run: {machine} had not applied what this computer sent before it within {} s. The tool run was not sent; press Cycle Start again.",
                 PRESS_WAIT.as_secs()
             ))
-        } else if self.shows_all_sent() {
+        } else if self.shows_all_sent() && self.z_set.is_none() {
             self.start_tool_run(&mut run, doc);
             None
         } else {
@@ -4225,6 +4295,228 @@ impl Connection {
     /// A Cycle Start press waits (`cycle_pending`).
     pub fn press_waits(&self) -> bool {
         self.press.is_some()
+    }
+
+    /// Sends the work Z `value` for `run`'s tool, set by `by` with the
+    /// machine still: the tool counts as touched off only once the machine
+    /// shows it applied (`z_set_check`), not by an earlier touch-off
+    /// meanwhile, as it may be another tool's (LIO-627 review). One the
+    /// link to the Pi cannot take now changes nothing, and is said so.
+    /// `then`: what a probe says once it is shown. Whether it waits.
+    fn send_z_set(
+        &mut self,
+        run: Option<&mut crate::run::Run>,
+        by: ZBy,
+        value: f64,
+        then: Option<String>,
+    ) -> bool {
+        let offset = self.snapshot.machine_pos[2] - value;
+        // Whatever was said of an earlier one is over.
+        self.z_said = None;
+        self.z_set = None;
+        #[cfg(test)]
+        let lost = self.lose_next_z.take();
+        #[cfg(not(test))]
+        let lost: Option<bool> = None;
+        let sent = match lost {
+            // Something else goes in its place, as a message dropped on
+            // its way is counted until it is.
+            Some(true) => self.driver.send(Command::Coolant {
+                flood: self.snapshot.flood,
+                mist: self.snapshot.mist,
+            }),
+            Some(false) => false,
+            None => self.driver.send(Command::SetWork { axis: 2, value }),
+        };
+        let mut tool = None;
+        let key = run.map(|run| {
+            run.hold_touch();
+            (run.zeroed, run.tool_kept) = (false, false);
+            tool = run.next_tool();
+            (run.epoch, run.next, tool.clone())
+        });
+        if sent {
+            // With no run, nothing is touched off by it: said at once.
+            let Some((epoch, next, _)) = key else {
+                return false;
+            };
+            self.z_set = Some(ZSet {
+                by,
+                offset,
+                epoch,
+                next,
+                tool,
+                then,
+            });
+            return true;
+        }
+        // The note the link made of it just now, not an older one.
+        let note = match (&self.driver, lost) {
+            (Driver::Remote(r, _), None) => r.link().notes.last().cloned(),
+            _ => None,
+        };
+        let why = (note.as_deref())
+            .map(|n| {
+                // The link names it as its `wire::label` does.
+                n.strip_prefix("Set work position not sent: ")
+                    .unwrap_or(n)
+                    .to_string()
+            })
+            .unwrap_or_else(|| "the link to the Pi is not answering".into());
+        self.z_not_set(by, key, &format!("was not sent ({why})"));
+        false
+    }
+
+    /// Says that the Z set by `by` for the run and tool run `key` (None: no
+    /// run) did not take (`how`): nothing changed, and how to set it
+    /// again.
+    fn z_not_set(&mut self, by: ZBy, key: Option<ZKey>, how: &str) {
+        let said = match by {
+            ZBy::Reference => format!(
+                "Set Z from reference {how}, so the tool does not count as touched off: touch it on the reference again and press Set Z from reference."
+            ),
+            ZBy::Probe => {
+                format!(
+                    "The work Z the probe found {how}, so the tool does not count as touched off: probe again."
+                )
+            }
+        };
+        if by == ZBy::Probe {
+            self.probed = Some((false, said.clone()));
+        }
+        self.z_said = key.map(|key| (key, by, said));
+    }
+
+    /// A Z set for the run's tool on its way (`z_set`), once the machine
+    /// shows everything this computer sent (`shows_all_sent`): the tool is
+    /// touched off if the machine's Z work offset is the one it sets; if
+    /// not, it was dropped on its way or not applied, nothing changed, and
+    /// the Tool change tab says so. Forgotten, nothing touched off, once
+    /// the run or the tool run of its start is another (LIO-627).
+    fn z_set_check(&mut self) {
+        // One that did not take is over once the tool is touched off
+        // another way (Zero Z, a probe of the top, Same tool, keep Z): it
+        // must not come back when a tool run's start clears that
+        // (LIO-627 review).
+        if self
+            .run
+            .as_ref()
+            .is_some_and(|r| r.touched() || r.tool_kept)
+        {
+            // And one on its way that another touch-off overtook: that one
+            // is the latest Z (LIO-627 review).
+            self.z_said = None;
+            self.drop_z_set();
+        }
+        let Some(z) = &self.z_set else {
+            return;
+        };
+        // Another run (another setup picked) knows nothing of it.
+        if self.run.as_ref().is_none_or(|r| r.epoch != z.epoch) {
+            self.drop_z_set();
+            return;
+        }
+        if !self.shows_all_sent() {
+            return;
+        }
+        let Some(z) = self.z_set.take() else {
+            return;
+        };
+        let step = (self.config.axes.get(2))
+            .map_or(0., |a| 1. / a.steps_per_unit)
+            .max(Z_SHOWN);
+        let applied = (self.snapshot.work_offset[2] - z.offset).abs() <= step;
+        let current = self.run.as_ref().is_some_and(|r| r.next == z.next);
+        match (applied, &mut self.run) {
+            (true, Some(run)) if current => {
+                run.z_touched();
+                run.zeroed = true;
+            }
+            // Another tool run picked meanwhile: the offset is the tool's it
+            // was pressed for, which holds for no other (LIO-627 review).
+            (true, Some(run)) => run.z_touched_for(z.tool.clone()),
+            _ => {}
+        }
+        if applied {
+            if let Some(said) = z.then {
+                self.probed = Some((true, said));
+            }
+        } else {
+            let machine = self.machine_name();
+            self.z_not_set(
+                z.by,
+                // Held for the tool run and tool it was pressed for,
+                // whichever is picked now (`z_failed`, LIO-627 review).
+                Some((z.epoch, z.next, z.tool.clone())),
+                &format!("did not reach {machine}, or {machine} did not apply it"),
+            );
+        }
+    }
+
+    /// Forgets the Z set on its way, and a probe's line that it waits.
+    fn drop_z_set(&mut self) {
+        if self.z_set.take().is_some_and(|z| z.then.is_some()) {
+            self.probed = None;
+        }
+    }
+
+    /// The run of epoch `was` is checked again as epoch `now` (`Run::epoch`):
+    /// a Z set for it on its way, or one that did not take, holds for it
+    /// still (LIO-627 review).
+    pub fn z_set_rechecked(&mut self, was: u64, now: u64) {
+        if let Some(z) = self.z_set.as_mut().filter(|z| z.epoch == was) {
+            z.epoch = now;
+        }
+        if let Some(z) = self.z_said.as_mut().filter(|z| z.0.0 == was) {
+            z.0.0 = now;
+        }
+    }
+
+    /// What the machine is called in what is said of what it applied.
+    pub fn machine_name(&self) -> &'static str {
+        if self.pi.is_some() {
+            "the Pi"
+        } else {
+            "the controller"
+        }
+    }
+
+    /// The Z set waiting for `run`'s tool is Set Z from reference: the
+    /// reference rows say it waits (a probe's says it itself).
+    pub fn z_set_by_reference_waits(&self, run: &crate::run::Run) -> bool {
+        self.z_set_waits(run) && self.z_set.as_ref().is_some_and(|z| z.by == ZBy::Reference)
+    }
+
+    /// A Z set from the reference or by probe for `run`'s tool waits for
+    /// the machine to show it (`z_set_check`): Cycle Start may be pressed,
+    /// and waits for it (LIO-627).
+    pub fn z_set_waits(&self, run: &crate::run::Run) -> bool {
+        (self.z_set.as_ref()).is_some_and(|z| z.epoch == run.epoch && z.next == run.next)
+    }
+
+    /// What is said of a Z set from the reference or by probe for `run`
+    /// that did not take, while its start is in the same tool run, or in
+    /// another with the same tool, and that tool is not touched off
+    /// since: Cycle Start waits for the touch-off (LIO-627 review).
+    pub fn z_failed(&self, run: &crate::run::Run) -> Option<&str> {
+        // Its tool run, or another with the same tool: the Z on the
+        // machine is not that tool's either (LIO-627 review).
+        let next_tool = run.next_tool();
+        (self.z_said.as_ref())
+            .filter(|((epoch, next, tool), _, _)| {
+                *epoch == run.epoch
+                    && (*next == run.next || (tool.is_some() && *tool == next_tool))
+                    && !run.touched()
+                    && !run.tool_kept
+            })
+            .map(|(_, _, said)| said.as_str())
+    }
+
+    /// `z_failed` of Set Z from reference: the reference rows say it (a
+    /// probe's is said with the probe, `probed`).
+    pub fn z_said(&self, run: &crate::run::Run) -> Option<&str> {
+        let by = self.z_said.as_ref().map(|z| z.1);
+        self.z_failed(run).filter(|_| by == Some(ZBy::Reference))
     }
 
     /// Tests: the waiting press was pressed `by` earlier.
@@ -4276,6 +4568,10 @@ impl Connection {
                 self.job_missing = None;
             }
             self.job_name = name;
+            // Its tool run started: what was said of a Z set before it, or
+            // one still on its way, is over (LIO-627 review).
+            self.z_said = None;
+            self.z_set = None;
         }
     }
 
@@ -4477,6 +4773,8 @@ impl Connection {
             ));
             return;
         };
+        // Set below only by a work Z the link did not take (`z_not_set`).
+        self.probed = None;
         let s = &self.snapshot;
         let (now, plate) = (s.machine_pos[2], p.plate.unwrap_or_default());
         let message = match p.touch {
@@ -4544,20 +4842,26 @@ impl Connection {
                 )
             }
             Touch::WorkZ(at) | Touch::FromReference(at) => {
-                self.send(Command::SetWork {
-                    axis: 2,
-                    value: work_z(at + plate, trip, now),
-                });
-                if let Some(run) = &mut self.run {
-                    run.z_touched();
-                    run.zeroed = true;
-                }
-                match p.plate {
+                let set = match p.plate {
                     Some(_) => format!(
                         "Work Z set: the plate's top is Z {:.3}, the surface under it Z {at:.3}.",
                         at + plate
                     ),
                     None => format!("Work Z set: the surface touched is Z {at:.3}."),
+                };
+                // The tool counts as touched off, and "Work Z set" is said,
+                // once the machine shows it (`z_set_check`, LIO-627).
+                let mut run = self.run.take();
+                let then = format!("Contact at machine Z {trip:.3}. {set}");
+                let value = work_z(at + plate, trip, now);
+                let waits = self.send_z_set(run.as_mut(), ZBy::Probe, value, Some(then));
+                self.run = run;
+                match waits {
+                    true => format!(
+                        "Work Z sent: it is set once {} shows it.",
+                        self.machine_name()
+                    ),
+                    false => set,
                 }
             }
         };
@@ -4571,7 +4875,11 @@ impl Connection {
                 feed,
             });
         }
-        self.probed = Some((true, format!("Contact at machine Z {trip:.3}. {message}")));
+        // A work Z the link did not take says so, never "Work Z set"
+        // (LIO-627).
+        if self.probed.is_none() {
+            self.probed = Some((true, format!("Contact at machine Z {trip:.3}. {message}")));
+        }
     }
 
     /// The first program of the setup picked in the Run panel, once it is

@@ -5063,9 +5063,15 @@ impl App {
             return Task::none();
         }
         self.run_epoch += 1;
-        if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
+        if let Some(c) = self.control.as_mut()
+            && let Some(r) = c.run.as_mut()
+        {
+            let was = r.epoch;
             r.check_again(self.run_epoch);
             r.left = None;
+            // The same run checked again: a Z set on its way, or one that
+            // did not take, still holds for it (LIO-627 review).
+            c.z_set_rechecked(was, self.run_epoch);
         }
         self.check_run()
     }

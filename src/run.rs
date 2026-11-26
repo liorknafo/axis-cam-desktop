@@ -302,6 +302,12 @@ pub struct TouchedFor {
     /// The Z work offset it left, once the machine shows what was sent
     /// (`Run::touch_shown`); None until then.
     z: Option<f64>,
+    /// A Z set from the reference or by probe was pressed since, and is
+    /// not shown applied (`Run::hold_touch`): the offset may still be this
+    /// tool's, so it still holds for no other, but it no longer counts as
+    /// touched off for this one (LIO-627 review).
+    #[serde(default)]
+    held: bool,
 }
 
 /// The driver's outcome of a job it refused before anything moved: "<name>:
@@ -1845,14 +1851,27 @@ impl Run {
     /// tool only (LIO-619).
     pub fn touched(&self) -> bool {
         let next = self.tool_of(self.next);
-        (self.touched_for.as_ref()).is_some_and(|t| next.is_some() && t.tool == next)
+        (self.touched_for.as_ref()).is_some_and(|t| next.is_some() && t.tool == next && !t.held)
+    }
+
+    /// The tool a touch-off now is for (`z_touched`).
+    pub fn next_tool(&self) -> Option<String> {
+        (self.tool_of(self.next)).or_else(|| self.rechecked_tool.clone())
     }
 
     /// Z is touched off for the next tool run's tool: Set Z from
     /// reference, Zero Z, Set Z, a probe or a touch-off.
     pub fn z_touched(&mut self) {
-        let tool = (self.tool_of(self.next)).or_else(|| self.rechecked_tool.clone());
-        self.z_touched_for(tool);
+        self.z_touched_for(self.next_tool());
+    }
+
+    /// A Z set for the next tool is on its way: the touch-off before it no
+    /// longer counts for its tool until the machine shows the new one, but
+    /// still says whose Z the offset is for the others (LIO-627).
+    pub fn hold_touch(&mut self) {
+        if let Some(t) = &mut self.touched_for {
+            t.held = true;
+        }
     }
 
     /// The setup is checked again, as check `epoch`, keeping its progress:
@@ -1877,13 +1896,15 @@ impl Run {
             tool,
             first,
             z: None,
+            held: false,
         });
     }
 
-    /// The Z work offset the last touch-off left, once shown.
+    /// The Z work offset the last touch-off left, once shown; none while
+    /// a Z set pressed since waits (`hold_touch`).
     #[cfg(test)]
     pub fn touched_z(&self) -> Option<f64> {
-        self.touched_for.as_ref()?.z
+        self.touched_for.as_ref().filter(|t| !t.held)?.z
     }
 
     /// The machine shows everything sent, with Z work offset `z`: what a
@@ -2653,9 +2674,19 @@ impl Run {
         };
         let first = &p.ops[from];
         let unset = unset_axes(c);
+        // A Z set from the reference or by probe on its way counts: Cycle
+        // Start waits for the machine to show it, and then asks again if it
+        // did not take (`Connection::z_set_waits`, LIO-627).
+        let z_waits = c.z_set_waits(self);
+        let (zeroed, touched) = (self.zeroed || z_waits, self.touched() || z_waits);
+        // One that did not take: Z is as it was, maybe another tool's,
+        // until the tool is touched off again (LIO-627 review).
+        if let Some(why) = c.z_failed(self) {
+            e.push(why.to_string());
+        }
         if let Some((oi, n)) = self.at_step() {
             let step = self.step_label(oi, n);
-            if !self.zeroed {
+            if !zeroed {
                 // Where the check cannot tell the stock they left, it is
                 // set by hand, and the reason said (LIO-586 review).
                 e.push(match self.partway_blocked() {
@@ -2677,7 +2708,7 @@ impl Run {
                     c.place(&unset_ids(c), true, true)
                 ));
             }
-            if !self.tool_kept && !self.touched() {
+            if !self.tool_kept && !touched {
                 e.push(format!(
                     "Confirm {}'s Z for the start at {step}: Same tool, keep Z if it was not taken out since, or Set Z from reference.",
                     crate::model::tool_label(first.tool, &first.tool_name)
@@ -2690,7 +2721,7 @@ impl Run {
             let later = self.later_cut();
             match self.partly() {
                 None if !later => e.push(format!("The check did not work out the stock operation {}, {}, starts from: pick its first operation, or check the setup again.", from + 1, first.name)),
-                _ if self.zeroed => {}
+                _ if zeroed => {}
                 _ => {
                     let oi = p.indexes.get(from).copied();
                     let steps: Vec<usize> = oi.map_or_else(Vec::new, |oi| self.cut_of(oi));
@@ -2904,7 +2935,7 @@ impl Run {
             .filter(|t| t.tool.as_ref() != Some(tool))
             .is_some_and(|t| t.z.is_none_or(unchanged));
         let change = (self.last.as_ref()).is_some_and(|(t, z)| t != tool && unchanged(*z));
-        if !self.touched() && (other || change) {
+        if !touched && (other || change) {
             e.push(format!(
                 "Tool run {} uses {}: touch off its Z first (Set Z from reference, or Zero Z).",
                 self.next + 1,
