@@ -4092,11 +4092,7 @@ impl App {
             if before == Some(cuts) || cuts.is_empty() {
                 continue;
             }
-            let add = |into: &mut Vec<run::CutInRun>| {
-                for &(oi, steps, print) in cuts {
-                    run::note_cut_in(into, oi, steps, print);
-                }
-            };
+            let add = |into: &mut Vec<run::CutInRun>| run::take_kept_cuts(into, before, cuts);
             match self.run_cuts.iter_mut().find(|(s, _)| s == id) {
                 Some((_, mine)) => add(mine),
                 None => self.run_cuts.push((id.clone(), cuts.clone())),

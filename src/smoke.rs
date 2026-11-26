@@ -5552,9 +5552,10 @@ flood = { pin = 8 }
         // Another session's tool run: what this setup's runs cut before is
         // not known, so no start goes by the check's stock (LIO-586 review).
         // What the session before kept of it, the Facing as it was sent,
-        // stays (LIO-594).
+        // up to all of it (LIO-601), stays (LIO-594).
         let cut: Vec<_> = run.cut_in_run.iter().map(|c| (c.0, c.1)).collect();
-        assert_eq!(cut, [(0, None), (crate::run::HISTORY_UNKNOWN, None)]);
+        let may = crate::run::MAY_HAVE_CUT_ALL;
+        assert_eq!(cut, [(0, may), (crate::run::HISTORY_UNKNOWN, None)]);
         assert!(run.outcome.is_none());
         assert!(
             (conn(&a).pi_note.as_ref()).is_some_and(|n| n.contains("tool run 1 of")),
@@ -8360,7 +8361,7 @@ flood = { pin = 8 }
         // The operation before the Drill's tool run, which it started at,
         // taken as cut (LIO-603).
         let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
-        assert_eq!(cut, [(1, None), (0, None)]);
+        assert_eq!(cut, [(1, crate::run::MAY_HAVE_CUT_ALL), (0, None)]);
         if run_of(&a).programs.is_none() {
             answer_skips(&mut a, 0);
         }
@@ -8401,7 +8402,7 @@ flood = { pin = 8 }
         let _ = a.update(Message::MachineEStop);
         run_until(&mut a, 5.0, "the E-stop", |r| r.running.is_none());
         let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
-        assert_eq!(cut, [(1, None), (0, None)]);
+        assert_eq!(cut, [(1, crate::run::MAY_HAVE_CUT_ALL), (0, None)]);
         let _ = a.update(Message::Disconnect);
     }
 
@@ -8624,6 +8625,171 @@ flood = { pin = 8 }
         // Over the stock top (work Z 0), not in the Pocket.
         let z = conn(&a).snapshot.work_pos[2];
         assert!(z > 0.5, "the tool stopped at work Z {z}");
+    }
+
+    /// The Face and the Pocket in setup 1, faced `stepdown` mm at a time,
+    /// and the Drill in setup 2 on the stock setup 1 leaves, its work zero
+    /// on the stock top (LIO-601).
+    fn two_setups(dir: &std::path::Path, stepdown: &str) -> App {
+        let mut a = run_app_of(dir, &fast_z_slow(), &[0, 1, 3]);
+        (a.doc.setups[0].operations[0].p).insert("stepdown".into(), stepdown.into());
+        let _ = a.update(Message::DuplicateSetup);
+        assert_eq!(a.doc.setups.len(), 2);
+        a.doc.setups[0].operations.truncate(2);
+        a.doc.setups[1].operations.drain(..2);
+        (a.doc.setups[1].p).insert("origin".into(), "Stock top front-left".into());
+        a.doc.active = a.doc.setups[0].id.clone();
+        a.page = Page::Control;
+        a
+    }
+
+    /// Setup `si` picked on the Run panel, its check answered as the app's
+    /// own is: setup 2's with the stock it leaves, pictured, which takes
+    /// the check's stock off the run (`App::picture_run`).
+    fn pick_checked(a: &mut App, si: usize, dir: &std::path::Path) {
+        use crate::run::Action as R;
+        let _ = a.update(Message::Run(R::Setup(si)));
+        assert_eq!(run_of(a).setup, si);
+        if si == 1 {
+            let check = stock_check(a, si);
+            answer_stock(a, dir, check);
+            assert!(run_of(a).left.is_none(), "not pictured");
+            return;
+        }
+        for _ in 0..3 {
+            answer_skips(a, si);
+            if run_of(a).programs.is_some() {
+                break;
+            }
+        }
+    }
+
+    /// Setup 2 on the stock top setup 1 left: Zero Z and Probe Z go by it,
+    /// or are refused with `blocked` and leave the work offset as it was.
+    fn setup_2_touches_off(a: &mut App, blocked: Option<&str>) {
+        let c = conn(a);
+        assert_eq!(c.partway_blocked().as_deref(), blocked);
+        assert_eq!(c.touch_off().is_some(), blocked.is_none());
+        if blocked.is_none() {
+            return;
+        }
+        assert!(c.probe_spots().iter().all(|s| s.1.is_err()));
+        assert!(c.cut_probe_blocked().is_some());
+        let before = c.snapshot.work_offset;
+        let _ = a.update(Message::Machine(crate::control::Action::TouchOff));
+        let _ = a.update(Message::Machine(crate::control::Action::ProbeZ));
+        for _ in 0..40 {
+            let _ = a.update(Message::Tick);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(conn(a).snapshot.work_offset, before);
+        assert!(!conn(a).probing());
+    }
+
+    /// The issue's case through the app (LIO-601 review): setup 1 stopped
+    /// after the Pocket's first level, setup 2 picked and checked as the app
+    /// checks it, its stock pictured. Neither Zero Z nor Probe Z sets Z, and
+    /// the Run panel says to finish the Pocket, named. Setup 1 resumed and
+    /// cut to its end, setup 2 touches off on the stock top again.
+    #[test]
+    fn setup_2_waits_for_setup_1s_pocket_stopped_after_a_level_to_be_finished() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = two_setups(dir.path(), "1");
+        let left = crate::run::check_steps(&a.doc, a.part_mesh().unwrap(), 0, &[], &[]).1;
+        let pocket = left.steps.iter().find(|s| s.op == 1).unwrap().steps.len();
+        assert!(pocket >= 2, "{pocket}");
+        let journal = stop_after(&mut a, 1, 0);
+        assert_eq!((journal.op, journal.step), (1, Some(0)));
+        let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
+        assert_eq!(cut, [(0, None), (1, Some(1))]);
+        pick_checked(&mut a, 1, dir.path());
+        assert!(run_of(&a).earlier_partway());
+        assert_eq!(run_of(&a).earlier_partway_named(&a.doc), ["Top / Pocket"]);
+        setup_2_touches_off(&mut a, Some(crate::run::EARLIER_PARTWAY_BLOCKED));
+        // Back to setup 1, the same part, resumed at the Pocket's level 2.
+        pick_checked(&mut a, 0, dir.path());
+        let _ = a.update(Message::Run(R::SamePart));
+        assert_eq!(run_of(&a).at_step(), Some((1, 1)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::KeepToolZ));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(&mut a, 10.0, "the pause over the entry", |s| {
+            matches!(s.state, Some(State::Paused(_)))
+        });
+        let _ = a.update(Message::Run(R::Resume));
+        run_until(&mut a, 120.0, "setup 1's tool run", |r| r.done[0]);
+        tick_until(&mut a, 10.0, "Idle", |s| s.state == Some(State::Idle));
+        let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
+        assert_eq!(cut, [(0, None), (1, None)]);
+        pick_checked(&mut a, 1, dir.path());
+        assert!(!run_of(&a).earlier_unfollowed());
+        setup_2_touches_off(&mut a, None);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// Stop after step at the Face's last level (LIO-601 review): the Face
+    /// is cut whole, the Pocket after it never run. Setup 2's check takes
+    /// setup 1 as cut whole, Pocket and all: neither Zero Z nor Probe Z
+    /// sets Z, and the Run panel names the Pocket not cut (`earlier_uncut`,
+    /// LIO-603), not the Face. The Pocket then cut to its end, setup 2
+    /// touches off on the stock top setup 1 left.
+    #[test]
+    fn a_stop_after_an_operations_last_step_counts_it_cut_whole() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = two_setups(dir.path(), "5");
+        let left = crate::run::check_steps(&a.doc, a.part_mesh().unwrap(), 0, &[], &[]).1;
+        let levels = left.steps.iter().find(|s| s.op == 0).unwrap().steps.len();
+        let journal = stop_after(&mut a, 0, levels - 1);
+        assert_eq!((journal.op, journal.step), (0, Some(levels - 1)));
+        let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
+        assert_eq!(cut, [(0, None)]);
+        pick_checked(&mut a, 1, dir.path());
+        assert!(!run_of(&a).earlier_partway());
+        assert!(run_of(&a).earlier_partway_named(&a.doc).is_empty());
+        let uncut: Vec<String> = (run_of(&a).earlier_uncut().iter())
+            .map(|n| n.to_string())
+            .collect();
+        assert!(uncut.len() == 1 && uncut[0].contains("Pocket"), "{uncut:?}");
+        let why = conn(&a).partway_blocked().unwrap();
+        assert!(why.starts_with(&uncut[0]), "{why}");
+        setup_2_touches_off(&mut a, Some(&why));
+        // Back to setup 1, the same part: the Pocket is the start.
+        pick_checked(&mut a, 0, dir.path());
+        let _ = a.update(Message::Run(R::SamePart));
+        let start = (run_of(&a).checked().unwrap().get(run_of(&a).next))
+            .and_then(|p| p.indexes.get(run_of(&a).from).copied());
+        assert_eq!(start, Some(1));
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::KeepToolZ));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        let mut resumed = false;
+        let mut deadline = Deadline::new(120.);
+        while !run_of(&a).done[0] {
+            let _ = a.update(Message::Tick);
+            if !resumed && matches!(conn(&a).snapshot.state, Some(State::Paused(_))) {
+                let _ = a.update(Message::Run(R::Resume));
+                resumed = true;
+            }
+            assert!(
+                deadline.within(&conn(&a).snapshot),
+                "{:?}",
+                run_of(&a).outcome
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        tick_until(&mut a, 10.0, "Idle", |s| s.state == Some(State::Idle));
+        let cut: Vec<_> = (run_of(&a).cut_in_run.iter()).map(|c| (c.0, c.1)).collect();
+        assert_eq!(cut, [(0, None), (1, None)]);
+        pick_checked(&mut a, 1, dir.path());
+        assert!(!run_of(&a).earlier_unfollowed());
+        setup_2_touches_off(&mut a, None);
+        let _ = a.update(Message::Disconnect);
     }
 
     /// Stopped after the Pocket's first level, the Face before it in its
@@ -12220,7 +12386,8 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
         let kept = (a.run_cuts.iter().find(|(id, _)| *id == a.doc.setups[0].id))
             .map(|(_, c)| c.iter().map(|c| (c.0, c.1)).collect::<Vec<_>>());
-        assert_eq!(kept, Some(vec![(0, None), (1, None), (2, None)]));
+        let may = crate::run::MAY_HAVE_CUT_ALL;
+        assert_eq!(kept, Some(vec![(0, may), (1, may), (2, may)]));
         let _ = a.update(Message::Connect);
         tick_until(&mut a, 5., "E-stop after connecting", |s| {
             s.state == Some(State::EStop)
@@ -13177,7 +13344,8 @@ flood = { pin = 8 }
         a.doc.machines.push(other);
         let _ = a.update(Message::Disconnect);
         let kept = a.run_cuts.iter().find(|(id, _)| *id == a.doc.setups[0].id);
-        assert!(kept.is_some_and(|(_, c)| c.iter().any(|c| c.0 == 0 && c.1.is_none())));
+        let may = crate::run::MAY_HAVE_CUT_ALL;
+        assert!(kept.is_some_and(|(_, c)| c.iter().any(|c| c.0 == 0 && c.1 == may)));
         let _ = a.update(Message::ControlMachine("lio582-other".into()));
         let _ = a.update(Message::Connect);
         tick_until(&mut a, 5., "the other machine", |s| {
@@ -13508,8 +13676,9 @@ flood = { pin = 8 }
         answer_skips(&mut a, 0);
         cycle_start(&mut a);
         assert!(run_of(&a).running.is_some(), "{:?}", problems(&a));
-        // Kept as the tool run starts, as cutting all it runs: AXIS CAM
-        // killed now has kept no less than it cut.
+        // Kept as the tool run starts, as cutting up to all it runs (not
+        // known whole, LIO-601): AXIS CAM killed now has kept no less than
+        // it cut. Cut to its end, whole.
         let setup = a.doc.setups[0].id.clone();
         let kept = || {
             let path = dir.path().join("uc100").join("cuts.json");
@@ -13519,10 +13688,12 @@ flood = { pin = 8 }
                 .map(|c| (c.0, c.1))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(kept(), [(0, None), (1, None)]);
+        let may = crate::run::MAY_HAVE_CUT_ALL;
+        assert_eq!(kept(), [(0, may), (1, may)]);
         run_until(&mut a, 90., "tool run 1", |r| r.running.is_none());
         assert!(run_of(&a).done[0]);
         assert!(conn(&a).journal().is_none());
+        assert_eq!(kept(), [(0, None), (1, None)]);
         // Removed while AXIS CAM is open (by hand, say): written again
         // from what it knows at its next update (LIO-594 review).
         std::fs::remove_file(dir.path().join("uc100").join("cuts.json")).unwrap();
@@ -13642,19 +13813,21 @@ flood = { pin = 8 }
                 .flat_map(|(_, c)| c.iter().map(|c| (c.0, c.1)))
                 .collect::<Vec<_>>()
         };
+        // Up to all of what it runs, not known whole (LIO-601).
+        let may = crate::run::MAY_HAVE_CUT_ALL;
         let _ = a.update(Message::Machine(crate::control::Action::WorkZero(None)));
         let _ = a.update(Message::Run(R::CycleStart));
         assert!(conn(&a).press_waits());
-        assert_eq!(kept(), [(0, None), (1, None)]);
+        assert_eq!(kept(), [(0, may), (1, may)]);
         let mut deadline = Deadline::new(2. * crate::control::PRESS_WAIT.as_secs_f64());
         while conn(&a).press_waits() {
             assert!(deadline.within(&conn(&a).snapshot), "the press waits");
             let _ = a.update(Message::Tick);
-            assert_eq!(kept(), [(0, None), (1, None)]);
+            assert_eq!(kept(), [(0, may), (1, may)]);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(run_of(&a).running.is_some(), "{:?}", problems(&a));
-        assert_eq!(kept(), [(0, None), (1, None)]);
+        assert_eq!(kept(), [(0, may), (1, may)]);
         tick_until(&mut a, 5., "running", |s| s.state == Some(State::Run));
         let _ = a.update(Message::Run(R::Stop));
         run_until(&mut a, 30., "the stop", |r| r.running.is_none());
@@ -15367,7 +15540,7 @@ flood = { pin = 8 }
             conn(&a)
                 .stock_top()
                 .unwrap_err()
-                .contains("Probe Z cannot set it")
+                .contains("So Probe Z cannot set Z either.")
         );
         assert!(conn(&a).edges_setup().is_err());
         assert!(conn(&a).probe_spots().iter().all(|(_, ok)| ok.is_err()));

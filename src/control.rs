@@ -4804,7 +4804,7 @@ impl Connection {
         }
         self.run_program()?;
         if let Some(why) = self.partway_blocked() {
-            return Err(format!("{why} Probe Z cannot set it."));
+            return Err(format!("{why} So Probe Z cannot set Z either."));
         }
         // The plate lies wherever it is put on the top, which the check
         // knows only at the touch-off spot.
@@ -4823,9 +4823,12 @@ impl Connection {
         {
             return Err("Earlier setups cut into the stock top, so a touch plate laid on it may not lie at a height the check knows: Probe Z cannot set Z. Touch the tool tip off at the touch-off spot instead.".into());
         }
-        self.touch_off()
-            .map(|(_, work)| work[2])
-            .ok_or_else(|| format!("{} Probe Z cannot set it.", crate::post::STOCK_TOP_CUT))
+        self.touch_off().map(|(_, work)| work[2]).ok_or_else(|| {
+            format!(
+                "{} So Probe Z cannot set Z either.",
+                crate::post::STOCK_TOP_CUT
+            )
+        })
     }
 
     /// Why Probe Z cannot start now; None when it can.

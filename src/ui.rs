@@ -11648,6 +11648,7 @@ fn work_zero_note(o: crate::orient::Orient) -> String {
 /// shows whether or not the run has started: a run kept across a
 /// disconnect has.
 fn stock_question<'a>(
+    doc: &crate::model::Document,
     c: &'a crate::control::Connection,
     run: &'a crate::run::Run,
 ) -> Option<iced::widget::Column<'a, Message>> {
@@ -11763,10 +11764,31 @@ fn stock_question<'a>(
     // Another setup's cuts the check does not follow: only new stock
     // clears them (LIO-582 review). Those of setups this project does not
     // have alone are said so: another project's, maybe (LIO-635).
+    // Said once the check answers: till then nothing is known of what it
+    // simulates (LIO-601 review).
     let stock = stock.or_else(|| {
-        run.earlier_unfollowed().then(|| {
+        (run.earlier_unfollowed() && run.checked().is_some()).then(|| {
+            // Which operation to finish, named (LIO-601 review).
+            let said = match run.earlier_partway() {
+                true => {
+                    let named = run.earlier_partway_named(doc);
+                    let (them, each) = match named.len() {
+                        0 | 1 => ("it", "it"),
+                        _ => ("them", "each"),
+                    };
+                    // None named: its setup gone from the project since.
+                    let which = match named.is_empty() {
+                        true => "an operation of this part".to_string(),
+                        false => crate::post::listed(&named),
+                    };
+                    format!(
+                        "Another setup's run left {which} unfinished (its run stopped partway through {each}, or where it stopped is not known): run {them} to the end first."
+                    )
+                }
+                false => run.earlier_unfollowed_note(),
+            };
             column![
-                text(run.earlier_unfollowed_note()).size(12),
+                text(said).size(12),
                 small(
                     "New stock loaded",
                     (!running).then_some(Message::Run(R::NewStock)),
@@ -11931,7 +11953,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
                 false,
             ),
         });
-        let stock = stock_question(c, run);
+        let stock = stock_question(&app.doc, c, run);
         // Asked for whenever Cycle Start waits for it (LIO-583 review).
         if run.asks_zero() {
             buttons = buttons.push(small(
@@ -11986,7 +12008,7 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
         ));
         // Asked here too: a run kept across a disconnect has started
         // (LIO-595).
-        if let Some(stock) = stock_question(c, run) {
+        if let Some(stock) = stock_question(&app.doc, c, run) {
             col = col.push(stock);
         }
         // A start at a step waits for the work zero the steps before it
