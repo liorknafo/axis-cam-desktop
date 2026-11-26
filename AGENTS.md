@@ -17,9 +17,10 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
 - Review briefs, notes and memories written before LIO-729 may still say to
   run `CARGO_INCREMENTAL=0 cargo test ...`. That advice is out of date: it
   saved disk when the disk was nearly full (the incremental data takes about
-  3 GB per checkout: 2.3 GB for the test binary, 0.9 GB for the app the
-  integration tests build). If your brief or a memory tells you to set it, leave
-  it unset and say so in your answer, so the brief gets corrected.
+  4.4 GB per checkout after `cargo test`: 3.1 GB for the test binary, 1.3 GB
+  for the app the integration tests build; `cargo build` adds 0.9 GB). If your
+  brief or a memory tells you to set it, leave it unset and say so in your
+  answer, so the brief gets corrected.
 - The first build in a new checkout compiles `axis-cam` whole, with the
   dependencies already built: about 95 s for `cargo test --no-run`, which
   builds it at `opt-level` 1 (below), and 28 s for `cargo build`. The builds
@@ -33,7 +34,7 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
   LIO-729): the test groups run 1.8–2.6 times faster (the full suite about
   17 min instead of 40). The cost: a one-line change rebuilds the test binary
   in about 22 s instead of 7, peaking at 6.3 GB of memory instead of 3.9, and
-  a cold `cargo test --no-run` peaks at 10.7 GB (it compiles the test binary
-  and the app at `opt-level` 1 at once). `cargo build` and `cargo run` stay
+  in a cold `cargo test --no-run` the compiler of the test binary alone
+  reaches about 10 GB (7.3 before). `cargo build` and `cargo run` stay
   at `opt-level` 0 (a one-line rebuild about 4 s). Don't override it for a
   run: each setting keeps its own copy of the crate in `target/`.

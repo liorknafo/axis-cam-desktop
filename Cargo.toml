@@ -74,7 +74,8 @@ debug = true
 # full suite took 16.8 min instead of 40 (smoke 4.6 min instead of 11.6).
 # The cost: a one-line rebuild of the test binary takes 21-24 s instead of
 # 7 and peaks at 6.3 GB instead of 3.9, and a cold `cargo test --no-run`
-# 136 s instead of 87, peaking at 10.7 GB. `cargo build` and `cargo run`
+# takes 136 s instead of 87, its largest compiler reaching about 10 GB
+# instead of 7.3. `cargo build` and `cargo run`
 # (the dev profile) stay at opt-level 0. Debug assertions and overflow
 # checks stay on.
 [profile.test.package.axis-cam]
