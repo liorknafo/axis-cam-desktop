@@ -277,6 +277,7 @@ pub const NOT_WORK_STATE: &[(&str, &str)] = &[
     ("cuts_failed", CONTROLLER),
     ("cuts_seen", CONTROLLER),
     ("cuts_grew", CONTROLLER),
+    ("cuts_forgot", CONTROLLER),
     ("journal_changes_seen", CONTROLLER),
     ("pi_control_seen", CONTROLLER),
     ("run_pending", CONTROLLER),
