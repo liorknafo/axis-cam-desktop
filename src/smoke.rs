@@ -15894,6 +15894,64 @@ flood = { pin = 8 }
         );
     }
 
+    /// The Drill's tool run done first (Start here on it), then the Face
+    /// skipped as cut, so the run starts at the Pocket (LIO-633 review): New
+    /// stock loaded takes the start back to the Face, the operator's pick or
+    /// the first operation of no tool run done, and Zero Z sets Z on the
+    /// stock top. The Drill, the last operation, skipped as cut after the
+    /// other tool run is done leaves no start; New stock loaded gives it
+    /// back, at the Drill.
+    #[test]
+    fn new_stock_takes_a_start_back_past_a_later_tool_run_done() {
+        use crate::run::{Action as R, Skip};
+        let z = |a: &App| conn(a).touch_off().map(|(_, w)| w[2]);
+        let start = |a: &App| {
+            let run = run_of(a);
+            (run.checked().unwrap().get(run.next)).and_then(|p| p.indexes.get(run.from).copied())
+        };
+        let new_stock = |a: &mut App| {
+            let _ = a.update(Message::Run(R::NewStock));
+            let _ = a.update(Message::Tick);
+            answer_skips(a, 0);
+        };
+        let fresh = |dir: &std::path::Path, done: usize| {
+            let mut a = ops_app(dir);
+            zeroed(&mut a);
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(&mut a, 0);
+            assert_eq!(sent(&a), [vec![0, 1, 2], vec![3]]);
+            let run = a.control.as_mut().unwrap().run.as_mut().unwrap();
+            run.done[done] = true;
+            a
+        };
+        for pick in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = fresh(dir.path(), 1);
+            if pick {
+                let _ = a.update(Message::Run(R::Next(0)));
+                assert_eq!(run_of(&a).start_picked, Some((0, 0)));
+            }
+            assert!(skip(&mut a, 0, Some(Skip::Cut)));
+            assert_eq!(start(&a), Some(1), "{pick}");
+            new_stock(&mut a);
+            assert!(run_of(&a).skips.is_empty());
+            assert_eq!(sent(&a), [vec![0, 1, 2], vec![3]]);
+            assert_eq!((start(&a), z(&a)), (Some(0), Some(0.)), "{pick}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh(dir.path(), 0);
+        {
+            let run = a.control.as_mut().unwrap().run.as_mut().unwrap();
+            (run.next, run.from) = (1, 0);
+        }
+        assert!(skip(&mut a, 3, Some(Skip::Cut)));
+        assert_eq!((sent(&a), start(&a)), (vec![vec![0, 1, 2]], None));
+        new_stock(&mut a);
+        assert!(run_of(&a).skips.is_empty());
+        assert_eq!(sent(&a), [vec![0, 1, 2], vec![3]]);
+        assert_eq!((run_of(&a).next, start(&a)), (1, Some(3)));
+    }
+
     /// A run from the setup's start with the Drilling's first hole taken as
     /// cut (LIO-621): the steps name only what sets Z there, Z by hand and
     /// Keep this work zero, and once a reference is recorded, Set Z from

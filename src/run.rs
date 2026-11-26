@@ -4480,21 +4480,21 @@ impl Run {
         if let Some(programs) = self.checked() {
             let (done, start) = self.progress_kept(programs);
             // Where the run would start but for the skips: the start the
-            // operator picked, or else the first operation after the tool
-            // runs done in this run. Operations skipped as cut from there
-            // to the start moved it on, and go now: kept there, they would
-            // be before the start, so taken as cut all the same, and Zero Z
-            // on the stock top would set Z on their floor on stock that is
-            // new (LIO-633). It goes back there. A start at a step it did
-            // not come to by a pick (where a run stopped) is LIO-634's.
-            let after_done = |oi: usize| done.iter().all(|&d| oi > d);
-            let picked = (self.start_picked)
-                .filter(|&(p, _)| after_done(p) && start.is_some_and(|s| p <= s));
-            let base = picked.map_or_else(|| done.iter().max().map_or(0, |d| d + 1), |p| p.0);
-            let back = start.is_some_and(|s| {
-                self.at_step().is_none_or(|a| Some(a) == picked)
-                    && skips.iter().any(|&(oi, _)| oi >= base && oi < s)
-            });
+            // operator picked, unless its tool run is done, or else the
+            // first operation of no tool run done in this run (a later one
+            // may be, run first by Start here). Operations skipped as cut
+            // from there to the start, or to the end when they left none,
+            // moved it on, and go now: kept there, they would be before the
+            // start, so taken as cut all the same, and Zero Z on the stock
+            // top would set Z on their floor on stock that is new
+            // (LIO-633). It goes back there. A start at a step it did not
+            // come to by a pick (where a run stopped) is LIO-634's.
+            let s = start.unwrap_or(usize::MAX);
+            let picked = (self.start_picked).filter(|&(p, _)| !done.contains(&p) && p <= s);
+            let open = (0..).find(|oi| !done.contains(oi)).unwrap_or(0);
+            let base = picked.map_or(open, |p| p.0);
+            let back = self.at_step().is_none_or(|a| Some(a) == picked)
+                && skips.iter().any(|&(oi, _)| oi >= base && oi < s);
             if back {
                 // A pick at a step is that step again.
                 self.start_step = picked.filter(|p| p.1 > 0);
