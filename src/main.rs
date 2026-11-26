@@ -5213,8 +5213,10 @@ impl App {
             let was = r.epoch;
             r.check_again(self.run_epoch);
             r.left = None;
-            // The same run checked again: a Z set on its way, or one that
-            // did not take, still holds for it (LIO-627 review).
+            // The same run checked again: one that did not take still
+            // holds for it (LIO-627 review); one on its way is a Z set
+            // before the check, shown as its tool's Z but forgotten for
+            // the start (`Run::starts`, LIO-618).
             c.z_set_rechecked(was, self.run_epoch);
         }
         self.check_run()
