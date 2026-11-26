@@ -1888,6 +1888,21 @@ impl Run {
         (self.touched_for.as_ref()).is_some_and(|t| next.is_some() && t.tool == next && !t.held)
     }
 
+    /// The tool a touch-off made before the setup's first check answered
+    /// is for, once it has: tool run 1's, when the run starts there; else
+    /// none known (LIO-619).
+    pub fn first_touch_tool(&self) -> Option<String> {
+        (self.next == 0 && self.from == 0 && self.at_step().is_none())
+            .then(|| self.tool_of(0))
+            .flatten()
+    }
+
+    /// No check of the setup has answered since it was picked: a touch-off
+    /// made now is for the tool the first one finds (`first_touch_tool`).
+    pub fn unanswered(&self) -> bool {
+        !self.answered
+    }
+
     /// The tool a touch-off now is for (`z_touched`).
     pub fn next_tool(&self) -> Option<String> {
         (self.tool_of(self.next)).or_else(|| self.rechecked_tool.clone())
@@ -2092,12 +2107,7 @@ impl Run {
             Some(f) => self.followed = Some(self.follow_again(f)),
             None => self.take_journal(),
         }
-        // A touch-off made before the setup's first check answered was for
-        // tool run 1's tool, when the run starts there; else for none
-        // known (LIO-619).
-        let start = (self.next == 0 && self.from == 0 && self.at_step().is_none())
-            .then(|| self.tool_of(0))
-            .flatten();
+        let start = self.first_touch_tool();
         if let Some(t) = &mut self.touched_for
             && std::mem::take(&mut t.first)
         {
@@ -2757,11 +2767,12 @@ impl Run {
         };
         let first = &p.ops[from];
         let unset = unset_axes(c);
-        // A Z set from the reference or by probe on its way counts: Cycle
-        // Start waits for the machine to show it, and then asks again if it
-        // did not take (`Connection::z_set_waits`, LIO-627).
-        let z_waits = c.z_set_waits(self);
-        let (zeroed, touched) = (self.zeroed || z_waits, self.touched() || z_waits);
+        // A Z set on its way counts: Cycle Start waits for the machine to
+        // show it, and then asks again if it did not take
+        // (`Connection::z_set_waits`, LIO-627); as the work zero too, for
+        // one that sets it (LIO-628).
+        let touched = self.touched() || c.z_set_waits(self);
+        let zeroed = self.zeroed || c.z_set_zeroes(self);
         // One that did not take: Z is as it was, maybe another tool's,
         // until the tool is touched off again (LIO-627 review).
         if let Some(why) = c.z_failed(self) {

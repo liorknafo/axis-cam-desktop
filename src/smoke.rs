@@ -3032,6 +3032,140 @@ flood = { pin = 8 }
         }
     }
 
+    /// LIO-628 review: T1 touched off with Zero on Z, then Zero on Z
+    /// pressed again 3 mm lower and lost on its way, refused by the link, or
+    /// left on its way while tool run 2 (T3) is picked. The machine's Z is
+    /// still T1's, or T1's new one, so tool run 2 still asks for its own
+    /// touch-off, as it does after a press that took; and Cycle Start does
+    /// not run T3 on T1's Z.
+    #[test]
+    fn a_z_set_that_does_not_take_leaves_another_tool_asking_for_its_touch_off() {
+        use crate::control::Action;
+        use crate::run::Action as R;
+        for variant in ["lost", "refused", "picked while on its way"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = run_app(dir.path());
+            zeroed(&mut a);
+            check_run(&mut a, 0);
+            mdi(&mut a, "G0 Z-22");
+            let _ = a.update(Message::Machine(Action::WorkZero(Some(2))));
+            run_until(&mut a, 2.0, "T1 touched off", |r| r.touched());
+            touch_shown(&mut a);
+            let _ = a.update(Message::Run(R::Next(1)));
+            assert!(!touch_first(&a).is_empty(), "{variant}: {:?}", problems(&a));
+            let _ = a.update(Message::Run(R::Next(0)));
+            assert!(run_of(&a).touched(), "{variant}");
+            mdi(&mut a, "G0 Z-25");
+            let before = conn(&a).snapshot.work_offset[2];
+            // Zero on Z sets the offset to the machine's Z here.
+            let zeroed_at = conn(&a).snapshot.machine_pos[2];
+            match variant {
+                "lost" => a.control.as_mut().unwrap().lose_next_z = Some(true),
+                "refused" => a.control.as_mut().unwrap().lose_next_z = Some(false),
+                _ => {}
+            }
+            let _ = a.update(Message::Machine(Action::WorkZero(Some(2))));
+            assert!(!run_of(&a).touched(), "{variant}");
+            if variant == "picked while on its way" {
+                // Tool run 2 picked before the machine shows it: it is
+                // still settled, for T1.
+                assert!(conn(&a).z_set_waits(run_of(&a)));
+                let _ = a.update(Message::Run(R::Next(1)));
+                tick_until(&mut a, 2.0, "Zero on Z shown", |s| {
+                    (s.work_offset[2] - zeroed_at).abs() < 1e-3
+                });
+                z_settled_any(&mut a);
+            } else {
+                z_settled(&mut a);
+                assert!(conn(&a).z_said(run_of(&a)).is_some(), "{variant}");
+                assert!((conn(&a).snapshot.work_offset[2] - before).abs() < 1e-9);
+                let _ = a.update(Message::Run(R::Next(1)));
+            }
+            // Tool run 2, T3: its touch-off asked for, Cycle Start refused.
+            assert!(!run_of(&a).touched(), "{variant}");
+            assert!(!touch_first(&a).is_empty(), "{variant}: {:?}", problems(&a));
+            cycle_start(&mut a);
+            assert!(run_of(&a).running.is_none(), "{variant}");
+            // Back on tool run 1: the Zero on Z that took counts for T1;
+            // one that did not still says so and holds Cycle Start back.
+            let _ = a.update(Message::Run(R::Next(0)));
+            if variant == "picked while on its way" {
+                assert!(run_of(&a).touched(), "{variant}");
+            } else {
+                assert!(!run_of(&a).touched(), "{variant}");
+                let said = conn(&a).z_said(run_of(&a)).expect("said").to_string();
+                assert!(
+                    problems(&a).contains(&said),
+                    "{variant}: {:?}",
+                    problems(&a)
+                );
+            }
+        }
+    }
+
+    /// LIO-628 review: Zero on Z pressed before the setup's first check
+    /// answers counts for tool run 1's tool, whichever comes first, the
+    /// check's answer or the machine showing it, as LIO-619 has a
+    /// touch-off made then; nothing then asks for T1's touch-off again.
+    /// Its tool is the one the check found when it answered: tool run 2
+    /// picked before it shows does not change it.
+    #[test]
+    fn a_z_set_pressed_before_the_first_check_answers_counts_for_tool_run_1() {
+        use crate::run::Action as R;
+        for (answered_first, picked) in [(true, false), (false, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = run_app(dir.path());
+            zeroed(&mut a);
+            let _ = a.update(Message::Run(R::Setup(0)));
+            assert!(run_of(&a).programs.is_none());
+            mdi(&mut a, "G0 Z-22");
+            // Zero on Z sets the offset to the machine's Z here.
+            let zeroed_at = conn(&a).snapshot.machine_pos[2];
+            let _ = a.update(Message::Machine(crate::control::Action::WorkZero(Some(2))));
+            assert!(conn(&a).z_set_pending());
+            if !answered_first {
+                z_settled_any(&mut a);
+            }
+            let epoch = run_of(&a).epoch;
+            let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+            let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+            assert_eq!(run_of(&a).next, 0);
+            if picked {
+                // Tool run 2 (T3) picked while it is on its way.
+                assert!(conn(&a).z_set_pending());
+                let _ = a.update(Message::Run(R::Next(1)));
+                z_settled_any(&mut a);
+                assert!(!touch_first(&a).is_empty(), "{:?}", problems(&a));
+                let _ = a.update(Message::Run(R::Next(0)));
+            }
+            z_settled_any(&mut a);
+            assert!(
+                (conn(&a).snapshot.work_offset[2] - zeroed_at).abs() < 1e-3,
+                "{answered_first}"
+            );
+            assert!(
+                run_of(&a).touched(),
+                "answered first {answered_first}, picked {picked}"
+            );
+            assert!(
+                problems(&a).is_empty(),
+                "answered first {answered_first}, picked {picked}: {:?}",
+                problems(&a)
+            );
+        }
+    }
+
+    /// Ticks until no Z set waits for the machine to show it, for any
+    /// tool run of the run.
+    fn z_settled_any(a: &mut App) {
+        let mut deadline = Deadline::new(5.);
+        while conn(a).z_set_pending() {
+            assert!(deadline.within(&conn(a).snapshot), "the Z set still waits");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = a.update(Message::Tick);
+        }
+    }
+
     /// A touch-off holds for its tool only (LIO-619): T1 touched off for
     /// tool run 1, tool run 2 picked next (the Drill's T3) waits for its own,
     /// while the Z work offset is the one T1's left; T3's then holds for
@@ -7067,7 +7201,9 @@ flood = { pin = 8 }
         mdi(&mut a, "G0 Z0");
         let _ = a.update(Message::Machine(crate::control::Action::WorkZero(Some(2))));
         tick_until(&mut a, 2.0, "Z zeroed", |s| s.work_pos[2].abs() < 1e-6);
-        assert!(run_of(&a).touched() && conn(&a).z_said(run_of(&a)).is_none());
+        // Touched off once the machine shows it (LIO-628).
+        run_until(&mut a, 2.0, "the touch-off", |r| r.touched());
+        assert!(conn(&a).z_said(run_of(&a)).is_none());
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
         cycle_start(&mut a);
         assert!(run_of(&a).running.is_some(), "{:?}", run_of(&a).outcome);
@@ -7129,6 +7265,225 @@ flood = { pin = 8 }
         assert!(run_of(&a).running.is_none());
         assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
         assert!((conn(&a).snapshot.work_offset[2] - offset).abs() < 1e-9);
+    }
+
+    /// Ticks until no Z set for the run's tool waits for the machine to
+    /// show it (`Connection::z_set_waits`).
+    fn z_settled(a: &mut App) {
+        let mut deadline = Deadline::new(5.);
+        while conn(a).z_set_waits(run_of(a)) {
+            assert!(deadline.within(&conn(a).snapshot), "the Z set still waits");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = a.update(Message::Tick);
+        }
+    }
+
+    /// LIO-628: Zero, ½ and Set on Z at a tool change on the Pi count the
+    /// new tool as touched off only once the Pi shows them applied. One the
+    /// link does not take, or loses on its way, changes nothing: Cycle
+    /// Start, pressed meanwhile, waits for it and then asks for the
+    /// touch-off, nothing run with the old tool's Z, and the Tool change
+    /// and Work zero tabs say to press it again. Set Z that reaches the Pi,
+    /// Cycle Start pressed at once waits for it and runs with the new Z.
+    #[test]
+    fn a_zero_half_or_set_on_z_that_never_reaches_the_pi_touches_nothing_off() {
+        use crate::control::Action;
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server) = pi_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 60., "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 5., "Idle", |s| s.state == Some(State::Idle));
+        assert!(run_of(&a).tool_change().is_some());
+        let before = conn(&a).snapshot.work_offset[2];
+        // Z alone: the work zero is as it was, set or not (LIO-628).
+        let zeroed = run_of(&a).zeroed;
+        let _ = a.update(Message::ControlPhaseTab(
+            crate::ui::ControlTab::ToolChange,
+            false,
+        ));
+        let unchanged = |a: &mut App, label: &str| {
+            assert!(!run_of(a).touched() && run_of(a).zeroed == zeroed);
+            assert!(!conn(a).z_set_waits(run_of(a)));
+            assert!((conn(a).snapshot.work_offset[2] - before).abs() < 1e-9);
+            assert!(
+                problems(a)
+                    .iter()
+                    .any(|p| p.contains("touch off its Z first")),
+                "{:?}",
+                problems(a)
+            );
+            let said = conn(a).z_said(run_of(a)).expect("said").to_string();
+            assert!(
+                said.starts_with(label)
+                    && said.ends_with(&format!(
+                        "so the tool does not count as touched off: press {label} again."
+                    )),
+                "{said}"
+            );
+            assert!(page_texts(a).contains(&said), "{:?}", page_texts(a));
+            // Said where the buttons are too.
+            let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+            assert!(page_texts(a).contains(&said), "{:?}", page_texts(a));
+            let _ = a.update(Message::ControlTab(crate::ui::ControlTab::ToolChange));
+            said
+        };
+        // Zero on Z, not taken by the link: said at once.
+        a.control.as_mut().unwrap().lose_next_z = Some(false);
+        let _ = a.update(Message::Machine(Action::WorkZero(Some(2))));
+        let said = unchanged(&mut a, "Zero on Z");
+        assert!(said.starts_with("Zero on Z was not sent ("), "{said}");
+        // ½ on Z, lost on its way: Cycle Start waits for it, then asks for
+        // the touch-off; nothing ran.
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Machine(Action::WorkHalf(2)));
+        assert!(conn(&a).z_said(run_of(&a)).is_none());
+        assert!(!run_of(&a).touched() && conn(&a).z_set_waits(run_of(&a)));
+        assert!(
+            (page_texts(&a).iter())
+                .any(|t| t == "Work Z sent: the tool counts as touched off once the Pi shows it."),
+            "{:?}",
+            page_texts(&a)
+        );
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_none());
+        // Held back by the ½ that did not take (LIO-627 review).
+        let (ok, message) = run_of(&a).outcome.clone().unwrap();
+        assert!(
+            !ok && message.contains("½ on Z did not reach the Pi"),
+            "{message}"
+        );
+        let said = unchanged(&mut a, "½ on Z");
+        assert!(
+            said.starts_with("½ on Z did not reach the Pi, or the Pi did not apply it,"),
+            "{said}"
+        );
+        assert_eq!(server.snapshot().unwrap().program_name, None);
+        // Set Z 2 mm over the work Z here, as for a tool 2 mm longer;
+        // Cycle Start at once: it waits for the Pi to show the new Z, and
+        // runs with it.
+        let z = conn(&a).snapshot.machine_pos[2];
+        let set = conn(&a).snapshot.work_pos[2] + 2.;
+        let _ = a.update(Message::Machine(Action::WorkText(2, format!("{set:.3}"))));
+        let _ = a.update(Message::Machine(Action::WorkSet(2)));
+        assert!(conn(&a).z_said(run_of(&a)).is_none());
+        assert!(conn(&a).z_set_waits(run_of(&a)) && !conn(&a).z_set_zeroes(run_of(&a)));
+        cycle_start(&mut a);
+        let offset = (run_of(&a).running.as_ref())
+            .unwrap_or_else(|| {
+                panic!(
+                    "not started: {:?} {:?} {:?}",
+                    run_of(&a).outcome,
+                    problems(&a),
+                    conn(&a).z_said(run_of(&a))
+                )
+            })
+            .offset;
+        assert!((offset[2] - (z - set)).abs() < 1e-3, "{offset:?} {z} {set}");
+        assert!(
+            (offset[2] - (before - 2.)).abs() < 1e-3,
+            "{offset:?} {before}"
+        );
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+    }
+
+    /// LIO-628 review: Zero on Z, Zero all or Set Z pressed at the pause
+    /// over a step's entry counts the tool as touched off once the
+    /// controller shows it. Paused, it sets the offset from where its plan
+    /// stands, off the position the snapshot shows by the part of a motor
+    /// step the work zero is off the step grid; one lost on its way there
+    /// still says so.
+    #[test]
+    fn a_z_set_at_the_pause_over_a_steps_entry_counts_once_shown() {
+        use crate::control::Action;
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        // The work zero off the motors' step grid (0.05 mm here), set Idle:
+        // at the pause the plan then stands off the motors' position.
+        let step = 1. / conn(&a).config.axes.get(2).unwrap().steps_per_unit;
+        assert!(step > 0.02, "{step}");
+        for (axis, value) in [(0, 0.0171), (1, -0.0234), (2, 0.0123)] {
+            let _ = a.update(Message::Machine(Action::WorkText(
+                axis,
+                format!("{value:.4}"),
+            )));
+            let _ = a.update(Message::Machine(Action::WorkSet(axis)));
+        }
+        tick_until(&mut a, 2.0, "the work zero off the grid", |s| {
+            (s.work_pos[2] - 0.0123).abs() < 1e-6
+        });
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        // Start at hole 3 of the Drill: Cycle Start waits over its entry.
+        let _ = a.update(Message::Run(R::Steps(Some(1))));
+        let _ = a.update(Message::Run(R::PickStep(1, 2)));
+        let _ = a.update(Message::Run(R::StartStep));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::KeepZero));
+        let _ = a.update(Message::Run(R::KeepToolZ));
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        let _ = a.update(Message::Run(R::CycleStart));
+        tick_until(
+            &mut a,
+            5.0,
+            "the pause over the entry",
+            |s| matches!(&s.state, Some(State::Paused(why)) if why.contains("hole 3")),
+        );
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let before = conn(&a).snapshot.work_offset[2];
+        // Lost on its way: nothing touched off, and said.
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Machine(Action::WorkZero(Some(2))));
+        assert!(conn(&a).z_set_waits(run_of(&a)));
+        z_settled(&mut a);
+        assert!(!run_of(&a).touched());
+        assert!((conn(&a).snapshot.work_offset[2] - before).abs() < 1e-9);
+        let said = conn(&a).z_said(run_of(&a)).expect("said").to_string();
+        assert!(
+            said.starts_with(
+                "Zero on Z did not reach the controller, or the controller did not apply it,"
+            ),
+            "{said}"
+        );
+        assert!(page_texts(&a).contains(&said), "{:?}", page_texts(&a));
+        // Zero on Z, applied: touched off, nothing said, though the offset
+        // the controller set is off the one worked out from the snapshot.
+        let _ = a.update(Message::Machine(Action::WorkZero(Some(2))));
+        z_settled(&mut a);
+        assert!(run_of(&a).touched(), "{:?}", conn(&a).z_said(run_of(&a)));
+        assert!(conn(&a).z_said(run_of(&a)).is_none());
+        let s = &conn(&a).snapshot;
+        let off = (s.work_offset[2] - (s.machine_pos[2] - 0.)).abs();
+        assert!(off > 1e-3 && off < step, "{off} {:?}", s.work_offset);
+        // Zero all and Set Z, applied: the same.
+        let _ = a.update(Message::Machine(Action::WorkZero(None)));
+        z_settled(&mut a);
+        assert!(run_of(&a).touched(), "{:?}", conn(&a).z_said(run_of(&a)));
+        assert!(conn(&a).z_said(run_of(&a)).is_none());
+        let _ = a.update(Message::Machine(Action::WorkText(2, "1.5".into())));
+        let _ = a.update(Message::Machine(Action::WorkSet(2)));
+        assert!(!run_of(&a).touched());
+        z_settled(&mut a);
+        assert!(run_of(&a).touched(), "{:?}", conn(&a).z_said(run_of(&a)));
+        assert!(conn(&a).z_said(run_of(&a)).is_none());
+        // Set Z lost on its way there: still caught.
+        let _ = a.update(Message::Machine(Action::WorkText(2, "15".into())));
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Machine(Action::WorkSet(2)));
+        z_settled(&mut a);
+        assert!(!run_of(&a).touched());
+        assert!(conn(&a).z_said(run_of(&a)).is_some());
+        let _ = a.update(Message::Run(R::Stop));
+        tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
     }
 
     /// LIO-562: Set machine zero declares the axes one at a time; until the
@@ -18792,7 +19147,10 @@ flood = { pin = 8 }
             let _ = a.update(Message::Tick);
             let _ = a.view();
             let c = conn(a);
-            if let (false, Some(p)) = (c.probing(), &c.probed) {
+            // What it found is said once the machine shows the work zero
+            // it sets (LIO-628).
+            let waits = (c.run.as_ref()).is_some_and(|r| c.z_set_waits(r));
+            if let (false, false, Some(p)) = (c.probing(), waits, &c.probed) {
                 return p.clone();
             }
             assert!(
@@ -19171,6 +19529,59 @@ flood = { pin = 8 }
         assert!((conn(&a).snapshot.work_offset[2] - -20.).abs() < 0.06);
     }
 
+    /// LIO-628: a work zero found by Probe corner, Probe edge or Probe
+    /// centre and lost on its way touches nothing off and sets no work
+    /// zero, and says so; the top probed by the probing screen whose Z the
+    /// link does not take says so in place of what it found.
+    #[test]
+    fn a_probed_work_zero_that_never_reaches_the_machine_touches_nothing_off() {
+        use crate::control::{Action, Feature};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = edges_app(dir.path(), Some("Stock top center"));
+        let (lo, hi) = conn(&a).block.unwrap();
+        let mid = [(lo[0] + hi[0]) / 2., (lo[1] + hi[1]) / 2.];
+        let before = conn(&a).snapshot.work_offset;
+        mdi(
+            &mut a,
+            &format!("G53 G0 X{} Y{} Z-30", mid[0] + 3., mid[1] - 2.),
+        );
+        assert_eq!(edges_blocked(&a), "");
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Machine(Action::ProbeEdges));
+        let (ok, message) = probed(&mut a);
+        tick_until(&mut a, 5.0, "backing off", |s| {
+            s.state == Some(uc100::controller::State::Idle) && (s.machine_pos[2] - -30.).abs() < 0.2
+        });
+        assert!(!ok, "{message}");
+        assert_eq!(
+            message,
+            "The work zero the probe found did not reach the controller, or the controller did not apply it, so it is not set and the tool does not count as touched off: probe again."
+        );
+        assert!(!run_of(&a).touched() && !run_of(&a).zeroed);
+        assert_eq!(conn(&a).snapshot.work_offset, before);
+        // The top, its Z not taken by the link: said at once, not what the
+        // probe found.
+        mdi(&mut a, &format!("G53 G0 X{} Y{} Z-30", mid[0], mid[1]));
+        a.control.as_mut().unwrap().lose_next_z = Some(false);
+        let _ = a.update(Message::Machine(Action::ProbeFeature(Feature::Top)));
+        let (ok, message) = probed(&mut a);
+        assert!(
+            !ok && message.starts_with("The work Z the probe found was not sent (")
+                && message.ends_with("so the tool does not count as touched off: probe again."),
+            "{message}"
+        );
+        assert!(!run_of(&a).touched());
+        assert_eq!(conn(&a).snapshot.work_offset, before);
+        // Probed again: touched off once the controller shows it.
+        mdi(&mut a, &format!("G53 G0 X{} Y{} Z-30", mid[0], mid[1]));
+        let _ = a.update(Message::Machine(Action::ProbeFeature(Feature::Top)));
+        let (ok, message) = probed(&mut a);
+        assert!(ok, "{message}");
+        z_settled(&mut a);
+        assert!(run_of(&a).touched() && !run_of(&a).zeroed);
+        assert!((conn(&a).snapshot.work_offset[2] - -40.).abs() < 0.15);
+    }
+
     /// The fixture's top setup (Stock top center, or `origin`) checked on a
     /// zeroed FAST machine with a probe input and a 4 mm probe tip probed at
     /// 1000 mm/min. The simulator's block takes the stock's X/Y size round
@@ -19334,21 +19745,18 @@ flood = { pin = 8 }
         let mid = [(lo[0] + hi[0]) / 2., (lo[1] + hi[1]) / 2.];
         let probe = |a: &mut App, f: Feature| {
             assert_eq!(conn(a).feature_blocked(f), None);
+            let start = conn(a).snapshot.machine_pos;
             let _ = a.update(Message::Machine(Action::ProbeFeature(f)));
             assert!(a.locked() && conn(a).feature() == Some(f));
             let _ = a.view();
             let (ok, message) = probed(a);
             assert!(ok, "{message}");
-            // The work offset is set, then the tip moves back: a job of its
-            // own, ended once its outcome is in.
-            let seq = conn(a)
-                .snapshot
-                .program_outcome
-                .as_ref()
-                .map_or(0, |o| o.seq);
+            // The work offset is set, then the tip moves back where it
+            // started: a job of its own, which may be done already once
+            // what was found is said (LIO-628).
             tick_until(a, 5.0, "back where it started", |s| {
                 s.state == Some(State::Idle)
-                    && s.program_outcome.as_ref().is_some_and(|o| o.seq > seq)
+                    && (0..3).all(|k| (s.machine_pos[k] - start[k]).abs() < 0.01)
             });
             message
         };
@@ -20036,6 +20444,58 @@ flood = { pin = 8 }
         work_offset(&a, zero);
         assert!(run_of(&a).touched());
         let _ = a.view();
+    }
+
+    /// LIO-628: the setup's touch-off on the stock lost on its way to the
+    /// controller sets neither the work zero nor the tool's Z: the Work
+    /// zero tab says to press it again, and Cycle Start waits for it.
+    /// Pressed again, both are set once the controller shows them.
+    #[test]
+    fn a_touch_off_lost_on_its_way_sets_no_work_zero() {
+        use crate::control::Action;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_on(dir.path(), &probe_profile());
+        a.doc.setups[0]
+            .p
+            .insert("origin".into(), "Stock bottom back".into());
+        material(&mut a, "Aluminium");
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let (lo, hi) = conn(&a).block.unwrap();
+        let height = run_of(&a).checked().unwrap()[0].stock.dimensions()[2] as f64;
+        let zero = [(lo[0] + hi[0]) / 2., hi[1], hi[2] - height];
+        let _ = a.update(Message::Machine(Action::ToSimZero));
+        tick_until(&mut a, 10.0, "the move onto the block", |s| {
+            s.state == Some(State::Idle)
+                && (s.machine_pos[2] - hi[2]).abs() < 0.06
+                && (s.machine_pos[1] - hi[1]).abs() < 0.06
+        });
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        let before = conn(&a).snapshot.work_offset;
+        let label = format!("Set X0 Y0 Z{}", crate::post::exact_mm(height as f32));
+        a.control.as_mut().unwrap().lose_next_z = Some(true);
+        let _ = a.update(Message::Machine(Action::TouchOff));
+        assert!(conn(&a).z_set_waits(run_of(&a)) && conn(&a).z_set_zeroes(run_of(&a)));
+        assert!(!run_of(&a).touched() && !run_of(&a).zeroed);
+        z_settled(&mut a);
+        assert!(!run_of(&a).touched() && !run_of(&a).zeroed);
+        assert_eq!(conn(&a).snapshot.work_offset, before);
+        let said = conn(&a).z_said(run_of(&a)).expect("said").to_string();
+        assert_eq!(
+            said,
+            format!(
+                "{label} did not reach the controller, or the controller did not apply it, so the work zero is not set and the tool does not count as touched off: press {label} again."
+            )
+        );
+        assert!(page_texts(&a).contains(&said), "{:?}", page_texts(&a));
+        assert!(!problems(&a).is_empty());
+        // Pressed again: the work zero and the tool's Z, once shown.
+        let _ = a.update(Message::Machine(Action::TouchOff));
+        assert!(conn(&a).z_said(run_of(&a)).is_none());
+        z_settled(&mut a);
+        assert!(run_of(&a).touched() && run_of(&a).zeroed);
+        work_offset(&a, zero);
     }
 
     #[test]

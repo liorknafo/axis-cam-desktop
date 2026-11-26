@@ -11229,14 +11229,15 @@ fn reference_rows<'a>(
     }
     col
 }
-/// Set Z from reference or a probe's work Z on its way to the machine, or
-/// Set Z from reference that did not take: the tool is not touched off
-/// until the machine shows it (LIO-627).
+/// A Z set for the run's tool on its way to the machine (Set Z from
+/// reference, a probe's, or a work zero button's), or one that did not
+/// take: the tool is not touched off until the machine shows it (LIO-627,
+/// LIO-628).
 fn z_set_note<'a>(
     c: &crate::control::Connection,
     run: &crate::run::Run,
 ) -> Option<Element<'a, Message>> {
-    if c.z_set_by_reference_waits(run) {
+    if c.z_set_noted_waits(run) {
         return Some(
             text(format!(
                 "Work Z sent: the tool counts as touched off once {} shows it.",
@@ -11876,6 +11877,14 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
             "Pick a setup in the run bar: its work zero on the stock is set here.",
         )));
     };
+    // Zero, ½ or Set on Z, or the touch-off, on its way to the machine or
+    // not taken: the tool is not touched off until the machine shows it
+    // (LIO-628). Said once: the reference rows below say it for a setup
+    // with tool changes.
+    let rows = run.checked().is_some_and(|p| p.len() > 1);
+    if let (Some(note), false) = (z_set_note(c, run), rows) {
+        col = col.push(note);
+    }
     let running = run.running.is_some();
     if let Some(steps) = work_zero_steps(app, c) {
         // The buttons act on the checked setup the steps are from, which an
@@ -13880,7 +13889,7 @@ fn work_words(work: [f64; 3]) -> String {
 }
 /// The button that sets the touch-off point's work position `work`
 /// (`control::Action::TouchOff`): Zero all for X0 Y0 Z0.
-fn touch_label(work: [f64; 3]) -> String {
+pub(crate) fn touch_label(work: [f64; 3]) -> String {
     if work.iter().all(|v| crate::post::exact_mm(*v as f32) == "0") {
         "Zero all".into()
     } else {

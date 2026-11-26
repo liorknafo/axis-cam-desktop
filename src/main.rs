@@ -9668,7 +9668,13 @@ impl App {
                     && let Some(r) = c.run.as_mut()
                     && r.epoch == epoch
                 {
+                    let first = r.unanswered();
                     r.checked_as(programs, Some(left), times);
+                    // A Z set on its way from before the first answer is
+                    // for the tool it finds (LIO-628 review).
+                    if first {
+                        c.z_set_answered();
+                    }
                     c.fit_sim_block();
                     self.rows_from_skips();
                     return self.picture_run();
