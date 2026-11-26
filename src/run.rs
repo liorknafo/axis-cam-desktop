@@ -4562,8 +4562,9 @@ impl Run {
                 at.is_none_or(|a| self.start_picked != Some(a))
                     && (to.is_some()
                         || !done.is_empty()
-                        // No start left: the skips moved it past the end.
-                        || at.is_none() && !skips.is_empty()
+                        // No start left: the skips moved it past the end, or
+                        // a stop after the last step did.
+                        || at.is_none()
                         || at.is_some_and(|(s, n)| {
                             (self.next, self.from) != (0, 0)
                                 || n > 0
@@ -4595,8 +4596,10 @@ impl Run {
         // sent again after it (LIO-634 review).
         self.done.iter_mut().for_each(|d| *d = false);
         if back {
-            // A pick at a step is that step again.
+            // A pick at a step is that step again; one not gone back to is
+            // the operator's start no more (LIO-634 review).
             self.start_step = to.filter(|p| p.1 > 0);
+            self.start_picked = to;
             // Nothing sets Z from programs checked for the old start until
             // the check answers.
             ((self.next, self.from), self.programs) = ((0, 0), None);

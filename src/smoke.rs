@@ -14288,6 +14288,9 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::NewStock));
         let _ = a.update(Message::Tick);
         mode(0o755).unwrap();
+        // What was cut is written again only a second after the write that
+        // failed (`keep_cut_history`), as the app ticks.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
         let _ = a.update(Message::Tick);
         answer_skips(&mut a, 0);
         assert_eq!(conn(&a).journal(), Some(journal));
@@ -16350,6 +16353,31 @@ flood = { pin = 8 }
         assert_eq!((run_of(&a).next, start(&a)), (0, Some(0)));
         assert!(run_of(&a).done.iter().all(|d| !d), "{:?}", run_of(&a).done);
         assert_eq!(z(&a), Some(0.));
+        // No start left with nothing done or skipped (a stop after the last
+        // step): New stock gives it back, at the Face (LIO-634 review).
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh(dir.path(), 0);
+        {
+            let run = a.control.as_mut().unwrap().run.as_mut().unwrap();
+            run.done = vec![false; 2];
+            (run.next, run.from) = (2, 0);
+        }
+        assert_eq!(start(&a), None);
+        new_stock(&mut a);
+        assert_eq!((run_of(&a).next, start(&a), z(&a)), (0, Some(0), Some(0.)));
+        // Next on the Drill's tool run, a skip, and New stock while the
+        // skip's check answers: the start goes back to the Face, and the
+        // Drill is the operator's start no more (LIO-634 review).
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh(dir.path(), 0);
+        a.control.as_mut().unwrap().run.as_mut().unwrap().done[0] = false;
+        let _ = a.update(Message::Run(R::Next(1)));
+        assert_eq!(run_of(&a).start_picked, Some((3, 0)));
+        let _ = a.update(Message::Run(R::Skip(0, Some(Skip::Cut))));
+        assert!(run_of(&a).programs.is_none());
+        new_stock(&mut a);
+        assert_eq!(run_of(&a).start_picked, None);
+        assert_eq!((run_of(&a).next, start(&a), z(&a)), (0, Some(0), Some(0.)));
     }
 
     /// A run from the setup's start with the Drilling's first hole taken as
