@@ -13429,6 +13429,28 @@ pub(crate) mod tests {
                 "Another setup's run and {cause}, so the computer does not know what they cut here.{way_out}"
             ),
         );
+        // With B's own setup 1's bore cut too, disabled since: setup 2's
+        // zeros say setup 1's case, then A's cuts, in one sentence.
+        let mut off = b.clone();
+        off.setups[0].operations[0].enabled = false;
+        let mut mixed = with.clone();
+        let mut mine = mixed.cuts[0].clone();
+        mine.0 = b.setups[0].id.clone();
+        mixed.cuts.insert(0, mine);
+        let also = format!(
+            "{}, and another project's runs on the computer cut stock on the machine too (\"Bracket\": {bore}), which this project's plan does not follow, so the computer cannot tell the surface where the stock top is touched off.{way_out}",
+            EarlierUnfollowed::Changed(0).said_on_tablet()
+        );
+        assert!(also.starts_with("Setup 1's run on the computer"), "{also}");
+        for z in zeros(&setup_in(&off, 1, &mixed)) {
+            assert_eq!(z.set_z, None);
+            assert_eq!(z.blocked.as_deref(), Some(&also[..]));
+            assert!(!z.probe_from.is_empty());
+            for spot in &z.probe_from {
+                let why = spot.problem.as_deref().unwrap();
+                assert!(why.contains("\"Bracket\""), "{why}");
+            }
+        }
         // A's own file: its setups' cuts are its own, said as before.
         for si in 0..2 {
             assert_eq!(setup_in(&a, si, &with), setup_in(&a, si, &without));
