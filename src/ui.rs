@@ -11579,7 +11579,9 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
     col = col.push(step_box(2, run.zeroed, placed && !run.zeroed, two));
     // 3. The tool's Z.
     let tool = crate::model::tool_label(o.tool, &o.tool_name);
-    let kept = run.tool_kept || run.touched();
+    // Z set elsewhere since, at a tool change, is not the tool's (LIO-630).
+    let touched = run.touched() && !run.z_elsewhere(c);
+    let kept = run.tool_kept || touched;
     let three = column![
         text(format!(
             "{tool}'s Z: the same tool, not taken out since, or touched off again."
@@ -11595,7 +11597,7 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
                 "Set Z from reference",
                 (manual && run.reference.is_some() && run.reference_a_problem(c).is_none())
                     .then_some(Message::Run(R::ZFromReference)),
-                run.touched()
+                touched
             ),
         ]
         .spacing(6)
