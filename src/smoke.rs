@@ -7087,9 +7087,29 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::CycleStart));
         tick_for(&mut a, 200);
         assert!(run_of(&a).running.is_none());
-        // And it holds for T3's tool run.
+        // T3's tool run picked again: the Z is T3's, but set before this
+        // start was picked, so it is asked for again (LIO-618).
         let _ = a.update(Message::Run(R::Next(1)));
-        assert!(run_of(&a).touched());
+        assert!(!run_of(&a).touched());
+        let said = touch_first(&a);
+        assert!(
+            said.len() == 1 && said[0].starts_with("Tool run 2 uses T3"),
+            "{:?}",
+            problems(&a)
+        );
+        // Pressed again, and tool run 1 then tool run 2 picked before the
+        // machine shows it: a Z set before the start was picked, it is
+        // asked for again too (LIO-618).
+        let _ = a.update(Message::Run(R::ZFromReference));
+        let _ = a.update(Message::Run(R::Next(0)));
+        let _ = a.update(Message::Run(R::Next(1)));
+        assert!(!conn(&a).z_set_waits(run_of(&a)));
+        tick_for(&mut a, 300);
+        assert!(!run_of(&a).touched() && !run_of(&a).zeroed);
+        assert!(!touch_first(&a).is_empty(), "{:?}", problems(&a));
+        // Pressed for this start, it holds.
+        let _ = a.update(Message::Run(R::ZFromReference));
+        run_until(&mut a, 5.0, "the touch-off", |r| r.touched());
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
         // Seated again, Set Z from reference lost, and tool run 1 picked
         // while it is on its way: back at tool run 2, it holds it.

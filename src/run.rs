@@ -747,6 +747,10 @@ pub struct Run {
     /// While the setup is checked again: the tool of the tool run the check
     /// before found next (`check_again`), what a touch-off is for meanwhile.
     rechecked_tool: Option<String>,
+    /// How many times a touch-off was forgotten for the start
+    /// (`forget_touch`): a Z set pressed before it and shown after counts
+    /// for no start since (`Connection::z_set_check`, LIO-618).
+    starts: u64,
     /// How the last tool run ended (ok, the driver's message).
     pub outcome: Option<(bool, String)>,
     /// The stock after each of the setup's operations, by its index in the
@@ -1473,6 +1477,7 @@ impl Run {
             touched_for: None,
             answered: false,
             rechecked_tool: None,
+            starts: 0,
             outcome: None,
             pictures: vec![],
             left: None,
@@ -1972,10 +1977,17 @@ impl Run {
     /// may move it (a skip) or number the tool runs otherwise (an edit,
     /// LIO-618). Whose Z the offset is stays known, so that another tool
     /// next is touched off first (LIO-619).
-    fn forget_touch(&mut self) {
+    pub fn forget_touch(&mut self) {
+        self.starts += 1;
         if let Some(t) = &mut self.touched_for {
             t.for_start = false;
         }
+    }
+
+    /// The start a Z set is pressed for (`forget_touch`): another picked
+    /// since, or the setup checked again, it counts for none (LIO-618).
+    pub fn starts(&self) -> u64 {
+        self.starts
     }
 
     /// The Z work offset the last touch-off left, once shown; none while
@@ -8818,6 +8830,7 @@ pub(crate) mod tests {
             touched_for: None,
             answered: false,
             rechecked_tool: None,
+            starts: 0,
             outcome: None,
             pictures: vec![],
             left: None,
