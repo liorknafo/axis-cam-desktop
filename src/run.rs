@@ -11925,6 +11925,87 @@ pub(crate) mod tests {
         assert!(says(&run, touch), "{:?}", run.problems(&c, &doc));
     }
 
+    /// A Z set with one tool moves the Z work offset off the one the last
+    /// tool run started with (LIO-630): T1, T2, T1 ran; tool run 1 picked
+    /// again and Set on Z (or Zero Z, a touch-off, a probe) made with T1
+    /// in; tool run 2 picked then waits for T2's Z, though the offset is
+    /// no longer the last tool run's. The other way round, Z set with T2
+    /// for tool run 2, then tool run 1 picked, waits for T1's. Z set with
+    /// the new tool for its own start lets Cycle Start go.
+    #[test]
+    fn a_z_set_with_one_tool_is_not_another_tools_after_the_offset_moved() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (doc, mesh) = tablet_fixture(&profile);
+        let mut m = doc.setups[0].machine.clone();
+        m.p.insert("uc100_connection".into(), "Simulated".into());
+        let c = crate::control::Connection::open(&m, dir.path()).unwrap();
+        // The Z work offset the machine shows, which the Z set leaves; the
+        // last tool run started 5 mm off it.
+        let offset = c.snapshot.work_offset[2];
+        let (whole, left) = check_steps(&doc, &mesh, 0, &[], &[]);
+        let (whole, left) = (Arc::new(whole), Arc::new(left));
+        let fresh = |last: usize| {
+            let mut run = Run::new(&doc, 0, 0);
+            run.checked_as(whole.clone(), Some(left.clone()), None);
+            let tool = run.tool_of(last).unwrap();
+            run.last = Some((tool, offset - 5.));
+            run
+        };
+        let probe = fresh(0);
+        let programs = probe.checked().unwrap();
+        assert_eq!(programs.len(), 2);
+        assert_ne!(programs[0].ops[0].tool_id, programs[1].ops[0].tool_id);
+        let label = |i: usize| {
+            let op = &programs[i].ops[0];
+            crate::model::tool_label(op.tool, &op.tool_name)
+        };
+        let wait = |i: usize| {
+            format!(
+                "Tool run {} uses {}: touch off its Z first",
+                i + 1,
+                label(i)
+            )
+        };
+        let touch = "touch off its Z first";
+        let problems = |run: &Run| run.problems(&c, &doc);
+        let says = |run: &Run, what: &str| problems(run).iter().any(|p| p.contains(what));
+        let set_z = |run: &mut Run| {
+            run.z_touched();
+            run.touch_shown(offset);
+        };
+        // The last tool run's tool was either: T1 (T1, T2, T1 ran) or T2.
+        for last in [0, 1] {
+            // Tool run 1 picked again, Z set with T1 in: it holds there.
+            let mut run = fresh(last);
+            run.start_at(0, 0);
+            set_z(&mut run);
+            assert!(run.touched(), "{last}");
+            assert!(!says(&run, touch), "{last}: {:?}", problems(&run));
+            // Tool run 2 picked: T2 would cut with T1's Z.
+            run.start_at(1, 0);
+            assert!(!run.touched());
+            assert!(says(&run, &wait(1)), "{last}: {:?}", problems(&run));
+            // T2's Z set for it: Cycle Start goes.
+            set_z(&mut run);
+            assert!(run.touched());
+            assert!(!says(&run, touch), "{last}: {:?}", problems(&run));
+            // The other way round: tool run 1 picked waits for T1's Z.
+            run.start_at(0, 0);
+            assert!(says(&run, &wait(0)), "{last}: {:?}", problems(&run));
+            set_z(&mut run);
+            assert!(!says(&run, touch), "{last}: {:?}", problems(&run));
+            // Tool run 2 picked first, Z set with T2, then tool run 1.
+            let mut run = fresh(last);
+            run.start_at(1, 0);
+            set_z(&mut run);
+            assert!(!says(&run, touch), "{last}: {:?}", problems(&run));
+            run.start_at(0, 0);
+            assert!(says(&run, &wait(0)), "{last}: {:?}", problems(&run));
+        }
+    }
+
     /// What this run's tool runs cut (`cut_in_run`, LIO-582 review): Face
     /// done and the Pocket stopped after its level 2. The start at level 3,
     /// where the stop leaves Cycle Start, goes by the stock the check
