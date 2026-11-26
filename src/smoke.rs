@@ -3053,8 +3053,11 @@ flood = { pin = 8 }
             touch_shown(&mut a);
             let _ = a.update(Message::Run(R::Next(1)));
             assert!(!touch_first(&a).is_empty(), "{variant}: {:?}", problems(&a));
+            // Tool run 1 picked again: T1's touch-off is forgotten for the
+            // start (LIO-618), but the Z is T1's, so nothing asks for it.
             let _ = a.update(Message::Run(R::Next(0)));
-            assert!(run_of(&a).touched(), "{variant}");
+            assert!(!run_of(&a).touched(), "{variant}");
+            assert!(touch_first(&a).is_empty(), "{variant}: {:?}", problems(&a));
             mdi(&mut a, "G0 Z-25");
             let before = conn(&a).snapshot.work_offset[2];
             // Zero on Z sets the offset to the machine's Z here.
@@ -3086,11 +3089,14 @@ flood = { pin = 8 }
             assert!(!touch_first(&a).is_empty(), "{variant}: {:?}", problems(&a));
             cycle_start(&mut a);
             assert!(run_of(&a).running.is_none(), "{variant}");
-            // Back on tool run 1: the Zero on Z that took counts for T1;
-            // one that did not still says so and holds Cycle Start back.
+            // Back on tool run 1: the Zero on Z that took is T1's Z, set
+            // before the start was picked, so nothing asks for it though it
+            // is forgotten for the start (LIO-618); one that did not still
+            // says so and holds Cycle Start back.
             let _ = a.update(Message::Run(R::Next(0)));
             if variant == "picked while on its way" {
-                assert!(run_of(&a).touched(), "{variant}");
+                assert!(!run_of(&a).touched(), "{variant}");
+                assert!(touch_first(&a).is_empty(), "{variant}: {:?}", problems(&a));
             } else {
                 assert!(!run_of(&a).touched(), "{variant}");
                 let said = conn(&a).z_said(run_of(&a)).expect("said").to_string();
@@ -3143,8 +3149,11 @@ flood = { pin = 8 }
                 (conn(&a).snapshot.work_offset[2] - zeroed_at).abs() < 1e-3,
                 "{answered_first}"
             );
-            assert!(
+            // Tool run 1 picked again, it is T1's Z but forgotten for the
+            // start (LIO-618): nothing asks for it either way.
+            assert_eq!(
                 run_of(&a).touched(),
+                !picked,
                 "answered first {answered_first}, picked {picked}"
             );
             assert!(
@@ -3204,9 +3213,11 @@ flood = { pin = 8 }
         let _ = a.view();
         let _ = a.update(Message::Run(R::CycleStart));
         assert!(run_of(&a).running.is_none());
-        // Back to tool run 1: T1's touch-off holds again.
+        // Back to tool run 1: T1's touch-off is forgotten for the start
+        // picked since (LIO-618), but the Z is still T1's, so tool run 1
+        // asks for no touch-off.
         let _ = a.update(Message::Run(R::Next(0)));
-        assert!(run_of(&a).touched() && touch_first(&a).is_empty());
+        assert!(!run_of(&a).touched() && touch_first(&a).is_empty());
         // Z changed since, by other means than the touch-off: no longer
         // T1's, as Z changed since the last tool run is not that tool's.
         let _ = a.update(Message::Run(R::Next(1)));
@@ -7085,9 +7096,29 @@ flood = { pin = 8 }
         let _ = a.update(Message::Run(R::CycleStart));
         tick_for(&mut a, 200);
         assert!(run_of(&a).running.is_none());
-        // And it holds for T3's tool run.
+        // T3's tool run picked again: the Z is T3's, but set before this
+        // start was picked, so it is asked for again (LIO-618).
         let _ = a.update(Message::Run(R::Next(1)));
-        assert!(run_of(&a).touched());
+        assert!(!run_of(&a).touched());
+        let said = touch_first(&a);
+        assert!(
+            said.len() == 1 && said[0].starts_with("Tool run 2 uses T3"),
+            "{:?}",
+            problems(&a)
+        );
+        // Pressed again, and tool run 1 then tool run 2 picked before the
+        // machine shows it: a Z set before the start was picked, it is
+        // asked for again too (LIO-618).
+        let _ = a.update(Message::Run(R::ZFromReference));
+        let _ = a.update(Message::Run(R::Next(0)));
+        let _ = a.update(Message::Run(R::Next(1)));
+        assert!(!conn(&a).z_set_waits(run_of(&a)));
+        tick_for(&mut a, 300);
+        assert!(!run_of(&a).touched() && !run_of(&a).zeroed);
+        assert!(!touch_first(&a).is_empty(), "{:?}", problems(&a));
+        // Pressed for this start, it holds.
+        let _ = a.update(Message::Run(R::ZFromReference));
+        run_until(&mut a, 5.0, "the touch-off", |r| r.touched());
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
         // Seated again, Set Z from reference lost, and tool run 1 picked
         // while it is on its way: back at tool run 2, it holds it.

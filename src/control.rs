@@ -2620,6 +2620,10 @@ struct ZSet {
     /// with another tool run picked meanwhile, it is that tool's Z, which
     /// holds for no other (LIO-627 review).
     tool: Option<String>,
+    /// The start it is pressed for (`Run::starts`): another start picked
+    /// meanwhile, or the setup checked again, it is a Z set before it,
+    /// which counts for no start (LIO-618).
+    starts: u64,
     /// What a probe says once it is shown (`Connection::probed`).
     then: Option<String>,
 }
@@ -4401,7 +4405,7 @@ impl Connection {
             None => (sets.iter())
                 .all(|&(axis, value)| self.driver.send(Command::SetWork { axis, value })),
         };
-        let mut tool = None;
+        let (mut tool, mut starts) = (None, 0);
         let mut early = false;
         let key = run.map(|run| {
             run.hold_touch();
@@ -4409,7 +4413,7 @@ impl Connection {
             if zeroes {
                 run.zeroed = false;
             }
-            tool = run.next_tool();
+            (tool, starts) = (run.next_tool(), run.starts());
             early = run.unanswered();
             (run.epoch, run.next, tool.clone())
         });
@@ -4427,6 +4431,7 @@ impl Connection {
                 epoch,
                 next,
                 tool,
+                starts,
                 then,
             });
             return true;
@@ -4545,6 +4550,7 @@ impl Connection {
         let applied = (z.offsets.iter())
             .all(|&(a, offset)| (self.snapshot.work_offset[a] - offset).abs() <= step(a));
         let current = self.run.as_ref().is_some_and(|r| r.next == z.next);
+        let same = self.run.as_ref().is_some_and(|r| r.starts() == z.starts);
         // On the A reference, the tool whose length it found; pressed
         // before the first check answered, the tool that check found
         // (`z_set_answered`, LIO-628).
@@ -4554,7 +4560,7 @@ impl Connection {
             (None, false) => None,
         };
         match (applied, &mut self.run) {
-            (true, Some(run)) if current => {
+            (true, Some(run)) if current && same => {
                 match tool {
                     Some(tool) => run.z_touched_for(tool),
                     None => run.z_touched(),
@@ -4563,6 +4569,16 @@ impl Connection {
                     run.length = Some(length.clone());
                 }
                 run.zeroed |= z.zeroes;
+            }
+            // Another start picked since it was pressed, or the setup
+            // checked again: a Z set before it, its tool's Z, forgotten for
+            // the start as one shown before it is (LIO-618).
+            (true, Some(run)) if !same => {
+                run.z_touched_for(tool.unwrap_or_else(|| z.tool.clone()));
+                if let Some(length) = &z.length {
+                    run.length = Some(length.clone());
+                }
+                run.forget_touch();
             }
             // Another tool run picked meanwhile: the offset is the tool's it
             // was pressed for, which holds for no other (LIO-627 review).
@@ -4649,7 +4665,8 @@ impl Connection {
     /// the machine to show it (`z_set_check`): Cycle Start may be pressed,
     /// and waits for it (LIO-627).
     pub fn z_set_waits(&self, run: &crate::run::Run) -> bool {
-        (self.z_set.as_ref()).is_some_and(|z| z.epoch == run.epoch && z.next == run.next)
+        (self.z_set.as_ref())
+            .is_some_and(|z| z.epoch == run.epoch && z.next == run.next && z.starts == run.starts())
     }
 
     /// The Z set for `run`'s tool waiting (`z_set_waits`) sets the work
