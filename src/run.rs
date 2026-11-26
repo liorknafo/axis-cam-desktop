@@ -11861,7 +11861,7 @@ pub(crate) mod tests {
             },
         )];
         let mut run = Run::new(&doc, 1, 0);
-        crate::give_earlier_cuts(&session, &mut run);
+        crate::give_earlier_cuts(&session, &[], &mut run);
         let (c, l) = check(&doc, &mesh, 1);
         run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
         // Before the disconnect, its start touches off on the stock the
@@ -11884,7 +11884,7 @@ pub(crate) mod tests {
         assert!(run.touch_off().is_some() && run.partway_blocked().is_none());
         // Nothing of setup 1's kept: nothing to ask.
         let mut run = Run::new(&doc, 1, 0);
-        crate::give_earlier_cuts(&[], &mut run);
+        crate::give_earlier_cuts(&[], &[], &mut run);
         crate::give_away(&away, &mut run);
         assert!(!run.stock_unconfirmed && run.away.is_none());
         // Setup 1 deleted since: still asked for, as put back its cuts are
@@ -11893,14 +11893,14 @@ pub(crate) mod tests {
         deleted.remove_setup(0).unwrap();
         let si = (deleted.setups.iter()).position(|s| s.p.get("rx").is_some_and(|r| r == "180"));
         let mut run = Run::new(&deleted, si.unwrap(), 0);
-        crate::give_earlier_cuts(&session, &mut run);
+        crate::give_earlier_cuts(&session, &[], &mut run);
         crate::give_away(&away, &mut run);
         assert!(run.stock_unconfirmed && run.away.is_some());
         // Another project's setup kept so (`earlier_elsewhere`): its cuts
         // set no Z until New stock loaded whatever is answered, and are said
         // as that project's (LIO-607), so nothing is asked for them.
         let mut run = Run::new(&deleted, si.unwrap(), 0);
-        crate::give_earlier_cuts(&session, &mut run);
+        crate::give_earlier_cuts(&session, &[], &mut run);
         let mut owner = CutOwner::of(&doc, 0);
         owner.project = "another project".into();
         run.earlier_elsewhere = vec![owner];
