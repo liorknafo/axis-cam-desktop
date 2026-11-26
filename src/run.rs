@@ -4257,20 +4257,20 @@ impl Run {
                 1 => ["it", "it", "was"],
                 _ => ["they", "them", "were"],
             };
+            let its = match uncut.len() {
+                1 => "its setup",
+                _ => "their setups",
+            };
             let said = format!(
-                "{} {were} not cut, though the runs of {} cut this part, and this setup's programs are made for {them} cut: their rapids could go through the material left.",
+                "{} {were} not cut, though the runs of {its} cut this part, and this setup's programs are made for {them} cut: their rapids could go through the material left.",
                 uncut.join(", "),
-                match uncut.len() {
-                    1 => "its setup",
-                    _ => "their setups",
-                }
             );
             return Some(match tablet {
                 false => format!(
-                    "{said} Cut {them} first, mark {them} Already cut if {they} {were} cut before, or disable {them}. If new stock is held, press New stock loaded under Work zero."
+                    "{said} Cut {them} first (pick {its}), mark {them} Already cut there if {they} {were} cut before, or disable {them}. If new stock is held, press New stock loaded under Work zero."
                 ),
                 true => format!(
-                    "{said} On the computer, cut {them} first, mark {them} Already cut if {they} {were} cut before, or disable {them}; then Sync projects here, or save the project for the tablet again.{}",
+                    "{said} On the computer, cut {them} first (pick {its}), mark {them} Already cut there if {they} {were} cut before, or disable {them}; then Sync projects here, or save the project for the tablet again.{}",
                     new_stock_on_the_computer!()
                 ),
             });
@@ -11513,14 +11513,6 @@ pub(crate) mod tests {
         assert_eq!(run.earlier_not_whole(&disabled), None);
     }
 
-    /// A bore milled through the stock, then a face with another tool (LIO-582
-    /// review): a start at the face, in the second tool run, finds no floor
-    /// at the stock top's centre, where the bore went through, so neither
-    /// the Run panel nor the tablet file sets a Z there.
-    /// A bore milled through the stock, then a face with another tool (LIO-582
-    /// review): a start at the face, in the second tool run, finds no floor
-    /// at the stock top's centre, where the bore went through, so neither
-    /// the Run panel nor the tablet file sets a Z there.
     /// A bore milled through the stock, then a face with another tool (LIO-582
     /// review): a start at the face, in the second tool run, finds no floor
     /// at the stock top's centre, where the bore went through, so neither
