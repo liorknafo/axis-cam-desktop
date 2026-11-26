@@ -727,7 +727,7 @@ mod tests {
         project(&state, "Open job", &part);
         let version = || shared(&state)[0].0.version.clone();
         let cut = |steps| Session {
-            cuts: vec![("a".into(), vec![(0, steps, Some(1))])],
+            cuts: vec![("a".into(), vec![(0, steps, Some(1), None)])],
             ..Session::default()
         };
         let before = version();

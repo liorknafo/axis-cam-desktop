@@ -6227,8 +6227,8 @@ flood = { pin = 8 }
     fn a_level_undone_before_the_answer_is_said_as_taken_as_cut_beside_another_setups_cuts() {
         // Another setup's cuts, or its record already unknown.
         for record in [
-            vec![(0, None, Some(1))],
-            vec![(crate::run::HISTORY_UNKNOWN, None, None)],
+            vec![(0, None, Some(1), None)],
+            vec![(crate::run::HISTORY_UNKNOWN, None, None, None)],
         ] {
             a_level_undone_beside(record);
         }
@@ -12938,7 +12938,7 @@ flood = { pin = 8 }
         }
         let other = second.id.clone();
         a.doc.setups.push(second);
-        let cut: Vec<crate::run::CutInRun> = vec![(0, None, Some(1))];
+        let cut: Vec<crate::run::CutInRun> = vec![(0, None, Some(1), None)];
         a.run_cuts.push((other.clone(), cut.clone()));
         let reconnect = |a: &mut App| {
             let _ = a.update(Message::Disconnect);
