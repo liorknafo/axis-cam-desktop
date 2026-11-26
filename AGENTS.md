@@ -16,7 +16,8 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
 - Review briefs, notes and memories written before LIO-729 may still say to
   run `CARGO_INCREMENTAL=0 cargo test ...`. That advice is out of date: it
   saved disk when the disk was nearly full (the incremental data takes about
-  2.4 GB per checkout). If your brief or a memory tells you to set it, leave
+  3 GB per checkout: 2.3 GB for the test binary, 0.9 GB for the app the
+  integration tests build). If your brief or a memory tells you to set it, leave
   it unset and say so in your answer, so the brief gets corrected.
 - The first build in a new checkout compiles `axis-cam` whole (about 50 s
   with the dependencies already built); the builds after it are incremental.
