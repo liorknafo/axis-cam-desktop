@@ -454,12 +454,22 @@ macro_rules! new_stock_on_the_computer {
     };
 }
 
+/// Why a probe cannot find a work zero from a spot of a stock
+/// `EARLIER_UNFOLLOWED` cut, where another setup's run cut an operation only
+/// in part (`Run::earlier_partway`, LIO-601).
+pub(crate) const EARLIER_PARTWAY_WHY: &str = "Another setup's run left an operation of this part unfinished earlier (its run stopped partway through it, or where it stopped is not known), and the check takes that operation as cut whole, so it does not know what is left here.";
+
+/// Why Zero Z on the stock top and Probe Z cannot set Z where another
+/// setup's run cut an operation only in part (`Run::earlier_partway`,
+/// LIO-601).
+pub(crate) const EARLIER_PARTWAY_BLOCKED: &str = "Another setup's run left an operation of this part unfinished earlier (its run stopped partway through it, or where it stopped is not known), and the check takes that operation as cut whole, so it cannot tell the surface where the stock top is touched off. Run that operation to its end first, in a run of its setup. If new stock is held, press New stock loaded under Work zero.";
+
 /// The computer's reasons for this session's cuts in the tablet file's
 /// words (LIO-590): the tablet has no Same part or New stock loaded, nor
 /// the computer's questions after a disconnect (LIO-595), and "this
 /// session" and "this computer" are the computer's, before the file was
 /// made.
-const FOR_TABLET: [(&str, &str); 9] = [
+const FOR_TABLET: [(&str, &str); 11] = [
     (
         STOCK_UNCONFIRMED_BLOCKED,
         "This setup's stock was cut, or taken as cut, on the computer before this tablet file was made, and the tablet cannot tell whether that part is still held, so it cannot tell the surface where the stock top is touched off.",
@@ -505,6 +515,20 @@ const FOR_TABLET: [(&str, &str); 9] = [
         EARLIER_ELSEWHERE_WHY,
         concat!(
             "Runs on the computer cut stock for a setup this project does not have, another project's or one deleted since, before this tablet file was made, and the tablet cannot tell whether that stock is the one held.",
+            new_stock_on_the_computer!()
+        ),
+    ),
+    (
+        EARLIER_PARTWAY_BLOCKED,
+        concat!(
+            "Another setup's run on the computer left an operation of this part unfinished before this tablet file was made (its run stopped partway through it, or where it stopped is not known), and the plan takes that operation as cut whole, so the computer cannot tell the surface where the stock top is touched off. Run that operation to its end first, in a run of its setup on the computer, then Sync projects here, or save the project for the tablet again.",
+            new_stock_on_the_computer!()
+        ),
+    ),
+    (
+        EARLIER_PARTWAY_WHY,
+        concat!(
+            "Another setup's run on the computer left an operation of this part unfinished before this tablet file was made (its run stopped partway through it, or where it stopped is not known), and the plan takes that operation as cut whole, so it does not know what is left here.",
             new_stock_on_the_computer!()
         ),
     ),
@@ -555,8 +579,17 @@ impl Run {
 
 /// What a tool run of a run cut (`Run::cut_in_run`): the operation (index in
 /// the setup), all of it (None) or its steps before the one given, and the
-/// print of the plan and cutter it cut (`OpSteps::cut_print`).
+/// print of the plan and cutter it cut (`OpSteps::cut_print`). Steps before
+/// one are a bound: the last of them may be cut only in part, after a stop
+/// in it, and `MAY_HAVE_CUT_ALL` is anywhere up to all of it.
 pub type CutInRun = (usize, Option<usize>, Option<u64>);
+
+/// `CutInRun`'s steps of an operation a tool run that did not finish ran,
+/// with nothing to tell how far: stopped where the run cannot place it, or
+/// dropped while it ran (`Run::cuts_so_far`). Any of it may be cut, all of
+/// it or only some (LIO-601): its own run takes it as all (`Run::cut_beyond`
+/// as for None), a later setup's as not cut whole (`Run::earlier_partway`).
+pub const MAY_HAVE_CUT_ALL: Option<usize> = Some(usize::MAX);
 
 /// Notes in `cuts` (`Run::cut_in_run`) that operation `oi` was cut: all of
 /// it (None) or its steps before `steps`, from the plan and cutter `print`.
@@ -576,6 +609,37 @@ pub(crate) fn note_cut_in(
             c.2 = c.2.filter(|&p| print == Some(p));
         }
         None => cuts.push((oi, steps, print)),
+    }
+}
+
+/// Takes into `into`, a setup's record of what runs cut here, `theirs`,
+/// what another AXIS CAM on the same folder kept for it, `base` what was
+/// kept when this one last read or wrote it. Unchanged here since, theirs
+/// is the newer: taken as it is. Changed by both, an operation one holds
+/// cut whole and the other in part may be either (`MAY_HAVE_CUT_ALL`):
+/// whole is no longer the safe side, partway no longer the only one, since
+/// a later setup trusts a whole one (LIO-601 review).
+pub(crate) fn take_kept_cuts(
+    into: &mut Vec<CutInRun>,
+    base: Option<&Vec<CutInRun>>,
+    theirs: &[CutInRun],
+) {
+    if base.is_some_and(|b| b == into) {
+        *into = theirs.to_vec();
+        return;
+    }
+    for &(oi, steps, print) in theirs {
+        match into.iter_mut().find(|c| c.0 == oi) {
+            Some(c) => {
+                c.1 = match (c.1, steps) {
+                    (None, None) => None,
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => MAY_HAVE_CUT_ALL,
+                };
+                c.2 = c.2.filter(|&p| print == Some(p));
+            }
+            None => into.push((oi, steps, print)),
+        }
     }
 }
 
@@ -697,8 +761,9 @@ pub struct Run {
     /// What the other setups cut this session (`App::run_cuts`), by setup
     /// id: in the part whether those setups come before it, were deleted or
     /// moved after it since. The check's stock has it only while it
-    /// simulates each such operation, before this setup, as it was cut
-    /// (`earlier_unfollowed`, LIO-582 review).
+    /// simulates each such operation, before this setup, as it was cut,
+    /// and whole: it has no stock for one cut partway (`earlier_unfollowed`,
+    /// LIO-582 review, LIO-601).
     pub earlier_cuts: Vec<(String, Vec<CutInRun>)>,
     /// The setups `earlier_cuts` was given for: one no longer in it was
     /// forgotten (New stock loaded).
@@ -771,6 +836,10 @@ pub struct Run {
     pub pictures: Vec<(usize, iced::widget::image::Handle)>,
     /// The stock the check left, until it is pictured (`App::picture_run`).
     pub left: Option<Arc<Left>>,
+    /// The operations of the setups before it the check simulated
+    /// (`Left::earlier`), kept once `left` is pictured (`earlier_unfollowed`,
+    /// LIO-601 review).
+    simulated_earlier: Vec<EarlierOp>,
     /// The stock before each operation of the setup, from the check
     /// (`Left::before`): where the live carve starts.
     pub before: Arc<Vec<OpStock>>,
@@ -1494,6 +1563,7 @@ impl Run {
             outcome: None,
             pictures: vec![],
             left: None,
+            simulated_earlier: vec![],
             before: Arc::new(vec![]),
             carving: None,
             times: None,
@@ -2139,6 +2209,7 @@ impl Run {
         }
         self.beneath = left.as_ref().map_or_else(Vec::new, |l| l.beneath.clone());
         self.steps = left.as_ref().map_or_else(Vec::new, |l| l.steps.clone());
+        self.simulated_earlier = left.as_ref().map_or_else(Vec::new, |l| l.earlier.clone());
         // A start at a step the check did not keep (a step of an operation
         // gone, or no longer in steps) is no start.
         if let Some((oi, n)) = self.start_step
@@ -2419,26 +2490,51 @@ impl Run {
         let ran: Vec<usize> = (self.checked().and_then(|c| c.get(r.index)))
             .map(|p| p.indexes[r.from.min(p.indexes.len())..].to_vec())
             .unwrap_or_default();
-        let up_to = |op: usize, steps: usize| -> Vec<(usize, Option<usize>)> {
+        // How much of operation `o` it cut, when the tool may have stopped
+        // anywhere up to all of it: whole if it was followed past it.
+        let passed = self.followed_past();
+        let bound = |o: usize| match passed.contains(&o) {
+            true => None,
+            false => MAY_HAVE_CUT_ALL,
+        };
+        // The operations before `op` cut `before`: whole once the tool went
+        // on past them, or up to all of them when it may not have.
+        let up_to = |op: usize, steps: usize, before: &dyn Fn(usize) -> Option<usize>| {
             (ran.iter().take_while(|&&o| o != op))
-                .map(|&o| (o, None))
+                .map(|&o| (o, before(o)))
                 .chain([(op, Some(steps))])
-                .collect()
+                .collect::<Vec<(usize, Option<usize>)>>()
         };
         let cut: Vec<(usize, Option<usize>)> = if o.ok {
             ran.iter().map(|&o| (o, None)).collect()
         } else if o.message.contains(NOT_STARTED) {
             vec![]
         } else if let Some((op, s)) = stopping {
-            up_to(op, s + 1)
+            // Stopped after its last step sent, the operation is cut whole
+            // (LIO-601 review): those after it were taken as cut before. Not
+            // so where an E-stop ended it as it stopped, the tool maybe
+            // still in that step's last feed (LIO-601 review).
+            let cut = self.cut_of(op);
+            let steps = self.op_steps(op).map_or(0, |o| o.steps.len());
+            let e_stop = o.message.contains("E-stop") || o.message.contains("E-STOP");
+            match !e_stop && (s + 1..steps).all(|t| cut.contains(&t)) {
+                true => (ran.iter().take_while(|&&o| o != op))
+                    .chain([&op])
+                    .map(|&o| (o, None))
+                    .collect(),
+                false => up_to(op, s + 1, &|_| None),
+            }
         } else if let Some(far) = self.reach(at).and_then(|b| self.stopped_on(b, "")) {
             // In a step: it may be cut in part, up to the furthest step the
             // tool may have got to (`reach`), not just the one it was last
-            // followed on, which may lag (LIO-586 review).
-            up_to(far.op, far.last.map_or(1, |l| l + 2))
+            // followed on, which may lag (LIO-586 review). The tool may not
+            // have got that far, so those before it are known whole only
+            // once it was followed past them (LIO-601).
+            up_to(far.op, far.last.map_or(1, |l| l + 2), &bound)
         } else {
-            // Where it stopped is not known: all it ran may be cut.
-            ran.iter().map(|&o| (o, None)).collect()
+            // Where it stopped is not known: all it ran may be cut, or only
+            // some of it, but for what it was followed past (LIO-601).
+            ran.iter().map(|&o| (o, bound(o))).collect()
         };
 
         if o.ok {
@@ -2536,6 +2632,22 @@ impl Run {
             .find(|&j| r.paths[j].is_some_and(|m| along(m, tip).is_some()))?;
         self.mark_step(p, r.marks.get(b).copied().flatten()?)?;
         Some(b)
+    }
+
+    /// The operations (index in the setup) of the running tool run the tool
+    /// was followed past: those it sends before the operation of the block
+    /// it was last followed on (`track`). Where it was followed lags where
+    /// it is, so it got at least that far: they are cut whole (LIO-601
+    /// review). None until a block in a step is followed.
+    fn followed_past(&self) -> Vec<usize> {
+        let Some(r) = &self.running else {
+            return vec![];
+        };
+        let Some(p) = self.checked().and_then(|c| c.get(r.index)) else {
+            return vec![];
+        };
+        let on = (r.on.and_then(|(b, _)| r.marks.get(b).copied().flatten())).map_or(0, |m| m.0);
+        p.indexes[r.from.min(on).min(p.indexes.len())..on.min(p.indexes.len())].to_vec()
     }
 
     /// `stopped_in` with the tool on block `block` of the running tool run.
@@ -3292,10 +3404,11 @@ impl Run {
     }
 
     /// What this run's tool runs have cut so far (`cut_in_run`), a tool
-    /// run that runs now taken as cutting every operation it runs whole,
-    /// as far as it may get: what is kept when the run is dropped while one
-    /// runs, the machine disconnected say, which no outcome then tells
-    /// (LIO-582 review).
+    /// run that runs now taken as cutting every operation it runs up to all
+    /// of it (`MAY_HAVE_CUT_ALL`) but those it was followed past
+    /// (`followed_past`), as far as it may get: what is kept when
+    /// the run is dropped while one runs, the machine disconnected say,
+    /// which no outcome then tells (LIO-582 review, LIO-601).
     ///
     /// With them, what a tool run that started took as cut, before its
     /// start (`taken_with`): a later setup goes by an earlier one's
@@ -3303,7 +3416,7 @@ impl Run {
     /// (`earlier_uncut`, LIO-603).
     pub fn cuts_so_far(&self) -> Vec<CutInRun> {
         match &self.running {
-            Some(r) => self.cuts_with(r.index, r.from),
+            Some(r) => self.cuts_with(r.index, r.from, &self.followed_past()),
             None => self.cut_in_run.clone(),
         }
     }
@@ -3313,21 +3426,26 @@ impl Run {
     /// review).
     pub fn cuts_if_started(&self) -> Vec<CutInRun> {
         let mut cuts = self.cuts_so_far();
-        let started = self.cuts_with(self.next, self.from);
+        let started = self.cuts_with(self.next, self.from, &[]);
         for (oi, steps, print) in started {
             note_cut_in(&mut cuts, oi, steps, print);
         }
         cuts
     }
 
-    /// `cut_in_run` and tool run `index` from its operation `from` on, all
-    /// of each, with what it takes as cut (`taken_with`).
-    fn cuts_with(&self, index: usize, from: usize) -> Vec<CutInRun> {
+    /// `cut_in_run` and tool run `index` from its operation `from` on, up
+    /// to all of each (`MAY_HAVE_CUT_ALL`), but those it was followed
+    /// `passed`, whole (LIO-601), with what it takes as cut (`taken_with`).
+    fn cuts_with(&self, index: usize, from: usize, passed: &[usize]) -> Vec<CutInRun> {
         let mut cuts = self.cut_in_run.clone();
         if let Some(p) = self.checked().and_then(|c| c.get(index)) {
             for &oi in &p.indexes[from.min(p.indexes.len())..] {
                 let print = self.op_steps(oi).map(|s| s.cut_print);
-                note_cut_in(&mut cuts, oi, None, print);
+                let steps = match passed.contains(&oi) {
+                    true => None,
+                    false => MAY_HAVE_CUT_ALL,
+                };
+                note_cut_in(&mut cuts, oi, steps, print);
             }
         }
         self.taken_with(cuts, index, from)
@@ -3414,9 +3532,12 @@ impl Run {
     ///
     /// So is one an earlier setup's runs neither cut nor took as cut, though
     /// they cut others of this part: its material left, or never run
-    /// (`earlier_uncut`, LIO-603).
+    /// (`earlier_uncut`, LIO-603). Or one cut not known whole: stopped
+    /// partway, or where it stopped not known (`earlier_unfinished`): the
+    /// check simulates it whole, so its stock lacks what is still there
+    /// (LIO-601).
     pub fn earlier_unfollowed(&self) -> bool {
-        self.unfollowed_earlier().next().is_some() || !self.earlier_uncut().is_empty()
+        self.earlier_unsimulated() || !self.earlier_uncut().is_empty() || self.earlier_unfinished()
     }
 
     /// The operations of the setups before this one, as the Run panel names
@@ -3437,7 +3558,7 @@ impl Run {
 
     /// `earlier_uncut`'s operations, as `Left::earlier` has them.
     fn earlier_uncut_ops(&self) -> Vec<&EarlierOp> {
-        let earlier = self.left.as_ref().map_or(&[][..], |l| &l.earlier[..]);
+        let earlier = &self.simulated_earlier[..];
         (earlier.iter())
             .filter(|e| {
                 let marked = (self.earlier_taken.iter()).any(|(id, t)| {
@@ -3564,7 +3685,7 @@ impl Run {
     /// names an operation of, after the first it names there: cut with
     /// that one's material still there (LIO-603 review).
     fn unfollowed_after_uncut(&self) -> bool {
-        let earlier = self.left.as_ref().map_or(&[][..], |l| &l.earlier[..]);
+        let earlier = &self.simulated_earlier[..];
         let uncut = self.earlier_uncut_ops();
         (self.earlier_cuts.iter()).all(|(id, cuts)| {
             let first = (uncut.iter())
@@ -3590,10 +3711,17 @@ impl Run {
         }
     }
 
-    /// The setups of `earlier_cuts` whose cuts the check does not follow
-    /// (`earlier_unfollowed`), with those cuts.
+    /// `earlier_unfollowed` for an operation the check does not simulate
+    /// before this setup as it was cut (`simulated_earlier`).
+    fn earlier_unsimulated(&self) -> bool {
+        self.unfollowed_earlier().next().is_some()
+    }
+
+    /// The setups of `earlier_cuts` whose cuts the check does not simulate
+    /// before this setup as they were cut (`earlier_unsimulated`), with
+    /// those cuts.
     fn unfollowed_earlier(&self) -> impl Iterator<Item = &(String, Vec<CutInRun>)> {
-        let earlier = self.left.as_ref().map_or(&[][..], |l| &l.earlier[..]);
+        let earlier = &self.simulated_earlier;
         (self.earlier_cuts.iter()).filter(move |(id, cuts)| {
             cuts.iter().any(|&(op, _, print)| {
                 !(earlier.iter()).any(|e| e.setup == *id && e.op == op && Some(e.cut) == print)
@@ -3728,6 +3856,9 @@ impl Run {
     /// Why a probe cannot find a work zero from a spot of a stock
     /// `EARLIER_UNFOLLOWED` cut.
     fn earlier_unfollowed_why(&self) -> String {
+        if self.earlier_partway() {
+            return EARLIER_PARTWAY_WHY.into();
+        }
         if let Some(said) = self.earlier_uncut_said() {
             return format!("{said}, so it does not know what is left here.");
         }
@@ -3741,6 +3872,9 @@ impl Run {
     /// Why a probe cannot find this work zero where `EARLIER_UNFOLLOWED`
     /// cut (`Connection::cut_probe_blocked`).
     pub fn earlier_unfollowed_probe(&self) -> String {
+        if self.earlier_partway() {
+            return "Another setup's run left an operation of this part unfinished earlier (its run stopped partway through it, or where it stopped is not known), and the check takes that operation as cut whole where a probe finds this work zero. Run that operation to its end first, in a run of its setup.".into();
+        }
         if let Some(said) = self.earlier_uncut_said() {
             return format!("{said}, where a probe finds this work zero.");
         }
@@ -3752,6 +3886,50 @@ impl Run {
             None if self.earlier_not_here() => "This computer's runs cut stock for a setup this project does not have, another project's or one deleted since: if that is the part held, they may have cut it where a probe finds this work zero. If new stock is held, press New stock loaded under Work zero.".into(),
             None => "Another setup's run cut this part earlier in a way the check does not follow, where a probe finds this work zero.".into(),
         }
+    }
+
+    /// Another setup's runs cut an operation not known to be cut whole
+    /// (`earlier_cuts` with steps): stopped in it, or where it stopped not
+    /// known (`MAY_HAVE_CUT_ALL`). Even steps before one past its last are
+    /// no proof: a stop in its last step is noted so too (`refresh`). One
+    /// they left or never ran is `earlier_uncut`'s (LIO-603).
+    fn earlier_unfinished(&self) -> bool {
+        !self.earlier_unfinished_ops().is_empty()
+    }
+
+    /// The operations `earlier_unfinished` is about: each setup's id and
+    /// the operation's index in it.
+    fn earlier_unfinished_ops(&self) -> Vec<(&str, usize)> {
+        (self.earlier_cuts.iter())
+            .flat_map(|(id, cuts)| {
+                (cuts.iter().filter(|c| c.1.is_some())).map(move |c| (id.as_str(), c.0))
+            })
+            .collect()
+    }
+
+    /// The operations `earlier_unfinished` is about, as "setup / operation",
+    /// for the operator to finish (LIO-601 review).
+    pub fn earlier_partway_named(&self, doc: &Document) -> Vec<String> {
+        (self.earlier_unfinished_ops().into_iter())
+            .filter_map(|(id, oi)| {
+                let setup = doc.setups.iter().find(|s| s.id == *id)?;
+                Some(format!(
+                    "{} / {}",
+                    setup.name(),
+                    setup.operations.get(oi)?.name()
+                ))
+            })
+            .collect()
+    }
+
+    /// `earlier_unfollowed` only because an earlier setup's run cut an
+    /// operation the check simulates before this setup, but maybe not to
+    /// its end (`earlier_unfinished`): the check takes it as cut whole, so
+    /// where what was not cut would have cut, its stock is lower than the
+    /// part's, and finishing that operation is what clears it (LIO-601).
+    /// Its reasons say so.
+    pub fn earlier_partway(&self) -> bool {
+        self.earlier_unfinished() && !self.earlier_unsimulated() && self.earlier_uncut().is_empty()
     }
 
     /// The stock the start begins from is not the setup's own: the run
@@ -3936,6 +4114,8 @@ impl Run {
             STOCK_UNCONFIRMED_BLOCKED.into()
         } else if partly.cut == [HISTORY_UNFOLLOWED] {
             HISTORY_UNFOLLOWED_BLOCKED.into()
+        } else if partly.cut == [EARLIER_UNFOLLOWED] && self.earlier_partway() {
+            EARLIER_PARTWAY_BLOCKED.into()
         } else if partly.cut == [EARLIER_UNFOLLOWED] {
             if let Some(blocked) = self.earlier_uncut_blocked() {
                 return Some(blocked);
@@ -9119,6 +9299,7 @@ pub(crate) mod tests {
             outcome: None,
             pictures: vec![],
             left: None,
+            simulated_earlier: vec![],
             before: Default::default(),
             times: None,
             carving: None,
@@ -11215,11 +11396,8 @@ pub(crate) mod tests {
         // followed on block `on` and standing at machine position `at`.
         let p = whole.as_ref().as_ref().unwrap()[0].clone();
         let blocks = p.from(0).unwrap();
-        let ran_at = |ok: bool,
-                      stopping: Option<(usize, usize)>,
-                      message: &str,
-                      on: Option<usize>,
-                      at: Option<[f64; 6]>| {
+        // Tool run 1 running, the tool last followed on block `on`.
+        let running = |on: Option<usize>| {
             let mut run = Run::new(&doc, 0, 0);
             run.checked_as(whole.clone(), Some(left.clone()), None);
             let marks = run.marks_of(&p, blocks);
@@ -11242,6 +11420,14 @@ pub(crate) mod tests {
                 on: on.map(|b| (b, 0.5)),
                 marks,
             });
+            run
+        };
+        let ran_at = |ok: bool,
+                      stopping: Option<(usize, usize)>,
+                      message: &str,
+                      on: Option<usize>,
+                      at: Option<[f64; 6]>| {
+            let mut run = running(on);
             run.stopping = stopping;
             run.refresh(
                 Some(&uc100::controller::ProgramOutcome {
@@ -11372,13 +11558,53 @@ pub(crate) mod tests {
         assert_eq!(cuts(&in_2), [(0, Some(2))]);
         refused(at_pass_2(in_2));
         // On no move, or where it stopped not known (on the Pi): all it
-        // ran may be cut.
+        // ran may be cut, or only some of it (LIO-601).
         let lost = e_stop([1e3; 6]);
-        assert_eq!(cuts(&lost), [(0, None), (1, None)]);
+        let may = MAY_HAVE_CUT_ALL;
+        assert_eq!(cuts(&lost), [(0, may), (1, may)]);
         refused(at_pass_2(lost));
         let unknown = ran_at(false, None, "E-stop", Some(one[0]), None);
-        assert_eq!(cuts(&unknown), [(0, None), (1, None)]);
+        assert_eq!(cuts(&unknown), [(0, may), (1, may)]);
         refused(at_pass_2(unknown));
+        // Stopped after the Face's last pass, or after the Pocket's last
+        // step: each cut whole (LIO-601 review); but not where an E-stop
+        // ended it as it stopped.
+        let last = face.steps.len() - 1;
+        assert_eq!(cuts(&ran(false, Some((0, last)))), [(0, None)]);
+        let e_stopped = ran_at(false, Some((0, last)), "E-stop", None, None);
+        assert_eq!(cuts(&e_stopped), [(0, Some(last + 1))]);
+        let pocket_steps = left.steps.iter().find(|s| s.op == 1).unwrap().steps.len();
+        let at_end = ran(false, Some((1, pocket_steps - 1)));
+        assert_eq!(cuts(&at_end), [(0, None), (1, None)]);
+        // Followed into the Pocket (LIO-601 review): the Face was cut whole,
+        // stopped where the run cannot tell (on the Pi), or dropped while
+        // the Pocket ran (`cuts_so_far`); only the Pocket may be cut in
+        // part. Its run finished, all is cut whole, so a later setup goes
+        // by it again (`earlier_unfinished`).
+        let pocket = (0..blocks.len()).find(|&j| marks[j].is_some_and(|m| m.0 == 1));
+        let pocket = pocket.unwrap();
+        let in_pocket = ran_at(false, None, "E-stop", Some(pocket), None);
+        assert_eq!(cuts(&in_pocket), [(0, None), (1, may)]);
+        let dropped = running(Some(pocket)).cuts_so_far();
+        let dropped: Vec<_> = dropped.iter().map(|c| (c.0, c.1)).collect();
+        assert_eq!(dropped, [(0, None), (1, may)]);
+        // Standing in the Pocket, the Face too.
+        let far = (0..blocks.len()).rev().find(|&j| {
+            path[j].is_some()
+                && marks[j]
+                    .and_then(|m| plain.mark_step(&p, m))
+                    .is_some_and(|m| m.0 == 1)
+        });
+        let in_pocket = ran_at(false, None, "E-stop", Some(pocket), Some(mid(far.unwrap())));
+        assert_eq!(cuts(&in_pocket)[0], (0, None));
+        let mut later = Run::new(&doc, 0, 0);
+        later.earlier_cuts = vec![("setup 1".into(), in_pocket.cut_in_run.clone())];
+        assert!(later.earlier_unfinished());
+        let mut finished = in_pocket;
+        finished.note_cut(1, None);
+        assert_eq!(cuts(&finished), [(0, None), (1, None)]);
+        later.earlier_cuts = vec![("setup 1".into(), finished.cut_in_run.clone())];
+        assert!(!later.earlier_unfinished());
     }
 
     /// A journal another session wrote, picked up again (LIO-586 review):
@@ -12732,6 +12958,201 @@ pub(crate) mod tests {
         run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
         assert!(run.earlier_uncut().is_empty() && !run.earlier_unfollowed());
         assert!(run.touch_off().is_some() && run.partway_blocked().is_none());
+    }
+
+    /// Setup 1 faces 2 mm off the ring's stock top in four levels; setup 2,
+    /// held the same way, bores it, its work zero on the stock top that
+    /// setup 1 leaves (LIO-601). Faced whole this session, setup 2 touches
+    /// off on the faced top. Stopped after its first level, the top is
+    /// still 1.5 mm higher than that: setup 2's check, which simulates the
+    /// face whole, cannot tell it, so neither Zero Z nor Probe Z sets Z,
+    /// from setup 2's start or partway, its probe spots are refused, and
+    /// the tablet file's zeros too; so where the face may have stopped
+    /// anywhere. Said to finish the face only when that is all there is.
+    #[test]
+    fn an_earlier_setups_cut_stopped_partway_blocks_a_later_setups_touch_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("template.toml");
+        std::fs::write(&profile, uc100::config::TEMPLATE).unwrap();
+        let (mut doc, _) = tablet_fixture(&profile);
+        let (path, mesh, [mill, small]) = ring(dir.path());
+        let mut first = ring_setup(&doc, "G54", "2", "0");
+        let mut face = ring_face(&mill, ring_top(&mesh, &first, true));
+        face.p.insert("stepdown".into(), "0.5".into());
+        first.operations = vec![face];
+        let mut second = ring_setup(&doc, "G55", "2", "0");
+        let top = ring_top(&mesh, &second, true);
+        second.operations = vec![
+            ring_bore(&mill, top.clone(), "1"),
+            ring_bore(&small, top, "1"),
+        ];
+        doc.active = second.id.clone();
+        doc.setups = vec![first, second];
+        doc.tools = vec![mill, small];
+        if let Some(f) = &mut doc.file {
+            (f.path, f.name, f.format) = (path, "ring.stl".into(), "stl".into());
+        }
+        // Setup 1's run: its face's levels are its steps.
+        let (c, l) = check(&doc, &mesh, 0);
+        let mut one = Run::new(&doc, 0, 0);
+        one.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        let levels = one.op_steps(0).map_or(0, |s| s.steps.len());
+        assert_eq!(levels, 4);
+        let stock_top = one.touch_off().unwrap().0[2];
+        // Setup 2 after setup 1's run cut its face (`cut`), from its start
+        // or at its second bore.
+        let session = |cut: Option<usize>| {
+            let mut one = Run::new(&doc, 0, 0);
+            let (c, l) = check(&doc, &mesh, 0);
+            one.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            one.note_cut(0, cut);
+            vec![(doc.setups[0].id.clone(), one.cut_in_run.clone())]
+        };
+        let setup_2 = |cut: Option<usize>, partway: bool| {
+            let session = session(cut);
+            let mut run = Run::new(&doc, 1, 0);
+            crate::give_earlier_cuts(&session, &[], &mut run);
+            let (c, l) = check(&doc, &mesh, 1);
+            run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+            assert!(run.checked().is_some(), "{:?}", run.programs);
+            if partway {
+                let programs = run.checked().unwrap();
+                let at = (programs.iter().enumerate())
+                    .find_map(|(i, p)| Some((i, p.indexes.iter().position(|&o| o == 1)?)));
+                let (i, k) = at.unwrap();
+                run.start_at(i, k);
+                assert!(run.partway());
+            }
+            run
+        };
+        // Faced whole: setup 2's stock top is the faced one, 2 mm down.
+        let whole = setup_2(None, false);
+        assert!(!whole.earlier_unfollowed() && !whole.on_cut_stock());
+        let (at, _) = whole.touch_off().unwrap();
+        assert!(
+            (at[2] - (stock_top - 2.)).abs() < 1e-3,
+            "{at:?} {stock_top}"
+        );
+        assert!(whole.partway_blocked().is_none());
+        // Stopped after its first level, then after its third; stopped in
+        // its last, the tool may not have got round it (`Run::refresh`);
+        // stopped where the run cannot tell, or dropped while it ran
+        // (`Run::cuts_so_far`), any of it may be cut.
+        for cut in [Some(1), Some(3), Some(levels), MAY_HAVE_CUT_ALL] {
+            for partway in [false, true] {
+                let run = setup_2(cut, partway);
+                assert!(run.earlier_unfollowed(), "{cut:?}");
+                assert!(run.on_cut_stock(), "{cut:?}");
+                assert!(run.touch_off().is_none(), "{cut:?} {:?}", run.touch_off());
+                let why = run.partway_blocked().unwrap();
+                assert!(
+                    why.starts_with(
+                        "Another setup's run left an operation of this part unfinished"
+                    ),
+                    "{why}"
+                );
+                let partly = run.partly().unwrap();
+                assert_eq!(partly.cut, [EARLIER_UNFOLLOWED]);
+                assert!(partly.surface.is_none() && partly.top_cut);
+                assert!(!partly.probe_from.is_empty());
+                for (_, ok) in &partly.probe_from {
+                    assert_eq!(ok.as_ref().unwrap_err(), EARLIER_PARTWAY_WHY);
+                }
+            }
+            // The tablet file made with this session's cuts (LIO-590)
+            // refuses setup 2's start, and its second bore's, as the Run
+            // panel does, in its own words.
+            let cuts = Session {
+                cuts: session(cut),
+                ..Session::default()
+            };
+            let runs = tablet_runs(&doc, Ok(&mesh), 1, &cuts);
+            assert!(runs.problems.is_empty(), "{:?}", runs.problems);
+            let zeros: Vec<TabletZero> = (runs.tool_runs.iter())
+                .flat_map(|r| std::iter::once(&r.zero).chain(r.starts.iter().map(|t| &t.zero)))
+                .flatten()
+                .cloned()
+                .collect();
+            assert!(runs.tool_runs[0].zero.is_some() && zeros.len() >= 2);
+            for z in zeros {
+                assert_eq!(z.set_z, None);
+                let blocked = for_tablet(EARLIER_PARTWAY_BLOCKED.into());
+                assert_eq!(z.blocked.as_deref(), Some(&blocked[..]));
+                assert!(!z.probe_from.is_empty());
+                for spot in &z.probe_from {
+                    let why = for_tablet(EARLIER_PARTWAY_WHY.into());
+                    assert_eq!(spot.problem.as_deref(), Some(&why[..]));
+                }
+            }
+        }
+        // Its plan changed since as well: the reason is that, which
+        // finishing the face does not clear.
+        let mut changed = session(Some(1));
+        changed[0].1[0].2 = changed[0].1[0].2.map(|p| p ^ 1);
+        let mut run = Run::new(&doc, 1, 0);
+        crate::give_earlier_cuts(&changed, &[], &mut run);
+        let (c, l) = check(&doc, &mesh, 1);
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        assert!(run.earlier_unfollowed() && !run.earlier_partway());
+        assert!(run.touch_off().is_none());
+        assert_eq!(
+            run.partway_blocked().as_deref(),
+            Some(EARLIER_UNFOLLOWED_BLOCKED)
+        );
+        // Setup 2's run stopped partway, and setup 1 picked: the check of
+        // setup 1 has nothing of setup 2, which is the reason.
+        let mut run = Run::new(&doc, 1, 0);
+        crate::give_earlier_cuts(&[], &[], &mut run);
+        let (c, l) = check(&doc, &mesh, 1);
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        run.note_cut(0, Some(1));
+        let later = vec![(doc.setups[1].id.clone(), run.cut_in_run.clone())];
+        let mut run = Run::new(&doc, 0, 0);
+        crate::give_earlier_cuts(&later, &[], &mut run);
+        let (c, l) = check(&doc, &mesh, 0);
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        assert!(run.earlier_unfollowed() && !run.earlier_partway());
+        assert!(run.touch_off().is_none());
+        assert_eq!(
+            run.partway_blocked().as_deref(),
+            Some(EARLIER_UNFOLLOWED_BLOCKED)
+        );
+        // Faced whole, the tablet file's start touches off as the plan has it.
+        let whole = Session {
+            cuts: session(None),
+            ..Session::default()
+        };
+        let runs = tablet_runs(&doc, Ok(&mesh), 1, &whole);
+        assert_eq!(runs, tablet_runs(&doc, Ok(&mesh), 1, &Session::default()));
+        // Cut whole later this session (resumed): followed again.
+        let mut one = Run::new(&doc, 0, 0);
+        let (c, l) = check(&doc, &mesh, 0);
+        one.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        one.note_cut(0, Some(1));
+        one.note_cut(0, None);
+        assert_eq!(one.cut_in_run[0].1, None);
+    }
+
+    /// What another AXIS CAM on the same folder kept (LIO-601 review): taken
+    /// as it is where this one changed nothing since it last read it; where
+    /// both changed, an operation one holds whole and the other in part may
+    /// be either, so neither: up to all of it.
+    #[test]
+    fn another_axis_cams_cuts_never_make_a_partway_one_whole() {
+        let base = vec![(0, None, Some(1))];
+        let theirs = [(0, Some(2), Some(1))];
+        let mut unchanged = base.clone();
+        take_kept_cuts(&mut unchanged, Some(&base), &theirs);
+        assert_eq!(unchanged, theirs);
+        let mut both = vec![(0, None, Some(1)), (1, None, Some(2))];
+        take_kept_cuts(&mut both, Some(&base), &theirs);
+        assert_eq!(both, [(0, MAY_HAVE_CUT_ALL, Some(1)), (1, None, Some(2))]);
+        let mut partway = vec![(0, Some(1), Some(1))];
+        take_kept_cuts(&mut partway, None, &[(0, None, Some(1))]);
+        assert_eq!(partway, [(0, MAY_HAVE_CUT_ALL, Some(1))]);
+        let mut deeper = vec![(0, Some(1), Some(1))];
+        take_kept_cuts(&mut deeper, None, &theirs);
+        assert_eq!(deeper, theirs);
     }
 
     /// The journal of where a run stopped (LIO-275) is written and read
