@@ -16339,6 +16339,17 @@ flood = { pin = 8 }
         assert_eq!((run_of(&a).next, start(&a)), (0, Some(0)));
         assert!(run_of(&a).done.iter().all(|d| !d));
         assert_eq!(z(&a), Some(0.));
+        // The Drill's tool run done, then Next on the Face's, nothing
+        // skipped: the operator's start stays, and the Drill's tool run is
+        // not done on the new stock (LIO-634 review).
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = fresh(dir.path(), 1);
+        let _ = a.update(Message::Run(R::Next(0)));
+        assert_eq!(run_of(&a).start_picked, Some((0, 0)));
+        new_stock(&mut a);
+        assert_eq!((run_of(&a).next, start(&a)), (0, Some(0)));
+        assert!(run_of(&a).done.iter().all(|d| !d), "{:?}", run_of(&a).done);
+        assert_eq!(z(&a), Some(0.));
     }
 
     /// A run from the setup's start with the Drilling's first hole taken as

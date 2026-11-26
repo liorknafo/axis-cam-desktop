@@ -4590,19 +4590,22 @@ impl Run {
                     }
             }
         };
+        // No tool run is done on the new stock, whatever the start: one run
+        // to its end on the old, the operator's pick before it kept, is
+        // sent again after it (LIO-634 review).
+        self.done.iter_mut().for_each(|d| *d = false);
         if back {
             // A pick at a step is that step again.
             self.start_step = to.filter(|p| p.1 > 0);
             // Nothing sets Z from programs checked for the old start until
             // the check answers.
             ((self.next, self.from), self.programs) = ((0, 0), None);
-            self.done.iter_mut().for_each(|d| *d = false);
             // The first operation sent from there once nothing is cut.
             self.keep = Some((vec![], Some(to.map_or(0, |p| p.0))));
         } else if skips.is_empty() && steps.is_empty() {
             return false;
         } else if let Some(programs) = self.checked() {
-            self.keep = Some(self.progress_kept(programs));
+            self.keep = Some((vec![], self.progress_kept(programs).1));
         }
         self.skips.retain(|s| s.1 != Skip::Cut);
         self.cut_steps.clear();
