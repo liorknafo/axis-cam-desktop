@@ -14143,6 +14143,51 @@ flood = { pin = 8 }
         new_stock(&mut f);
         assert!(run_of(&f).journal.is_none() && conn(&f).journal().is_none());
         let _ = f.update(Message::Disconnect);
+        // Stopped after pass 1, AXIS CAM opened again, Start here on the Face
+        // picked, then New stock: the operator's start stays, and where the
+        // run stopped is over all the same, so AXIS CAM opened again starts
+        // at the Face, not at pass 2 on stock it never cut (LIO-634 review).
+        let dir = tempfile::tempdir().unwrap();
+        let mut g = two_pass_app(dir.path());
+        stop_after(&mut g, 0, 0);
+        let _ = g.update(Message::Disconnect);
+        let mut h = reopen(g, dir.path());
+        zeroed(&mut h);
+        let _ = h.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut h, 0);
+        if run_of(&h).programs.is_none() {
+            answer_skips(&mut h, 0);
+        }
+        assert_eq!(run_of(&h).at_step(), Some((0, 1)));
+        let _ = h.update(Message::Run(R::From(0, 0)));
+        let _ = h.update(Message::Tick);
+        if run_of(&h).programs.is_none() {
+            answer_skips(&mut h, 0);
+        }
+        assert_eq!(
+            (run_of(&h).next, run_of(&h).from, run_of(&h).at_step()),
+            (0, 0, None)
+        );
+        let _ = h.update(Message::Run(R::NewStock));
+        let _ = h.update(Message::Tick);
+        if run_of(&h).programs.is_none() {
+            answer_skips(&mut h, 0);
+        }
+        let run = run_of(&h);
+        assert!(run.resumed.is_none() && run.journal.is_none() && !run.stock_unconfirmed);
+        assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
+        assert_eq!(z(&h), Some(0.));
+        assert!(conn(&h).journal().is_none());
+        let _ = h.update(Message::Disconnect);
+        let mut k = reopen(h, dir.path());
+        zeroed(&mut k);
+        let _ = k.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut k, 0);
+        let run = run_of(&k);
+        assert!(run.resumed.is_none() && !run.history_unknown());
+        assert_eq!((run.next, run.from, run.at_step()), (0, 0, None));
+        assert_eq!(z(&k), Some(0.));
+        let _ = k.update(Message::Disconnect);
     }
 
     /// LIO-634: the Face and the Pocket's tool run cut to its end, so the

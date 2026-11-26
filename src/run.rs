@@ -4530,14 +4530,20 @@ impl Run {
     /// run stopped, this session's or a journal's, or after tool runs done.
     /// Kept there, what comes before it would be taken as cut on stock that
     /// is new, and Zero Z on the stock top would set Z on its floor
-    /// (LIO-634). Whether it went back so: where a run of the setup stopped
-    /// is then over (`Connection::run_act`).
+    /// (LIO-634). Where a run of the setup stopped is over whatever the
+    /// start (`journal`, `resumed`; the file, `Connection::run_act`).
+    /// Whether it went back.
     pub fn new_stock(&mut self) -> bool {
         (self.cut_in_run, self.earlier_cuts) = (vec![], vec![]);
         self.earlier_taken.clear();
         (self.stock_unconfirmed, self.declared_lost) = (false, false);
         (self.declared_stale, self.declared_from) = (false, None);
         let (skips, steps) = self.declared();
+        // Where a run of it stopped is over, whatever the start (LIO-634
+        // review): a journal waiting for the check to take it
+        // (`take_journal`), and the one the start came from.
+        let waits = (self.journal.take()).is_some_and(|j| j.setup == self.setup_id);
+        (self.journal_own, self.resumed) = (false, None);
         let mut to = None;
         let back = match self.checked() {
             Some(programs) => {
@@ -4561,15 +4567,9 @@ impl Run {
             // setup's first operation unless it is the operator's start at
             // a step. A start the operator picked otherwise goes back too
             // then, which sets no Z on a floor that new stock does not have.
-            // A journal of where a run of it stopped, waiting for the check
-            // to take it (`take_journal`), is a start too: dropped, so that
-            // the check does not put the start there after all.
+            // A journal waiting for the check was a start too: the check
+            // would have put the start there.
             None => {
-                let waits = self
-                    .journal
-                    .take()
-                    .is_some_and(|j| j.setup == self.setup_id);
-                self.journal_own = false;
                 waits
                     || match self.start_step {
                         Some(at) => self.start_picked != Some(at),
@@ -4583,7 +4583,7 @@ impl Run {
         };
         if back {
             // A pick at a step is that step again.
-            (self.start_step, self.resumed) = (to.filter(|p| p.1 > 0), None);
+            self.start_step = to.filter(|p| p.1 > 0);
             // Nothing sets Z from programs checked for the old start until
             // the check answers.
             ((self.next, self.from), self.programs) = ((0, 0), None);

@@ -4188,13 +4188,15 @@ impl Connection {
             }
             // What was taken as cut goes too, the setup checked again
             // without it (LIO-583 review).
-            R::NewStock if run.running.is_none() => {
-                // Its start gone back to the setup's first operation, where a
-                // run of it stopped is over, as when its last tool run ends:
-                // AXIS CAM opened again starts there no more (LIO-634).
-                if run.new_stock()
-                    && crate::run::Journal::read(&self.journal)
-                        .is_some_and(|j| j.setup == run.setup_id)
+            // Not while a probe begun for the old start runs: it would set
+            // Z from the stock that start found (LIO-634 review).
+            R::NewStock if run.running.is_none() && !self.probing() => {
+                run.new_stock();
+                // Where a run of it stopped is over, as when its last tool
+                // run ends, whatever the start now, even one the operator
+                // picked: AXIS CAM opened again starts there no more, on
+                // stock it never cut (LIO-634 review).
+                if crate::run::Journal::read(&self.journal).is_some_and(|j| j.setup == run.setup_id)
                 {
                     let _ = std::fs::remove_file(&self.journal);
                     self.journal_changes += 1;

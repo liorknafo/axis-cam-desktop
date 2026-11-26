@@ -9596,26 +9596,16 @@ impl App {
                 }
                 if let Some(c) = &mut self.control {
                     let away = c.run.as_ref().is_some_and(|r| r.away.is_some());
+                    // As `Connection::run_act` takes it.
                     let new_stock = matches!(action, run::Action::NewStock)
+                        && !c.probing()
                         && (c.run.as_ref()).is_some_and(|r| r.running.is_none());
+                    // New stock loaded ends the setup's journal there
+                    // (`Connection::run_act`, LIO-634): `keep_cut_history`
+                    // drops the copy kept of it. One that could not be
+                    // removed is not taken as known, so a run picked from it
+                    // sets no Z from the check's stock.
                     c.run_act(action.clone(), &self.doc);
-                    // New stock loaded: what runs cut before is forgotten,
-                    // and with it what a journal of theirs no session kept
-                    // left unknown. The journal there now is known from
-                    // here on, its run's cuts this session's (LIO-594).
-                    if new_stock
-                        && let Some(r) = &c.run
-                        && let Some((j, text, _)) = c.journal_text()
-                        && j.setup == r.setup_id
-                    {
-                        let file = c.journal_name();
-                        self.cut_journals.retain(|k| k.file != file);
-                        self.cut_journals.push(run::KeptJournal {
-                            setup: j.setup,
-                            file,
-                            text,
-                        });
-                    }
                     // Said for the part after a disconnect: it answers for
                     // every setup's record (LIO-596).
                     if away && c.run.as_ref().is_some_and(|r| r.away.is_none()) {
