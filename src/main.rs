@@ -1630,6 +1630,10 @@ pub struct App {
     /// whether anything else ran on it meanwhile (`run::Run::away`,
     /// LIO-595).
     run_away: Vec<(String, run::Away)>,
+    /// The tool runs the Pi showed that this session did not send and has
+    /// answered for (`App::note_done_elsewhere`, LIO-596): seen while
+    /// nothing it cut was at stake, or taken as cutting the part already.
+    pi_runs_known: Vec<u64>,
     /// The journals of where runs stopped as this session, or the one
     /// that kept `run_cuts` before it, wrote them (`run::KeptJournal`,
     /// LIO-594).
@@ -2269,6 +2273,7 @@ impl App {
             run_cuts: history.cuts,
             cut_owners: history.owners,
             run_away,
+            pi_runs_known: vec![],
             cut_journals: history.journals,
             others_unknown: history.others_unknown,
             cuts_path,
@@ -4929,6 +4934,108 @@ impl App {
                 .and_then(|c| c.run.as_ref())
                 .is_some_and(|r| r.left.is_some())
     }
+
+    /// The Pi shows a tool run this session did not send and has not
+    /// answered for (`pi_runs_known`), or another computer in control
+    /// (`control::Connection::done_elsewhere`), the link dropped and back
+    /// or not (LIO-596): either may have cut the part. Whatever this
+    /// session's runs cut, of every setup, is unknown from now on
+    /// (`run::HISTORY_UNKNOWN`), until New stock loaded, and the Pi's note
+    /// says why. Nothing at stake (nothing cut yet, or New stock loaded
+    /// since), nothing changes.
+    fn note_done_elsewhere(&mut self) {
+        let Some(c) = self.control.as_mut() else {
+            return;
+        };
+        let (runs, holder) = c.done_elsewhere(&self.pi_runs_known);
+        if runs.is_empty() && holder.is_none() {
+            return;
+        }
+        self.pi_runs_known.extend(runs);
+        if !self.cut_elsewhere() {
+            return;
+        }
+        let what = match holder {
+            Some(h) => format!("{h} took control of the Pi"),
+            None => "A tool run this computer did not send ran on the Pi".into(),
+        };
+        if let Some(c) = self.control.as_mut() {
+            c.pi_note = Some(format!(
+                "{what}: it may have cut the part, so what this computer's runs cut is not known any more. No start sets Z from the stock the check finds until New stock loaded under Work zero; keep the work zero, or set Z by hand."
+            ));
+        }
+    }
+
+    /// Something else may have cut the part (LIO-596): the record of what
+    /// every setup's runs cut this session (`run_cuts`, `run_pending`, and
+    /// the run's) is unknown from now on. True when any was not already.
+    fn cut_elsewhere(&mut self) -> bool {
+        let mut marked = false;
+        for (_, cuts) in &mut self.run_cuts {
+            marked |= run::note_unknown(cuts);
+        }
+        for p in &mut self.run_pending {
+            marked |= run::note_unknown_before(&mut p.3);
+        }
+        // A setup whose operations or steps were only taken as cut: their
+        // material may be cut deeper since too (LIO-596 review).
+        // Not the run's own setup: its kept entry is refreshed only as the
+        // run is dropped, and the run says what it takes as cut now
+        // (`Run::note_cut_elsewhere`, LIO-596 review).
+        let live = (self.control.as_ref())
+            .and_then(|c| c.run.as_ref())
+            .map(|r| r.setup_id.clone());
+        let mut declared = vec![];
+        for d in &self.run_declared {
+            if d.skips.is_empty() && d.steps.is_empty() && !d.lost {
+                continue;
+            }
+            if live.as_ref() == Some(&d.setup) {
+                continue;
+            }
+            match self.run_cuts.iter_mut().find(|(id, _)| *id == d.setup) {
+                Some((_, cuts)) => marked |= run::note_unknown_before(cuts),
+                None => {
+                    self.run_cuts.push((d.setup.clone(), vec![]));
+                    let cuts = &mut self.run_cuts.last_mut().unwrap().1;
+                    marked |= run::note_unknown_before(cuts);
+                }
+            }
+            declared.push(d.setup.clone());
+        }
+        if let Some(r) = self.control.as_mut().and_then(|c| c.run.as_mut()) {
+            // The run picked has another such setup's mark as it would
+            // picked now (`give_earlier_cuts`), so it sets no Z as its note
+            // says, and New stock loaded forgets the mark with the rest
+            // (`keep_run_cuts`, LIO-596 review).
+            for id in declared.into_iter().filter(|id| *id != r.setup_id) {
+                match r.earlier_cuts.iter_mut().find(|(e, _)| *e == id) {
+                    Some((_, cuts)) => marked |= run::note_unknown_before(cuts),
+                    None => {
+                        let cuts = vec![(run::HISTORY_UNKNOWN, None, None)];
+                        r.earlier_cuts.push((id.clone(), cuts));
+                    }
+                }
+                if !r.earlier_given.contains(&id) {
+                    r.earlier_given.push(id);
+                }
+            }
+            marked |= r.note_cut_elsewhere();
+        }
+        marked
+    }
+
+    /// The run's operator said, after a disconnect, whether the part is
+    /// still the one held and whether anything else ran (`action`): it is
+    /// said of the part, so of every setup's record kept across it, not
+    /// asked again for each (LIO-596).
+    fn answered_away(&mut self, action: &run::Action) {
+        if matches!(action, run::Action::OtherRunsMayHaveCut) {
+            self.cut_elsewhere();
+        }
+        self.run_away.clear();
+    }
+
     /// While the machine moves (`locked`), the setup being run is only marked
     /// to be checked: the Tick checks it once the machine stops, so that the
     /// simulation of the job never competes with the driver feeding it
@@ -9466,9 +9573,10 @@ impl App {
                     }
                 }
                 if let Some(c) = &mut self.control {
+                    let away = c.run.as_ref().is_some_and(|r| r.away.is_some());
                     let new_stock = matches!(action, run::Action::NewStock)
                         && (c.run.as_ref()).is_some_and(|r| r.running.is_none());
-                    c.run_act(action, &self.doc);
+                    c.run_act(action.clone(), &self.doc);
                     // New stock loaded: what runs cut before is forgotten,
                     // and with it what a journal of theirs no session kept
                     // left unknown. The journal there now is known from
@@ -9485,6 +9593,25 @@ impl App {
                             file,
                             text,
                         });
+                    }
+                    // Said for the part after a disconnect: it answers for
+                    // every setup's record (LIO-596).
+                    if away && c.run.as_ref().is_some_and(|r| r.away.is_none()) {
+                        self.answered_away(&action);
+                    }
+                    // New stock loaded: what runs cut, and what every setup
+                    // took as cut, is forgotten now, not only once the run
+                    // is dropped, so nothing seen since says it is unknown
+                    // (LIO-596 review).
+                    if new_stock
+                        && let Some(r) = (self.control.as_ref())
+                            .and_then(|c| c.run.as_ref())
+                            .filter(|r| r.cut_in_run.is_empty())
+                    {
+                        keep_run_cuts(&mut self.run_cuts, r, self.others_unknown);
+                        keep_pending_cuts(&mut self.run_pending, r);
+                        self.run_declared.clear();
+                        keep_declared(&mut self.run_declared, r);
                     }
                 }
             }
@@ -10722,6 +10849,9 @@ impl App {
                         };
                     }
                 }
+                // Something else ran on the Pi, or holds it: what this
+                // session's runs cut is unknown from now on (LIO-596).
+                self.note_done_elsewhere();
                 let phase_tab = self.phase_tab();
                 // AXIS CAM opened again while the Pi runs the tool run it
                 // sent before: its run, built anew, follows it, once the
@@ -12386,16 +12516,29 @@ fn mark_away(
 /// Gives `run` its setup's entry of `away` (`App::run_away`): its cuts, or
 /// what was taken as cut in it (LIO-606), were kept across a disconnect, so
 /// the operator is asked whether it is the same part and whether anything
-/// else ran meanwhile (LIO-595).
+/// else ran meanwhile (LIO-595). So is it when it has none, but has another
+/// setup's kept so (`earlier_cuts`), which the answer covers too (LIO-596);
+/// given after them and after whose they are (`give_elsewhere`). Not for
+/// another project's setup (`Run::earlier_elsewhere`): its cuts set no Z
+/// until New stock loaded whatever is answered, and are said as that
+/// project's (LIO-607). A setup deleted from this project is asked for: put
+/// back, its cuts are followed again (LIO-596 review).
 fn give_away(away: &[(String, run::Away)], run: &mut run::Run) {
     let (skips, steps) = run.declared();
     let kept = !run.cuts_so_far().is_empty()
         || !skips.is_empty()
         || !steps.is_empty()
         || run.declared_lost;
-    if let Some((_, a)) = away.iter().find(|(id, _)| *id == run.setup_id)
-        && kept
-    {
+    let own = (away.iter())
+        .find(|(id, _)| *id == run.setup_id)
+        .filter(|_| kept);
+    let ours = |id: &String| !run.earlier_elsewhere.iter().any(|o| o.setup == *id);
+    let earlier = || {
+        away.iter().find(|(id, _)| {
+            ours(id) && (run.earlier_cuts.iter()).any(|(e, cuts)| e == id && !cuts.is_empty())
+        })
+    };
+    if let Some((_, a)) = own.or_else(earlier) {
         run.away = Some(a.clone());
         run.stock_unconfirmed = true;
     }

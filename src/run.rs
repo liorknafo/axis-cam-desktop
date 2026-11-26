@@ -371,19 +371,19 @@ pub(crate) const LATER_UNFOLLOWED_WHY: &str = "Operations or steps after the sta
 /// What this setup's runs cut earlier, said as `Partly::cut`,
 /// while the operator has not said whether the same part is still held
 /// (`Run::stock_unconfirmed`).
-pub(crate) const STOCK_UNCONFIRMED: &str = "stock this setup's runs cut, or with operations or steps of it taken as cut, earlier, which may or may not still be held";
+pub(crate) const STOCK_UNCONFIRMED: &str = "stock earlier runs cut, or with operations or steps of it taken as cut, which may or may not still be held";
 
 /// Why a probe cannot find a work zero from a spot while
 /// `Run::stock_unconfirmed`.
-const STOCK_UNCONFIRMED_WHY: &str = "This setup's runs cut the stock earlier, or operations or steps of it were taken as cut: say under Work zero whether it is the same part or new stock.";
+const STOCK_UNCONFIRMED_WHY: &str = "Earlier runs cut the stock, or operations or steps of it were taken as cut: say under Work zero whether it is the same part or new stock.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed`.
-const STOCK_UNCONFIRMED_BLOCKED: &str = "This setup's runs cut the stock earlier, or operations or steps of it were taken as cut: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
+const STOCK_UNCONFIRMED_BLOCKED: &str = "Earlier runs cut the stock, or operations or steps of it were taken as cut: press Same part if that part is still held, or New stock loaded if not, under Work zero.";
 
 /// Why Zero Z on the stock top and Probe Z cannot set Z while
 /// `Run::stock_unconfirmed` after a disconnect (`Run::away`, LIO-595).
-pub(crate) const STOCK_AWAY_BLOCKED: &str = "This setup's runs cut the stock earlier, or operations or steps of it were taken as cut, and the machine was disconnected or AXIS CAM closed since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile.";
+pub(crate) const STOCK_AWAY_BLOCKED: &str = "Earlier runs cut the stock, or operations or steps of it were taken as cut, and the machine was disconnected or AXIS CAM closed since: say under Work zero whether the part is still held and whether anything else ran on the machine meanwhile. The answer covers every setup.";
 
 /// What runs this computer did not follow may have cut, said as
 /// `Partly::cut` (`HISTORY_UNKNOWN` in `Run::cut_in_run`): another
@@ -466,7 +466,7 @@ const FOR_TABLET: [(&str, &str); 9] = [
     ),
     (
         STOCK_AWAY_BLOCKED,
-        "This setup's runs on the computer cut the stock before this tablet file was made, and the machine was disconnected from it since: the tablet cannot tell whether that part is still held, or what else ran on the machine, so it cannot tell the surface where the stock top is touched off.",
+        "Runs on the computer cut the stock before this tablet file was made, and the machine was disconnected from it or AXIS CAM closed since: the tablet cannot tell whether that part is still held, or what else ran on the machine, so it cannot tell the surface where the stock top is touched off.",
     ),
     (
         HISTORY_UNFOLLOWED_BLOCKED,
@@ -565,6 +565,25 @@ pub(crate) fn note_cut_in(
         }
         None => cuts.push((oi, steps, print)),
     }
+}
+
+/// Notes in a record of what runs cut (`Run::cut_in_run`, `App::run_cuts`)
+/// that something else may have cut the part since (`HISTORY_UNKNOWN`,
+/// LIO-596). An empty record says nothing was cut and stays so. True when
+/// it was not already unknown.
+pub(crate) fn note_unknown(cuts: &mut Vec<CutInRun>) -> bool {
+    !cuts.is_empty() && note_unknown_before(cuts)
+}
+
+/// As `note_unknown`, for what was cut before a tool run that runs or ran
+/// (`Run::before_follow`, `App::run_pending`), empty or not: that tool run
+/// cuts the part, and its outcome starts from this (LIO-596 review).
+pub(crate) fn note_unknown_before(cuts: &mut Vec<CutInRun>) -> bool {
+    if cuts.iter().any(|c| c.0 == HISTORY_UNKNOWN) {
+        return false;
+    }
+    note_cut_in(cuts, HISTORY_UNKNOWN, None, None);
+    true
 }
 
 /// What this run's own tool runs cut, said as `Partly::cut`, when the
@@ -2116,9 +2135,51 @@ impl Run {
         note_cut_in(&mut self.cut_in_run, HISTORY_UNKNOWN, None, None);
     }
 
-    /// What this setup's runs cut is unknown (`note_history_unknown`).
+    /// What this setup's runs cut is unknown (`note_history_unknown`), or
+    /// what another setup's did that this one has (`earlier_cuts`, LIO-596).
     pub fn history_unknown(&self) -> bool {
-        self.cut_in_run.iter().any(|c| c.0 == HISTORY_UNKNOWN)
+        (self.cut_in_run.iter()).any(|c| c.0 == HISTORY_UNKNOWN)
+            || (self.earlier_cuts.iter())
+                .any(|(_, cuts)| cuts.iter().any(|c| c.0 == HISTORY_UNKNOWN))
+    }
+
+    /// Something else may have cut the part: the Pi showed a tool run this
+    /// computer did not send, or another computer in control (LIO-596), or
+    /// the operator said other runs may have cut it after a disconnect
+    /// (`Action::OtherRunsMayHaveCut`, LIO-595). What this setup's runs
+    /// cut, a tool run of its running included (`cuts_so_far`), what the
+    /// other setups' did (`earlier_cuts`), and what was cut before a tool
+    /// run it follows (`before_follow`) are unknown from now on
+    /// (`HISTORY_UNKNOWN`), until New stock loaded. True when any of them
+    /// was not already.
+    pub fn note_cut_elsewhere(&mut self) -> bool {
+        // A tool run running cuts, its check in or not; what was taken as
+        // cut, skipped, stepped over or started after (`partway`), may be
+        // cut deeper since too (LIO-596 review).
+        let (skips, steps) = self.declared();
+        let declared = !skips.is_empty() || steps.iter().any(|(_, s)| !s.is_empty());
+        let own = (self.running.is_some()
+            || !self.cuts_so_far().is_empty()
+            || declared
+            || self.declared_lost
+            || self.partway()
+            // A start at a later operation or step, while its check is
+            // pending (`partway` needs it).
+            || (((self.next, self.from) != (0, 0) || self.start_step.is_some())
+                && !self.started())
+            || !self.all_cut().is_empty())
+            && !(self.cut_in_run.iter()).any(|c| c.0 == HISTORY_UNKNOWN);
+        if own {
+            self.note_history_unknown();
+        }
+        let mut marked = own;
+        for (_, cuts) in &mut self.earlier_cuts {
+            marked |= note_unknown(cuts);
+        }
+        if let Some(cuts) = &mut self.before_follow {
+            marked |= note_unknown_before(cuts);
+        }
+        marked
     }
 
     /// This computer saw this setup's runs cut it (`cut_in_run`), not
@@ -2345,7 +2406,14 @@ impl Run {
         if let Some(before) = self.before_follow.take()
             && !o.message.contains(NOT_STARTED)
         {
+            // Unknown stays unknown: something else may have cut the part
+            // since, which no outcome of this computer's tells (LIO-596
+            // review).
+            let unknown = self.cut_in_run.iter().any(|c| c.0 == HISTORY_UNKNOWN);
             self.cut_in_run = before;
+            if unknown {
+                self.note_history_unknown();
+            }
         }
         for (op, steps) in cut {
             self.note_cut(op, steps);
@@ -3371,16 +3439,20 @@ impl Run {
 
     /// The stock the start begins from is not the setup's own: the run
     /// starts partway (`partway`), or a tool run of it has started, which
-    /// cut it, or has cut (`cut_in_run`). Zero Z on the stock top, Probe Z
-    /// and the probe spots go by the stock the check finds before the start
-    /// (`partly`) then (LIO-582 review). Whether Cycle Start waits for the
-    /// work zero is `asks_zero`'s, not this (LIO-583).
+    /// cut it, or has cut (`cut_in_run`); or whether the part runs cut is
+    /// still held is not said yet (`stock_unconfirmed`), its own runs' or
+    /// only other setups' (`earlier_cuts`) kept across a disconnect
+    /// (LIO-596 review). Zero Z on the stock top, Probe Z and the probe
+    /// spots go by the stock the check finds before the start (`partly`)
+    /// then (LIO-582 review). Whether Cycle Start waits for the work zero
+    /// is `asks_zero`'s, not this (LIO-583).
     pub fn on_cut_stock(&self) -> bool {
         self.checked().is_some()
             && (self.partway()
                 || self.started()
                 || !self.cut_in_run.is_empty()
-                || self.earlier_unfollowed())
+                || self.earlier_unfollowed()
+                || self.stock_unconfirmed)
     }
 
     /// The run starts partway through the setup before any of its tool runs
@@ -3821,6 +3893,21 @@ impl Run {
                 steps: vec![],
             }));
         }
+        // Runs this computer did not follow may have cut it: another
+        // session's, anything that ran while it was disconnected, or that
+        // the Pi showed since: this setup's or another's record (LIO-586
+        // review, LIO-595, LIO-596).
+        if self.history_unknown() {
+            return Some(Cow::Owned(Partly {
+                cut: vec![HISTORY_UNFOLLOWED.into()],
+                surface: None,
+                top_cut: true,
+                probe_from: (before.probe_from.iter())
+                    .map(|(r, _)| (*r, Err(HISTORY_UNFOLLOWED_WHY.into())))
+                    .collect(),
+                steps: vec![],
+            }));
+        }
         // Another setup's run cut an operation the check does not simulate
         // so before this setup (LIO-582 review).
         if self.earlier_unfollowed() {
@@ -3830,20 +3917,6 @@ impl Run {
                 top_cut: true,
                 probe_from: (before.probe_from.iter())
                     .map(|(r, _)| (*r, Err(self.earlier_unfollowed_why())))
-                    .collect(),
-                steps: vec![],
-            }));
-        }
-        // Runs this computer did not follow may have cut it: another
-        // session's, or anything that ran while it was disconnected
-        // (LIO-586 review, LIO-595).
-        if self.history_unknown() {
-            return Some(Cow::Owned(Partly {
-                cut: vec![HISTORY_UNFOLLOWED.into()],
-                surface: None,
-                top_cut: true,
-                probe_from: (before.probe_from.iter())
-                    .map(|(r, _)| (*r, Err(HISTORY_UNFOLLOWED_WHY.into())))
                     .collect(),
                 steps: vec![],
             }));
@@ -11189,12 +11262,12 @@ pub(crate) mod tests {
         one.checked_as(Arc::new(c), Some(Arc::new(l)), None);
         one.note_cut(0, None);
         let session = vec![(doc.setups[0].id.clone(), one.cut_in_run.clone())];
-        let at_level_2 = |doc: &Document| {
+        let at_level_2_of = |doc: &Document, session: &[(String, Vec<CutInRun>)]| {
             // The flipped setup, wherever it is now.
             let si = (doc.setups.iter()).position(|s| s.p.get("rx").is_some_and(|r| r == "180"));
             let si = si.unwrap();
             let mut run = Run::new(doc, si, 0);
-            crate::give_earlier_cuts(&session, &mut run);
+            crate::give_earlier_cuts(session, &mut run);
             let (c, l) = check(doc, &mesh, si);
             run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
             let level_2 = run.op_steps(0).is_some_and(|s| s.steps.len() >= 2);
@@ -11204,6 +11277,7 @@ pub(crate) mod tests {
             assert_eq!(run.at_step(), Some((0, 1)));
             run
         };
+        let at_level_2 = |doc: &Document| at_level_2_of(doc, &session);
         let unfollowed = |run: &Run| run.partly().is_some_and(|p| p.cut == [EARLIER_UNFOLLOWED]);
         // As it was cut: setup 2's check has the bore (and blocks the
         // floor over it, as before).
@@ -11248,6 +11322,89 @@ pub(crate) mod tests {
             assert!(kept.is_empty(), "{kept:?}");
             assert!(!run.earlier_unfollowed());
         }
+        // Something else may have cut the part since (LIO-596): setup 1's
+        // record, as setup 2 has it, is unknown, and so is the level setup
+        // 2's start at level 2 takes as cut (LIO-596 review).
+        let mut run = at_level_2(&doc);
+        assert!(run.note_cut_elsewhere(), "{:?}", run.earlier_cuts);
+        assert!(!run.note_cut_elsewhere(), "noted once");
+        assert_eq!(run.cut_in_run, [(HISTORY_UNKNOWN, None, None)]);
+        let unknown = |run: &Run| run.partly().is_some_and(|p| p.cut == [HISTORY_UNFOLLOWED]);
+        let said = |run: &Run| {
+            let why = run.partway_blocked().unwrap();
+            assert!(
+                why.starts_with("Runs this computer did not follow"),
+                "{why}"
+            );
+        };
+        assert!(run.history_unknown() && unknown(&run) && run.touch_off().is_none());
+        said(&run);
+        // So is it in the session's record (`App::run_cuts`): a run of
+        // setup 2 made anew has it so, from its start too.
+        let mut marked = session.clone();
+        assert!(note_unknown(&mut marked[0].1) && !note_unknown(&mut marked[0].1));
+        let mut run = at_level_2_of(&doc, &marked);
+        assert!(run.history_unknown() && unknown(&run) && run.touch_off().is_none());
+        said(&run);
+        run.start_at(0, 0);
+        assert!(run.on_cut_stock() && unknown(&run) && run.touch_off().is_none());
+        // An empty record says nothing was cut, and stays so.
+        assert!(!note_unknown(&mut vec![]));
+        // Kept across a disconnect, setup 1's record is asked about when
+        // setup 2 is picked, though setup 2's runs cut nothing: the answer
+        // is said of the part (LIO-596).
+        let away = vec![(
+            doc.setups[0].id.clone(),
+            Away {
+                seen: Some(vec![7]),
+            },
+        )];
+        let mut run = Run::new(&doc, 1, 0);
+        crate::give_earlier_cuts(&session, &mut run);
+        let (c, l) = check(&doc, &mesh, 1);
+        run.checked_as(Arc::new(c), Some(Arc::new(l)), None);
+        // Before the disconnect, its start touches off on the stock the
+        // check carves with setup 1's cuts.
+        assert!(run.touch_off().is_some() && run.partway_blocked().is_none());
+        crate::give_away(&away, &mut run);
+        assert!(run.stock_unconfirmed);
+        assert_eq!(
+            run.away,
+            Some(Away {
+                seen: Some(vec![7])
+            })
+        );
+        // Until answered, nothing sets Z from the stock the check carves:
+        // the part may not be the one held, or cut since (Fable review).
+        assert!(run.touch_off().is_none());
+        assert_eq!(run.partway_blocked().as_deref(), Some(STOCK_AWAY_BLOCKED));
+        // Same part, nothing else ran: as before.
+        (run.stock_unconfirmed, run.away) = (false, None);
+        assert!(run.touch_off().is_some() && run.partway_blocked().is_none());
+        // Nothing of setup 1's kept: nothing to ask.
+        let mut run = Run::new(&doc, 1, 0);
+        crate::give_earlier_cuts(&[], &mut run);
+        crate::give_away(&away, &mut run);
+        assert!(!run.stock_unconfirmed && run.away.is_none());
+        // Setup 1 deleted since: still asked for, as put back its cuts are
+        // followed again (LIO-596 review).
+        let mut deleted = doc.clone();
+        deleted.remove_setup(0).unwrap();
+        let si = (deleted.setups.iter()).position(|s| s.p.get("rx").is_some_and(|r| r == "180"));
+        let mut run = Run::new(&deleted, si.unwrap(), 0);
+        crate::give_earlier_cuts(&session, &mut run);
+        crate::give_away(&away, &mut run);
+        assert!(run.stock_unconfirmed && run.away.is_some());
+        // Another project's setup kept so (`earlier_elsewhere`): its cuts
+        // set no Z until New stock loaded whatever is answered, and are said
+        // as that project's (LIO-607), so nothing is asked for them.
+        let mut run = Run::new(&deleted, si.unwrap(), 0);
+        crate::give_earlier_cuts(&session, &mut run);
+        let mut owner = CutOwner::of(&doc, 0);
+        owner.project = "another project".into();
+        run.earlier_elsewhere = vec![owner];
+        crate::give_away(&away, &mut run);
+        assert!(!run.stock_unconfirmed && run.away.is_none());
     }
 
     /// Setup 1 bores the ring from below in a run this session; setup 2,

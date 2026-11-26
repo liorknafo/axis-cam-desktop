@@ -2879,8 +2879,10 @@ thread_local! {
     static SENT_TOOL_RUNS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(vec![]) };
 }
 
-/// The numbers of the tool runs this session sent a Pi: none of them ran
-/// while it was away (`Connection::same_part_refused`, LIO-595).
+/// The numbers of the tool runs this session sent a Pi, with the one AXIS
+/// CAM here last sent before it opened again (its `PiPending`): none of
+/// them ran while it was away (`Connection::same_part_refused`, LIO-595),
+/// nor is another computer's (`Connection::done_elsewhere`, LIO-596).
 pub fn sent_tool_runs() -> Vec<u64> {
     SENT_TOOL_RUNS.with(|s| s.borrow().clone())
 }
@@ -3028,7 +3030,18 @@ impl Connection {
         c.pi = Some(address.to_owned());
         // The tool run last sent, to follow again if the Pi still has it or
         // has ended it since (`take_reattach`).
-        c.reattach = PiPending::read(&c.pi_pending()).and_then(|p| Some((p.id, p.follow?)));
+        let pending = PiPending::read(&c.pi_pending());
+        // Sent by AXIS CAM here, before it opened again perhaps: this
+        // computer's, not another's (`done_elsewhere`, LIO-596).
+        if let Some(p) = &pending {
+            SENT_TOOL_RUNS.with(|s| {
+                let mut s = s.borrow_mut();
+                if !s.contains(&p.id) {
+                    s.push(p.id);
+                }
+            });
+        }
+        c.reattach = pending.and_then(|p| Some((p.id, p.follow?)));
         Ok(c)
     }
 
@@ -4134,7 +4147,16 @@ impl Connection {
                 run.away = None;
             }
             R::OtherRunsMayHaveCut if run.running.is_none() && run.away.is_some() => {
-                run.note_history_unknown();
+                // Its own record, unless it has none and was asked for the
+                // other setups' it has (`earlier_cuts`): it cut nothing
+                // itself, and theirs are marked (`App::answered_away`).
+                // Asked with nothing inherited either, its own is marked:
+                // the operator said something else may have cut the part
+                // (LIO-596 review).
+                let inherited = (run.earlier_cuts.iter()).any(|(_, c)| !c.is_empty());
+                if !run.cut_in_run.is_empty() || !inherited {
+                    run.note_history_unknown();
+                }
                 run.stock_unconfirmed = false;
                 run.away = None;
             }
@@ -4977,7 +4999,7 @@ impl Connection {
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::STOCK_UNCONFIRMED] =>
             {
-                Some("This setup's runs cut the stock earlier, or operations or steps of it were taken as cut: say under Work zero whether it is the same part or new stock before a probe finds this work zero.".into())
+                Some("Earlier runs cut the stock, or operations or steps of it were taken as cut: say under Work zero whether it is the same part or new stock before a probe finds this work zero.".into())
             }
             Some((Some(partly), _))
                 if p.probe.is_ok() && partly.cut == [crate::run::STEPS_UNFOLLOWED] =>
@@ -6606,6 +6628,35 @@ impl Connection {
                 .chain(link.tool_run_going.iter().copied())
                 .collect(),
         )
+    }
+
+    /// What the Pi shows that this computer did not do, any time, the link
+    /// dropped and back or not (LIO-596): the tool runs, going or ended,
+    /// that it did not send (`sent_tool_runs`) and `known` lacks; and the
+    /// name of another computer in control. Not this computer's own older
+    /// connection, which may hold control for a moment after the link
+    /// comes back, under the name it was paired as. Nothing when it is not
+    /// a Pi.
+    pub fn done_elsewhere(&self, known: &[u64]) -> (Vec<u64>, Option<String>) {
+        let Some(link) = &self.link else {
+            return (vec![], None);
+        };
+        let sent = sent_tool_runs();
+        let mut runs: Vec<u64> = (link.tool_run_ends.iter().map(|e| e.id))
+            .chain(link.tool_run_going.iter().copied())
+            .filter(|id| !sent.contains(id) && !known.contains(id))
+            .collect();
+        runs.sort_unstable();
+        runs.dedup();
+        let holder = match &link.state {
+            uc100_remote::LinkState::Watching { holder: Some(h) }
+                if link.name.as_ref() != Some(h) =>
+            {
+                Some(h.clone())
+            }
+            _ => None,
+        };
+        (runs, holder)
     }
 
     /// The journal of where a run stopped on this machine, if any.
