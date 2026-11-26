@@ -4561,14 +4561,25 @@ impl Run {
             // setup's first operation unless it is the operator's start at
             // a step. A start the operator picked otherwise goes back too
             // then, which sets no Z on a floor that new stock does not have.
-            None => match self.start_step {
-                Some(at) => self.start_picked != Some(at),
-                None => {
-                    (self.next, self.from) != (0, 0)
-                        || self.done.contains(&true)
-                        || !skips.is_empty()
-                }
-            },
+            // A journal of where a run of it stopped, waiting for the check
+            // to take it (`take_journal`), is a start too: dropped, so that
+            // the check does not put the start there after all.
+            None => {
+                let waits = self
+                    .journal
+                    .take()
+                    .is_some_and(|j| j.setup == self.setup_id);
+                self.journal_own = false;
+                waits
+                    || match self.start_step {
+                        Some(at) => self.start_picked != Some(at),
+                        None => {
+                            (self.next, self.from) != (0, 0)
+                                || self.done.contains(&true)
+                                || !skips.is_empty()
+                        }
+                    }
+            }
         };
         if back {
             // A pick at a step is that step again.

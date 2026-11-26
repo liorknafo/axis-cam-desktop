@@ -13134,7 +13134,11 @@ flood = { pin = 8 }
         );
         // Started from the setup's start, nothing is taken as cut either:
         // nothing is at stake (a start at pass 2 takes pass 1 as cut, which
-        // evidence would make unknown, LIO-596 review).
+        // evidence would make unknown, LIO-596 review). New stock took the
+        // start at pass 2 back there itself, checked again (LIO-634).
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        assert_eq!((run_of(&a).next, run_of(&a).from), (0, 0));
         let _ = a.update(Message::Run(R::From(0, 0)));
         assert!(!run_of(&a).partway(), "{:?}", run_of(&a).at_step());
         assert!(!a.cut_elsewhere());
@@ -14124,6 +14128,21 @@ flood = { pin = 8 }
         assert_eq!(run_of(&d).at_step(), Some((0, 1)));
         assert_eq!(z(&d), Some(-2.));
         let _ = d.update(Message::Disconnect);
+        // Stopped after pass 1, AXIS CAM opened again, and New stock pressed
+        // before the first check answers, the journal waiting for it: the
+        // check does not start at pass 2, and the journal is over.
+        let dir = tempfile::tempdir().unwrap();
+        let mut e = two_pass_app(dir.path());
+        let journal = stop_after(&mut e, 0, 0);
+        assert_eq!((journal.op, journal.step), (0, Some(0)));
+        let _ = e.update(Message::Disconnect);
+        let mut f = reopen(e, dir.path());
+        zeroed(&mut f);
+        let _ = f.update(Message::Run(R::Setup(0)));
+        assert!(run_of(&f).journal.is_some() && run_of(&f).programs.is_none());
+        new_stock(&mut f);
+        assert!(run_of(&f).journal.is_none() && conn(&f).journal().is_none());
+        let _ = f.update(Message::Disconnect);
     }
 
     /// LIO-634: the Face and the Pocket's tool run cut to its end, so the
