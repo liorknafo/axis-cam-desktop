@@ -4188,8 +4188,28 @@ impl Connection {
             }
             // What was taken as cut goes too, the setup checked again
             // without it (LIO-583 review).
-            R::NewStock if run.running.is_none() => {
+            // Not while a probe begun for the old start runs: it would set
+            // Z from the stock that start found (LIO-634 review).
+            R::NewStock if run.running.is_none() && !self.probing() => {
                 run.new_stock();
+                // Where a run of it stopped is over, as when its last tool
+                // run ends, whatever the start now, even one the operator
+                // picked: AXIS CAM opened again starts there no more, on
+                // stock it never cut (LIO-634 review). So in the journal of
+                // each way to the same table (`table_journals`): by USB and
+                // by the Pi, not the simulator's, whose stock is not the
+                // table's, nor the other way round.
+                for f in self.table_journals() {
+                    if crate::run::Journal::read(&f).is_some_and(|j| j.setup == run.setup_id) {
+                        // One that stays is not this session's: not known.
+                        if std::fs::remove_file(&f).is_err() {
+                            crate::run::disown(&f);
+                        }
+                        if f == self.journal {
+                            self.journal_changes += 1;
+                        }
+                    }
+                }
                 run.away = None;
             }
             R::More(oi) => {
@@ -6914,6 +6934,28 @@ impl Connection {
         let (data, own) = crate::run::read_own(&self.journal)?;
         let j = serde_json::from_slice(&data).ok()?;
         Some((j, String::from_utf8(data).ok()?, own))
+    }
+
+    /// The journals of the ways to the table this connection's stock is on
+    /// (LIO-634 review): the machine's own by USB and by its Pi, which
+    /// drive the same UC100 and so cut the same stock; the simulator's
+    /// alone for a simulated connection, whose stock is the computer's
+    /// only. This connection's journal is the first.
+    pub fn table_journals(&self) -> Vec<std::path::PathBuf> {
+        let mut files = vec![self.journal.clone()];
+        let name = |kind: &str| format!("{}{kind}-journal.json", self.machine_id);
+        let simulated = self.journal_name() == name("-simulated");
+        if let Some(dir) = self.journal.parent()
+            && !simulated
+        {
+            for kind in ["", "-pi"] {
+                let f = dir.join(name(kind));
+                if !files.contains(&f) {
+                    files.push(f);
+                }
+            }
+        }
+        files
     }
 
     /// The name of the file the journal is kept in, which tells this
