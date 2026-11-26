@@ -2522,6 +2522,9 @@ impl Run {
                     .chain([&op])
                     .map(|&o| (o, None))
                     .collect(),
+                // Ended by an E-stop, those before it are whole only where
+                // the tool was followed past them (LIO-601 review).
+                false if e_stop => up_to(op, s + 1, &bound),
                 false => up_to(op, s + 1, &|_| None),
             }
         } else if let Some(far) = self.reach(at).and_then(|b| self.stopped_on(b, "")) {
@@ -11583,6 +11586,13 @@ pub(crate) mod tests {
         // by it again (`earlier_unfinished`).
         let pocket = (0..blocks.len()).find(|&j| marks[j].is_some_and(|m| m.0 == 1));
         let pocket = pocket.unwrap();
+        // Stop after step at the Pocket's end, ended by an E-stop: the Face
+        // is whole only once it was followed past (LIO-601 review).
+        let at = Some((1, pocket_steps - 1));
+        let unfollowed = ran_at(false, at, "E-stop", None, None);
+        assert_eq!(cuts(&unfollowed)[0], (0, may));
+        let followed = ran_at(false, at, "E-stop", Some(pocket), None);
+        assert_eq!(cuts(&followed)[0], (0, None));
         let in_pocket = ran_at(false, None, "E-stop", Some(pocket), None);
         assert_eq!(cuts(&in_pocket), [(0, None), (1, may)]);
         let dropped = running(Some(pocket)).cuts_so_far();

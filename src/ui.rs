@@ -11773,12 +11773,16 @@ fn stock_question<'a>(
                 true => {
                     let named = run.earlier_partway_named(doc);
                     let (them, each) = match named.len() {
-                        1 => ("it", "it"),
+                        0 | 1 => ("it", "it"),
                         _ => ("them", "each"),
                     };
+                    // None named: its setup gone from the project since.
+                    let which = match named.is_empty() {
+                        true => "an operation of this part".to_string(),
+                        false => crate::post::listed(&named),
+                    };
                     format!(
-                        "Another setup's run left {} unfinished (its run stopped partway through {each}, or where it stopped is not known): run {them} to the end first.",
-                        crate::post::listed(&named)
+                        "Another setup's run left {which} unfinished (its run stopped partway through {each}, or where it stopped is not known): run {them} to the end first."
                     )
                 }
                 false => run.earlier_unfollowed_note(),
