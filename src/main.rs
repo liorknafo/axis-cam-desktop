@@ -4979,9 +4979,18 @@ impl App {
         }
         // A setup whose operations or steps were only taken as cut: their
         // material may be cut deeper since too (LIO-596 review).
+        // Not the run's own setup: its kept entry is refreshed only as the
+        // run is dropped, and the run says what it takes as cut now
+        // (`Run::note_cut_elsewhere`, LIO-596 review).
+        let live = (self.control.as_ref())
+            .and_then(|c| c.run.as_ref())
+            .map(|r| r.setup_id.clone());
         let mut declared = vec![];
         for d in &self.run_declared {
             if d.skips.is_empty() && d.steps.is_empty() && !d.lost {
+                continue;
+            }
+            if live.as_ref() == Some(&d.setup) {
                 continue;
             }
             match self.run_cuts.iter_mut().find(|(id, _)| *id == d.setup) {

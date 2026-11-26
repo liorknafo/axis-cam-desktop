@@ -6017,6 +6017,119 @@ flood = { pin = 8 }
         let _ = a.update(Message::Disconnect);
     }
 
+    /// Pass 1 taken as cut, the setup picked again and called the same
+    /// part, then pass 1 undone and the run started from the setup's start:
+    /// nothing is at stake, though the setup's kept entry still says pass 1
+    /// (refreshed only as the run is dropped). Another computer's tool run
+    /// says nothing and leaves Set Z offered (LIO-596 review).
+    #[test]
+    fn evidence_says_nothing_of_steps_undone_since_the_setup_was_picked() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, server, relay) = face_on_the_pi(dir.path());
+        let pick = |a: &mut App| {
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(a, 0);
+            if run_of(a).programs.is_none() {
+                answer_skips(a, 0);
+            }
+        };
+        let take_pass_1 = |a: &mut App, cut: bool| {
+            let _ = a.update(Message::Run(R::Steps(Some(0))));
+            let _ = a.update(Message::Run(R::PickStep(0, 0)));
+            let _ = a.update(Message::Run(R::SkipSteps(cut)));
+            answer_skips(a, 0);
+            if run_of(a).programs.is_none() {
+                answer_skips(a, 0);
+            }
+        };
+        pick(&mut a);
+        take_pass_1(&mut a, true);
+        pick(&mut a);
+        let _ = a.update(Message::Run(R::SamePart));
+        take_pass_1(&mut a, false);
+        let _ = a.update(Message::Run(R::From(0, 0)));
+        if run_of(&a).programs.is_none() {
+            answer_skips(&mut a, 0);
+        }
+        assert!(!a.run_declared.is_empty(), "the kept entry, stale");
+        assert!(!run_of(&a).partway() && run_of(&a).all_cut().is_empty());
+        let fresh = conn(&a).touch_off().map(|(_, w)| w[2]);
+        assert!(fresh.is_some());
+        assert!(!tool_run_elsewhere_said(
+            &mut a,
+            dir.path(),
+            &server,
+            &relay,
+            99
+        ));
+        assert!(!run_of(&a).history_unknown());
+        assert!(
+            a.run_cuts.iter().all(|(_, c)| c.is_empty()),
+            "{:?}",
+            a.run_cuts
+        );
+        assert_eq!(conn(&a).touch_off().map(|(_, w)| w[2]), fresh);
+        let _ = a.update(Message::Disconnect);
+    }
+
+    /// LIO-606's question for a level taken as cut and undone before the
+    /// answer, while another setup's runs cut this session, no disconnect
+    /// between: only the setup's own record is asked for, so it is still
+    /// said as taken as cut, not as its runs' cut (LIO-596 review).
+    #[test]
+    fn a_level_undone_before_the_answer_is_said_as_taken_as_cut_beside_another_setups_cuts() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app_of(dir.path(), &fast_z_slow(), &[0, 3]);
+        let face = &mut a.doc.setups[0].operations[0].p;
+        face.insert("stepdown".into(), "2".into());
+        face.insert("feed".into(), "6000".into());
+        let mut second = a.doc.setups[0].clone();
+        second.id = crate::id();
+        for op in &mut second.operations {
+            op.id = crate::id();
+        }
+        let other = second.id.clone();
+        a.doc.setups.push(second);
+        zeroed(&mut a);
+        a.run_cuts.push((other, vec![(0, None, Some(1))]));
+        let take_pass_1 = |a: &mut App, cut: bool| {
+            let _ = a.update(Message::Run(R::Steps(Some(0))));
+            let _ = a.update(Message::Run(R::PickStep(0, 0)));
+            let _ = a.update(Message::Run(R::SkipSteps(cut)));
+            answer_skips(a, 0);
+            if run_of(a).programs.is_none() {
+                answer_skips(a, 0);
+            }
+        };
+        let pick = |a: &mut App| {
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(a, 0);
+            if run_of(a).programs.is_none() {
+                answer_skips(a, 0);
+            }
+        };
+        pick(&mut a);
+        take_pass_1(&mut a, true);
+        assert_eq!(run_of(&a).all_cut(), [(0, vec![0])]);
+        pick(&mut a);
+        assert!(run_of(&a).stock_unconfirmed && run_of(&a).away.is_none());
+        take_pass_1(&mut a, false);
+        let _ = a.update(Message::Resized(iced::Size::new(1440., 900.)));
+        let _ = a.update(Message::ControlTab(crate::ui::ControlTab::WorkZero));
+        shows(
+            &a,
+            &[
+                "Operations or steps of this setup were taken as cut earlier. Is it still the same part?",
+            ],
+        );
+        lacks(
+            &a,
+            &["This setup's runs cut a part earlier. Is it still the one held?"],
+        );
+    }
+
     /// A start at the Drilling takes the Face as cut; evidence seen while
     /// its check is computed again (`partway` needs the check) still marks
     /// it, and no Set Z is offered once the check is in (LIO-596 review).

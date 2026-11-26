@@ -11630,12 +11630,13 @@ fn stock_question<'a>(
     // the whole story either, for something is taken as cut, or was and
     // has been dropped or undone since, Don't skip pressed before the
     // answer say (LIO-606 review).
-    // Not for a setup asked only for another setup's record it has
-    // (`earlier_cuts`, LIO-596): earlier runs cut that part.
+    // Not after a disconnect for a setup asked only for another setup's
+    // record it has (`earlier_cuts`, LIO-596): earlier runs cut that part.
+    // Without one, only its own record is asked for (LIO-596 review).
     let only_taken = {
         let (skips, steps) = run.declared();
         let taken = !skips.is_empty() || !steps.is_empty() || run.declared_lost;
-        let inherited = (run.earlier_cuts.iter()).any(|(_, c)| !c.is_empty());
+        let inherited = run.away.is_some() && (run.earlier_cuts.iter()).any(|(_, c)| !c.is_empty());
         !run.cut_by_runs() && (taken || (!run.history_unknown() && !inherited))
     };
     // This setup's runs cut a part earlier, this session or before AXIS
