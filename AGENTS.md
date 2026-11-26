@@ -27,3 +27,8 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
   `Cargo.toml`); `axis-cam`, the UC100 driver and uc100-server keep theirs.
   To step into another dependency in a debugger, turn it on for that crate
   on your own machine, not in a commit.
+- Tests build `axis-cam` at `opt-level = 1` (`[profile.test.package.axis-cam]`,
+  LIO-729): the tests run 2–4 times faster, and a one-line change rebuilds
+  the test binary in about 22 s instead of 7. `cargo build` and `cargo run`
+  stay at `opt-level` 0. Don't override it for a run: each setting keeps its
+  own copy of the crate in `target/`.
