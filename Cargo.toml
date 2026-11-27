@@ -30,9 +30,9 @@ sha2 = "0.10"
 clipper2 = "0.6.0"
 fidget = { version = "=0.4.3", default-features = false, features = ["mesh"] }
 toml_edit = "0.25"
-uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "bb3ae02961f3d3c5a9008700ffdbedcf77f3b0f1", default-features = false }
+uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "2d422b3ed2f8d3c7364fb1fe107090f064612636", default-features = false }
 # The UC100 run by uc100-server on a Raspberry Pi, across the network ("Network (Pi)").
-uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "34469ca071d581e7fbe3e50fbc69114a68175605" }
+uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "5a1941e0e20c13b798b81edf82f6724c135540fc" }
 # The GPU stock mesher (`gpu_mesh`), on the wgpu iced already draws with.
 wgpu = "27"
 bytemuck = { version = "1", features = ["derive"] }
