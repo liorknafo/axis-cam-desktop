@@ -13448,7 +13448,7 @@ flood = { pin = 8 }
         let face = &mut a.doc.setups[0].operations[0].p;
         face.insert("stepdown".into(), "2".into());
         face.insert("feed".into(), "6000".into());
-        stop_after(&mut a, 0, 0);
+        let _ = stop_after(&mut a, 0, 0);
         answer_skips(&mut a, 0);
         // Another setup of the project, whose runs cut its first operation
         // whole this session.
@@ -15496,6 +15496,494 @@ flood = { pin = 8 }
         let _ = b.update(Message::Disconnect);
     }
 
+    /// LIO-637: two AXIS CAMs open on the same folder, part and machine,
+    /// each with its own setup picked, and each run's first tool run cut
+    /// to its end, the second's on the work zero kept by hand once the
+    /// first's cuts reached it.
+    fn two_cut_setups(dir: &std::path::Path) -> (App, App) {
+        use crate::run::Action as R;
+        let mut a = two_pass_app(dir);
+        let mut b = two_pass_app(dir);
+        b.replace_document(a.doc.clone(), None);
+        b.imported_mesh = a.imported_mesh.clone();
+        b.page = Page::Control;
+        b.doc.setups[0].id = crate::id();
+        zeroed(&mut a);
+        idle(&mut b);
+        for x in [&mut a, &mut b] {
+            let _ = x.update(Message::Run(R::Setup(0)));
+            answer_skips(x, 0);
+        }
+        cycle_start(&mut a);
+        run_until(&mut a, 90., "tool run 1", |r| r.running.is_none());
+        assert!(run_of(&a).done[0]);
+        let _ = b.update(Message::Tick);
+        assert!(run_of(&b).earlier_unfollowed());
+        let _ = b.update(Message::Run(R::KeepZero));
+        cycle_start(&mut b);
+        assert!(run_of(&b).running.is_some(), "{:?}", problems(&b));
+        run_until(&mut b, 90., "tool run 1", |r| r.running.is_none());
+        assert!(run_of(&b).done[0]);
+        (a, b)
+    }
+
+    /// The version of `path` and what it holds: a write, which puts a new
+    /// file there, changes it.
+    fn file_version(path: &std::path::Path) -> (u64, std::time::SystemTime, Vec<u8>) {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(path).unwrap();
+        (m.ino(), m.modified().unwrap(), std::fs::read(path).unwrap())
+    }
+
+    /// Ticks `a` and `b` in turn, `n` times each.
+    fn tick_both(a: &mut App, b: &mut App, n: usize) {
+        for _ in 0..n {
+            let _ = a.update(Message::Tick);
+            let _ = b.update(Message::Tick);
+        }
+    }
+
+    /// LIO-637: two AXIS CAMs open on the same folder, each with a run of
+    /// its own setup that cut, settle: once each has taken in what the
+    /// other kept, neither writes what runs cut again while nothing
+    /// changes.
+    #[test]
+    fn two_axis_cams_with_runs_of_different_setups_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = two_cut_setups(dir.path());
+        let path = dir.path().join("uc100").join("cuts.json");
+        tick_both(&mut a, &mut b, 3);
+        let kept = file_version(&path);
+        let h = crate::run::CutHistory::read(&path).unwrap().unwrap();
+        for s in [&a.doc.setups[0].id, &b.doc.setups[0].id] {
+            let cut = h.cuts.iter().find(|(id, _)| id == s);
+            assert!(cut.is_some_and(|(_, c)| !c.is_empty()), "{:?}", h.cuts);
+        }
+        tick_both(&mut a, &mut b, 20);
+        assert!(file_version(&path) == kept, "cuts.json written again");
+        let _ = a.update(Message::Disconnect);
+        let _ = b.update(Message::Disconnect);
+    }
+
+    /// LIO-637, LIO-725: New stock loaded in one of two AXIS CAMs on the
+    /// same folder, each with a run that cut its own setup, stays answered:
+    /// the other cut nothing since, so it forgets both setups' cuts too,
+    /// its own run's and those it took in, and writes neither back. A
+    /// Cycle Start pressed as it learns of it sends nothing. Once it really
+    /// cuts since, a tool run of its setup started again, what it cuts
+    /// reaches the first as another setup's cuts, which set no Z from the
+    /// check's stock, until New stock loaded there, which the first learns
+    /// of and says. Each time, the two settle.
+    #[test]
+    fn new_stock_loaded_in_one_axis_cam_is_not_undone_by_the_other() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = two_cut_setups(dir.path());
+        let path = dir.path().join("uc100").join("cuts.json");
+        let (first, second) = (a.doc.setups[0].id.clone(), b.doc.setups[0].id.clone());
+        let kept = |id: &str| {
+            let h = crate::run::CutHistory::read(&path).unwrap().unwrap();
+            h.cuts.iter().any(|(s, c)| s == id && !c.is_empty())
+        };
+        tick_both(&mut a, &mut b, 3);
+        assert!(kept(&first) && kept(&second));
+        let _ = a.update(Message::Run(R::NewStock));
+        let _ = a.update(Message::Tick);
+        assert!(!kept(&first) && !kept(&second));
+        // The other learns of it as Cycle Start is pressed: it sends nothing.
+        let _ = b.update(Message::Run(R::CycleStart));
+        assert!(run_of(&b).running.is_none() && !conn(&b).press_waits());
+        assert!(
+            b.status
+                .starts_with("Cycle Start sent nothing: New stock was loaded"),
+            "{}",
+            b.status
+        );
+        tick_both(&mut a, &mut b, 3);
+        assert!(!kept(&first), "the first setup's cuts written back");
+        assert!(!kept(&second), "the second setup's cuts written back");
+        for x in [&a, &b] {
+            let run = run_of(x);
+            assert!(run.cut_in_run.is_empty() && run.earlier_cuts.is_empty());
+            assert!(!run.earlier_unfollowed());
+        }
+        // Taken as New stock loaded there: no tool run is done on the new
+        // stock, so nothing before the start is taken as cut (LIO-634).
+        assert!(!run_of(&b).done.contains(&true), "{:?}", run_of(&b).done);
+        let settled = file_version(&path);
+        tick_both(&mut a, &mut b, 20);
+        assert!(file_version(&path) == settled, "cuts.json written again");
+        // The other cuts again: kept, and the first's run sets no Z from
+        // the check's stock over it.
+        let _ = b.update(Message::Run(R::Next(0)));
+        answer_skips(&mut b, 0);
+        cycle_start(&mut b);
+        assert!(run_of(&b).running.is_some(), "{:?}", problems(&b));
+        assert!(kept(&second));
+        tick_until(&mut b, 5., "running", |s| s.state == Some(State::Run));
+        let _ = b.update(Message::Run(R::Stop));
+        run_until(&mut b, 30., "the stop", |r| r.running.is_none());
+        tick_both(&mut a, &mut b, 3);
+        assert!(kept(&second) && !kept(&first));
+        assert!(run_of(&a).earlier_unfollowed());
+        let settled = file_version(&path);
+        tick_both(&mut a, &mut b, 20);
+        assert!(file_version(&path) == settled, "cuts.json written again");
+        // New stock loaded in the other now: the first, which only took
+        // those cuts in, forgets them as it learns of it, and says so.
+        let _ = b.update(Message::Run(R::NewStock));
+        let _ = b.update(Message::Tick);
+        let _ = a.update(Message::Tick);
+        assert!(
+            a.status
+                .starts_with("New stock was loaded in another AXIS CAM"),
+            "{}",
+            a.status
+        );
+        tick_both(&mut a, &mut b, 3);
+        assert!(!kept(&first) && !kept(&second));
+        assert!(!run_of(&a).earlier_unfollowed());
+        let settled = file_version(&path);
+        tick_both(&mut a, &mut b, 20);
+        assert!(file_version(&path) == settled, "cuts.json written again");
+        let _ = a.update(Message::Disconnect);
+        let _ = b.update(Message::Disconnect);
+    }
+
+    /// New stock loaded, and the check it asks for answered.
+    fn new_stock(x: &mut App) {
+        let _ = x.update(Message::Run(crate::run::Action::NewStock));
+        if run_of(x).programs.is_none() {
+            answer_skips(x, 0);
+        }
+    }
+
+    /// LIO-637 review: two AXIS CAMs on the same folder, each with a run
+    /// of its own setup that cut, the second's Drilling marked Already
+    /// cut. New stock loaded in the second holds: the first, which only
+    /// kept the mark as it was, forgets it, and does not write it back as
+    /// dropped, which would set no Z there until New stock loaded again.
+    /// New stock loaded in the first, the mark made again, holds too: the
+    /// second's run, which changed nothing since, forgets its mark, and
+    /// says so. Each time, the two settle.
+    #[test]
+    fn marks_already_cut_follow_new_stock_loaded_in_either_axis_cam() {
+        use crate::run::Skip;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut a, mut b) = two_cut_setups(dir.path());
+        let path = dir.path().join("uc100").join("cuts.json");
+        let second = b.doc.setups[0].id.clone();
+        let declared = || {
+            let h = crate::run::CutHistory::read(&path).unwrap().unwrap();
+            h.declared
+        };
+        for in_first in [false, true] {
+            tick_both(&mut a, &mut b, 3);
+            assert!(skip(&mut b, 2, Some(Skip::Cut)) || !run_of(&b).declared().0.is_empty());
+            tick_both(&mut a, &mut b, 3);
+            assert!(
+                declared().iter().any(|k| k.setup == second),
+                "{:?}",
+                declared()
+            );
+            match in_first {
+                false => new_stock(&mut b),
+                true => {
+                    new_stock(&mut a);
+                    let _ = a.update(Message::Tick);
+                    let _ = b.update(Message::Tick);
+                    assert!(
+                        b.status
+                            .starts_with("New stock was loaded in another AXIS CAM"),
+                        "{}",
+                        b.status
+                    );
+                }
+            }
+            for _ in 0..4 {
+                tick_both(&mut a, &mut b, 1);
+                answer_skips(&mut b, 0);
+            }
+            assert_eq!(declared(), [], "in the first: {in_first}");
+            let run = run_of(&b);
+            assert!(!run.declared_lost, "in the first: {in_first}");
+            assert!(run.declared().0.is_empty(), "in the first: {in_first}");
+            assert!(!run_of(&a).declared_lost);
+            let settled = file_version(&path);
+            tick_both(&mut a, &mut b, 20);
+            assert!(file_version(&path) == settled, "cuts.json written again");
+        }
+        let _ = a.update(Message::Disconnect);
+        let _ = b.update(Message::Disconnect);
+    }
+
+    /// LIO-637 review: New stock loaded in one of two AXIS CAMs on the same
+    /// folder, and its run cuts the new stock, before the other learns of
+    /// it (asleep, say), or while it cuts. The other takes the New stock
+    /// loaded, but keeps what the first cut since as another setup's cuts:
+    /// nothing it writes forgets them, and the first, which cut them,
+    /// takes no New stock loaded from it and sets no Z on a surface cut
+    /// away. The two settle. So too on a folder where what runs cut was
+    /// lost once (`others_unknown`), which keeps forgotten setups empty.
+    #[test]
+    fn cuts_made_on_new_stock_before_the_other_axis_cam_learns_of_it_stay() {
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        for (asleep, lost) in [(true, false), (false, false), (true, true)] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut a, mut b) = two_cut_setups(dir.path());
+            let path = dir.path().join("uc100").join("cuts.json");
+            if lost {
+                std::fs::write(&path, "{ not json").unwrap();
+                tick_both(&mut a, &mut b, 3);
+                assert!(a.others_unknown && b.others_unknown);
+            }
+            let first = a.doc.setups[0].id.clone();
+            let kept_first = || {
+                let h = crate::run::CutHistory::read(&path).unwrap().unwrap();
+                h.cuts.iter().any(|(s, c)| *s == first && !c.is_empty())
+            };
+            tick_both(&mut a, &mut b, 3);
+            new_stock(&mut a);
+            let _ = a.update(Message::Tick);
+            if !run_of(&a).zeroed {
+                let _ = a.update(Message::Run(R::KeepZero));
+            }
+            cycle_start(&mut a);
+            assert!(run_of(&a).running.is_some(), "{:?}", problems(&a));
+            match asleep {
+                true => run_until(&mut a, 90., "tool run 1", |r| r.running.is_none()),
+                false => tick_until(&mut a, 5., "running", |s| s.state == Some(State::Run)),
+            }
+            let _ = a.update(Message::Tick);
+            assert!(kept_first());
+            // The other learns of it now.
+            let _ = b.update(Message::Tick);
+            assert!(
+                kept_first(),
+                "asleep: {asleep}, lost: {lost}: the first's cuts forgotten"
+            );
+            let _ = a.update(Message::Tick);
+            assert!(
+                !a.status.starts_with("New stock was loaded"),
+                "asleep: {asleep}: {}",
+                a.status
+            );
+            if !asleep {
+                run_until(&mut a, 90., "tool run 1", |r| r.running.is_none());
+            }
+            tick_both(&mut a, &mut b, 4);
+            assert!(kept_first(), "asleep: {asleep}");
+            assert!(!run_of(&a).cut_in_run.is_empty(), "asleep: {asleep}");
+            let theirs = run_of(&b).earlier_cuts.iter().find(|(s, _)| *s == first);
+            assert!(
+                theirs.is_some_and(|(_, c)| !c.is_empty()),
+                "asleep: {asleep}"
+            );
+            assert!(run_of(&b).earlier_unfollowed());
+            let settled = file_version(&path);
+            tick_both(&mut a, &mut b, 20);
+            assert!(file_version(&path) == settled, "cuts.json written again");
+            let _ = a.update(Message::Disconnect);
+            let _ = b.update(Message::Disconnect);
+        }
+    }
+
+    /// LIO-637 review: a run of the first AXIS CAM on the folder stopped
+    /// after Face pass 1, which the second, its run of another setup,
+    /// takes in with the journal of where it stopped. New stock loaded in
+    /// the first ends that journal there, and the second forgets it too
+    /// and what it took in, with nothing left to ask whether the same part
+    /// is held: written back, the journal would be one gone, whose cuts
+    /// are not known, and the first's setup picked again would set no Z
+    /// until New stock loaded once more.
+    #[test]
+    fn a_stopped_runs_journal_follows_new_stock_loaded_in_the_other_axis_cam() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("uc100").join("cuts.json");
+        let mut a = two_pass_app(dir.path());
+        let _ = stop_after(&mut a, 0, 0);
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Tick);
+        let journals = || {
+            crate::run::CutHistory::read(&path)
+                .unwrap()
+                .unwrap()
+                .journals
+        };
+        assert!(!journals().is_empty());
+        let mut b = two_pass_app(dir.path());
+        b.replace_document(a.doc.clone(), None);
+        b.imported_mesh = a.imported_mesh.clone();
+        b.page = Page::Control;
+        b.doc.setups[0].id = crate::id();
+        idle(&mut b);
+        let _ = b.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut b, 0);
+        tick_both(&mut a, &mut b, 3);
+        assert!(!b.cut_journals.is_empty());
+        new_stock(&mut a);
+        let _ = a.update(Message::Tick);
+        assert_eq!(journals(), []);
+        let _ = b.update(Message::Tick);
+        answer_skips(&mut b, 0);
+        let run = run_of(&b);
+        assert!(run.earlier_cuts.iter().all(|(_, c)| c.is_empty()));
+        assert!(!run.stock_unconfirmed && run.away.is_none());
+        tick_both(&mut a, &mut b, 4);
+        assert_eq!(journals(), [], "the journal written back");
+        assert!(b.cut_journals.is_empty());
+        let settled = file_version(&path);
+        tick_both(&mut a, &mut b, 20);
+        assert!(file_version(&path) == settled, "cuts.json written again");
+        // The first's setup picked again: known, its touch-off offered.
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Tick);
+        assert!(!run_of(&a).history_unknown());
+        assert!(!run_of(&a).stock_unconfirmed);
+        assert!(conn(&a).touch_off().is_some(), "{:?}", problems(&a));
+        let _ = a.update(Message::Disconnect);
+        let _ = b.update(Message::Disconnect);
+    }
+
+    /// Answers the check of setup `si`'s run, setup 0's skips or a later
+    /// setup's stock.
+    fn checked(x: &mut App, si: usize, dir: &std::path::Path) {
+        for _ in 0..4 {
+            if run_of(x).programs.is_some() {
+                break;
+            }
+            match si {
+                0 => answer_skips(x, 0),
+                _ => {
+                    let check = stock_check(x, si);
+                    answer_stock(x, dir, check);
+                }
+            }
+        }
+    }
+
+    /// LIO-637 review: one project of two setups open in two AXIS CAMs on
+    /// the same folder, the first with setup 1 picked, the second with
+    /// setup 2, each cut. New stock loaded in the first: the second, which
+    /// changed nothing since, takes it, its start back at its first tool
+    /// run. Setup 1 then cut partway on the new stock: setup 2 sets no Z
+    /// from the check's stock, whether the second learnt of the New stock
+    /// loaded before or only now, the whole record of the old stock never
+    /// standing for the partway one. Each time, the two settle.
+    #[test]
+    fn one_projects_two_setups_in_two_axis_cams_follow_new_stock_and_a_partway_cut() {
+        use crate::control::Action as M;
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        for asleep in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("uc100").join("cuts.json");
+            let mut a = two_setups(dir.path(), "5");
+            let mut b = two_setups(dir.path(), "5");
+            b.replace_document(a.doc.clone(), None);
+            b.imported_mesh = a.imported_mesh.clone();
+            b.page = Page::Control;
+            zeroed(&mut a);
+            idle(&mut b);
+            let _ = b.update(Message::Machine(M::Wcs(1)));
+            tick_until(&mut b, 20., "G55", |s| s.active_wcs == 1);
+            let _ = b.update(Message::Machine(M::WorkZero(None)));
+            tick_until(&mut b, 20., "work zero", |s| {
+                s.active_wcs == 1 && s.work_pos[..3].iter().all(|v| v.abs() < 1e-6)
+            });
+            cut_setup_whole(&mut a, dir.path(), 0);
+            let _ = a.update(Message::Tick);
+            pick_checked(&mut b, 1, dir.path());
+            if !problems(&b).is_empty() {
+                let _ = b.update(Message::Run(R::KeepZero));
+                let _ = b.update(Message::Run(R::KeepToolZ));
+            }
+            cycle_start(&mut b);
+            assert!(run_of(&b).running.is_some(), "{:?}", problems(&b));
+            run_until(&mut b, 90., "setup 2 tool run 1", |r| r.running.is_none());
+            tick_both(&mut a, &mut b, 3);
+            let settled = file_version(&path);
+            tick_both(&mut a, &mut b, 20);
+            assert!(file_version(&path) == settled, "cuts.json written again");
+            // New stock loaded in the first.
+            let _ = a.update(Message::Run(R::NewStock));
+            checked(&mut a, 0, dir.path());
+            let _ = a.update(Message::Tick);
+            if !asleep {
+                let _ = b.update(Message::Tick);
+                checked(&mut b, 1, dir.path());
+                let _ = b.update(Message::Tick);
+                let run = run_of(&b);
+                assert!(run.cut_in_run.is_empty(), "{:?}", run.cut_in_run);
+                assert!(!run.done.contains(&true), "{:?}", run.done);
+                assert_eq!((run.next, run.from), (0, 0));
+                let _ = a.update(Message::Tick);
+                let settled = file_version(&path);
+                tick_both(&mut a, &mut b, 20);
+                assert!(file_version(&path) == settled, "cuts.json written again");
+            }
+            // Setup 1 cut partway on the new stock in the first.
+            if !problems(&a).is_empty() {
+                let _ = a.update(Message::Run(R::KeepZero));
+                let _ = a.update(Message::Run(R::KeepToolZ));
+            }
+            cycle_start(&mut a);
+            assert!(run_of(&a).running.is_some(), "{:?}", problems(&a));
+            tick_until(&mut a, 20., "running", |s| s.state == Some(State::Run));
+            let _ = a.update(Message::Run(R::Stop));
+            run_until(&mut a, 30., "the stop", |r| r.running.is_none());
+            tick_until(&mut a, 20., "Idle", |s| s.state == Some(State::Idle));
+            for _ in 0..3 {
+                let _ = a.update(Message::Tick);
+            }
+            let _ = b.update(Message::Tick);
+            checked(&mut b, 1, dir.path());
+            let _ = b.update(Message::Tick);
+            assert_eq!(conn(&b).touch_off(), None, "asleep: {asleep}");
+            assert!(!problems(&b).is_empty(), "asleep: {asleep}");
+            tick_both(&mut a, &mut b, 4);
+            let settled = file_version(&path);
+            tick_both(&mut a, &mut b, 20);
+            assert!(file_version(&path) == settled, "cuts.json written again");
+            let _ = a.update(Message::Disconnect);
+            let _ = b.update(Message::Disconnect);
+        }
+    }
+
+    /// LIO-637 review: two AXIS CAMs on the same folder with runs of the
+    /// same setup, an operation marked Already cut in one: each keeps its
+    /// own record of what was taken as cut, and they settle.
+    #[test]
+    fn two_axis_cams_with_runs_of_one_setup_and_a_mark_settle() {
+        use crate::run::{Action as R, Skip};
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = two_pass_app(dir.path());
+        let mut b = two_pass_app(dir.path());
+        b.replace_document(a.doc.clone(), None);
+        b.imported_mesh = a.imported_mesh.clone();
+        b.page = Page::Control;
+        zeroed(&mut a);
+        idle(&mut b);
+        for x in [&mut a, &mut b] {
+            let _ = x.update(Message::Run(R::Setup(0)));
+            answer_skips(x, 0);
+        }
+        assert!(skip(&mut a, 2, Some(Skip::Cut)));
+        let path = dir.path().join("uc100").join("cuts.json");
+        tick_both(&mut a, &mut b, 3);
+        // What was taken as cut there is not the part's here.
+        assert!(run_of(&b).declared_lost);
+        let settled = file_version(&path);
+        tick_both(&mut a, &mut b, 20);
+        assert!(file_version(&path) == settled, "cuts.json written again");
+        let _ = a.update(Message::Disconnect);
+        let _ = b.update(Message::Disconnect);
+    }
+
     /// LIO-594 review: what runs cut, kept on disk, becomes unreadable while
     /// a run is picked: what it held is lost, so the run asks again whether
     /// the same part is held, sets no Z from the check's stock, and is no
@@ -16366,8 +16854,11 @@ flood = { pin = 8 }
         let _ = b.update(Message::Run(R::SkipSteps(true)));
         answer_skips(&mut b, 0);
         let kept = kept_declared(dir.path());
+        // In the order of their ids, whichever writes (LIO-637).
         let setups: Vec<&str> = kept.iter().map(|k| k.setup.as_str()).collect();
-        assert_eq!(setups, [first.as_str(), own.as_str()], "{kept:?}");
+        let mut both = [first.as_str(), own.as_str()];
+        both.sort();
+        assert_eq!(setups, both, "{kept:?}");
         // The first's setup, picked there: what was taken as cut, asked.
         b.doc.setups[0].id = first.clone();
         let _ = b.update(Message::Run(R::Setup(0)));

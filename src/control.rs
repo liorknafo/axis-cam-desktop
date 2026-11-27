@@ -2496,12 +2496,43 @@ fn tool_run_id() -> u64 {
     );
     let id = h.finish();
     SENT_TOOL_RUNS.with(|s| s.borrow_mut().push(id));
+    SENT_UNKEPT.with(|s| s.borrow_mut().push(id));
     id
 }
 
 thread_local! {
     /// The numbers of the tool runs this session sent a Pi (`tool_run_id`).
     static SENT_TOOL_RUNS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(vec![]) };
+    /// Of `SENT_TOOL_RUNS`, those sent since what runs cut, kept on disk,
+    /// was last read or written with them (`take_sent_tool_runs`,
+    /// `sent_tool_runs_kept`).
+    static SENT_UNKEPT: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(vec![]) };
+}
+
+/// Takes `ids`, the tool runs this computer sent a Pi as another AXIS CAM
+/// on the same folder kept them (`run::CutHistory::sent`), in their order:
+/// those this session sent since go after them, and any others before, so
+/// that the latest it keeps (`run::SENT_KEPT`) are those the other kept,
+/// with what was sent since. Two AXIS CAMs that each sent one then keep
+/// them in one order, and stop writing over each other (LIO-637).
+pub fn take_sent_tool_runs(ids: &[u64]) {
+    SENT_UNKEPT.with(|u| {
+        let mut u = u.borrow_mut();
+        u.retain(|id| !ids.contains(id));
+        SENT_TOOL_RUNS.with(|s| {
+            let mut s = s.borrow_mut();
+            s.retain(|id| !ids.contains(id) && !u.contains(id));
+            s.extend_from_slice(ids);
+            s.extend_from_slice(&u);
+        });
+    });
+}
+
+/// What runs cut was written with `ids` as the tool runs this computer sent
+/// (`run::CutHistory::sent`): none of them is sent since any more
+/// (`take_sent_tool_runs`).
+pub fn sent_tool_runs_kept(ids: &[u64]) {
+    SENT_UNKEPT.with(|u| u.borrow_mut().retain(|id| !ids.contains(id)));
 }
 
 /// What happened on the Pi while this computer was not looking
@@ -2542,6 +2573,7 @@ pub fn remember_sent_tool_runs(ids: &[u64]) {
 #[cfg(test)]
 pub(crate) fn forget_sent_tool_runs() {
     SENT_TOOL_RUNS.with(|s| s.borrow_mut().clear());
+    SENT_UNKEPT.with(|s| s.borrow_mut().clear());
 }
 
 /// Why Same part with nothing else run is refused while the Pi shows a
@@ -11681,5 +11713,31 @@ mod rotary_machine_tests {
 
     fn num_f(m: &Machine, k: &str) -> f64 {
         get(&m.p, k).parse().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod sent_tool_runs_tests {
+    use super::*;
+
+    /// LIO-637: what another AXIS CAM on the same folder kept of the tool
+    /// runs this computer sent is taken in its order, those sent here
+    /// since after it, and any others before it, so that the latest kept
+    /// (`run::SENT_KEPT`) are the other's with what was sent since; once
+    /// written, none is sent since any more.
+    #[test]
+    fn tool_runs_sent_are_taken_in_the_order_another_axis_cam_kept() {
+        forget_sent_tool_runs();
+        remember_sent_tool_runs(&[1, 2]);
+        let mine = tool_run_id();
+        take_sent_tool_runs(&[2, 9]);
+        assert_eq!(sent_tool_runs(), [1, 2, 9, mine]);
+        // Taken again as it was: the same.
+        take_sent_tool_runs(&[2, 9]);
+        assert_eq!(sent_tool_runs(), [1, 2, 9, mine]);
+        sent_tool_runs_kept(&[2, 9, mine]);
+        take_sent_tool_runs(&[9, mine, 7]);
+        assert_eq!(sent_tool_runs(), [1, 2, 9, mine, 7]);
+        forget_sent_tool_runs();
     }
 }

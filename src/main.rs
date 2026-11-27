@@ -1662,6 +1662,11 @@ pub struct App {
     /// What another AXIS CAM kept, taken in as this update began, says it
     /// cut the run's setup since: a Cycle Start pressed now sends nothing.
     cuts_grew: bool,
+    /// Whether, at this update, what the run cut or took in was forgotten
+    /// as another AXIS CAM open on the same folder forgot it (New stock
+    /// loaded there, `sync_cut_history`): Cycle Start sends nothing now
+    /// (LIO-637).
+    cuts_forgot: bool,
     /// The connection's `journal_changes` last seen.
     journal_changes_seen: u64,
     /// The Pi's start and count of control takes as last heard
@@ -2248,6 +2253,7 @@ impl App {
             cuts_failed: None,
             cuts_seen: None,
             cuts_grew: false,
+            cuts_forgot: false,
             journal_changes_seen: 0,
             pi_control_seen,
             run_pending: vec![],
@@ -4002,7 +4008,7 @@ impl App {
         let seen = std::fs::metadata(&self.cuts_path)
             .ok()
             .map(|m| (m.modified().ok(), m.len()));
-        self.cuts_grew = false;
+        (self.cuts_grew, self.cuts_forgot) = (false, false);
         if seen != self.cuts_seen {
             self.cuts_seen = seen;
             self.cuts_grew = self.sync_cut_history();
@@ -4012,8 +4018,11 @@ impl App {
     /// this one last read or wrote it (`cuts_kept`), so that writing over
     /// it loses nothing, and a setup picked here knows it (LIO-594
     /// review). Each setup's cuts it changed are added to this one's, as
-    /// is each journal it kept, and `others_unknown`: what it forgot (New
-    /// stock loaded there) stays known here, the safe side. A run of a
+    /// is each journal it kept, and `others_unknown`. What it forgot (New
+    /// stock loaded there) is forgotten on disk here too where this one cut
+    /// nothing of it since it last kept it, so the other's answer stays
+    /// unless this one really cut since (LIO-637); this one's run goes by
+    /// what it took in until New stock loaded here, the safe side. A run of a
     /// setup it cut, no tool run running, asks again whether the same part
     /// is held, and a work zero set for its start before is set again or
     /// kept anew. Whether that run's cuts grew.
@@ -4042,14 +4051,96 @@ impl App {
         }
         let mut grew = theirs.others_unknown && !self.others_unknown && self.note_history_lost();
         let base = self.cuts_kept.take().unwrap_or_default();
+        let unknown = self.others_unknown || theirs.others_unknown;
+        // New stock loaded there for the live run's setup: all it kept of
+        // it, what its runs cut and what was taken as cut, gone there, and
+        // none of it changed here since this one last kept it, no tool run
+        // of it running or dropped running: taken here as New stock loaded
+        // here (`adopt_new_stock`), the start going back as it says
+        // (LIO-633, LIO-634), so that the answer stays (LIO-637 review).
+        // Where it changed here since, it stays, and is written back.
+        let adopt = (self.control.as_ref()).and_then(|c| {
+            let r = c.run.as_ref()?;
+            let own = r.setup_id.as_str();
+            let cuts = |h: &run::CutHistory| {
+                (h.cuts.iter().find(|(s, _)| s == own)).map_or(vec![], |(_, c)| c.clone())
+            };
+            let marks = |h: &run::CutHistory| h.declared.iter().find(|k| k.setup == own).cloned();
+            let had = !cuts(&base).is_empty() || marks(&base).is_some();
+            let gone = cuts(&theirs).is_empty() && marks(&theirs).is_none();
+            let unchanged = cuts(&base) == r.cut_in_run && marks(&base) == declared_entry(r);
+            let idle = r.running.is_none() && !c.probing();
+            let pending = self.run_pending.iter().any(|p| p.0 == own);
+            (had && gone && unchanged && idle && !pending).then(|| own.to_string())
+        });
         let mut live = self.control.as_mut().and_then(|c| c.run.as_mut());
         let mut earlier = false;
-        for (id, cuts) in &theirs.cuts {
-            let before = base.cuts.iter().find(|(s, _)| s == id).map(|(_, c)| c);
-            if before == Some(cuts) || cuts.is_empty() {
+        // What the run took in of another setup's, forgotten as the other
+        // forgot it (LIO-637).
+        let mut forgot = adopt.is_some();
+        let mut ids: Vec<&String> = theirs.cuts.iter().map(|(s, _)| s).collect();
+        for (s, _) in &base.cuts {
+            if !ids.contains(&s) {
+                ids.push(s);
+            }
+        }
+        for id in ids {
+            if adopt.as_ref() == Some(id) {
                 continue;
             }
-            let add = |into: &mut Vec<run::CutInRun>| run::take_kept_cuts(into, before, cuts);
+            let find = |h: &run::CutHistory| {
+                (h.cuts.iter().find(|(s, _)| s == id)).map(|(_, c)| c.clone())
+            };
+            let (before, now) = (find(&base), find(&theirs));
+            if before == now {
+                continue;
+            }
+            // Forgotten there (New stock loaded), or kept as cut nothing:
+            // forgotten here too where nothing here cut them since this one
+            // last kept them, so that the answer stays unless this one
+            // really cuts since (LIO-637). A whole record kept of a stock
+            // that is new would let a touch-off set Z on a floor that is not
+            // there (LIO-601), so keeping it is not the safe side. Where they
+            // changed here since, or a tool run of the setup runs or ran
+            // dropped, they stay, as they are on disk; so do the live run's
+            // own, but where it takes New stock loaded (`adopt`).
+            let Some(cuts) = now.filter(|c| !c.is_empty()) else {
+                let pending = self.run_pending.iter().any(|p| p.0 == *id);
+                let mine = self.run_cuts.iter().find(|(s, _)| s == id).map(|(_, c)| c);
+                if !pending && mine == before.as_ref() {
+                    self.run_cuts.retain(|(s, _)| s != id);
+                    // Kept as cut nothing rather than as lost
+                    // (`note_lost_cuts`) while what runs cut is lost.
+                    if unknown && !theirs.others_unknown
+                        || (theirs.cuts.iter()).any(|(s, _)| s == id)
+                    {
+                        self.run_cuts.push((id.clone(), vec![]));
+                    }
+                }
+                // Another setup's the run took in, as kept then: forgotten
+                // in it too. What it set from them is set again (`zeroed`),
+                // and a Cycle Start pressed now sends nothing
+                // (`cuts_forgot`), below.
+                forgot |= match live.as_deref_mut() {
+                    Some(r) if r.setup_id == *id => false,
+                    // A tool run of it dropped running cut since: kept.
+                    Some(_) if pending => false,
+                    Some(r) => {
+                        let at = r
+                            .earlier_cuts
+                            .iter()
+                            .position(|(s, c)| s == id && Some(c) == before.as_ref());
+                        if let Some(at) = at {
+                            r.earlier_cuts.remove(at);
+                        }
+                        at.is_some()
+                    }
+                    None => false,
+                };
+                continue;
+            };
+            let add =
+                |into: &mut Vec<run::CutInRun>| run::take_kept_cuts(into, before.as_ref(), &cuts);
             match self.run_cuts.iter_mut().find(|(s, _)| s == id) {
                 Some((_, mine)) => add(mine),
                 None => self.run_cuts.push((id.clone(), cuts.clone())),
@@ -4103,14 +4194,48 @@ impl App {
                 self.cut_journals.push(k.clone());
             }
         }
+        // One it no longer keeps (New stock loaded there ended it) is
+        // forgotten here too, where this one keeps it as it was: written
+        // back, it would be a journal gone there, whose cuts are not known
+        // (`journal_known`), so New stock loaded would not hold (LIO-637
+        // review).
+        (self.cut_journals).retain(|k| !base.journals.contains(k) || theirs.journals.contains(k));
         // What it took as cut and changed, or forgot (`take_in_declared`).
-        let live = self.control.as_mut().and_then(|c| c.run.as_mut());
+        let live = (self.control.as_mut())
+            .and_then(|c| c.run.as_mut())
+            .filter(|_| adopt.is_none());
         grew |= take_in_declared(
             &base.declared,
             &theirs.declared,
             &mut self.run_declared,
             live,
+            &self.run_pending,
         );
+        if adopt.is_some() {
+            self.adopt_new_stock(&theirs);
+        }
+        if let Some(r) = (self.control.as_mut())
+            .and_then(|c| c.run.as_mut())
+            .filter(|r| forgot && r.running.is_none())
+        {
+            r.zeroed = false;
+            // Nothing left to ask whether the same part holds, or whether
+            // anything else ran meanwhile, which is asked only for a record
+            // (`give_away`), as New stock loaded here ends both (LIO-637
+            // review).
+            let marks = r.declared();
+            if r.cut_in_run.is_empty()
+                && r.earlier_cuts.iter().all(|(_, c)| c.is_empty())
+                && r.earlier_taken.iter().all(|(_, m)| m.is_empty())
+                && marks.0.is_empty()
+                && marks.1.is_empty()
+                && !r.declared_lost
+            {
+                (r.stock_unconfirmed, r.away) = (false, None);
+            }
+            self.cuts_forgot = true;
+            self.status = format!("{NEW_STOCK_ELSEWHERE}.");
+        }
         // The run's marks of the other setups go by what is kept now: one
         // the other AXIS CAM undid or lost no longer counts, and the run's
         // work zero is set again where that leaves an operation not cut
@@ -4126,15 +4251,81 @@ impl App {
             }
         }
         self.others_unknown |= theirs.others_unknown;
-        control::remember_sent_tool_runs(&theirs.sent);
+        control::take_sent_tool_runs(&theirs.sent);
         // Kept as this one would write it, its own setups' owners its
         // project's as it is now: another AXIS CAM's that differ (another
         // title, say) are no change of this one's, so the two do not write
         // over each other at every update (LIO-607 review).
         let mut theirs = theirs;
         theirs.owners = owners_of(&theirs.cuts, &self.doc, &theirs.owners);
+        // So is the live run's setup's record of what was taken as cut,
+        // its own: two AXIS CAMs with runs of one setup, one with a mark,
+        // each write their own, which is no change of the other's
+        // (LIO-637 review).
+        if let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref()) {
+            theirs.declared.retain(|k| k.setup != r.setup_id);
+            theirs.declared.extend(declared_entry(r));
+            theirs.declared.sort_by(|a, b| a.setup.cmp(&b.setup));
+        }
         self.cuts_kept = Some(theirs);
         grew
+    }
+    /// New stock loaded in another AXIS CAM open on the same folder, for
+    /// the live run's setup, which changed nothing here since
+    /// (`sync_cut_history`, LIO-637 review): as New stock loaded here, the
+    /// run's start going back (`run::Run::new_stock`), the setup's journals
+    /// of the same table ended, and what its runs cut and every setup took
+    /// as cut forgotten, as the other forgot them. What the other still
+    /// keeps, `theirs`, is kept here too and is the run's again, for it may
+    /// be on the stock held: another setup's cuts there as taken in
+    /// (`run_cuts`), cut there since its New stock loaded, say, and what
+    /// was taken as cut (LIO-637 review).
+    fn adopt_new_stock(&mut self, theirs: &run::CutHistory) {
+        let taken_in = self.run_cuts.clone();
+        let Some(c) = self.control.as_mut() else {
+            return;
+        };
+        let away = c.run.as_ref().is_some_and(|r| r.away.is_some());
+        c.run_act(run::Action::NewStock, &self.doc);
+        let files: Vec<String> = (c.table_journals().iter())
+            .filter_map(|f| Some(f.file_name()?.to_string_lossy().into_owned()))
+            .collect();
+        let Some(r) = c.run.as_mut().filter(|r| r.cut_in_run.is_empty()) else {
+            return;
+        };
+        (self.cut_journals).retain(|k| k.setup != r.setup_id || !files.contains(&k.file));
+        keep_run_cuts(&mut self.run_cuts, r, self.others_unknown);
+        // Over an entry kept empty too, as while what runs cut is lost
+        // (`others_unknown`, `keep_cuts_of`).
+        // And a setup's whose tool run was dropped running (`run_pending`),
+        // which cuts the part still, as the forget keeps it.
+        for (id, cuts) in &taken_in {
+            let kept = (theirs.cuts.iter()).any(|(s, c)| s == id && !c.is_empty())
+                || self.run_pending.iter().any(|p| p.0 == *id);
+            if *id == r.setup_id || !kept || cuts.is_empty() {
+                continue;
+            }
+            match self.run_cuts.iter_mut().find(|(s, _)| s == id) {
+                Some((_, mine)) if mine.is_empty() => *mine = cuts.clone(),
+                Some(_) => {}
+                None => self.run_cuts.push((id.clone(), cuts.clone())),
+            }
+        }
+        keep_pending_cuts(&mut self.run_pending, r);
+        self.run_declared = (theirs.declared.iter())
+            .filter(|k| k.setup != r.setup_id)
+            .cloned()
+            .collect();
+        keep_declared(&mut self.run_declared, r);
+        let cuts: Vec<_> = (self.run_cuts.iter())
+            .filter(|(_, c)| !c.is_empty())
+            .cloned()
+            .collect();
+        give_earlier_cuts(&cuts, &self.run_declared, r);
+        // Answered for the part after a disconnect too, as here (LIO-596).
+        if away {
+            self.answered_away(&run::Action::NewStock);
+        }
     }
     /// What runs cut, kept on disk, was lost (the file unreadable since,
     /// or another AXIS CAM found it so): every setup's cuts are unknown
@@ -4178,6 +4369,13 @@ impl App {
         if let Some(r) = self.control.as_ref().and_then(|c| c.run.as_ref()) {
             keep_declared(&mut declared, r);
         }
+        // In one order whichever AXIS CAM on the same folder writes it, so
+        // that two that know the same do not write over each other at each
+        // update (LIO-637).
+        cuts.sort_by(|a, b| a.0.cmp(&b.0));
+        declared.sort_by(|a, b| a.setup.cmp(&b.setup));
+        let mut journals = self.cut_journals.clone();
+        journals.sort_by(|a, b| (&a.setup, &a.file, &a.text).cmp(&(&b.setup, &b.file, &b.text)));
         let sent = control::sent_tool_runs();
         let sent = sent[sent.len().saturating_sub(run::SENT_KEPT)..].to_vec();
         let owners = owners_of(&cuts, &self.doc, &self.cut_owners);
@@ -4191,7 +4389,7 @@ impl App {
         };
         run::CutHistory {
             cuts,
-            journals: self.cut_journals.clone(),
+            journals,
             others_unknown: self.others_unknown,
             sent,
             owners,
@@ -4217,8 +4415,12 @@ impl App {
                 .open(&lock)
                 .map_err(|e| e.to_string())?;
             file.lock().map_err(|e| e.to_string())?;
+            self.cuts_forgot = false;
             if self.sync_cut_history() && starting {
                 return Err(CUT_ELSEWHERE.into());
+            }
+            if self.cuts_forgot && starting {
+                return Err(NEW_STOCK_ELSEWHERE.into());
             }
             let history = self.cut_history(starting);
             if self.cuts_kept.as_ref() != Some(&history) {
@@ -4228,11 +4430,12 @@ impl App {
         })();
         match written {
             Ok(history) => {
+                control::sent_tool_runs_kept(&history.sent);
                 self.cuts_kept = Some(history);
                 self.cuts_failed = None;
                 Ok(())
             }
-            Err(e) if e == CUT_ELSEWHERE => Err(e),
+            Err(e) if e == CUT_ELSEWHERE || e == NEW_STOCK_ELSEWHERE => Err(e),
             Err(e) => {
                 if self.cuts_failed.is_none() {
                     self.status = format!(
@@ -9534,15 +9737,16 @@ impl App {
                     && r.running.is_none()
                 {
                     let kept_for = (r.setup_id.clone(), r.next, r.from);
-                    let kept = match self.cuts_grew {
-                        true => Err(CUT_ELSEWHERE.to_string()),
-                        false => self.write_cut_history(true),
+                    let kept = match (self.cuts_grew, self.cuts_forgot) {
+                        (true, _) => Err(CUT_ELSEWHERE.to_string()),
+                        (_, true) => Err(NEW_STOCK_ELSEWHERE.to_string()),
+                        _ => self.write_cut_history(true),
                     };
                     if let Some(c) = &mut self.control {
                         c.cuts_kept_for = kept.is_ok().then_some(kept_for);
                     }
                     if let Err(e) = kept {
-                        self.status = match e == CUT_ELSEWHERE {
+                        self.status = match e == CUT_ELSEWHERE || e == NEW_STOCK_ELSEWHERE {
                             true => format!("Cycle Start sent nothing: {e}."),
                             false => format!(
                                 "Cycle Start sent nothing: what the tool run may cut could not be kept on disk first ({e})."
@@ -12536,6 +12740,12 @@ fn give_away(away: &[(String, run::Away)], run: &mut run::Run) {
 /// since (`App::sync_cut_history`, LIO-594 review).
 const CUT_ELSEWHERE: &str = "another AXIS CAM open on this folder cut this setup, or took some of it as cut, since. Say under Work zero whether the same part is held, and set the work zero again";
 
+/// Why Cycle Start sent nothing: New stock loaded in another AXIS CAM open
+/// on the same folder forgot what this run's setup, or a setup before it,
+/// cut, so the work zero set from it may be on stock no longer held
+/// (`App::sync_cut_history`, LIO-637). Said as it is learnt, too.
+const NEW_STOCK_ELSEWHERE: &str = "New stock was loaded in another AXIS CAM open on this folder. Set the work zero again under Work zero";
+
 /// Where what setups' runs cut is kept (`run::CutHistory`), beside the
 /// machines' journals (LIO-594).
 fn cut_history_path(state_path: &std::path::Path) -> PathBuf {
@@ -12587,17 +12797,23 @@ fn journal_known(
 /// (`run::Run::declared_prints`, LIO-611).
 fn keep_declared(declared: &mut Vec<run::KeptDeclared>, run: &run::Run) {
     declared.retain(|k| k.setup != run.setup_id);
+    declared.extend(declared_entry(run));
+}
+
+/// What `keep_declared` keeps of `run`: none once nothing is taken as cut.
+fn declared_entry(run: &run::Run) -> Option<run::KeptDeclared> {
     let now = run.declared();
-    if !now.0.is_empty() || !now.1.is_empty() || run.declared_lost {
-        let prints = run.declared_prints(&now);
-        declared.push(run::KeptDeclared {
-            setup: run.setup_id.clone(),
-            skips: now.0,
-            steps: now.1,
-            lost: run.declared_lost,
-            prints,
-        });
+    if now.0.is_empty() && now.1.is_empty() && !run.declared_lost {
+        return None;
     }
+    let prints = run.declared_prints(&now);
+    Some(run::KeptDeclared {
+        setup: run.setup_id.clone(),
+        skips: now.0,
+        steps: now.1,
+        lost: run.declared_lost,
+        prints,
+    })
 }
 
 /// The project changed: what each setup kept in `declared` took as cut is
@@ -12642,12 +12858,19 @@ fn give_earlier_cuts(
 /// stock loaded) is dropped so too, not kept as marked: a later setup
 /// takes an operation marked Already cut as cut (`run::Run::earlier_taken`,
 /// LIO-603 review), and the setup's own run, its material maybe gone,
-/// still sets no Z. Whether the live run's work zero is to be set again.
+/// still sets no Z. But where this one only kept it as it was, no tool run
+/// of its setup running or dropped running (`pending`), what the other
+/// forgot (New stock loaded there, say) is forgotten here too: written
+/// back as dropped, it came back there as dropped too, so New stock loaded
+/// never held while the other was open (LIO-637 review); the live run's
+/// own, so, is `App::adopt_new_stock`'s. Whether the live run's work zero
+/// is to be set again.
 fn take_in_declared(
     base: &[run::KeptDeclared],
     theirs: &[run::KeptDeclared],
     mine: &mut Vec<run::KeptDeclared>,
     mut live: Option<&mut run::Run>,
+    pending: &[(String, usize, usize, Vec<run::CutInRun>)],
 ) -> bool {
     let mut grew = false;
     let dropped = |setup: &str| run::KeptDeclared {
@@ -12666,6 +12889,7 @@ fn take_in_declared(
         if before == k {
             continue;
         }
+        let pending = pending.iter().any(|p| p.0 == setup);
         if let Some(r) = live.as_deref_mut().filter(|r| r.setup_id == setup) {
             if !r.declared_lost {
                 r.declared_lost = true;
@@ -12678,11 +12902,16 @@ fn take_in_declared(
         }
         let at = mine.iter().position(|m| m.setup == setup);
         let Some(k) = k else {
-            // Forgotten there: dropped here, marks and all.
-            if let Some(i) = at
-                && (!mine[i].skips.is_empty() || !mine[i].steps.is_empty())
-            {
-                mine[i] = dropped(setup);
+            // Forgotten there: here too where this one only kept it as it
+            // was, else dropped here, marks and all.
+            match at {
+                Some(i) if !pending && before == Some(&mine[i]) => {
+                    mine.remove(i);
+                }
+                Some(i) if !mine[i].skips.is_empty() || !mine[i].steps.is_empty() => {
+                    mine[i] = dropped(setup);
+                }
+                _ => {}
             }
             continue;
         };

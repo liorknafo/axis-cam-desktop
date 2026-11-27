@@ -14068,7 +14068,9 @@ pub(crate) mod tests {
         // (`theirs`). Taken in as `App::sync_cut_history` does
         // (`take_in_declared`, then `retake_marks`), the finish is not cut
         // again, on the Run panel and in the tablet file, and setup 2's
-        // work zero is set again (LIO-603 review).
+        // work zero is set again (LIO-603 review). Gone there, unchanged
+        // here, it is forgotten here too, not kept as dropped (LIO-637
+        // review).
         let (cuts, declared) = drop(&early);
         let lost = {
             let mut lost = declared.clone();
@@ -14079,11 +14081,14 @@ pub(crate) mod tests {
             let mut run = setup_2(&early);
             assert!(run.earlier_uncut().is_empty());
             let mut mine = declared.clone();
-            crate::take_in_declared(&declared, &theirs, &mut mine, Some(&mut run));
-            assert!(
-                mine.iter().all(|k| k.skips.is_empty() && k.lost),
-                "{mine:?}"
-            );
+            crate::take_in_declared(&declared, &theirs, &mut mine, Some(&mut run), &[]);
+            match theirs.is_empty() {
+                true => assert_eq!(mine, [], "{mine:?}"),
+                false => assert!(
+                    !mine.is_empty() && mine.iter().all(|k| k.skips.is_empty() && k.lost),
+                    "{mine:?}"
+                ),
+            }
             assert!(crate::retake_marks(&mine, &mut run));
             refused(run, &["Finish face (Top)"]);
             let session = Session {
@@ -14108,7 +14113,8 @@ pub(crate) mod tests {
             &declared,
             &declared,
             &mut mine,
-            Some(&mut run)
+            Some(&mut run),
+            &[]
         ));
         assert_eq!(mine, declared);
         assert!(!crate::retake_marks(&mine, &mut run));
