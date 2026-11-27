@@ -158,7 +158,9 @@ def is_macho(path):
 
 
 def binaries(prof):
-    """The Mach-O files at the top of a profile folder and in its unit folders."""
+    """The Mach-O files at the top of a profile folder and in its unit folders,
+    each file once (Cargo hard-links debug/axis-cam to its copy in deps/)."""
+    seen = set()
     for sub in ("",) + UNIT_SUBDIRS:
         for dp, dns, fns in os.walk(os.path.join(prof, sub)):
             if sub == "":
@@ -166,7 +168,14 @@ def binaries(prof):
             dns[:] = [d for d in dns if not d.endswith(".dSYM")]
             for fn in fns:
                 p = os.path.join(dp, fn)
-                if not fn.endswith(NOT_MACHO) and not os.path.islink(p) and is_macho(p):
+                if fn.endswith(NOT_MACHO) or os.path.islink(p):
+                    continue
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                if (st.st_dev, st.st_ino) not in seen and is_macho(p):
+                    seen.add((st.st_dev, st.st_ino))
                     yield p
 
 
@@ -292,6 +301,9 @@ def main():
                 # Under the lock nothing more is written here: what a build linked
                 # since the scan began is read now.
                 try:
+                    # A folder made again since the scan (cargo clean, then a build)
+                    # has a new inode: forget what the scan learnt of folders.
+                    _folders.clear()
                     here = keep | referenced(written_since(prof, start))
                 except NmFailed as e:
                     sys.exit(f"{e}\nstopped: nothing more is swept")

@@ -1,7 +1,7 @@
 #!/usr/bin/env -S python3 -I
 """Checks scripts/sweep-rcgu.py on a small crate in a temporary folder (LIO-676).
 
-Usage: scripts/test-sweep-rcgu.py      (macOS; about a minute; prints "ok" at the end)
+Usage: scripts/test-sweep-rcgu.py      (macOS; a few seconds; prints "ok" at the end)
 
 The crate (a binary using a library from a path dependency) is built
 incrementally a few times, so deps/ fills with object files of earlier builds.
@@ -134,6 +134,15 @@ def main():
         assert linked and all(os.path.exists(p) for p in linked), (out, [p for p in linked if not os.path.exists(p)][:3])
         r = sh("cargo", "build", "-v", cwd=demo).stderr
         assert "Compiling" not in r, r
+
+        # The same with the folder made again (cargo clean) by a build that spells
+        # the path another way (/var for /private/var): its new objects stay too.
+        assert target.startswith("/private/"), target
+        hook = shlex.join(["env", f"CARGO_TARGET_DIR={target[len('/private'):]}", "sh", "-c",
+                           f"cd {shlex.quote(demo)} && cargo clean -q && cargo build -q"])
+        out = sh(sys.executable, "-I", SWEEP, "--delete", target, cwd=tmp, env={"SWEEP_RCGU_AFTER_SCAN": hook}).stdout
+        linked = [p for p in referenced(f"{target}/debug") if "/demo-" in p or "/demo." in p]
+        assert linked and all(os.path.exists(p) for p in linked), (out, [p for p in linked if not os.path.exists(p)][:3])
         edit(f"{demo}/src/main.rs", 4)
         sh("cargo", "test", "--no-run", "-q", cwd=demo)
         sh("cargo", "build", "-q", cwd=demo)
