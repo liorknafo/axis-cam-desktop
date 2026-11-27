@@ -61,3 +61,20 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
   `cargo run` build both crates at `opt-level` 0 (a one-line rebuild 2–4 s on
   the Mac, 5–9 s on the Linux laptop). Don't override it for a run: each
   setting keeps its own copy of a crate in `target/`.
+- **Leftover object files on macOS** (LIO-676): every incremental build of
+  `axis-cam` or `axis-core` leaves another 256 `*.rcgu.o` files in
+  `target/debug/deps/`, and Cargo never deletes the old ones. The debug
+  profile's split debug info keeps them there for backtraces, so a checkout's
+  `target/` grows by gigabytes a day. `scripts/sweep-rcgu.py` deletes the ones
+  no binary points at: nothing is rebuilt afterwards, and backtraces keep
+  their file and line. It leaves alone any build folder that is building,
+  testing or waiting for the heavy-tests lock. On the Mac a launchd job runs
+  it every hour over the worktrees in `~/.t3/worktrees/axis-cam-desktop/`
+  (`scripts/install-sweep-rcgu.sh`; log in `~/Library/Logs/sweep-rcgu.log`),
+  so you don't need to run it yourself. macOS doesn't let the job read
+  `~/Documents`, so the main checkout's `target/` is swept only by hand:
+  `scripts/sweep-rcgu.py --delete --worktrees .` from any checkout.
+  Without `--delete` it only reports what it would delete.
+  Don't switch to `split-debuginfo = "packed"` to avoid this: `dsymutil` adds
+  about 17 s to every link of the test binary. `scripts/test-sweep-rcgu.py`
+  checks the script on a small crate.
