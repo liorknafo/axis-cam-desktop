@@ -841,6 +841,19 @@ mod tests {
         }
     }
 
+    /// The project at `path` and its part, its picks found again on the
+    /// part as this computer's STEP reader meshes it, as opening it in the
+    /// app does (`App::take_model`): what each pick followed to is said.
+    fn render_project(path: &str) -> (crate::model::Document, crate::mesh::Mesh) {
+        let mut doc = crate::storage::load(std::path::Path::new(path)).unwrap();
+        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        let followed = crate::picks::follow(&mut doc, &mesh, None);
+        eprintln!("picks followed on {} operations", followed.operations);
+        for note in &followed.notes {
+            eprintln!("picks: {note}");
+        }
+        (doc, mesh)
+    }
     /// The tablet's screens of `AXIS_RENDER_PROJECT` (a copy), as
     /// `save_for_tablet` draws them, into `AXIS_RENDER_DIR`: setup
     /// `AXIS_RENDER_SETUP` (an index, else every hand setup), each screen's
@@ -852,9 +865,7 @@ mod tests {
     fn render_a_projects_tablet_numbers() {
         let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
         std::fs::create_dir_all(&dir).unwrap();
-        let path = std::env::var("AXIS_RENDER_PROJECT").unwrap();
-        let doc = crate::storage::load(std::path::Path::new(&path)).unwrap();
-        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        let (doc, mesh) = render_project(&std::env::var("AXIS_RENDER_PROJECT").unwrap());
         let only = std::env::var("AXIS_RENDER_SETUP")
             .ok()
             .map(|s| s.parse::<usize>().unwrap());
@@ -912,9 +923,7 @@ mod tests {
     fn render_a_projects_steps_on_the_computer() {
         let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
         std::fs::create_dir_all(&dir).unwrap();
-        let path = std::env::var("AXIS_RENDER_PROJECT").unwrap();
-        let doc = crate::storage::load(std::path::Path::new(&path)).unwrap();
-        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        let (doc, mesh) = render_project(&std::env::var("AXIS_RENDER_PROJECT").unwrap());
         let (steps, _) = super::steps(&doc, Ok(&mesh));
         for (k, s) in steps.setups.iter().enumerate() {
             let mut d = doc.clone();
@@ -941,9 +950,7 @@ mod tests {
         let var = |k: &str| std::env::var(k).unwrap();
         let dir = std::path::PathBuf::from(var("AXIS_RENDER_DIR"));
         std::fs::create_dir_all(&dir).unwrap();
-        let mut doc =
-            crate::storage::load(std::path::Path::new(&var("AXIS_RENDER_PROJECT"))).unwrap();
-        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
+        let (mut doc, mesh) = render_project(&var("AXIS_RENDER_PROJECT"));
         let si: usize = var("AXIS_RENDER_SETUP").parse().unwrap();
         doc.active = doc.setups[si].id.clone();
         let mut a = crate::steps::tests::app_of(doc, mesh);

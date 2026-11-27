@@ -1932,7 +1932,8 @@ fn head<'a>(p: &Page<'a>, here: usize) -> iced::widget::Row<'a, Message> {
         }
         tags.push(chip(format!("~{} min", s.minutes.ceil())));
     }
-    header.push(row(tags).spacing(6))
+    // A long tool name leaves the chips after it room on a line below.
+    header.push(row(tags).spacing(6).width(Fill).wrap().vertical_spacing(6))
 }
 fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
     let g = &shown.guide;
@@ -1950,12 +1951,14 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         setup,
         tablet: false,
     };
-    let header = head(&page, here)
-        .push(space().width(Fill))
-        .push(bold(place(&app.doc, g, here, at), 14).color(ACCENT));
+    let header = head(&page, here);
+    // Where the job is, on the setup's line: an operation's long name and
+    // chips leave it no room on the section's (LIO-688).
     let top = row![
         bold(setup_title(setup), 16),
-        muted(format!("~{} min", g.minutes.ceil())).size(13)
+        muted(format!("~{} min", g.minutes.ceil())).size(13),
+        space().width(Fill),
+        bold(place(&app.doc, g, here, at), 14).color(ACCENT)
     ]
     .spacing(12)
     .align_y(Alignment::Center);
