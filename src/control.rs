@@ -2624,8 +2624,22 @@ struct ZSet {
     /// meanwhile, or the setup checked again, it is a Z set before it,
     /// which counts for no start (LIO-618).
     starts: u64,
+    /// The machine's active work system it was sent in: the work offsets
+    /// are that system's, shown only while it is active, and they touch
+    /// the tool off only when it is the setup's (LIO-643).
+    wcs: usize,
     /// What a probe says once it is shown (`Connection::probed`).
     then: Option<String>,
+}
+
+/// Why what sets a setup's work zero or its tool's Z cannot be pressed
+/// now: the machine's active work system (`Snapshot::active_wcs`, G54 is
+/// 0) is not `offset`, the setup's. None when it is (LIO-643).
+pub fn wcs_mismatch(offset: &str, active: usize) -> Option<String> {
+    let active = format!("G{}", 54 + active);
+    (offset != active).then(|| {
+        format!("This setup uses {offset}, but the active work system is {active}: select {offset} first.")
+    })
 }
 
 /// How near the work offsets a `ZSet` sets the machine's must be for it to
@@ -4034,7 +4048,12 @@ impl Connection {
             Action::ProbeFeature(f) => self.start_routine(f),
             // Both act on the checked setup, which an edit may have changed:
             // like the probes, they wait while its check is out of date (#39).
-            Action::TouchOff if self.manual() && self.run_program().is_ok() => {
+            // Only in the setup's work system (LIO-643).
+            Action::TouchOff
+                if self.manual()
+                    && self.run_program().is_ok()
+                    && self.run_wcs_problem().is_none() =>
+            {
                 if let Some((_, work)) = self.touch_off() {
                     // On the pins, the pins set X and Y: the touch-off is Z's.
                     // So it is for a run that starts partway: X and Y stay
@@ -4165,7 +4184,13 @@ impl Connection {
             R::From(i, k) if !self.probing() => run.pick_start(i, k),
             // Operations or steps taken as cut ask for it once a tool run has
             // started too (LIO-583 review).
-            R::KeepZero if run.running.is_none() && run.asks_zero() => run.zeroed = true,
+            // Only in the setup's work system: another's is not the setup's
+            // work zero (LIO-643).
+            R::KeepZero
+                if run.running.is_none() && run.asks_zero() && run.wcs_problem(self).is_none() =>
+            {
+                run.zeroed = true
+            }
             // Nothing else ran meanwhile: not while the Pi shows a tool run
             // this computer did not send (LIO-595).
             R::SamePart if run.running.is_none() && self.same_part_refused_for(&run).is_none() => {
@@ -4251,18 +4276,27 @@ impl Connection {
                     epoch: run.epoch,
                 });
             }
-            R::RecordReference if self.manual() => {
+            // The reference and Set Z from it, by hand or by probe, only in
+            // the setup's work system: in another, the surface's work Z is
+            // that system's, and the Z set there not the setup's (LIO-643).
+            R::RecordReference if self.manual() && run.in_wcs(self) => {
                 run.record_reference(self, self.snapshot.work_pos[2])
             }
             // The tool counts as touched off once the machine shows it
             // (`z_set_check`, LIO-627).
-            R::ZFromReference if self.manual() && run.reference_a_problem(self).is_none() => {
+            R::ZFromReference
+                if self.manual()
+                    && run.reference_a_problem(self).is_none()
+                    && run.wcs_problem(self).is_none() =>
+            {
                 if let Some(z) = run.reference {
                     self.send_z_set(Some(&mut run), ZBy::Reference, z, None);
                 }
             }
-            R::ProbeReference => self.start_probe(Touch::Reference),
-            R::ProbeFromReference if run.reference_a_problem(self).is_none() => {
+            R::ProbeReference if run.in_wcs(self) => self.start_probe(Touch::Reference),
+            R::ProbeFromReference
+                if run.reference_a_problem(self).is_none() && run.wcs_problem(self).is_none() =>
+            {
                 if let Some(z) = run.reference {
                     self.start_probe(Touch::FromReference(z));
                 }
@@ -4396,6 +4430,27 @@ impl Connection {
         length: Option<(String, f64, f64)>,
         then: Option<String>,
     ) -> bool {
+        // In another work system than the setup's it sets that system's,
+        // not the setup's: the tool is not touched off by it, nor the work
+        // zero set, and what the setup's had is left as it was (LIO-643).
+        let setup = run.as_ref().and_then(|r| r.wcs());
+        if let Some(w) = setup.filter(|&w| w != self.snapshot.active_wcs) {
+            for &(axis, value) in sets {
+                self.send(Command::SetWork { axis, value });
+            }
+            // A probe says so with what it found (LIO-643 review).
+            if let Some(then) = then {
+                self.probed = Some((
+                    false,
+                    format!(
+                        "{then} That is G{}'s work Z, not G{}'s, the setup's: the tool does not count as touched off.",
+                        54 + self.snapshot.active_wcs,
+                        54 + w
+                    ),
+                ));
+            }
+            return false;
+        }
         // The machine shows Z applied, and X and Y too for a work zero:
         // what the tool's touch-off and the work zero go by.
         let offsets: Vec<(usize, f64)> = (sets.iter())
@@ -4452,6 +4507,7 @@ impl Connection {
                 next,
                 tool,
                 starts,
+                wcs: self.snapshot.active_wcs,
                 then,
             });
             return true;
@@ -4558,6 +4614,27 @@ impl Connection {
         if !self.shows_all_sent() {
             return;
         }
+        // The machine shows the work offsets of the active work system
+        // alone: one sent in another waits until it is active again. One
+        // sent before the setup's work system was known (its first check)
+        // touches nothing off once that is found to be another, and says
+        // so (LIO-643).
+        if let Some(w) = (self.run.as_ref().and_then(|r| r.wcs())).filter(|&w| w != z.wcs) {
+            let Some(z) = self.z_set.take() else {
+                return;
+            };
+            let how = format!(
+                "was set in G{}, not G{}, the setup's work system",
+                54 + z.wcs,
+                54 + w
+            );
+            let several = z.offsets.len() > 1;
+            self.z_not_set(z.by, several, Some((z.epoch, z.next, z.tool)), &how);
+            return;
+        }
+        if self.snapshot.active_wcs != z.wcs {
+            return;
+        }
         let Some(z) = self.z_set.take() else {
             return;
         };
@@ -4609,6 +4686,11 @@ impl Connection {
                 }
             }
             _ => {}
+        }
+        // In the work system it was sent in: a setup found in another
+        // later does not count it (`Run::touched`, LIO-643).
+        if applied && let Some(run) = &mut self.run {
+            run.touched_in(z.wcs);
         }
         if applied {
             if let Some(said) = z.then {
@@ -4993,9 +5075,21 @@ impl Connection {
             Touch::Reference => {
                 // The surface under the plate, at today's work offset.
                 let surface = trip - now + s.work_pos[2] - plate;
+                // In the setup's work system alone (LIO-643).
+                let mut other = None;
                 if let Some(mut run) = self.run.take() {
-                    run.record_reference(self, surface);
+                    match run.in_wcs(self) {
+                        true => run.record_reference(self, surface),
+                        false => {
+                            other = Some(run.wcs_problem(self).unwrap_or_else(|| {
+                                "The setup's work system is not known until it is checked.".into()
+                            }))
+                        }
+                    }
                     self.run = Some(run);
+                }
+                if let Some(why) = other {
+                    self.probed = Some((false, format!("Reference surface not recorded. {why}")));
                 }
                 match p.plate {
                     Some(plate) => format!(
@@ -6031,7 +6125,7 @@ impl Connection {
                 at[0], at[1]
             ));
         }
-        if let Some(why) = self.probe_blocked() {
+        if let Some(why) = self.probe_blocked().or_else(|| self.run_wcs_problem()) {
             return Err(why);
         }
         Ok(Touch::ToolReference {
@@ -6370,14 +6464,12 @@ impl Connection {
         if let Ok(Probe { tip: None, .. }) = self.probe {
             return Some("Probe tip diameter is not set: set it in the Machine library.".into());
         }
-        let active = 54 + self.snapshot.active_wcs;
-        if p.offset != format!("G{active}") {
-            return Some(format!(
-                "This setup uses {}, but the active work system is G{active}: select {} first.",
-                p.offset, p.offset
-            ));
-        }
-        None
+        wcs_mismatch(&p.offset, self.snapshot.active_wcs)
+    }
+
+    /// `Run::wcs_problem` of the setup picked, if one is (LIO-643).
+    pub fn run_wcs_problem(&self) -> Option<String> {
+        self.run.as_ref()?.wcs_problem(self)
     }
 
     /// Starts Probe corner or Probe centre from where the probe is.
