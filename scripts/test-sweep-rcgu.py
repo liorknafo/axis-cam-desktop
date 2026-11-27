@@ -14,7 +14,8 @@ It checks that:
 * a profile folder whose Cargo lock is held, and a target folder with a file
   open below it, are left alone;
 * a build that starts and finishes while the sweep reads the binaries keeps
-  every object its binary points at.
+  every object its binary points at;
+* when nm fails, nothing is deleted and the sweep exits with an error.
 """
 
 import fcntl
@@ -110,6 +111,14 @@ def main():
             fcntl.flock(held, fcntl.LOCK_EX)
             out = sweep("--delete", target, cwd=tmp)
             assert "busy (Cargo holds its lock)" in out and objects(target) == before, out
+
+        os.makedirs(f"{tmp}/bad-nm")
+        with open(f"{tmp}/bad-nm/nm", "w") as f:
+            f.write("#!/bin/sh\necho 'xcrun: error: invalid active developer path' >&2\nexit 1\n")
+        os.chmod(f"{tmp}/bad-nm/nm", 0o755)
+        r = sh(sys.executable, "-I", SWEEP, "--delete", target, cwd=tmp, check=False,
+               env={"PATH": f"{tmp}/bad-nm" + os.pathsep + os.environ["PATH"]})
+        assert r.returncode != 0 and "nothing is swept" in r.stderr and objects(target) == before, (r.stdout, r.stderr)
 
         with open(f"{target}/debug/demo"):
             out = sweep("--delete", target, cwd=tmp)

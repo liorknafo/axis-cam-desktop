@@ -61,5 +61,8 @@ EOF
 plutil -lint "$plist" >/dev/null
 
 launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+# bootout returns before a running sweep has exited; bootstrap fails until it has.
+i=0
+while launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1 && [ $i -lt 60 ]; do sleep 1; i=$((i + 1)); done
 launchctl bootstrap "gui/$(id -u)" "$plist"
 echo "installed $label: $bin hourly over the checkouts of $main and the folders in $worktrees; log $log"

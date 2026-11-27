@@ -28,7 +28,9 @@ given target folders names it in its debug map, and deleted otherwise. Cargo's
 fingerprints don't look at these files, so no build is redone, the next
 incremental build works as before, and every backtrace keeps its file:line.
 A binary copied out of target/ (into a thread's evidence folder, say) keeps
-working, but its backtraces lose file:line once its objects are swept.
+working, but its backtraces lose file:line once its objects are swept. When
+nm can't read a binary (Xcode moved, its licence not accepted) nothing is
+swept: the run stops with an error.
 
 A target folder is left alone while it is in use: when a process has a file
 open below it (a running test binary; Cargo's lock files are asked
@@ -168,15 +170,44 @@ def binaries(prof):
                     yield p
 
 
+class NmFailed(Exception):
+    pass
+
+
+_folders = {}
+
+
+def name_key(path):
+    """A file's name in its folder, the folder told by its device and inode: the
+    same for any spelling of the path (letter case, symlinks, /tmp or
+    /private/tmp), and different for each hard-linked name of one file."""
+    folder = os.path.dirname(path)
+    if folder not in _folders:
+        try:
+            st = os.stat(folder)
+            _folders[folder] = (st.st_dev, st.st_ino)
+        except OSError:
+            _folders[folder] = None
+    return _folders[folder] and (_folders[folder], os.path.basename(path))
+
+
 def referenced(bins):
-    """The real paths of the loose object files these binaries point at."""
+    """The names (name_key) of the loose object files these binaries point at.
+    Raises NmFailed when nm can't read one: without its references every
+    object would look unused."""
     keep = set()
     for p in bins:
-        out = subprocess.run(["nm", "-ap", p], capture_output=True, text=True).stdout
-        for line in out.splitlines():
+        run = subprocess.run(["nm", "-ap", p], capture_output=True, text=True)
+        if run.returncode != 0:
+            if not os.path.exists(p):  # removed since it was listed (cargo clean, a rebuild)
+                continue
+            raise NmFailed(f"nm failed on {p} (exit {run.returncode}): {run.stderr.strip()[:300]}")
+        for line in run.stdout.splitlines():
             m = OSO.search(line)
             if m and not m.group(1).endswith(")"):  # `lib….rlib(member.o)` is not a loose file
-                keep.add(os.path.realpath(m.group(1)))
+                key = name_key(m.group(1))
+                if key:
+                    keep.add(key)
     return keep
 
 
@@ -230,14 +261,16 @@ def main():
     # than `start` (a second of slack for clocks), and is kept below.
     start = time.time() - 1
     profs = {t: list(profile_dirs(t)) for t in targets}
-    keep = referenced(b for ps in profs.values() for prof in ps for b in binaries(prof))
+    try:
+        keep = referenced(b for ps in profs.values() for prof in ps for b in binaries(prof))
+    except NmFailed as e:
+        sys.exit(f"{e}\nnothing is swept: without it no object can be told unused")
     hook = os.environ.get("SWEEP_RCGU_AFTER_SCAN")  # scripts/test-sweep-rcgu.py builds here
     if hook:
         subprocess.run(shlex.split(hook), check=True)
     files, tool_cwds = in_use()
 
     total_files = total_bytes = 0
-    seen = set()
     for target in targets:
         checkout = os.path.dirname(target)
         if any(under(f, target) for f in files):
@@ -258,8 +291,12 @@ def main():
             try:
                 # Under the lock nothing more is written here: what a build linked
                 # since the scan began is read now.
-                here = keep | referenced(written_since(prof, start))
-                n = size = kept = 0
+                try:
+                    here = keep | referenced(written_since(prof, start))
+                except NmFailed as e:
+                    sys.exit(f"{e}\nstopped: nothing more is swept")
+                n = kept = 0
+                files_here = {}  # (dev, inode): [names it had, names deleted, bytes]
                 for p in object_files(prof):
                     try:
                         st = os.lstat(p)
@@ -267,7 +304,7 @@ def main():
                         continue
                     # Not ctime as well: unlinking one name of a file changes the
                     # ctime of its other names, and a reused object has several.
-                    if os.path.realpath(p) in here:
+                    if name_key(p) in here:
                         kept += 1
                         continue
                     try:
@@ -276,18 +313,20 @@ def main():
                     except OSError:
                         continue
                     n += 1
-                    if (st.st_dev, st.st_ino) not in seen:  # hard links: count a file once
-                        seen.add((st.st_dev, st.st_ino))
-                        size += st.st_blocks * 512
+                    f = files_here.setdefault((st.st_dev, st.st_ino), [st.st_nlink, 0, st.st_blocks * 512])
+                    f[1] += 1
+                # Only a file left with no name frees its blocks: most old names are
+                # hard links of a file incremental/ or a newer name still has.
+                size = sum(b for links, gone, b in files_here.values() if gone >= links)
                 if n:
-                    print(f"{verb} {n} ({size / 2**30:.2f} GB), kept {kept} in use: {prof}")
+                    print(f"{verb} {n} ({size / 2**30:.2f} GB freed), kept {kept} in use: {prof}")
                 total_files += n
                 total_bytes += size
             finally:
                 for fd in fds:
                     os.close(fd)
-    print(f"{verb} {total_files} files, at most {total_bytes / 2**30:.1f} GB (less where a file is"
-          " still hard-linked from incremental/ or shares blocks with an APFS clone)")
+    print(f"{verb} {total_files} files, freeing {total_bytes / 2**30:.1f} GB (less where a file"
+          " shares blocks with an APFS clone)")
 
 
 main()
