@@ -37,7 +37,8 @@ dirs = "6"
 tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-# The run's stock mesher sets its thread's QoS (`below_the_driver`).
+# A STEP file macOS refuses to let the app read (EPERM) names where to allow it
+# (`step::unreadable`).
 libc = "0.2"
 
 [dev-dependencies]

@@ -1442,8 +1442,9 @@ pub fn prepare(
 /// rows `cuts` at the same Z: the feed crossed with the step to the next
 /// row's midpoint. Positive: the material is on the left of the feed (with
 /// CW, M3, conventional); negative: on the right (CW climb).
+// The core's `cam::tests` use it, which the app's tests build too (`test-support`).
 #[cfg(any(test, feature = "test-support"))]
-pub fn uncut_sides(cuts: &[&Move]) -> Vec<f32> {
+pub(crate) fn uncut_sides(cuts: &[&Move]) -> Vec<f32> {
     let mid = |m: &Move| [(m.from[0] + m.to[0]) / 2., (m.from[1] + m.to[1]) / 2.];
     cuts.windows(2)
         .filter(|p| p[0].to[2] == p[1].to[2])
