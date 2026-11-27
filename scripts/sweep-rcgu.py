@@ -37,7 +37,9 @@ clippy, a linker, dsymutil, a `lockf` waiting for the shared heavy-tests lock)
 runs with its working folder in that checkout. A profile folder (debug,
 release, <triple>/<profile>) is left alone when Cargo's build-folder locks
 can't all be taken at once; with --delete they are held while its files are
-deleted, so a build that starts meanwhile waits for them.
+deleted, so a build that starts meanwhile waits for them. A build that starts
+and finishes while the sweep reads the binaries loses nothing: under the lock,
+every binary written since the sweep began is read again.
 
 The Mac runs it hourly from a launchd job (scripts/install-sweep-rcgu.sh):
 ~/Library/LaunchAgents/local.sweep-rcgu.plist runs ~/.local/bin/sweep-rcgu (a
@@ -51,8 +53,10 @@ when it is run by hand.
 import fcntl
 import os
 import re
+import shlex
 import subprocess
 import sys
+import time
 
 LOCKS = (".cargo-build-lock", ".cargo-lock", ".cargo-artifact-lock")
 MACHO = (b"\xcf\xfa\xed\xfe", b"\xca\xfe\xba\xbe")  # 64-bit Mach-O, universal
@@ -162,17 +166,27 @@ def binaries(prof):
                     yield p
 
 
-def referenced(profs):
-    """The real paths of the loose object files the binaries in these folders point at."""
+def referenced(bins):
+    """The real paths of the loose object files these binaries point at."""
     keep = set()
-    for prof in profs:
-        for p in binaries(prof):
-            out = subprocess.run(["nm", "-ap", p], capture_output=True, text=True).stdout
-            for line in out.splitlines():
-                m = OSO.search(line)
-                if m and not m.group(1).endswith(")"):  # `lib….rlib(member.o)` is not a loose file
-                    keep.add(os.path.realpath(m.group(1)))
+    for p in bins:
+        out = subprocess.run(["nm", "-ap", p], capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            m = OSO.search(line)
+            if m and not m.group(1).endswith(")"):  # `lib….rlib(member.o)` is not a loose file
+                keep.add(os.path.realpath(m.group(1)))
     return keep
+
+
+def written_since(prof, start):
+    """The binaries of a profile folder written (or hard-linked) since `start`."""
+    for p in binaries(prof):
+        try:
+            st = os.stat(p)
+        except OSError:
+            continue
+        if max(st.st_mtime, st.st_ctime) >= start:
+            yield p
 
 
 def object_files(prof):
@@ -210,8 +224,14 @@ def main():
 
     # References from every binary of every given checkout: clone-cargo-cache's
     # clones of a build script or proc macro point at the checkout they came from.
+    # A build can start and finish while the scan runs: what it wrote is newer
+    # than `start` (a second of slack for clocks), and is kept below.
+    start = time.time() - 1
     profs = {t: list(profile_dirs(t)) for t in targets}
-    keep = referenced(p for ps in profs.values() for p in ps)
+    keep = referenced(b for ps in profs.values() for prof in ps for b in binaries(prof))
+    hook = os.environ.get("SWEEP_RCGU_AFTER_SCAN")  # scripts/test-sweep-rcgu.py builds here
+    if hook:
+        subprocess.run(shlex.split(hook), check=True)
     files, tool_cwds = in_use()
 
     total_files = total_bytes = 0
@@ -229,18 +249,26 @@ def main():
             if fds is None:
                 print(f"busy (Cargo holds its lock), left alone: {prof}")
                 continue
-            if not delete:  # a dry run never makes a build wait
+            if not delete:  # a dry run lets go of them at once
                 for fd in fds:
                     os.close(fd)
                 fds = []
             try:
+                # Under the lock nothing more is written here: what a build linked
+                # since the scan began is read now.
+                here = keep | referenced(written_since(prof, start))
                 n = size = kept = 0
                 for p in object_files(prof):
-                    if os.path.realpath(p) in keep:
+                    try:
+                        st = os.lstat(p)
+                    except OSError:
+                        continue
+                    # Not ctime as well: unlinking one name of a file changes the
+                    # ctime of its other names, and a reused object has several.
+                    if os.path.realpath(p) in here:
                         kept += 1
                         continue
                     try:
-                        st = os.lstat(p)
                         if delete:
                             os.unlink(p)
                     except OSError:

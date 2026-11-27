@@ -12,12 +12,15 @@ It checks that:
   incrementally, and a panic's backtrace still has its file:line;
 * the dry run deletes nothing;
 * a profile folder whose Cargo lock is held, and a target folder with a file
-  open below it, are left alone.
+  open below it, are left alone;
+* a build that starts and finishes while the sweep reads the binaries keeps
+  every object its binary points at.
 """
 
 import fcntl
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -111,6 +114,22 @@ def main():
         with open(f"{target}/debug/demo"):
             out = sweep("--delete", target, cwd=tmp)
             assert "busy (a file below it is open)" in out and objects(target) == before, out
+
+        # A build between the sweep's scan and its deletion (the test hook runs
+        # right after the scan): the new binary's objects all stay.
+        hook = shlex.join(["sh", "-c", f"cd {shlex.quote(demo)} && sed -i '' 's/const K: u64 = [0-9]*;/const K: u64 = 77;/'"
+                           " src/main.rs && cargo build -q"])
+        out = sh(sys.executable, "-I", SWEEP, "--delete", target, cwd=tmp, env={"SWEEP_RCGU_AFTER_SCAN": hook}).stdout
+        assert "deleted" in out, out
+        linked = [p for p in referenced(f"{target}/debug") if "/demo-" in p or "/demo." in p]
+        assert linked and all(os.path.exists(p) for p in linked), (out, [p for p in linked if not os.path.exists(p)][:3])
+        r = sh("cargo", "build", "-v", cwd=demo).stderr
+        assert "Compiling" not in r, r
+        edit(f"{demo}/src/main.rs", 4)
+        sh("cargo", "test", "--no-run", "-q", cwd=demo)
+        sh("cargo", "build", "-q", cwd=demo)
+        before = objects(target)
+        keep = referenced(target)
 
         out = sweep("--delete", target, cwd=tmp)
         after = objects(target)

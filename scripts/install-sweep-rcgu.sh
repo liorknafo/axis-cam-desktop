@@ -29,6 +29,8 @@ log="$HOME/Library/Logs/sweep-rcgu.log"
 mkdir -p "$HOME/.local/bin" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 install -m 755 "$here/sweep-rcgu.py" "$bin"
 
+xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
 cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -40,9 +42,9 @@ cat > "$plist" <<EOF
     <string>/bin/sh</string>
     <string>-c</string>
     <string>date; exec /usr/bin/python3 -I -u "\$0" --delete --worktrees "\$1" --in "\$2"</string>
-    <string>$bin</string>
-    <string>$main</string>
-    <string>$worktrees</string>
+    <string>$(xml "$bin")</string>
+    <string>$(xml "$main")</string>
+    <string>$(xml "$worktrees")</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict><key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string></dict>
@@ -51,8 +53,8 @@ cat > "$plist" <<EOF
   <key>ProcessType</key><string>Background</string>
   <key>LowPriorityIO</key><true/>
   <key>Nice</key><integer>10</integer>
-  <key>StandardOutPath</key><string>$log</string>
-  <key>StandardErrorPath</key><string>$log</string>
+  <key>StandardOutPath</key><string>$(xml "$log")</string>
+  <key>StandardErrorPath</key><string>$(xml "$log")</string>
 </dict>
 </plist>
 EOF
