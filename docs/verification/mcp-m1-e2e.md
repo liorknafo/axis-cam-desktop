@@ -198,5 +198,5 @@ library ids.
 
 Found outside `src/mcp`, not changed: a centring added with a manual-mill
 Drill, before the drill has holes, is named "Centre drill · " (empty), since
-`centre::centring` (`src/centre.rs`) names it after the drill's stored name,
+`centre::centring` (`crates/axis-core/src/centre.rs`) names it after the drill's stored name,
 which is still empty then.
