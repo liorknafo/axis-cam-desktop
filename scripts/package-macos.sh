@@ -17,7 +17,7 @@ if [ -z "${AXIS_PACKAGE_ALLOW_UNSUPPORTED:-}" ]; then
             ;;
     esac
 fi
-# build.rs exports AXIS_BUILT_STEP_HELPER; cargo's JSON messages name the helper this build linked.
+# crates/axis-core/build.rs exports AXIS_BUILT_STEP_HELPER; cargo's JSON messages name the helper this build linked.
 cargo_messages="$(mktemp -t axis-cam-cargo)"
 cargo build --release --locked --message-format=json-render-diagnostics > "$cargo_messages"
 build_dir="$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')"
