@@ -1180,6 +1180,8 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
     let stock = done[0].1.stock;
     let zero = crate::post::datum(setup, stock, mesh)?;
     let work = |b: Bounds| b.translated(zero.map(|v| -v));
+    // The part's bottom in work Z: a hole whose tip goes below it is through.
+    let bottom = simulation::part_box(setup, mesh).min[2] - zero[2];
     let tool_time = num(&machine.p, "tool_time").unwrap_or(0.);
 
     // Set up.
@@ -1384,7 +1386,15 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 Features::Holes {
                     diameter: size,
                     thread: None,
-                    holes: hole_rows(doc, op, &plan, &holes, &mouths_of(moves, zero), &uncentred),
+                    holes: hole_rows(
+                        doc,
+                        op,
+                        &plan,
+                        &holes,
+                        &mouths_of(moves, zero),
+                        &uncentred,
+                        bottom,
+                    ),
                 }
             }
             Strategy::Drill => {
@@ -1418,7 +1428,7 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 Features::Holes {
                     diameter: 2. * r,
                     thread: thread.map(|s| s.name.to_string()),
-                    holes: hole_rows(doc, op, &plan, &holes, &mouths, &uncentred),
+                    holes: hole_rows(doc, op, &plan, &holes, &mouths, &uncentred, bottom),
                 }
             }
             Strategy::Slot => {
@@ -1540,7 +1550,9 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
 /// their centres and the work Z the tool's tip goes to, `mouths` the work Z
 /// each cut starts at, `uncentred` by hole (LIO-688). How deep each goes is
 /// what its Check measured (LIO-450): through when the operation breaks
-/// out (a cone or a fixture pin's hole never does); else from the mouth,
+/// out, or when the hole comes out under the part's `bottom` (work Z) at
+/// its full size, a tap's tip under it (a cone or a fixture pin's hole is
+/// never through); else from the mouth,
 /// which a cut starts Top over (`rest::start_over`), a fixture pin's on the
 /// face itself (`cam::pin_holes`), down to where the hole is its full size:
 /// a twist drill's point above its tip, a tap's lead above its tip; a cone,
@@ -1552,6 +1564,7 @@ fn hole_rows(
     holes: &[[f32; 3]],
     mouths: &[f32],
     uncentred: &[bool],
+    bottom: f32,
 ) -> Vec<Hole> {
     let pins = op.drills_pin_holes();
     let air = if pins {
@@ -1580,10 +1593,14 @@ fn hole_rows(
                 d if d >= 0.005 => d,
                 _ => mouth - tip,
             };
+            // A tap's full thread ends a lead above its tip, which is
+            // under the part once it has threaded all of it.
+            let past = if op.tapping() { tip } else { tip + full };
+            let out = !cone && !pins && past < bottom - 0.005;
             Hole {
                 at: [h[0], h[1]],
                 mouth,
-                depth: match through {
+                depth: match through || out {
                     true => Depth::Through { tip },
                     false => Depth::Blind { deep, tip },
                 },

@@ -266,6 +266,7 @@ pub const NOT_WORK_STATE: &[(&str, &str)] = &[
     ("run_away", CONTROLLER),
     ("pi_runs_known", CONTROLLER),
     ("cut_journals", CONTROLLER),
+    ("cut_owners", CONTROLLER),
     ("others_unknown", CONTROLLER),
     ("cuts_path", CONTROLLER),
     ("cuts_kept", CONTROLLER),

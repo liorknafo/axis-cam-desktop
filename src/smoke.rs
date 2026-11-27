@@ -11891,10 +11891,16 @@ flood = { pin = 8 }
         );
         let (shown, _) = a.guide_at().unwrap();
         let centre = |o: usize| crate::centre::centres(&ops[o]).is_some();
-        let pages = (shown.guide.steps.iter())
-            .filter(|s| matches!(s, Step::Sheet { op, .. } if centre(*op)))
-            .count();
-        assert_eq!(pages, 1, "one page for the centre drill");
+        // A page an operation (LIO-688), the centre drillings' one after
+        // another before any other: the centre drill goes in once.
+        let pages: Vec<bool> = (shown.guide.steps.iter())
+            .filter_map(|s| match s {
+                Step::Sheet { op, .. } => Some(centre(*op)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pages[..3], [true; 3], "{pages:?}");
+        assert!(!pages[3..].contains(&true), "{pages:?}");
         assert!(
             // Named Thread since LIO-419.
             a.status
@@ -23049,7 +23055,7 @@ flood = { pin = 8 }
         a.smoke_manual_check();
         let texts = page_texts(&a);
         // The setup as the one setup picker names it (LIO-431).
-        for want in ["1 Manual Mill · by hand", "Set up", "Face", "Hold"] {
+        for want in ["1 Manual Mill · by hand", "Set up", "Face", "Zero"] {
             assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
         }
     }
@@ -23148,10 +23154,12 @@ flood = { pin = 8 }
             a.guide_at().unwrap().1,
             a.guide_at().unwrap().0.guide.sections[2].steps.start
         );
-        // The Step's first screen: the Face's tool is still in, so only
-        // the DRO (LIO-368).
+        // The Step's page: its box (LIO-688).
         let texts = page_texts(&a);
-        assert!(texts.iter().any(|t| t == "Comp"), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| t == "where the box is cut"),
+            "{texts:?}"
+        );
         // The way back to the CNC works too.
         let _ = a.update(Message::Guide(crate::GuideAction::Open(1)));
         assert!(!a.steps_page() && a.doc.active == a.doc.setups[1].id);

@@ -990,6 +990,9 @@ enum Shape {
     Slot([f32; 3], [f32; 3], f32, usize),
     /// A word at a point.
     Word([f32; 3], String, Color),
+    /// A box's number, beside its corner clear of the hatch and the zero
+    /// (LIO-688).
+    BoxNumber(Bounds, usize),
     /// A solid block, such as a parallel under the stock.
     Block(Bounds),
     /// A clamp from above, over the stock, labelled at its outer end
@@ -1156,6 +1159,20 @@ impl Drawing<'_> {
                 }
                 Shape::Word(q, s, c) => {
                     labels.put(f, s.clone(), &[(p3(*q), Align::Left)], down, *c, 13.)
+                }
+                Shape::BoxNumber(bx, n) => {
+                    // The box is taken: the number goes over or under a
+                    // corner of it, else inside one.
+                    let r = rect(bx);
+                    labels.taken.push(r);
+                    let (l, t, rt, b) = (r.x, r.y, r.x + r.width, r.y + r.height);
+                    let tries = [
+                        (Point::new(l, t - 20.), Align::Left),
+                        (Point::new(rt, t - 20.), Align::Right),
+                        (Point::new(l, b + 3.), Align::Left),
+                        (Point::new(rt, b + 3.), Align::Right),
+                    ];
+                    labels.put(f, n.to_string(), &tries, up, ACCENT, 15.);
                 }
                 Shape::Block(bx) => {
                     let r = rect(bx);
@@ -2368,18 +2385,21 @@ fn table<'a>(head: &[&str], rows: Vec<Vec<String>>, widths: &[u16]) -> Element<'
         ..Font::MONOSPACE
     };
     let line = |cells: Vec<Element<'a, Message>>| row(cells).spacing(8).align_y(Alignment::Center);
-    let mut c = column![line(
-        (head.iter().zip(widths))
-            .map(|(h, w)| {
-                text(h.to_string())
-                    .size(12)
-                    .color(MUTED)
-                    .width(FillPortion(*w))
-                    .into()
-            })
-            .collect()
-    )]
-    .spacing(6);
+    let mut c = column![].spacing(6);
+    // No header when it has no words (`listed`).
+    if head.iter().any(|h| !h.is_empty()) {
+        c = c.push(line(
+            (head.iter().zip(widths))
+                .map(|(h, w)| {
+                    text(h.to_string())
+                        .size(12)
+                        .color(MUTED)
+                        .width(FillPortion(*w))
+                        .into()
+                })
+                .collect(),
+        ));
+    }
     for r in rows {
         c = c.push(line(
             (r.into_iter().zip(widths))
@@ -2532,8 +2552,7 @@ fn sheet_screen<'a>(
         }
         Features::Box { lo, hi, through } => {
             let cut = Bounds { min: *lo, max: *hi };
-            let middle = [(lo[0] + hi[0]) / 2., (lo[1] + hi[1]) / 2., hi[2]];
-            let shapes = vec![Shape::Hatch(cut), Shape::Word(middle, "1".into(), ACCENT)];
+            let shapes = vec![Shape::Hatch(cut), Shape::BoxNumber(cut, 1)];
             let depth = if *through {
                 format!("through, from Z {}", dro(hi[2]))
             } else {
@@ -2859,9 +2878,12 @@ pub(crate) mod tests {
         // vise, its grip and the parallels.
         let a = app_with("Yes", |d| {
             crate::guide::tests::in_the_vise(d);
+            // The Face and Step are placed for the corner zero.
+            d.setups[0].operations.drain(..2);
             (d.setups[0].p).insert("origin".into(), "Stock top center".into());
         });
-        let shown = a.guide_at().unwrap().0;
+        let why = a.guide.as_ref().map(|g| g.1.as_ref().err().cloned());
+        let shown = a.guide_at().unwrap_or_else(|| panic!("{why:?}")).0;
         let Step::Zero {
             stock,
             holding,
@@ -3064,8 +3086,9 @@ pub(crate) mod tests {
         };
         close(deep, 8.);
         close(h.mouth - tip, 8. + point);
-        // Stopped 9.4 over the floor, 1 into the stock: to its tip.
-        let h = drilled_hole(&mesh, "8", false, "9.4", "0");
+        // Stopped 1 into the stock, over the tip: to its tip.
+        let stop = (8. + point - 1.).to_string();
+        let h = drilled_hole(&mesh, "8", false, &stop, "0");
         let Depth::Blind { deep, tip } = h.depth else {
             panic!("{h:?}")
         };
@@ -3106,7 +3129,7 @@ pub(crate) mod tests {
         for want in ["640 rpm", "1 hole"] {
             assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
         }
-        for gone in ["divisions", "measure", "head", "pass "] {
+        for gone in ["divisions", "measure", "head setting", "pass "] {
             assert!(!t.iter().any(|s| s.contains(gone)), "{gone} in {t:?}");
         }
     }

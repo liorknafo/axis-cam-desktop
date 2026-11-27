@@ -864,6 +864,9 @@ mod tests {
             if only.is_some_and(|o| o != si) {
                 continue;
             }
+            if let Some(why) = &s.problem {
+                eprintln!("setup {si} has no steps: {why}");
+            }
             for screen in &s.screens {
                 for (what, png) in [("numbers", &screen.numbers), ("picture", &screen.picture)] {
                     let name = format!("{si}-{:02}-{what}.png", screen.step);
