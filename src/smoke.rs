@@ -3531,6 +3531,72 @@ flood = { pin = 8 }
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
     }
 
+    /// Z set by MDI after the new tool's touch-off, back to the Z work
+    /// offset the last tool run started with, is the old tool's Z, not the
+    /// new one's (LIO-775, the tablet's LIO-663): T1 cut tool run 1 and
+    /// tool run 2 is next; T3 touched off (Zero on Z, or Set on Z) moves
+    /// the offset, then `G10 L2` puts T1's back. Cycle Start waits for
+    /// T3's Z again, and the Tool change tab no longer counts it touched
+    /// off. Touched off again, it goes.
+    #[test]
+    fn z_set_back_to_the_old_tools_by_mdi_after_a_touch_off_waits_for_the_new_tools_z() {
+        use crate::control::Action as C;
+        use crate::run::Action as R;
+        for by in ["Zero on Z", "Set on Z"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = run_app(dir.path());
+            zeroed(&mut a);
+            check_run(&mut a, 0);
+            cycle_start(&mut a);
+            run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+            tick_until(&mut a, 2.0, "Idle", |s| {
+                s.state == Some(uc100::controller::State::Idle)
+            });
+            assert_eq!(run_of(&a).next, 1, "{by}");
+            assert!(run_of(&a).tool_change().is_some(), "{by}");
+            // T1's Z work offset, the one tool run 1 started with.
+            let t1 = conn(&a).snapshot.work_offset[2];
+            let waits = |a: &App| {
+                let said = touch_first(a);
+                said.len() == 1 && said[0].starts_with("Tool run 2 uses T3")
+            };
+            // What the Tool change tab counts as touched off.
+            let tab_touched = |a: &App| run_of(a).touched() && !run_of(a).z_elsewhere(conn(a));
+            let touch_off = |a: &mut App| {
+                match by {
+                    "Zero on Z" => {
+                        mdi(a, "G0 Z-3");
+                        let _ = a.update(Message::Machine(C::WorkZero(Some(2))));
+                    }
+                    _ => {
+                        let z = format!("{:.3}", conn(a).snapshot.work_pos[2] + 3.);
+                        let _ = a.update(Message::Machine(C::WorkText(2, z)));
+                        let _ = a.update(Message::Machine(C::WorkSet(2)));
+                    }
+                }
+                touch_shown(a);
+            };
+            assert!(waits(&a), "{by}: {:?}", problems(&a));
+            // T3 touched off: its own Z, Cycle Start goes.
+            touch_off(&mut a);
+            assert!((conn(&a).snapshot.work_offset[2] - t1).abs() > 1., "{by}");
+            assert!(tab_touched(&a), "{by}");
+            assert!(problems(&a).is_empty(), "{by}: {:?}", problems(&a));
+            // T1's offset put back by MDI: T3 would cut with T1's Z.
+            mdi(&mut a, &format!("G10 L2 P1 Z{t1}"));
+            assert!((conn(&a).snapshot.work_offset[2] - t1).abs() < 1e-6, "{by}");
+            assert!(run_of(&a).touched(), "{by}");
+            assert!(!tab_touched(&a), "{by}");
+            assert!(waits(&a), "{by}: {:?}", problems(&a));
+            let _ = a.update(Message::Run(R::CycleStart));
+            assert!(run_of(&a).running.is_none(), "{by}");
+            // T3 touched off again: Cycle Start goes.
+            touch_off(&mut a);
+            assert!(tab_touched(&a), "{by}");
+            assert!(problems(&a).is_empty(), "{by}: {:?}", problems(&a));
+        }
+    }
+
     /// A start at a step needs its tool's Z confirmed (LIO-619): a touch-off
     /// made for another tool run's tool is not it.
     #[test]
