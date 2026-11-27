@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Checks that every backticked snake_case name in docs/VALIDATION.md that
 # reads as a test name (a path such as `control::tests::name`, or a name of
-# four words or more) exists as `fn <name>` in src/ or crates/axis-core/src/, so that a renamed or
-# deleted test cannot stay cited. Tests of the uc100 driver crate are looked
+# four words or more) exists as `fn <name>` in src/ or crates/axis-core/src/,
+# so that a renamed or deleted test cannot stay cited. Tests of the uc100 driver crate are looked
 # up in its checkout under ~/.cargo/git/checkouts when there is one; a module
 # such as `model::path_json` counts as `mod <name>`.
 # Run it from anywhere: ./scripts/check-validation-names.sh

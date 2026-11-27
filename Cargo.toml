@@ -34,6 +34,8 @@ futures-util = "0.3.34"
 sha2 = "0.10"
 clipper2 = "0.6.0"
 toml_edit = "0.25"
+# The same revision as crates/axis-core/Cargo.toml's: one driver for the app and
+# the core.
 uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "bb3ae02961f3d3c5a9008700ffdbedcf77f3b0f1", default-features = false }
 # The UC100 run by uc100-server on a Raspberry Pi, across the network ("Network (Pi)").
 uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "34469ca071d581e7fbe3e50fbc69114a68175605" }

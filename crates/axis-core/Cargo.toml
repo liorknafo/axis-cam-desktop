@@ -26,6 +26,8 @@ sha2 = "0.10"
 clipper2 = "0.6.0"
 fidget = { version = "=0.4.3", default-features = false, features = ["mesh"] }
 toml_edit = "0.25"
+# The same revision as the app's (the root Cargo.toml) and the tablet's
+# (android/Cargo.toml): one driver, or two copies of its types that do not mix.
 uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "bb3ae02961f3d3c5a9008700ffdbedcf77f3b0f1", default-features = false }
 # The GPU stock mesher (`gpu_mesh`), on the wgpu iced already draws with.
 wgpu = "27"
