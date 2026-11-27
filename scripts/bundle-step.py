@@ -10,7 +10,7 @@ messages = pathlib.Path(sys.argv[2])
 binary = app / 'Contents/MacOS/axis-step'
 frameworks = app / 'Contents/Frameworks'
 frameworks.mkdir(parents=True, exist_ok=True)
-# build.rs exports the helper's path as AXIS_BUILT_STEP_HELPER; cargo reports it for the build just made.
+# crates/axis-core/build.rs exports the helper's path as AXIS_BUILT_STEP_HELPER; cargo reports it for the build just made.
 helpers = []
 for line in messages.read_text().splitlines():
     try:

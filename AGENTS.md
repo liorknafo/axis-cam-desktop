@@ -5,6 +5,19 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
 
 ## Builds
 
+- **Two crates, one workspace** (LIO-729): the app `axis-cam` (`src/`: UI,
+  machine control, runs, MCP, planner, tablet, smoke tests) and the core
+  `axis-core` (`crates/axis-core/`: model, geometry, toolpath strategies,
+  simulation, posting, analysis, proposal, plan check, storage, importers, and
+  the STEP helper's `build.rs` and `native/`). The app reaches a core module as
+  `crate::<module>` (`pub(crate) use axis_core::<module>;` in `src/main.rs`).
+  `cargo test -p axis-core` builds and runs the core's tests without the app;
+  `cargo test -p axis-cam` tests the app, and `--workspace` both. The core's
+  test-only helpers the app's tests use sit behind its `test-support` feature,
+  which the app's dev-dependency turns on. `cargo fmt --all` and `cargo clippy
+  --workspace` cover both. The opt-level note below (`[profile.test.package.*]`)
+  covers both crates.
+
 - **Never set `CARGO_INCREMENTAL=0`**: not on a command line, in the
   environment or in a Cargo config. `axis-cam` is one crate of about 270,000
   lines of code, so without incremental compilation every change compiles

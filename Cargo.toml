@@ -5,7 +5,13 @@ edition = "2024"
 description = "AXIS CAM Studio — native Rust/Iced CAM workflow prototype"
 license = "MIT"
 
+[workspace]
+members = [".", "crates/axis-core"]
+resolver = "3"
+
 [dependencies]
+# The core (LIO-729): model, geometry, toolpaths, simulation, posting, storage.
+axis-core = { path = "crates/axis-core" }
 iced = { version = "0.14", features = ["advanced", "canvas", "svg", "image", "tokio"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -14,7 +20,6 @@ dirs = "6"
 rfd = "0.15"
 png = "0.17"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-roxmltree = "0.21"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "sync", "macros"] }
 # Runs an Iced `Task` to its messages (`task::into_stream`): the headless MCP
@@ -28,15 +33,10 @@ getrandom = "0.4.3"
 futures-util = "0.3.34"
 sha2 = "0.10"
 clipper2 = "0.6.0"
-fidget = { version = "=0.4.3", default-features = false, features = ["mesh"] }
 toml_edit = "0.25"
 uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "bb3ae02961f3d3c5a9008700ffdbedcf77f3b0f1", default-features = false }
 # The UC100 run by uc100-server on a Raspberry Pi, across the network ("Network (Pi)").
 uc100-remote = { git = "https://github.com/liorknafo/uc100-server.git", rev = "34469ca071d581e7fbe3e50fbc69114a68175605" }
-# The GPU stock mesher (`gpu_mesh`), on the wgpu iced already draws with.
-wgpu = "27"
-bytemuck = { version = "1", features = ["derive"] }
-pollster = "0.4"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3.7.0"
@@ -80,6 +80,10 @@ debug = true
 # checks stay on.
 [profile.test.package.axis-cam]
 opt-level = 1
+# The core (crates/axis-core, LIO-729 step 3b) holds the toolpath, simulation
+# and posting code: the same setting for it.
+[profile.test.package.axis-core]
+opt-level = 1
 
 [target.'cfg(unix)'.dev-dependencies]
 # Asks each of the test process's open files what it is (`fstat`), with no
@@ -87,6 +91,8 @@ opt-level = 1
 libc = "0.2"
 
 [dev-dependencies]
+# The core's test-only helpers the app's tests use (`post::fixture`...).
+axis-core = { path = "crates/axis-core", features = ["test-support"] }
 # Lay a page out on the software renderer, with no window, to read its widget
 # tree and click it (`ui::probe`); both are already in the tree through iced.
 iced_renderer = "0.14"

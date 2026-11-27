@@ -14,7 +14,7 @@ The distributed macOS STEP helper links dynamically to unmodified Homebrew Open 
 
 Portions of this software are copyright © 2026 The FreeType Project (www.freetype.org). All rights reserved.
 
-The CAD helper's source is `native/step_preview.cpp`. Rebuild it and the app with a C++17 compiler, Rust and an Open CASCADE installation: set OCCT_PREFIX and run the packaging script. The dynamically linked libraries can be replaced with compatible modified versions in `Contents/Frameworks`; re-sign the local bundle after replacing binaries. No license term of this application restricts modification or reverse engineering needed to debug changes to these libraries. No distribution signing credentials are required for local ad-hoc signing.
+The CAD helper's source is `crates/axis-core/native/step_preview.cpp`. Rebuild it and the app with a C++17 compiler, Rust and an Open CASCADE installation: set OCCT_PREFIX and run the packaging script. The dynamically linked libraries can be replaced with compatible modified versions in `Contents/Frameworks`; re-sign the local bundle after replacing binaries. No license term of this application restricts modification or reverse engineering needed to debug changes to these libraries. No distribution signing credentials are required for local ad-hoc signing.
 
 `examples/totem-case-top-right.step` is the right BLE case top of the TOTEM keyboard by GEIST ([GEIGEIGEIST/TOTEM](https://github.com/GEIGEIGEIST/TOTEM)), copyright © 2022 GEIST, under the CERN Open Hardware Licence Version 2 – Permissive (CERN-OHL-P), unmodified. It is a test part only and is not distributed with the app; its licence is in `examples/totem-case-top-LICENSE.md`.
 

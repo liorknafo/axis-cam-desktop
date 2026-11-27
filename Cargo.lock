@@ -499,11 +499,10 @@ name = "axis-cam"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "axis-core",
  "base64 0.23.1",
- "bytemuck",
  "clipper2",
  "dirs",
- "fidget",
  "futures-util",
  "getrandom 0.4.3",
  "iced",
@@ -513,10 +512,8 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "png 0.17.16",
- "pollster",
  "reqwest",
  "rfd",
- "roxmltree 0.21.1",
  "security-framework",
  "serde",
  "serde_json",
@@ -527,8 +524,30 @@ dependencies = [
  "uc100",
  "uc100-remote",
  "uuid",
- "wgpu",
  "windows-sys 0.61.2",
+ "zip",
+]
+
+[[package]]
+name = "axis-core"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "clipper2",
+ "dirs",
+ "fidget",
+ "libc",
+ "png 0.17.16",
+ "pollster",
+ "roxmltree 0.21.1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml_edit",
+ "uc100",
+ "uuid",
+ "wgpu",
  "zip",
 ]
 

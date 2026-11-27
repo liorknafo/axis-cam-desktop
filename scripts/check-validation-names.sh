@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Checks that every backticked snake_case name in docs/VALIDATION.md that
 # reads as a test name (a path such as `control::tests::name`, or a name of
-# four words or more) exists as `fn <name>` in src/, so that a renamed or
+# four words or more) exists as `fn <name>` in src/ or crates/axis-core/src/, so that a renamed or
 # deleted test cannot stay cited. Tests of the uc100 driver crate are looked
 # up in its checkout under ~/.cargo/git/checkouts when there is one; a module
 # such as `model::path_json` counts as `mod <name>`.
@@ -9,14 +9,14 @@
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 doc="$root/docs/VALIDATION.md"
-dirs=("$root/src")
+dirs=("$root/src" "$root/crates/axis-core/src")
 for d in "${CARGO_HOME:-$HOME/.cargo}"/git/checkouts/uc100-driver-*/*; do
     [ -d "$d" ] && dirs+=("$d")
 done
 missing=0
 while IFS= read -r name; do
     if ! grep -rqE --include='*.rs' "(fn|mod) ${name}\b" "${dirs[@]}"; then
-        echo "docs/VALIDATION.md cites \`$name\`, but no \`fn $name\` is in src/ or the driver crate" >&2
+        echo "docs/VALIDATION.md cites \`$name\`, but no \`fn $name\` is in src/, crates/axis-core/src/ or the driver crate" >&2
         missing=1
     fi
 done < <(

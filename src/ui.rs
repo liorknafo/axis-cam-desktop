@@ -18177,7 +18177,7 @@ mod tests {
     fn sources_and_docs_have_no_mojibake() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
         let mut hits = Vec::new();
-        for path in ["src", "docs", "README.md"] {
+        for path in ["src", "crates/axis-core/src", "docs", "README.md"] {
             scan(&root.join(path), &mut hits);
         }
         assert!(hits.is_empty(), "mojibake found:\n{}", hits.join("\n"));
