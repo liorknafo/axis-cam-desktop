@@ -12044,14 +12044,29 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
         // were cut with, which the check may not be able to find on the
         // stock this run cut: why, and what to do then (LIO-586 review).
         if let Some(why) = c.partway_blocked().filter(|_| run.partway()) {
+            // At a tool change the Start at a step tab is not shown: its
+            // Keep it is here, as Keep this work zero (LIO-699).
+            let tool_change = run.tool_change().is_some();
             col = col.push(
                 text(format!(
                     "{why} Zero Z on the stock top and Probe Z are off: {}.",
-                    crate::run::STEP_ZERO_BY_HAND
+                    crate::run::step_zero_by_hand(tool_change)
                 ))
                 .size(12)
                 .color(AMBER),
             );
+            if tool_change && run.asks_zero() {
+                let wcs = run.wcs_problem(c).filter(|_| !running);
+                col = col.push(small(
+                    "Keep this work zero",
+                    (c.run_program().is_ok() && !run.zeroed && !running && wcs.is_none())
+                        .then_some(Message::Run(R::KeepZero)),
+                    run.zeroed,
+                ));
+                if let Some(why) = wcs {
+                    col = col.push(text(why).size(12).color(AMBER));
+                }
+            }
         } else if run.asks_zero() {
             // Operations or steps taken as cut since: Cycle Start waits for
             // the work zero they were cut with, kept here (LIO-583 review).

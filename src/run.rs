@@ -861,6 +861,21 @@ const RUN_UNFOLLOWED_BLOCKED: &str = "This run's tool runs have cut the stock si
 /// (LIO-586 review).
 pub(crate) const STEP_ZERO_BY_HAND: &str = "keep the work zero they were cut with (Keep it, under Start at a step), or set Z by hand on a surface whose height you know (Set under Work zero)";
 
+/// `STEP_ZERO_BY_HAND` at a tool change: the Control page shows the Tool
+/// change tab there, not Start at a step, so the Work zero tab's button is
+/// named (LIO-699).
+pub(crate) const STEP_ZERO_BY_HAND_AT_TOOL_CHANGE: &str = "keep the work zero they were cut with (Keep this work zero, under Work zero), or set Z by hand on a surface whose height you know (Set under Work zero)";
+
+/// `STEP_ZERO_BY_HAND`, or at a tool change
+/// `STEP_ZERO_BY_HAND_AT_TOOL_CHANGE` (LIO-699).
+pub(crate) fn step_zero_by_hand(at_tool_change: bool) -> &'static str {
+    if at_tool_change {
+        STEP_ZERO_BY_HAND_AT_TOOL_CHANGE
+    } else {
+        STEP_ZERO_BY_HAND
+    }
+}
+
 /// Why Zero Z on the stock top and Probe Z cannot set Z for a run from the
 /// setup's start (`Run::inherited_unknown`).
 const INHERITED_UNKNOWN: &str = "Earlier setups may have cut the stock under the stock top where it is touched off, so the check cannot tell its surface there.";
@@ -3587,16 +3602,26 @@ impl Run {
         if let Some((oi, n)) = self.at_step() {
             let step = self.step_label(oi, n);
             if !zeroed {
+                // At a tool change the Control page shows the Tool change
+                // tab, not Start at a step: the Work zero tab's button is
+                // named (LIO-699).
+                let tool_change = self.tool_change().is_some();
                 // Where the check cannot tell the stock they left, it is
                 // set by hand, and the reason said (LIO-586 review).
                 e.push(match self.partway_blocked() {
                     Some(why) => format!(
-                        "This run starts {} at {step}, the steps before it taken as cut: {STEP_ZERO_BY_HAND}. {why}",
-                        first.name
+                        "This run starts {} at {step}, the steps before it taken as cut: {}. {why}",
+                        first.name,
+                        step_zero_by_hand(tool_change)
                     ),
                     None => format!(
-                        "This run starts {} at {step}, the steps before it taken as cut: keep the work zero they were cut with (Keep it, under Start at a step), or set it on the stock they left.",
-                        first.name
+                        "This run starts {} at {step}, the steps before it taken as cut: keep the work zero they were cut with ({}), or set it on the stock they left.",
+                        first.name,
+                        if tool_change {
+                            "Keep this work zero, under Work zero"
+                        } else {
+                            "Keep it, under Start at a step"
+                        }
                     ),
                 });
             }
