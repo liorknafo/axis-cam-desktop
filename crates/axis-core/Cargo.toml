@@ -1,0 +1,45 @@
+[package]
+name = "axis-core"
+version = "0.1.0"
+edition = "2024"
+description = "AXIS CAM's core: model, geometry, toolpath strategies, simulation, posting, analysis, storage and importers (LIO-729)"
+license = "MIT"
+publish = false
+
+[lib]
+name = "axis_core"
+
+[features]
+# The core's test-only helpers (`post::fixture`, `mesh::normalize`, the
+# `tests` modules the app's tests build on...), for the app's own tests: a
+# dependency is built without `cfg(test)`, so the app's dev-dependency turns
+# this on.
+test-support = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+roxmltree = "0.21"
+sha2 = "0.10"
+clipper2 = "0.6.0"
+fidget = { version = "=0.4.3", default-features = false, features = ["mesh"] }
+toml_edit = "0.25"
+# The same revision as the app's (the root Cargo.toml) and the tablet's
+# (android/Cargo.toml): one driver, or two copies of its types that do not mix.
+uc100 = { git = "https://github.com/liorknafo/UC100-driver.git", rev = "bb3ae02961f3d3c5a9008700ffdbedcf77f3b0f1", default-features = false }
+# The GPU stock mesher (`gpu_mesh`), on the wgpu iced already draws with.
+wgpu = "27"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.4"
+dirs = "6"
+tempfile = "3"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# A STEP file macOS refuses to let the app read (EPERM) names where to allow it
+# (`step::unreadable`).
+libc = "0.2"
+
+[dev-dependencies]
+png = "0.17"

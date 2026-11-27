@@ -444,24 +444,43 @@ dependencies = [
 ]
 
 [[package]]
-name = "axis-shop"
+name = "axis-core"
 version = "0.1.0"
 dependencies = [
- "base64 0.23.1",
  "bytemuck",
  "clipper2",
  "dirs",
  "fidget",
+ "libc",
+ "pollster",
+ "roxmltree 0.21.2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml_edit",
+ "uc100",
+ "uuid",
+ "wgpu",
+ "zip",
+]
+
+[[package]]
+name = "axis-shop"
+version = "0.1.0"
+dependencies = [
+ "axis-core",
+ "base64 0.23.1",
+ "clipper2",
+ "dirs",
  "futures-util",
  "getrandom 0.4.3",
  "iced",
  "iced_android",
  "jsonwebtoken",
  "png 0.17.16",
- "pollster",
  "reqwest",
  "rfd-stub",
- "roxmltree 0.21.2",
  "serde",
  "serde_json",
  "sha2",
@@ -471,7 +490,6 @@ dependencies = [
  "uc100",
  "uc100-remote",
  "uuid",
- "wgpu",
  "zip",
 ]
 

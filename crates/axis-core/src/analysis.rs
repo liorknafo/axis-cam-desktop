@@ -1,0 +1,3840 @@
+//! Deterministic summary of the imported part for the AI planner: what can be
+//! reached from each of the six axis-aligned orientations. Lengths are mm.
+use crate::{
+    cam::{self, Geometry},
+    material::BANDS,
+    mesh::{Bounds, Mesh, rotation},
+    model::{Document, Operation, Setup, Strategy, get, num},
+    proposal::clip,
+    surface::Selection,
+    volume::{Frame, Volume},
+};
+
+use serde::Serialize;
+use std::collections::BTreeMap;
+
+/// Orientation name (the part axis that points up) and its setup rotation.
+pub const ORIENTATIONS: [(&str, [f32; 3]); 6] = [
+    ("+Z", [0., 0., 0.]),
+    ("-Z", [180., 0., 0.]),
+    ("+X", [0., -90., 0.]),
+    ("-X", [0., 90., 0.]),
+    ("+Y", [90., 0., 0.]),
+    ("-Y", [-90., 0., 0.]),
+];
+const MAX_PLANES: usize = 40;
+/// Faces whose heights differ by no more than this (mm) are one plane.
+const PLANE_TOLERANCE: f32 = 0.01;
+const MAX_HOLES: usize = 100;
+/// The openings listed for one floor at most; a floor with more lists none.
+const MAX_OPENINGS: usize = 60;
+/// The largest cutter a floor's report looks for, mm: a ledge open to a
+/// lower area takes any cutter its walls leave room for.
+const MAX_CUTTER: f32 = 50.;
+/// cos 0.5°: a face this close to horizontal counts as planar-horizontal.
+const FLAT: f32 = 0.99996;
+/// cos 89.5°: steeper faces count as vertical walls.
+const WALL: f32 = 0.0087;
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PartReport {
+    pub units: &'static str,
+    pub part_size: [f32; 3],
+    pub material: MaterialReport,
+    pub machine: MachineReport,
+    /// The machines a setup may be planned on, numbered from 1: the user's
+    /// setup's first, then the hand machines (`machines`). Empty, and not
+    /// told, when there is no hand machine to plan on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub machines: Vec<MachineEntry>,
+    /// Where setup 1's work zero is, from the model's -X/-Y/bottom corner in
+    /// setup 1's axes; told only with `machines`, for a Box's coordinates.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub work_zero: Option<[f32; 3]>,
+    pub tools: Vec<ToolReport>,
+    /// The vises and clamps of the user's library a setup may be held by,
+    /// numbered from 1 in library order, by size only.
+    pub workholding_library: Vec<LibraryEntry>,
+    /// Setup 1's modelled vise or clamps; absent without them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workholding: Option<WorkholdingReport>,
+    /// Why setup 1's holder cannot hold the raw stock, when a hand machine
+    /// may prepare it first; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workholding_problem: Option<String>,
+    /// The first entry is setup 1's orientation.
+    pub orientations: Vec<OrientationReport>,
+    /// The rotary A axis, on a machine that has one with its geometry
+    /// recorded; absent on a 3-axis machine.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rotary: Option<RotaryReport>,
+    /// Setup 1's sheet on its spoilboard; absent for any other stock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sheet: Option<SheetReport>,
+    /// The part as turned about each orientation's vertical axis; only when
+    /// `machines` has a lathe.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub turning: Vec<TurningReport>,
+}
+/// Setup 1's stock when it is a sheet lying on a spoilboard (`sheet`), mm.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SheetReport {
+    /// X, Y and thickness.
+    pub size: [f32; 3],
+    /// How far a cut through the sheet may go on into the spoilboard: a
+    /// through cut's bottom offset (or breakthrough) of up to this much below
+    /// the model's bottom, no more.
+    pub spoilboard_allowance: f32,
+    /// What holds the sheet down: "Screws" (their heads are setup 1's
+    /// `workholding` boxes, which every move keeps clear of), "Tape" (holds
+    /// the part too) or "None".
+    pub holddown: String,
+    /// With screws only the waste is held: an outside contour that cuts
+    /// through must leave tabs.
+    pub needs_tabs: bool,
+}
+/// Setup 1's sheet for the report, or None for any other stock.
+fn sheet_report(setup1: &Setup, mesh: &Mesh) -> Option<SheetReport> {
+    if !crate::sheet::is_sheet(setup1) {
+        return None;
+    }
+    let stock = crate::stock::resolve(setup1, Some(mesh)).ok()?.stock;
+    Some(SheetReport {
+        size: stock.dimensions().map(r2),
+        spoilboard_allowance: r2(crate::sheet::below(setup1)),
+        holddown: crate::sheet::holddown(setup1).to_string(),
+        needs_tabs: crate::sheet::loose_part(setup1).is_some(),
+    })
+}
+/// The machine's rotary A axis for the planner (`model::RotaryUnit`), mm and
+/// degrees: what holds in the chuck, what fits, and how far to trust it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RotaryReport {
+    /// The A centreline above the table.
+    pub centre_height: f32,
+    /// The largest stock diameter, and the longest stock from the chuck's
+    /// face, that fit on the rotary unit.
+    pub max_diameter: f32,
+    pub max_length: f32,
+    /// The machine's A range.
+    pub a_min: f32,
+    pub a_max: f32,
+    /// The smallest and largest stock the jaws grip: a round bar's diameter,
+    /// or a box's thinner side and its diagonal.
+    pub grip_min: f32,
+    pub grip_max: f32,
+    /// "measured" while the A centreline was probed and has not gone stale,
+    /// else "assumed".
+    pub centreline: &'static str,
+}
+/// The rotary axis for the report of a job whose setup 1 is `setup1`, or
+/// None without an A axis around X and its rotary unit's sizes.
+fn rotary_report(doc: &Document, setup1: &Setup) -> Option<RotaryReport> {
+    let unit = doc.rotary_unit(&setup1.machine)?;
+    let m = &setup1.machine.p;
+    Some(RotaryReport {
+        centre_height: r2(unit.centre_height),
+        max_diameter: r2(unit.fit_diameter),
+        max_length: r2(unit.fit_length),
+        a_min: r2(num(m, "rotary_min")?),
+        a_max: r2(num(m, "rotary_max")?),
+        grip_min: r2(unit.grip_min),
+        grip_max: r2(unit.grip_max),
+        centreline: if doc.centre_mark(&setup1.machine) == crate::machine_profile::MEASURED {
+            "measured"
+        } else {
+            "assumed"
+        },
+    })
+}
+/// The orientation (the part axis that points up) of setup `base`'s part
+/// once A has turned it by `turn` degrees about +X (`indexed::Turn::turn`),
+/// or None when that is not one of the six.
+pub fn orientation_at(base: &Setup, turn: f32) -> Option<&'static str> {
+    let angles = ["rx", "ry", "rz"].map(|k| num(&base.p, k).unwrap_or(f32::NAN));
+    let mut turned = base.clone();
+    for (key, value) in ["rx", "ry", "rz"]
+        .iter()
+        .zip(crate::indexed::turned_angles(angles, turn))
+    {
+        turned.p.insert((*key).into(), value.to_string());
+    }
+    up_axis(&turned)
+}
+/// One vise or clamp of the library, told by number and size: never its name,
+/// notes or id. `proposal::build` finds the entry again by `number`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LibraryEntry {
+    /// Counts from 1 over `library`.
+    pub number: usize,
+    /// "Vise", "Clamp", or for a round bar "V-block", "Soft jaws" or
+    /// "Collet block", as the library names its kinds.
+    pub kind: &'static str,
+    /// A vise: `jaw_width`, `jaw_height`, `jaw_thickness`, `max_opening`,
+    /// `grip`. A clamp: `length`, `width`, `height`, `bite`. In mm, sorted by
+    /// name; a size the entry lacks is left out.
+    #[serde(flatten)]
+    pub sizes: BTreeMap<&'static str, f32>,
+    /// The `machines` numbers the entry fits; told only with `machines`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machines: Option<Vec<usize>>,
+}
+/// One machine a setup may be planned on, by number: never its name.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MachineEntry {
+    pub number: usize,
+    /// "CNC", "Manual mill" or "Lathe".
+    pub kind: &'static str,
+    pub travel: [f32; 3],
+    /// A CNC's maximum rpm and feed, as `machine` gives them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_rpm: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_feed: Option<f32>,
+    /// A hand machine's spindle speeds, rpm, lowest first; with `variable`
+    /// true the two ends of a variable drive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gears: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable: Option<bool>,
+    /// The manual mill's fastest steady hand feed and its hand rapid, mm/min.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand_feed: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand_rapid: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub power_w: Option<f32>,
+    /// Whether the manual mill's DRO has tool-radius compensation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dro_compensation: Option<bool>,
+    /// A hand machine's time to set one pass, s, to change a tool, min, and
+    /// to move the stock to or from it, min.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pass_time_s: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_time_min: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub move_time_min: Option<f32>,
+    /// The lathe's carriage power feeds, mm per revolution, and the threads
+    /// its gearbox cuts, mm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feeds_mm_per_rev: Option<Vec<f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pitches: Option<Vec<f32>>,
+    /// What the lathe's cross-slide dial reads, `Diameter` or `Radius`, or
+    /// `unknown` until the user's dial check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_reads: Option<&'static str>,
+}
+/// The part as a lathe turns it about the vertical axis of one orientation:
+/// its axis through the centre of its box across, the free end its top.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TurningReport {
+    pub up: &'static str,
+    /// Along the axis, and the largest diameter, mm.
+    pub length: f32,
+    pub largest_diameter: f32,
+    /// The share of the length (0 to 1) over which the part is round.
+    pub round_share: f32,
+    /// From the top down: where each step starts and ends below the part's
+    /// top, its outside and inside diameters (inside 0 when solid on the
+    /// axis), and whether it is round. Listed only when `round_share` is at
+    /// least 0.3.
+    pub steps: Vec<TurnStep>,
+    /// The threads on the axis.
+    pub threads: Vec<TurnThread>,
+    /// More steps than are listed.
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TurnStep {
+    pub from_top: f32,
+    pub to_top: f32,
+    pub outer_diameter: f32,
+    pub inner_diameter: f32,
+    pub round: bool,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TurnThread {
+    /// Its standard size, or Ø major × pitch.
+    pub size: String,
+    pub internal: bool,
+    pub major_diameter: f32,
+    pub pitch: f32,
+    pub from_top: f32,
+    pub to_top: f32,
+}
+/// The steps a `TurningReport` lists at most.
+const MAX_STEPS: usize = 40;
+/// `setup1` turned so that `up` faces up, with the part on the axis: the
+/// centre of its box across on X0 Y0, standing on Z0, as a lathe holds it.
+pub fn on_axis(setup1: &Setup, up: &str, mesh: &Mesh) -> Option<Setup> {
+    let mut setup = oriented(setup1, up)?;
+    for key in ["tx", "ty", "tz"] {
+        setup.p.insert(key.into(), "0".into());
+    }
+    let scale = mesh.display_scale();
+    let placed = crate::stock::Placement::unturned(mesh, Some(&setup)).bounds;
+    let shift = [
+        -(placed.min[0] + placed.max[0]) / 2. / scale,
+        -(placed.min[1] + placed.max[1]) / 2. / scale,
+        -placed.min[2] / scale,
+    ];
+    for (key, value) in ["tx", "ty", "tz"].iter().zip(shift) {
+        setup.p.insert((*key).into(), value.to_string());
+    }
+    Some(setup)
+}
+/// The part turned about each orientation's vertical axis.
+fn turning_report(setup1: &Setup, mesh: &Mesh, order: &[&'static str]) -> Vec<TurningReport> {
+    order
+        .iter()
+        .filter_map(|&up| {
+            let setup = on_axis(setup1, up, mesh)?;
+            let slabs = crate::turn::profile_round(&setup, mesh);
+            let top = slabs
+                .iter()
+                .map(|(s, _)| s[1])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let bottom = slabs
+                .iter()
+                .map(|(s, _)| s[0])
+                .fold(f32::INFINITY, f32::min);
+            let length = top - bottom;
+            // Also refuses NaN.
+            if length.partial_cmp(&0.) != Some(std::cmp::Ordering::Greater) {
+                return None;
+            }
+            let round: f32 = (slabs.iter())
+                .filter(|(_, round)| *round)
+                .map(|(s, _)| s[1] - s[0])
+                .sum();
+            let round_share = r2(round / length);
+            let mut steps: Vec<TurnStep> = slabs
+                .iter()
+                .rev()
+                .map(|(s, round)| TurnStep {
+                    from_top: r2(top - s[1]),
+                    to_top: r2(top - s[0]),
+                    outer_diameter: r2(2. * s[3]),
+                    inner_diameter: r2(2. * s[2]),
+                    round: *round,
+                })
+                .collect();
+            let truncated = round_share >= 0.3 && steps.len() > MAX_STEPS;
+            if round_share < 0.3 {
+                steps.clear();
+            }
+            steps.truncate(MAX_STEPS);
+            let threads = crate::thread::in_setup(&setup, mesh)
+                .into_iter()
+                .filter(|t| t.axis == 2 && !t.tapered && t.centre[0].hypot(t.centre[1]) <= 0.2)
+                .map(|t| TurnThread {
+                    size: t.spec.map_or_else(
+                        || format!("Ø{:.2} × {}", t.major, t.pitch),
+                        |s| s.name.to_string(),
+                    ),
+                    internal: t.internal,
+                    major_diameter: r2(t.major),
+                    pitch: t.pitch,
+                    from_top: r2(top - t.to.max(t.from)),
+                    to_top: r2(top - t.to.min(t.from)),
+                })
+                .collect();
+            Some(TurningReport {
+                up,
+                length: r2(length),
+                largest_diameter: r2(2. * slabs.iter().map(|(s, _)| s[3]).fold(0., f32::max)),
+                round_share,
+                steps,
+                threads,
+                truncated,
+            })
+        })
+        .collect()
+}
+/// The index of the user's setup: the first that is not on a hand machine,
+/// or the first when every setup is. It holds the user's stock, holding and
+/// work zero; hand setups a plan puts before it start from that stock.
+pub fn base(doc: &Document) -> usize {
+    doc.setups
+        .iter()
+        .position(|s| !crate::manual::is_hand(&s.machine))
+        .unwrap_or(0)
+}
+/// `doc` as the planner reads it: the user's setup first, its own stock the
+/// fresh stock, without the hand setups before it. Their machines stay, in
+/// the library when it has them no more, so the view numbers the same
+/// `machines` as `doc` and a hand machine kept only in a setup's snapshot
+/// still prepares the stock.
+pub fn planning(doc: &Document) -> std::borrow::Cow<'_, Document> {
+    match base(doc) {
+        0 => std::borrow::Cow::Borrowed(doc),
+        b => {
+            let mut view = doc.clone();
+            for setup in view.setups.drain(..b) {
+                if plannable(&setup.machine)
+                    && !view.machines.iter().any(|m| m.id == setup.machine.id)
+                {
+                    view.machines.push(setup.machine);
+                }
+            }
+            view.sync_stock_sources();
+            std::borrow::Cow::Owned(view)
+        }
+    }
+}
+/// Whether the planner may plan setups on hand machine `m`.
+pub fn plannable(m: &crate::model::Machine) -> bool {
+    crate::manual::is_hand(m)
+}
+/// Whether `machines` has a lathe, so the report and the plan take its
+/// tools, its chucks and the part as turned.
+pub fn has_lathe(machines: &[&crate::model::Machine]) -> bool {
+    machines.iter().any(|m| crate::lathe::is_lathe(m))
+}
+/// The machines a plan may use, as `machines` numbers them from 1: the
+/// user's setup's, then each plannable hand machine of the library and of
+/// the current setups, once by id. Only the user's when there is none.
+pub fn machines(doc: &Document) -> Vec<&crate::model::Machine> {
+    let Some(own) = doc.setups.get(base(doc)).map(|s| &s.machine) else {
+        return vec![];
+    };
+    let mut list = vec![own];
+    for m in doc
+        .machines
+        .iter()
+        .chain(doc.setups.iter().map(|s| &s.machine))
+    {
+        if plannable(m) && !list.iter().any(|x| x.id == m.id) {
+            list.push(m);
+        }
+    }
+    list
+}
+/// The `machines` number of the machine with `id`.
+pub fn machine_number(doc: &Document, id: &str) -> Option<usize> {
+    machines(doc).iter().position(|m| m.id == id).map(|i| i + 1)
+}
+/// The `machines` numbers `fits` holds for, None without hand machines.
+fn fitting(
+    list: &[&crate::model::Machine],
+    fits: impl Fn(&crate::model::Machine) -> bool,
+) -> Option<Vec<usize>> {
+    (list.len() > 1).then(|| {
+        (list.iter().enumerate())
+            .filter(|(_, m)| fits(m))
+            .map(|(i, _)| i + 1)
+            .collect()
+    })
+}
+fn machine_entry(number: usize, m: &crate::model::Machine) -> Result<MachineEntry, String> {
+    let given = |k: &str| num(&m.p, k).filter(|v| v.is_finite());
+    let mut entry = MachineEntry {
+        number,
+        kind: if crate::manual::is_manual(m) {
+            "Manual mill"
+        } else if crate::lathe::is_lathe(m) {
+            "Lathe"
+        } else {
+            "CNC"
+        },
+        travel: [0, 1, 2].map(|k| r2(crate::manual::travel_mm(m, k).unwrap_or(0.))),
+        max_rpm: None,
+        max_feed: None,
+        gears: None,
+        variable: None,
+        hand_feed: None,
+        hand_rapid: None,
+        power_w: None,
+        dro_compensation: None,
+        pass_time_s: None,
+        tool_time_min: None,
+        move_time_min: None,
+        feeds_mm_per_rev: None,
+        pitches: None,
+        cross_reads: None,
+    };
+    if !crate::manual::is_hand(m) {
+        let limits = machine_report(m)?;
+        (entry.travel, entry.max_rpm, entry.max_feed) =
+            (limits.travel, Some(limits.max_rpm), Some(limits.max_feed));
+        return Ok(entry);
+    }
+    entry.gears = Some(crate::manual::gears(m));
+    entry.variable = Some(crate::manual::variable(m).is_some());
+    entry.power_w = given("power");
+    entry.pass_time_s = given("pass_time");
+    entry.tool_time_min = given("tool_time");
+    entry.move_time_min = given("move_time");
+    if crate::lathe::is_lathe(m) {
+        entry.feeds_mm_per_rev = Some(crate::lathe::feeds(m));
+        entry.pitches = Some(crate::lathe::pitches(m));
+        entry.cross_reads = Some(crate::lathe::cross_reads(m).unwrap_or("unknown"));
+    }
+    if crate::manual::is_manual(m) {
+        entry.hand_feed = given("hand_feed");
+        entry.hand_rapid = given("hand_rapid");
+        entry.dro_compensation = Some(get(&m.p, "dro_comp") == "Yes");
+    }
+    Ok(entry)
+}
+/// The library entries a setup may use, in library order: those of a kind the
+/// program models. The report numbers them from 1 and a proposal's `holder`
+/// counts the same way.
+pub fn library(doc: &Document) -> Vec<&crate::holding::Holder> {
+    // A lathe's chucks only when the plan may use a lathe.
+    let chucks = has_lathe(&machines(doc));
+    doc.workholding
+        .iter()
+        .filter(|h| {
+            matches!(h.kind(), "Vise" | "Clamp")
+                || crate::round_hold::KINDS.contains(&h.kind())
+                || (chucks && h.kind() == "Chuck")
+        })
+        .collect()
+}
+/// The number, counted as `library` is, of the entry that holds `setup1`: None
+/// when setup 1 models no vise or clamps or its entry is not in the library.
+/// Only setup 1 may name it as its `holder`, and a later setup's `holder` of
+/// null shares it.
+pub fn own_entry(doc: &Document, setup1: &Setup) -> Option<usize> {
+    crate::holding::modelled(setup1)
+        .then(|| {
+            library(doc)
+                .iter()
+                .position(|h| h.id == get(&setup1.p, "holder"))
+        })
+        .flatten()
+        .map(|i| i + 1)
+}
+fn library_report(doc: &Document, machines: &[&crate::model::Machine]) -> Vec<LibraryEntry> {
+    library(doc)
+        .into_iter()
+        .enumerate()
+        .map(|(n, holder)| LibraryEntry {
+            number: n + 1,
+            kind: crate::holding::library_kind(holder.kind()).unwrap_or("Clamp"),
+            sizes: holder
+                .keys()
+                .iter()
+                .filter_map(|k| Some((*k, r2(num(&holder.p, k)?))))
+                .collect(),
+            machines: fitting(machines, |m| holder.fits(m)),
+        })
+        .collect()
+}
+/// Setup 1's vise or clamps as keep-out zones. Only their kind, size, place
+/// and clearance gap are told: never the library entry's name or notes.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkholdingReport {
+    /// "Vise", "Clamps" or "Chuck", a round bar's "V-block", "Soft jaws"
+    /// or "Collet block", or "Hold-down screws" (a sheet's, through its
+    /// waste into the spoilboard: each box is a screw's head).
+    pub kind: &'static str,
+    /// The `workholding_library` number of setup 1's entry, which a later
+    /// setup's `holder` of null shares; absent when setup 1 has no entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<usize>,
+    /// Each jaw or clamp as x0, y0, z0, x1, y1, z1 in setup 1's axes, measured
+    /// from the model's -X/-Y/bottom corner, without the gap. A jaw is shown
+    /// from the stock's bottom up.
+    pub boxes: Vec<[f32; 6]>,
+    /// The clearance every box is grown by for the check.
+    pub gap: f32,
+    /// How far above the stock top the highest box and its gap reach; absent
+    /// when none reaches above the stock top.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clearance_above_stock_top: Option<f32>,
+    /// The chuck on the rotary A axis, for "Chuck".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chuck: Option<ChuckReport>,
+    /// The round bar a V-block, soft jaws or a collet block holds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub round_bar: Option<RoundBarReport>,
+}
+/// Setup 1's round bar on a 3-axis mill (`round_hold`), mm.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RoundBarReport {
+    pub diameter: f32,
+    pub length: f32,
+    /// "X" for a bar lying along X (a V-block, soft jaws bored along X),
+    /// "Z" for one standing (soft jaws bored upright, a collet block).
+    pub along: &'static str,
+}
+/// Setup 1's chuck (`chuck::Rig`), mm.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ChuckReport {
+    /// 3 or 4.
+    pub jaws: usize,
+    pub chuck_diameter: f32,
+    pub jaw_length: f32,
+    /// How long the jaws grip the stock.
+    pub gripped_length: f32,
+    /// How far the stock reaches out of the jaws, towards +X.
+    pub stickout: f32,
+    /// The stock's diameter when it is a round bar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bar_diameter: Option<f32>,
+    /// "Retracted", "Supports the stock" or "Off the table".
+    pub tailstock: String,
+    /// The A angle every operation runs at.
+    pub a_angle: f32,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MachineReport {
+    pub max_rpm: f32,
+    pub max_feed: f32,
+    pub travel: [f32; 3],
+    /// What fits in the machine, when it gives the figures (LIO-252): the
+    /// program refuses a part and tool that do not fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clearance: Option<ClearanceReport>,
+    /// The coolant choices the machine has outputs for.
+    pub coolants: Vec<&'static str>,
+}
+/// A machine's clearances in mm, as the model is told them; a missing figure
+/// is not checked.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ClearanceReport {
+    /// From the spindle nose, with Z at its top, to the table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nose_to_table: Option<f32>,
+    /// Under the gantry beam, and between its uprights.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gantry_height: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gantry_width: Option<f32>,
+    /// The machine's figures that are only ASSUMED, not measured.
+    pub assumed: Vec<&'static str>,
+}
+/// The project material and its cutting data, as the model sees them.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct MaterialReport {
+    pub name: String,
+    pub group: String,
+    pub hardness: String,
+    pub notes: String,
+    pub vc_min_m_per_min: f32,
+    pub vc_max_m_per_min: f32,
+    pub chip_load_mm: Vec<ChipLoadBand>,
+}
+/// Chip load per tooth (mm) for tool diameters up to `up_to_mm` (and above
+/// the previous band); `None` is every larger diameter.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ChipLoadBand {
+    pub up_to_mm: Option<f32>,
+    pub min: f32,
+    pub max: f32,
+}
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct ToolReport {
+    pub number: u32,
+    pub name: String,
+    pub kind: String,
+    pub diameter: f32,
+    pub flutes: u32,
+    pub flute_length: f32,
+    pub stickout: f32,
+    /// Explicit capability for a manual Slot's plunge. Missing is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub center_cutting: Option<bool>,
+    /// A chamfer mill's included tip angle, degrees.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tip_angle: Option<f32>,
+    /// A chamfer mill's flat tip, across, mm, when it is not pointed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tip_flat: Option<f32>,
+    /// A thread mill's thread angle (55 or 60), and a tap's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_angle: Option<f32>,
+    /// A thread mill's finest and coarsest pitch, mm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pitches: Option<[f32; 2]>,
+    /// How deep a thread mill's neck lets it reach, mm; a keyseat cutter's
+    /// reach from its head's bottom to its shank.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reach: Option<f32>,
+    /// A keyseat cutter's neck diameter, mm (its `diameter` is the head's
+    /// and its `flute_length` the head's width).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub neck_diameter: Option<f32>,
+    /// A thread mill's teeth stacked along it, when more than one: it cuts
+    /// only the pitch they are spaced at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub teeth: Option<usize>,
+    /// A tap's thread size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<String>,
+    /// A reamer's tolerance class, like H7.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tolerance: Option<String>,
+    /// A boring head's smallest and largest bore, mm; its `diameter` is
+    /// its body's and its `flute_length` how far its bar reaches below it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bore_range: Option<[f32; 2]>,
+    /// The `machines` numbers the tool fits; told only with `machines`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machines: Option<Vec<usize>>,
+    /// A turning tool's hand and lead angle, degrees; its nose radius and a
+    /// boring bar's, mm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hand: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lead_angle: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nose_radius: Option<f32>,
+    /// The smallest bore a boring bar enters, mm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_bore: Option<f32>,
+    /// A grooving tool's or parting blade's width, mm.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width: Option<f32>,
+}
+/// A lathe tool as the report tells it: its kind and the sizes the Turn
+/// checks use; its mill sizes are 0. None without a number.
+fn lathe_tool(t: &crate::model::Tool, machines: &[&crate::model::Machine]) -> Option<ToolReport> {
+    let value = |k: &str| num(&t.p, k).filter(|v| v.is_finite());
+    let kind = get(&t.p, "type");
+    Some(ToolReport {
+        number: t.number()?,
+        name: t.name().to_string(),
+        kind: kind.to_string(),
+        hand: (kind == "Turning tool").then(|| get(&t.p, "hand").to_string()),
+        lead_angle: (kind == "Turning tool")
+            .then(|| value("lead_angle"))
+            .flatten(),
+        nose_radius: value("nose_radius"),
+        min_bore: value("min_bore"),
+        width: value("width"),
+        reach: value("reach"),
+        thread_angle: (kind == "Threading tool")
+            .then(|| value("thread_angle"))
+            .flatten(),
+        pitches: (kind == "Threading tool")
+            .then(|| {
+                let (a, b) = get(&t.p, "pitches").split_once('-')?;
+                Some([a.trim().parse().ok()?, b.trim().parse().ok()?])
+            })
+            .flatten(),
+        thread: crate::lathe::die_spec(t).map(|s| s.name.to_string()),
+        machines: fitting(machines, |m| t.fits(m)),
+        ..ToolReport::default()
+    })
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OrientationReport {
+    pub up: &'static str,
+    pub is_setup1: bool,
+    /// Model extent in this orientation: X, Y and height.
+    pub model_size: [f32; 3],
+    /// Stock beyond the model before any machining: top, bottom, -X, +X, -Y, +Y.
+    pub stock_margin: [f32; 6],
+    /// Visible horizontal faces, largest first. Positions are measured from
+    /// the model's -X/-Y corner in this orientation.
+    pub planes: Vec<PlaneReport>,
+    /// Visible area that is neither horizontal nor vertical (mm²).
+    pub freeform_area: f32,
+    pub truncated: bool,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlaneReport {
+    pub surfaces: Vec<usize>,
+    /// "top" for the highest plane, otherwise "floor".
+    pub kind: &'static str,
+    pub depth_below_top: f32,
+    pub area: f32,
+    /// x0, y0, x1, y1
+    pub bbox: [f32; 4],
+    /// Largest flat cutter that fits inside the floor outline (floors only).
+    pub max_cutter_diameter: Option<f32>,
+    pub holes: Vec<HoleReport>,
+    /// Holes through this floor, of any shape, with nothing of the part over
+    /// or under them (floors only).
+    pub openings: Vec<OpeningReport>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OpeningReport {
+    /// x0, y0, x1, y1
+    pub bbox: [f32; 4],
+    /// From the floor down to where the opening's walls end.
+    pub depth: f32,
+    pub max_cutter_diameter: f32,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HoleReport {
+    pub center: [f32; 2],
+    /// Narrowest diameter down to the bottom, a bore read at its
+    /// tessellation's vertices (its nominal size): the largest drill that fits.
+    pub diameter: f32,
+    pub opening_diameter: f32,
+    pub depth: f32,
+    pub through: bool,
+    /// The cone the opening narrows down in, when it is countersunk.
+    pub countersink: Option<CountersinkReport>,
+    /// The thread modeled in it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread: Option<ThreadReport>,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ThreadReport {
+    /// Its standard size ("M6×1", "1/4-20 UNC"), or Ø major × pitch.
+    pub size: String,
+    pub pitch: f32,
+    pub right_hand: bool,
+    /// How far it runs down from the hole's top.
+    pub length: f32,
+    /// The drill its hole takes before it is threaded.
+    pub tap_drill: f32,
+}
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CountersinkReport {
+    /// Its included angle, degrees.
+    pub angle: f32,
+    /// From the plane down to where the cone ends.
+    pub depth: f32,
+}
+fn r2(v: f32) -> f32 {
+    // Adding 0 turns a rounded -0.0 into 0.0, so it never prints as "-0.0".
+    (v * 100.).round() / 100. + 0.
+}
+/// The part axis that points up in this setup, when the setup is square to
+/// the part (every rotation a multiple of 90°).
+pub fn up_axis(setup: &Setup) -> Option<&'static str> {
+    let angles = ["rx", "ry", "rz"].map(|k| num(&setup.p, k).unwrap_or(f32::NAN));
+    let axes = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]].map(|a| rotation(a, angles));
+    if axes
+        .iter()
+        .flatten()
+        .any(|v| !v.is_finite() || (v.abs() > 0.001 && v.abs() < 0.999))
+    {
+        return None;
+    }
+    let (axis, z) = (0..3)
+        .map(|k| (k, axes[k][2]))
+        .find(|(_, z)| z.abs() > 0.5)?;
+    Some(match (axis, z > 0.) {
+        (0, true) => "+X",
+        (0, false) => "-X",
+        (1, true) => "+Y",
+        (1, false) => "-Y",
+        (_, true) => "+Z",
+        (_, false) => "-Z",
+    })
+}
+/// The setup rotation for an orientation: setup 1's own rotation for its up
+/// axis, the canonical rotation otherwise.
+pub fn rotation_for(setup1: &Setup, up: &str) -> Option<[f32; 3]> {
+    if up_axis(setup1) == Some(up) {
+        return Some(["rx", "ry", "rz"].map(|k| num(&setup1.p, k).unwrap_or(0.)));
+    }
+    ORIENTATIONS
+        .iter()
+        .find(|(name, _)| *name == up)
+        .map(|(_, r)| *r)
+}
+/// A copy of setup 1 turned to `up`. Later setups carry no translation.
+pub fn oriented(setup1: &Setup, up: &str) -> Option<Setup> {
+    let rotation = rotation_for(setup1, up)?;
+    let mut setup = setup1.clone();
+    let first = up_axis(setup1) == Some(up);
+    for (key, value) in ["rx", "ry", "rz"].iter().zip(rotation) {
+        setup.p.insert((*key).into(), value.to_string());
+    }
+    if !first {
+        for key in ["tx", "ty", "tz"] {
+            setup.p.insert(key.into(), "0".into());
+        }
+    }
+    Some(setup)
+}
+/// XY bucket index over the placed triangles, for height queries.
+pub(crate) struct Index<'a> {
+    geometry: &'a Geometry,
+    cell: f32,
+    n: [usize; 2],
+    cells: Vec<Vec<u32>>,
+}
+impl<'a> Index<'a> {
+    pub(crate) fn new(geometry: &'a Geometry) -> Self {
+        let d = geometry.bounds.dimensions();
+        let cell = (d[0].max(d[1]) / 128.).max(0.01);
+        let n = [0, 1].map(|k| (d[k] / cell).ceil() as usize + 1);
+        let mut cells = vec![vec![]; n[0] * n[1]];
+        let mut index = Self {
+            geometry,
+            cell,
+            n,
+            cells: vec![],
+        };
+        for (i, t) in geometry.triangles.iter().enumerate() {
+            let lo = [0, 1].map(|k| t.p.iter().map(|p| p[k]).fold(f32::INFINITY, f32::min));
+            let hi = [0, 1].map(|k| t.p.iter().map(|p| p[k]).fold(f32::NEG_INFINITY, f32::max));
+            let (a, b) = (index.cell_of(lo), index.cell_of(hi));
+            for y in a[1]..=b[1] {
+                for x in a[0]..=b[0] {
+                    cells[y * n[0] + x].push(i as u32);
+                }
+            }
+        }
+        index.cells = cells;
+        index
+    }
+    fn cell_of(&self, xy: [f32; 2]) -> [usize; 2] {
+        [0, 1].map(|k| {
+            (((xy[k] - self.geometry.bounds.min[k]) / self.cell)
+                .floor()
+                .max(0.) as usize)
+                .min(self.n[k] - 1)
+        })
+    }
+    /// Triangles whose XY bucket contains `xy`.
+    pub(crate) fn near(&self, xy: [f32; 2]) -> impl Iterator<Item = &'a cam::Triangle> + '_ {
+        let c = self.cell_of(xy);
+        self.cells[c[1] * self.n[0] + c[0]]
+            .iter()
+            .map(|i| &self.geometry.triangles[*i as usize])
+    }
+    /// Highest mesh point above `xy`.
+    fn height(&self, xy: [f32; 2]) -> Option<f32> {
+        self.near(xy)
+            .filter_map(|t| cam::plane_height(&t.p, xy))
+            .max_by(f32::total_cmp)
+    }
+}
+/// Crossings of the vertical line through `xy` with the surface, lowest
+/// first: height, and whether the face points up. Crossings within 0.0001 mm
+/// of the one below them are at one height, and there those facing down come
+/// first, whatever the triangle order, so a pair facing both ways errs
+/// towards solid.
+fn crossings(index: &Index, xy: [f32; 2]) -> Vec<(f32, bool)> {
+    let mut hits: Vec<(f32, bool)> = index
+        .near(xy)
+        .filter_map(|t| Some((cam::plane_height(&t.p, xy)?, normal(&t.p)[2] > 0.)))
+        .collect();
+    hits.sort_by(|a, b| a.0.total_cmp(&b.0));
+    for run in hits.chunk_by_mut(|a, b| b.0 - a.0 < 1e-4) {
+        run.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.total_cmp(&b.0)));
+    }
+    hits.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-4 && a.1 == b.1);
+    hits
+}
+/// Solid spans from `hits`, lowest first, or `None` when the face directions
+/// are inconsistent. A column whose spans are all of zero length (a crossing
+/// facing down and one facing up within 0.0001 mm of one height, with
+/// nothing solid on either side, as through a sheet written with both
+/// windings) is inconsistent too.
+fn spans(hits: &[(f32, bool)]) -> Option<Vec<(f32, f32)>> {
+    let mut spans = vec![];
+    let (mut depth, mut start, mut consistent) = (0i32, 0f32, true);
+    for (z, up) in hits {
+        if !*up {
+            if depth == 0 {
+                start = *z;
+            }
+            depth += 1;
+        } else {
+            depth -= 1;
+            if depth == 0 {
+                spans.push((start, *z));
+            }
+            consistent &= depth >= 0;
+        }
+    }
+    let solid = spans.is_empty() || spans.iter().any(|(lo, hi)| hi - lo >= 1e-4);
+    (consistent && depth == 0 && solid).then_some(spans)
+}
+/// The lowest crossing of an inconsistent column and whether it faces down,
+/// and the highest and whether it faces up.
+type Ends = [(f32, bool); 2];
+/// The column at `xy` and, while it is inconsistent, at four points 0.002 mm
+/// away: `Ok` with the first consistent spans, or `Err` with the ends of all
+/// five when they are all inconsistent. Crossings within 0.0001 mm of one
+/// height that face both ways count as facing the way that makes more of the
+/// column solid.
+fn retried(index: &Index, xy: [f32; 2]) -> Result<Vec<(f32, f32)>, Ends> {
+    let (mut low, mut high) = ((f32::INFINITY, true), (f32::NEG_INFINITY, true));
+    for d in [
+        [0., 0.],
+        [0.002, 0.],
+        [-0.002, 0.],
+        [0., 0.002],
+        [0., -0.002],
+    ] {
+        let hits = crossings(index, [xy[0] + d[0], xy[1] + d[1]]);
+        if let Some(spans) = spans(&hits) {
+            return Ok(spans);
+        }
+        for (z, up) in hits {
+            if z < low.0 - 1e-4 {
+                low = (z, !up);
+            } else if z <= low.0 + 1e-4 {
+                low = (low.0.min(z), low.1 && !up);
+            }
+            if z > high.0 + 1e-4 {
+                high = (z, up);
+            } else if z >= high.0 - 1e-4 {
+                high = (high.0.max(z), high.1 && up);
+            }
+        }
+    }
+    Err([low, high])
+}
+/// Solid spans along the vertical line through `xy`, erring towards solid: an
+/// inconsistent column is retried at four nearby offsets, and if it stays
+/// inconsistent it counts as solid from its lowest crossing if that faces
+/// down, otherwise from the model's bottom, up to its highest crossing if
+/// that faces up, otherwise up to `top`. A column with no crossing is empty.
+pub(crate) fn solid(index: &Index, xy: [f32; 2], top: f32) -> Vec<(f32, f32)> {
+    retried(index, xy).unwrap_or_else(|[(low, down), (high, up)]| {
+        let from = if down {
+            low
+        } else {
+            index.geometry.bounds.min[2]
+        };
+        let to = if up { high } else { top };
+        vec![(from, to.max(from))]
+    })
+}
+/// Share of a 48 × 48 grid of vertical rays over the model that cross its
+/// surface inconsistently at all five positions `retried` tries; rays that
+/// hit nothing are not counted. A model no ray hits counts as inconsistent.
+fn inconsistent_share(geometry: &Geometry) -> f32 {
+    let index = Index::new(geometry);
+    let b = geometry.bounds;
+    let (mut hit, mut bad) = (0, 0);
+    for i in 0..48 * 48 {
+        let xy = [i % 48, i / 48].map(|n| (n as f32 + 0.5) / 48.);
+        let xy = [0, 1].map(|k| b.min[k] + (b.max[k] - b.min[k]) * xy[k] + 1e-4);
+        match retried(&index, xy) {
+            Ok(spans) if spans.is_empty() => {}
+            Ok(_) => hit += 1,
+            Err(_) => (hit, bad) = (hit + 1, bad + 1),
+        }
+    }
+    if hit == 0 {
+        1.
+    } else {
+        bad as f32 / hit as f32
+    }
+}
+/// Coordinates beyond this are not checked (mm).
+const FAR: f64 = 1_000_000.;
+/// The part's triangles in mm, in the mesh's own frame (whether a surface is
+/// closed does not depend on where setup 1 puts it), and the largest absolute
+/// coordinate the part had in its file (mm).
+fn mm_triangles(mesh: &Mesh) -> (Vec<[[f64; 3]; 3]>, f64) {
+    let scale = f64::from(mesh.display_scale());
+    let origin = mesh.origin.map(f64::from);
+    let mut largest = 0f64;
+    let triangles = mesh
+        .faces
+        .iter()
+        .filter(|f| f.points.len() == 3)
+        .map(|f| {
+            std::array::from_fn(|i| {
+                let p = f.points[i].map(f64::from);
+                for k in 0..3 {
+                    largest = largest.max(((p[k] - origin[k]) / scale).abs());
+                }
+                p.map(|v| v / scale)
+            })
+        })
+        .collect();
+    (triangles, largest)
+}
+/// What the closed-surface test finds.
+#[derive(Debug, PartialEq)]
+struct Closure {
+    open_edges: usize,
+    encloses_volume: bool,
+    /// A coordinate lies beyond `FAR` or is not finite.
+    far: bool,
+    /// Ends of open edges the split looked at, for the test that keeps it
+    /// far below every end for every open edge.
+    looked: usize,
+}
+/// How far apart two points may be and still be one point, in a part whose
+/// coordinates reach `largest` mm: 8 f32 steps at that coordinate (float
+/// rounding), or √3 times the last digit of 7 significant digits there if
+/// that is more (coordinates written as text, as ASCII STL's `%.6e`), with
+/// the reach taken as at least 1 mm.
+fn tolerance(largest: f64) -> f64 {
+    let f = largest as f32;
+    let float = 8. * f64::from(f32::from_bits(f.to_bits() + 1) - f);
+    // The power of ten at or below the reach.
+    let mut decade = 1f64;
+    while decade < FAR && decade * 10. <= largest {
+        decade *= 10.;
+    }
+    float.max(3f64.sqrt() * decade / 1e6)
+}
+/// The closed-surface test on `triangles` (mm), whose coordinates reached
+/// `largest` mm in the part's file. The tolerance comes from the largest
+/// absolute coordinate in either frame (see `tolerance`). Points within it of
+/// each other are one vertex unless they span more than twice the tolerance
+/// (see `weld`), zero-area triangles are ignored, and a triangle written more
+/// than once with the same winding counts once; with opposite windings both
+/// count, and their edges cancel. An edge used by an odd number of triangles
+/// is open. Each open edge is then split at every end of an open edge that
+/// lies within the tolerance of it and farther than that from both its ends,
+/// as at a T-junction, and the pieces used an odd number of times are the
+/// open edges left. The enclosed volume is about zero when it is under 1e-9
+/// of the bounding box's, as for a sheet written with both windings.
+/// Coordinates beyond `FAR` or not finite set `far` and make every edge open.
+fn closure(triangles: &[[[f64; 3]; 3]], largest: f64) -> Closure {
+    let mut largest = largest;
+    for v in triangles.iter().flatten().flatten() {
+        if v.is_nan() || v.abs() > FAR {
+            largest = f64::INFINITY;
+            break;
+        }
+        largest = largest.max(v.abs());
+    }
+    if largest.is_nan() || largest > FAR {
+        return Closure {
+            open_edges: 3 * triangles.len(),
+            encloses_volume: false,
+            far: true,
+            looked: 0,
+        };
+    }
+    let tol = tolerance(largest);
+    let (corners, points) = weld(triangles, tol);
+    let mut faces: Vec<[u32; 3]> = triangles
+        .iter()
+        .zip(corners)
+        .filter_map(|(t, ids)| {
+            let n = cross(sub(t[1], t[0]), sub(t[2], t[0]));
+            let longest = (0..3)
+                .map(|k| dot(sub(t[(k + 1) % 3], t[k]), sub(t[(k + 1) % 3], t[k])))
+                .fold(0., f64::max);
+            // Zero area: corners welded together, or flat to f64 rounding.
+            let zero = ids[0] == ids[1]
+                || ids[1] == ids[2]
+                || ids[0] == ids[2]
+                || dot(n, n) <= 1e-24 * longest * longest;
+            // Written from its smallest id, a triangle with the same winding
+            // is always the same triple.
+            let k = (0..3).min_by_key(|k| ids[*k]).unwrap_or(0);
+            (!zero).then_some([ids[k], ids[(k + 1) % 3], ids[(k + 2) % 3]])
+        })
+        .collect();
+    faces.sort_unstable();
+    faces.dedup();
+    let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+    for p in triangles.iter().flatten() {
+        for k in 0..3 {
+            lo[k] = lo[k].min(p[k]);
+            hi[k] = hi[k].max(p[k]);
+        }
+    }
+    // Measured from the box's centre, which keeps the rounding small.
+    let centre: [f64; 3] = std::array::from_fn(|k| (lo[k] + hi[k]) / 2.);
+    let volume: f64 = faces
+        .iter()
+        .map(|f| {
+            let [a, b, c] = f.map(|i| sub(points[i as usize], centre));
+            dot(a, cross(b, c))
+        })
+        .sum::<f64>()
+        / 6.;
+    let encloses_volume = volume.abs() > 1e-9 * (0..3).map(|k| hi[k] - lo[k]).product::<f64>();
+    let open = odd(faces
+        .iter()
+        .flat_map(|f| [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])])
+        .map(|(a, b)| (a.min(b), a.max(b)))
+        .collect());
+    if open.is_empty() {
+        return Closure {
+            open_edges: 0,
+            encloses_volume,
+            far: false,
+            looked: 0,
+        };
+    }
+    // Only the ends of open edges can split one.
+    let mut ends: Vec<u32> = open.iter().flat_map(|e| [e.0, e.1]).collect();
+    ends.sort_unstable();
+    ends.dedup();
+    let tree = Tree::new(&points, ends);
+    let (mut pieces, mut cuts, mut looked) = (vec![], vec![], 0);
+    for &(a, b) in &open {
+        let (pa, pb) = (points[a as usize], points[b as usize]);
+        let d = sub(pb, pa);
+        cuts.clear();
+        tree.near(pa, pb, tol, |v| {
+            looked += 1;
+            let p = points[v as usize];
+            let t = (dot(sub(p, pa), d) / dot(d, d)).clamp(0., 1.);
+            let off = sub(p, std::array::from_fn(|k| pa[k] + d[k] * t));
+            let far = |q: [f64; 3]| dot(sub(p, q), sub(p, q)) > tol * tol;
+            if dot(off, off) <= tol * tol && far(pa) && far(pb) {
+                cuts.push((t, v));
+            }
+        });
+        cuts.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+        let mut from = a;
+        for &(_, v) in &cuts {
+            pieces.push((from.min(v), from.max(v)));
+            from = v;
+        }
+        pieces.push((from.min(b), from.max(b)));
+    }
+    Closure {
+        open_edges: odd(pieces).len(),
+        encloses_volume,
+        far: false,
+        looked,
+    }
+}
+/// The edges that occur an odd number of times in `edges`.
+fn odd(mut edges: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    edges.sort_unstable();
+    edges
+        .chunk_by(|a, b| a == b)
+        .filter(|run| run.len() % 2 == 1)
+        .map(|run| run[0])
+        .collect()
+}
+/// Welded vertex ids of the corners of `triangles`, and a position for each
+/// (its first copy). Copies within `tol` of each other are grouped, and so
+/// are chains of such copies; a group is one vertex when its points fit in a
+/// box whose diagonal is at most 2 × `tol` (so no group wider than that is
+/// welded), and otherwise its points stay distinct, as a row of distinct
+/// points is not copies of one. Copies that differ only by rounding are
+/// within `tol` of each other, so their box's diagonal is at most √3 × `tol`.
+/// Equal copies are found first. The rest are grouped in cells `tol` / √3
+/// across, so all copies in one cell are within `tol` of each other and need
+/// no comparison, and each cell is compared only with the cells up to two
+/// cells away.
+fn weld(triangles: &[[[f64; 3]; 3]], tol: f64) -> (Vec<[u32; 3]>, Vec<[f64; 3]>) {
+    use std::collections::HashMap;
+    let mut seen: HashMap<[u64; 3], u32> = HashMap::new();
+    let mut points: Vec<[f64; 3]> = vec![];
+    let corners: Vec<[u32; 3]> = triangles
+        .iter()
+        .map(|t| {
+            t.map(|p| {
+                // Adding zero makes -0 and 0 one key.
+                *seen
+                    .entry(p.map(|v| (v + 0.).to_bits()))
+                    .or_insert_with(|| {
+                        points.push(p);
+                        points.len() as u32 - 1
+                    })
+            })
+        })
+        .collect();
+    let side = tol / 1.7321;
+    let mut order: Vec<([i64; 3], u32)> = points
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.map(|v| (v / side).floor() as i64), i as u32))
+        .collect();
+    order.sort_unstable();
+    // Each cell's key and its copies (a range of `order`).
+    let mut cells: Vec<([i64; 3], std::ops::Range<usize>)> = vec![];
+    for run in order.chunk_by(|a, b| a.0 == b.0) {
+        let start = cells.last().map_or(0, |c| c.1.end);
+        cells.push((run[0].0, start..start + run.len()));
+    }
+    fn root(parent: &mut [u32], mut i: u32) -> u32 {
+        while parent[i as usize] != i {
+            parent[i as usize] = parent[parent[i as usize] as usize];
+            i = parent[i as usize];
+        }
+        i
+    }
+    let mut parent: Vec<u32> = (0..cells.len() as u32).collect();
+    let near = |p: u32, q: u32| {
+        let d = sub(points[p as usize], points[q as usize]);
+        dot(d, d) <= tol * tol
+    };
+    // Each pair of cells up to two apart once, the later one in key order:
+    // for each X and Y step, the cells with Z up to two either way (only
+    // above, when X and Y are the same). The keys are sorted, so each step's
+    // cursor only moves forward.
+    let steps: Vec<[i64; 2]> = (0..=2)
+        .flat_map(|x| (-2..=2).map(move |y| [x, y]))
+        .filter(|s| *s >= [0, 0])
+        .collect();
+    let mut cursors = vec![0; steps.len()];
+    for c in 0..cells.len() {
+        let key = cells[c].0;
+        for (step, cursor) in steps.iter().zip(&mut cursors) {
+            let below = if *step == [0, 0] { 1 } else { -2 };
+            let lo = [key[0] + step[0], key[1] + step[1], key[2] + below];
+            let hi = [lo[0], lo[1], key[2] + 2];
+            while *cursor < cells.len() && cells[*cursor].0 < lo {
+                *cursor += 1;
+            }
+            for d in (*cursor..cells.len()).take_while(|d| cells[*d].0 <= hi) {
+                let (a, b) = (root(&mut parent, c as u32), root(&mut parent, d as u32));
+                if a != b
+                    && order[cells[c].1.clone()]
+                        .iter()
+                        .any(|(_, p)| order[cells[d].1.clone()].iter().any(|(_, q)| near(*p, *q)))
+                {
+                    parent[a.max(b) as usize] = a.min(b);
+                }
+            }
+        }
+    }
+    let mut group_of = vec![0usize; points.len()];
+    for (c, (_, range)) in cells.iter().enumerate() {
+        let r = root(&mut parent, c as u32) as usize;
+        for (_, i) in &order[range.clone()] {
+            group_of[*i as usize] = r;
+        }
+    }
+    // Each group's box.
+    let (mut lo, mut hi) = (
+        vec![[f64::INFINITY; 3]; cells.len()],
+        vec![[f64::NEG_INFINITY; 3]; cells.len()],
+    );
+    for (p, &r) in points.iter().zip(&group_of) {
+        for k in 0..3 {
+            lo[r][k] = lo[r][k].min(p[k]);
+            hi[r][k] = hi[r][k].max(p[k]);
+        }
+    }
+    // Ids in order of first use, each placed at its first copy.
+    let (mut id_of_root, mut ids, mut welded) = (vec![u32::MAX; cells.len()], vec![], vec![]);
+    for (p, r) in points.iter().zip(group_of) {
+        let diagonal = sub(hi[r], lo[r]);
+        if dot(diagonal, diagonal) > 4. * tol * tol {
+            ids.push(welded.len() as u32);
+            welded.push(*p);
+            continue;
+        }
+        if id_of_root[r] == u32::MAX {
+            id_of_root[r] = welded.len() as u32;
+            welded.push(*p);
+        }
+        ids.push(id_of_root[r]);
+    }
+    let corners = corners
+        .into_iter()
+        .map(|c| c.map(|i| ids[i as usize]))
+        .collect();
+    (corners, welded)
+}
+/// Points in a k-d tree, to find those near a segment.
+struct Tree<'a> {
+    points: &'a [[f64; 3]],
+    ids: Vec<u32>,
+    /// Each node's box, its points (a range of `ids`) and its children.
+    nodes: Vec<Node>,
+}
+type Node = (
+    [f64; 3],
+    [f64; 3],
+    std::ops::Range<usize>,
+    Option<[usize; 2]>,
+);
+impl<'a> Tree<'a> {
+    fn new(points: &'a [[f64; 3]], ids: Vec<u32>) -> Self {
+        let mut tree = Self {
+            points,
+            ids,
+            nodes: vec![],
+        };
+        tree.build(0..tree.ids.len());
+        tree
+    }
+    fn build(&mut self, range: std::ops::Range<usize>) -> usize {
+        let points = self.points;
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for i in &self.ids[range.clone()] {
+            let p = points[*i as usize];
+            for k in 0..3 {
+                lo[k] = lo[k].min(p[k]);
+                hi[k] = hi[k].max(p[k]);
+            }
+        }
+        let node = self.nodes.len();
+        self.nodes.push((lo, hi, range.clone(), None));
+        if range.len() > 8 {
+            let axis = (0..3)
+                .max_by(|a, b| (hi[*a] - lo[*a]).total_cmp(&(hi[*b] - lo[*b])))
+                .unwrap_or(0);
+            let mid = range.start + range.len() / 2;
+            self.ids[range.clone()].select_nth_unstable_by(mid - range.start, |a, b| {
+                points[*a as usize][axis].total_cmp(&points[*b as usize][axis])
+            });
+            let children = [self.build(range.start..mid), self.build(mid..range.end)];
+            self.nodes[node].3 = Some(children);
+        }
+        node
+    }
+    /// Calls `visit` with every point within `reach` of the segment from `a`
+    /// to `b`, and with some others near it.
+    fn near(&self, a: [f64; 3], b: [f64; 3], reach: f64, mut visit: impl FnMut(u32)) {
+        let mut stack = vec![0];
+        while let Some(n) = stack.pop() {
+            let (lo, hi, range, children) = &self.nodes[n];
+            if !meets(a, b, lo.map(|v| v - reach), hi.map(|v| v + reach)) {
+                continue;
+            }
+            match children {
+                Some(c) => stack.extend(c),
+                None => self.ids[range.clone()].iter().for_each(|i| visit(*i)),
+            }
+        }
+    }
+}
+/// Whether the segment from `a` to `b` meets the box from `lo` to `hi`.
+fn meets(a: [f64; 3], b: [f64; 3], lo: [f64; 3], hi: [f64; 3]) -> bool {
+    let (mut t0, mut t1) = (0f64, 1f64);
+    for k in 0..3 {
+        let d = b[k] - a[k];
+        if d == 0. {
+            if a[k] < lo[k] || a[k] > hi[k] {
+                return false;
+            }
+            continue;
+        }
+        let (u, v) = ((lo[k] - a[k]) / d, (hi[k] - a[k]) / d);
+        t0 = t0.max(u.min(v));
+        t1 = t1.min(u.max(v));
+        if t0 > t1 {
+            return false;
+        }
+    }
+    true
+}
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|k| a[k] - b[k])
+}
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    (0..3).map(|k| a[k] * b[k]).sum()
+}
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+/// Unnormalized normal; its length is twice the triangle's area.
+pub(crate) fn normal(p: &[[f32; 3]; 3]) -> [f32; 3] {
+    let a: [f32; 3] = std::array::from_fn(|i| p[1][i] - p[0][i]);
+    let b: [f32; 3] = std::array::from_fn(|i| p[2][i] - p[0][i]);
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+pub(crate) fn centroid(p: &[[f32; 3]; 3]) -> [f32; 3] {
+    std::array::from_fn(|i| (p[0][i] + p[1][i] + p[2][i]) / 3.)
+}
+#[derive(Default)]
+struct Face {
+    z: f32,
+    area: f32,
+    visible: f32,
+    flat: bool,
+    bbox: [f32; 4],
+}
+/// The largest cutter diameter that still fits inside the plane's outline.
+fn orientation(
+    setup1: &Setup,
+    stock: &Volume,
+    mesh: &Mesh,
+    up: &'static str,
+    max_holes: usize,
+) -> Option<OrientationReport> {
+    let setup = oriented(setup1, up)?;
+    let geometry = Geometry::new(&setup, mesh);
+    let index = Index::new(&geometry);
+    let model = geometry.bounds;
+    let mut faces: std::collections::BTreeMap<usize, Face> = Default::default();
+    let mut freeform = 0.;
+    for t in &geometry.triangles {
+        let n = normal(&t.p);
+        let twice_area = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        if twice_area < 1e-9 {
+            continue;
+        }
+        let (c, slope) = (centroid(&t.p), n[2] / twice_area);
+        let visible = index.height([c[0], c[1]]).is_none_or(|h| h <= c[2] + 0.01);
+        if slope.abs() < FLAT {
+            if slope > WALL && visible {
+                freeform += twice_area / 2.;
+            }
+            continue;
+        }
+        let Some(id) = t.feature else { continue };
+        let face = faces.entry(id).or_insert(Face {
+            z: c[2],
+            flat: true,
+            bbox: [
+                f32::INFINITY,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+            ],
+            ..Default::default()
+        });
+        face.area += twice_area / 2.;
+        if visible {
+            face.visible += twice_area / 2.;
+        }
+        for p in &t.p {
+            face.flat &= (p[2] - face.z).abs() <= 0.002;
+            face.bbox = [
+                face.bbox[0].min(p[0]),
+                face.bbox[1].min(p[1]),
+                face.bbox[2].max(p[0]),
+                face.bbox[3].max(p[1]),
+            ];
+        }
+    }
+    // Coplanar visible faces at one height form one plane. Heights are sorted
+    // and a cluster closes when a face is more than PLANE_TOLERANCE above its
+    // lowest, so faces a few µm apart are never split by where a fixed bin
+    // edge happens to fall and a chain of faces cannot drift across any height.
+    let mut heights: Vec<(f32, usize)> = faces
+        .iter()
+        .filter(|(_, face)| face.flat && face.visible >= face.area * 0.5)
+        .map(|(id, face)| (face.z, *id))
+        .collect();
+    heights.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let mut cluster_of: std::collections::HashMap<usize, usize> = Default::default();
+    let mut cluster = 0;
+    let mut start = f32::NEG_INFINITY;
+    for (i, (z, id)) in heights.iter().enumerate() {
+        if i == 0 {
+            start = *z;
+        } else if z - start > PLANE_TOLERANCE {
+            cluster += 1;
+            start = *z;
+        }
+        cluster_of.insert(*id, cluster);
+    }
+    // A plane's depth is the area-weighted height of its faces, so that it
+    // does not depend on the order of the surface ids.
+    let mut weighted: std::collections::HashMap<usize, (f64, f64)> = Default::default();
+    for (id, face) in &faces {
+        if let Some(&cluster) = cluster_of.get(id) {
+            let w = weighted.entry(cluster).or_default();
+            w.0 += f64::from(face.z) * f64::from(face.area);
+            w.1 += f64::from(face.area);
+        }
+    }
+    let mut planes: std::collections::BTreeMap<usize, PlaneReport> = Default::default();
+    for (id, face) in &faces {
+        let Some(&cluster) = cluster_of.get(id) else {
+            continue;
+        };
+        let plane = planes.entry(cluster).or_insert_with(|| {
+            let (sum, area) = weighted[&cluster];
+            PlaneReport {
+                surfaces: vec![],
+                kind: "floor",
+                depth_below_top: model.max[2] - (sum / area.max(f64::MIN_POSITIVE)) as f32,
+                area: 0.,
+                bbox: face.bbox,
+                max_cutter_diameter: None,
+                holes: vec![],
+                openings: vec![],
+            }
+        });
+        plane.surfaces.push(*id);
+        plane.area += face.area;
+        plane.bbox = [
+            plane.bbox[0].min(face.bbox[0]),
+            plane.bbox[1].min(face.bbox[1]),
+            plane.bbox[2].max(face.bbox[2]),
+            plane.bbox[3].max(face.bbox[3]),
+        ];
+    }
+    let mut planes: Vec<PlaneReport> = planes.into_values().filter(|p| p.area >= 1.).collect();
+    planes.sort_by(|a, b| b.area.total_cmp(&a.area));
+    let mut truncated = planes.len() > MAX_PLANES;
+    planes.truncate(MAX_PLANES);
+    let mut holes_left = max_holes;
+    for plane in &mut planes {
+        let top = plane.depth_below_top < 0.01;
+        if top {
+            plane.kind = "top";
+        }
+        // A flat part on a sheet: its cut-outs are openings through the top.
+        if !top || crate::sheet::is_sheet(&setup) {
+            let ids = plane.surfaces.iter().copied().collect();
+            if let Ok(floor) = crate::pocket::floor(&setup, &ids, mesh) {
+                if !top {
+                    plane.max_cutter_diameter = Some(r2(floor.largest(MAX_CUTTER)));
+                }
+                let sizes = floor.opening_sizes();
+                if sizes.len() > MAX_OPENINGS {
+                    truncated = true;
+                } else {
+                    plane.openings = floor
+                        .openings
+                        .iter()
+                        .zip(sizes)
+                        .map(|((_, bottom), (bbox, fit))| OpeningReport {
+                            bbox: [
+                                r2(bbox[0] - model.min[0]),
+                                r2(bbox[1] - model.min[1]),
+                                r2(bbox[2] - model.min[0]),
+                                r2(bbox[3] - model.min[1]),
+                            ],
+                            depth: r2(floor.plane - bottom),
+                            max_cutter_diameter: r2(fit),
+                        })
+                        .collect();
+                }
+            }
+        }
+        let mut probe = Operation::new(Strategy::Drill, String::new());
+        probe.geometry.clear();
+        probe.surfaces = Some(Selection {
+            mesh_fingerprint: mesh.fingerprint.clone(),
+            ids: plane.surfaces.clone(),
+        });
+        // A plane's holes are listed completely or not at all, and planes
+        // with too many openings are not searched.
+        if cam::hole_candidates(&setup, &probe, mesh) > holes_left {
+            truncated = true;
+        } else {
+            plane.holes = cam::holes(&setup, &probe, mesh)
+                .unwrap_or_default()
+                .iter()
+                .map(|h| HoleReport {
+                    center: [
+                        r2(h.center[0] - model.min[0]),
+                        r2(h.center[1] - model.min[1]),
+                    ],
+                    diameter: r2(h.diameter),
+                    opening_diameter: r2(h.opening),
+                    depth: r2(h.top - h.bottom),
+                    through: h.through,
+                    countersink: h.countersink.map(|c| CountersinkReport {
+                        angle: (c.angle * 10.).round() / 10. + 0.,
+                        depth: r2(c.depth),
+                    }),
+                    thread: h.thread.as_ref().map(|t| ThreadReport {
+                        size: t.name(),
+                        pitch: t.pitch,
+                        right_hand: t.right_hand,
+                        length: r2(h.top - t.from.max(h.bottom)),
+                        tap_drill: r2(t.spec.map_or(t.major - t.pitch, |s| s.tap_drill)),
+                    }),
+                })
+                .collect();
+            holes_left = holes_left.saturating_sub(plane.holes.len());
+        }
+        plane.depth_below_top = r2(plane.depth_below_top);
+        plane.area = r2(plane.area);
+        plane.bbox = [
+            r2(plane.bbox[0] - model.min[0]),
+            r2(plane.bbox[1] - model.min[1]),
+            r2(plane.bbox[2] - model.min[0]),
+            r2(plane.bbox[3] - model.min[1]),
+        ];
+    }
+    let stock: Bounds = stock.transformed_bounds(Frame::new(&setup, mesh));
+    Some(OrientationReport {
+        up,
+        is_setup1: up_axis(setup1) == Some(up),
+        model_size: model.dimensions().map(r2),
+        stock_margin: [
+            stock.max[2] - model.max[2],
+            model.min[2] - stock.min[2],
+            model.min[0] - stock.min[0],
+            stock.max[0] - model.max[0],
+            model.min[1] - stock.min[1],
+            stock.max[1] - model.max[1],
+        ]
+        .map(r2),
+        planes,
+        freeform_area: r2(freeform),
+        truncated,
+    })
+}
+/// One line of the planner's readiness checklist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Precondition {
+    pub label: &'static str,
+    pub ok: bool,
+    /// What to do when it is not met.
+    pub hint: String,
+}
+/// What must be in place before a plan can be requested or checked.
+pub fn preconditions(doc: &Document, mesh: Option<&Mesh>) -> Vec<Precondition> {
+    let line = |label, problem: Option<String>| Precondition {
+        label,
+        ok: problem.is_none(),
+        hint: problem.unwrap_or_default(),
+    };
+    let part = (doc.file.is_none() || mesh.is_none()).then(|| {
+        "Import a part and wait for it to load. The built-in example cannot be planned.".to_string()
+    });
+    let doc = &*planning(doc);
+    let setup = match doc.setups.first() {
+        None => Some("Create setup 1 with your machine and stock.".to_string()),
+        // A job on the hand machines alone is planned too (LIO-430): it
+        // makes no program, so no post or CNC limits are asked of it.
+        Some(setup1) if crate::manual::is_hand(&setup1.machine) => {
+            crate::stock::resolve(setup1, mesh).err().or_else(|| {
+                up_axis(setup1).is_none().then(|| {
+                    "Setup 1 must be square to the part: use rotations that are multiples of 90°.".into()
+                })
+            })
+        }
+        Some(setup1) => crate::post::PostSettings::for_machine(&setup1.machine)
+            .err()
+            .and_then(|e| e.into_iter().next())
+            .or_else(|| machine_report(&setup1.machine).err())
+            .or_else(|| crate::stock::resolve(setup1, mesh).err())
+            .or_else(|| {
+                up_axis(setup1).is_none().then(|| {
+                    "Setup 1 must be square to the part: use rotations that are multiples of 90°.".into()
+                })
+            })
+            .or_else(|| holding_problem(doc, mesh).filter(|_| !prepares(doc))),
+    };
+    let material = material_report(doc).err();
+    let tools = if doc.tools.is_empty() {
+        Some("Add at least one tool to the library.".to_string())
+    } else {
+        doc.tools
+            .iter()
+            .find_map(|t| doc.tool_number_issues(t).into_iter().next())
+    };
+    vec![
+        line("Imported part", part),
+        line("Setup 1: a machine and stock", setup),
+        line("Material", material),
+        line("Tool library", tools),
+    ]
+}
+/// A machine's limits as the model is told them. A UC100 machine's profile
+/// limits them further, as a run checks: the spindle's maximum rpm, and the
+/// coolant it has outputs for.
+pub fn machine_report(machine: &crate::model::Machine) -> Result<MachineReport, String> {
+    let inch = if get(&machine.p, "units") == "inch" {
+        25.4
+    } else {
+        1.
+    };
+    let mut max_rpm = num(&machine.p, "rpm").unwrap_or(0.);
+    if let Some(cap) = crate::machine_profile::spindle_cap(machine)? {
+        max_rpm = max_rpm.min(cap);
+    }
+    Ok(MachineReport {
+        max_rpm,
+        max_feed: r2(num(&machine.p, "feed").unwrap_or(0.) * inch),
+        travel: ["x", "y", "z"].map(|k| r2(num(&machine.p, k).unwrap_or(0.) * inch)),
+        clearance: clearance_report(machine, inch),
+        coolants: crate::machine_profile::coolants(machine)?,
+    })
+}
+/// The machine's clearances for the report, None when it gives none.
+fn clearance_report(machine: &crate::model::Machine, inch: f32) -> Option<ClearanceReport> {
+    let given = |k: &str| num(&machine.p, k).filter(|v| *v > 0.).map(|v| r2(v * inch));
+    let report = ClearanceReport {
+        nose_to_table: given("nose_to_table"),
+        gantry_height: given("gantry_height"),
+        gantry_width: given("gantry_width"),
+        assumed: crate::envelope::assumed(machine),
+    };
+    (report.nose_to_table.is_some()
+        || report.gantry_height.is_some()
+        || report.gantry_width.is_some())
+    .then_some(report)
+}
+/// The project's material and its cutting data, or why planning cannot use
+/// the project's material. The user's text is cleaned and bounded.
+pub fn material_report(doc: &Document) -> Result<MaterialReport, String> {
+    let material = doc
+        .selected_material()
+        .ok_or("Choose a material on the setup page.")?;
+    let data = material.cutting_data().ok_or_else(|| {
+        format!(
+            "Add cutting data to {} on the Materials page.",
+            material.name()
+        )
+    })?;
+    let text = |key: &str, limit| clip(get(&material.p, key), limit);
+    Ok(MaterialReport {
+        name: text("name", 60),
+        group: text("group", 40),
+        hardness: text("hardness", 40),
+        notes: text("notes", 500),
+        vc_min_m_per_min: data.vc.0,
+        vc_max_m_per_min: data.vc.1,
+        chip_load_mm: BANDS
+            .iter()
+            .zip(data.fz)
+            .map(|((_, up_to), (min, max))| ChipLoadBand {
+                up_to_mm: up_to.is_finite().then_some(*up_to),
+                min,
+                max,
+            })
+            .collect(),
+    })
+}
+/// Setup 1, the part axis that points up in it and its stock, or the first
+/// reason planning cannot start.
+fn basics<'a>(doc: &'a Document, mesh: &Mesh) -> Result<(&'a Setup, &'static str, Volume), String> {
+    let setup1 = doc
+        .setups
+        .first()
+        .ok_or("Create a machining setup first.")?;
+    let first = up_axis(setup1)
+        .ok_or("Setup 1 must be square to the part: use rotations that are multiples of 90°.")?;
+    let stock = crate::stock::resolve(setup1, Some(mesh))?.stock;
+    // With a hand machine to prepare the stock on, the report says what the
+    // holder cannot hold, for the plan to answer (`workholding_problem`).
+    if let Some(problem) = holding_problem(doc, Some(mesh)).filter(|_| !prepares(doc)) {
+        return Err(problem);
+    }
+    let round = crate::stock::round(setup1, stock);
+    Ok((
+        setup1,
+        first,
+        Volume::new(stock, Frame::new(setup1, mesh)).rounded(round),
+    ))
+}
+/// The whole report, or the first reason planning cannot start. The part must
+/// be a closed solid: no open edges, an enclosed volume, and vertical rays (in
+/// setup 1's frame) that cross it consistently.
+pub fn report(doc: &Document, mesh: &Mesh) -> Result<PartReport, String> {
+    // Numbered over the whole job, as `proposal::build` numbers them.
+    let machines = machines(doc);
+    let view = planning(doc);
+    let (setup1, first, stock) = basics(&view, mesh)?;
+    closed_solid(setup1, mesh)?;
+    describe(&view, mesh, setup1, first, &stock, &machines)
+}
+/// `Ok` when the part is a closed solid, otherwise why it is not.
+fn closed_solid(setup1: &Setup, mesh: &Mesh) -> Result<(), String> {
+    let (triangles, largest) = mm_triangles(mesh);
+    let found = closure(&triangles, largest);
+    if found.far {
+        return Err("The part lies more than 1 000 000 mm from its file origin. Move it closer to the origin and re-export it.".into());
+    }
+    if found.open_edges > 0 {
+        return Err(format!(
+            "The part is not a closed solid ({} open edges), so the planner cannot check its plans against it. Repair or re-export the model.",
+            found.open_edges
+        ));
+    }
+    if !found.encloses_volume {
+        return Err("The part encloses no volume, so the planner cannot check its plans against it. Repair or re-export the model.".into());
+    }
+    if inconsistent_share(&Geometry::new(setup1, mesh)) > 0.02 {
+        return Err("The part is not a closed solid, so the planner cannot check its plans against it. Repair or re-export the model.".into());
+    }
+    Ok(())
+}
+/// The least spindle speed a plan may ask for, rpm.
+pub const MIN_RPM: f64 = 100.;
+/// A range with the value a tool is recommended to run at in it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Recommended {
+    pub min: u32,
+    pub max: u32,
+    pub recommended: u32,
+}
+/// The feed range at the recommended spindle speed, mm/min.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct FeedRange {
+    /// The spindle speed the feed range is for: the recommended rpm.
+    pub at_rpm: u32,
+    pub min: u32,
+    pub max: u32,
+    pub recommended: u32,
+}
+/// The chip-load band of a tool's diameter, in mm per tooth.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BandUsed {
+    /// The largest diameter the band holds; null for every larger one.
+    pub up_to_mm: Option<f32>,
+    pub min: f32,
+    pub max: f32,
+}
+/// The spindle speed and feed a tool can run at in a material on a machine.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CuttingData {
+    pub tool: u32,
+    pub diameter: f32,
+    pub flutes: u32,
+    pub rpm: Recommended,
+    pub feed_mm_per_min: FeedRange,
+    pub chip_load_band: BandUsed,
+}
+/// What a tool of `diameter` with `flutes` (numbered `number`, named
+/// `named` in what is said) can run at in `material` on `machine`: the rpm
+/// range from the material's surface speed and the machine's maximum, a
+/// recommended rpm (`material::pick`, whole), and at that rpm the feed range
+/// from the chip-load band of the diameter (scaled down under 3 mm) and the
+/// flutes, clipped to the machine's maximum feed, with a recommended feed;
+/// or one sentence on why there is none.
+pub fn cutting_data(
+    material: &MaterialReport,
+    machine: &MachineReport,
+    (number, named): (u32, &str),
+    diameter: f32,
+    flutes: u32,
+) -> Result<CuttingData, String> {
+    let band = material.chip_load_mm.get(crate::material::band(diameter));
+    let Some(band) = band.filter(|band| {
+        material.vc_min_m_per_min > 0.
+            && material.vc_max_m_per_min >= material.vc_min_m_per_min
+            && band.min > 0.
+            && band.max >= band.min
+    }) else {
+        return Err("The material has no cutting data.".into());
+    };
+    if machine.max_rpm <= 0. || machine.max_feed <= 0. {
+        return Err("The machine has no maximum rpm or feed.".into());
+    }
+    if diameter <= 0. || flutes == 0 {
+        return Err(format!(
+            "{named} has no diameter or flutes to compute with."
+        ));
+    }
+    let (d, n) = (f64::from(diameter), f64::from(flutes));
+    // The surface speed range as rpm, up to what the machine gives. When even
+    // the maximum is too slow for the least surface speed, it counts as in range.
+    let rpm_at = |vc: f32| f64::from(vc) * 1000. / (std::f64::consts::PI * d);
+    let max_rpm = f64::from(machine.max_rpm);
+    let top = rpm_at(material.vc_max_m_per_min).min(max_rpm);
+    // A plan's spindle speed is at least MIN_RPM: a range under it holds no
+    // speed the checks accept.
+    if top < MIN_RPM {
+        return Err(format!(
+            "{named} cannot be used in this material: its surface speed range gives at most {top:.0} rpm, under the plan's minimum of {MIN_RPM} rpm. Choose a smaller tool."
+        ));
+    }
+    let bottom = rpm_at(material.vc_min_m_per_min).max(MIN_RPM).min(top);
+    // The chip load the tool takes: the band's, less under 3 mm, as the
+    // check reads it (`material::chip_load`).
+    let share = crate::material::chip_share(diameter);
+    let (fz_min, fz_max) = (band.min * share, band.max * share);
+    // The speed and feed a material change sets (`material::pick`), whole:
+    // a value above the machine's maximum, or below the least surface speed
+    // at a maximum that cannot reach it, would not pass the check.
+    let max_feed = f64::from(machine.max_feed);
+    let (rpm, feed) = crate::material::pick(
+        (bottom as f32, top as f32),
+        (fz_min, fz_max),
+        flutes as f32,
+        machine.max_rpm,
+        machine.max_feed,
+    );
+    let rpm = f64::from(rpm)
+        .round()
+        .clamp(bottom.ceil().min(top.floor()), top.floor());
+    // The feed range at that rpm, up to what the machine gives; when even the
+    // maximum feed is below the least chip load, it counts as in range.
+    let feed_top = (f64::from(fz_max) * n * rpm).min(max_feed);
+    let feed_bottom = (f64::from(fz_min) * n * rpm).min(feed_top);
+    let feed = f64::from(feed)
+        .clamp(feed_bottom, feed_top)
+        .round()
+        .min(max_feed.floor());
+    let (rpm, feed) = (rpm as u32, feed as u32);
+    Ok(CuttingData {
+        tool: number,
+        diameter,
+        flutes,
+        rpm: Recommended {
+            min: (bottom.ceil() as u32).min(top.floor() as u32),
+            max: top.floor() as u32,
+            recommended: rpm,
+        },
+        feed_mm_per_min: FeedRange {
+            at_rpm: rpm,
+            min: (feed_bottom.ceil() as u32).min(feed_top.floor() as u32),
+            max: feed_top.floor() as u32,
+            recommended: feed,
+        },
+        chip_load_band: BandUsed {
+            up_to_mm: band.up_to_mm,
+            min: fz_min,
+            max: fz_max,
+        },
+    })
+}
+/// One orientation that lists a surface, with the plane that does.
+#[derive(Debug, Serialize)]
+pub struct Seen<'a> {
+    pub up: &'static str,
+    #[serde(flatten)]
+    pub plane: &'a PlaneReport,
+}
+/// What the part report and the part say of one surface.
+#[derive(Debug, Serialize)]
+pub struct SurfaceInfo<'a> {
+    pub surface: usize,
+    /// This surface's faces alone, mm²; `area` of an entry is its whole plane's.
+    pub surface_area: f64,
+    /// The area-weighted mean of the faces' normals in setup 1's frame; null
+    /// when they cancel out, as the faces of a closed round surface do.
+    pub mean_normal: Option<[f64; 3]>,
+    pub orientations: Vec<Seen<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<&'static str>,
+}
+/// `value` rounded to `places` decimals, never -0.
+fn rounded(value: f64, places: i32) -> f64 {
+    let scale = 10f64.powi(places);
+    // Adding 0 turns a rounded -0.0 into 0.0, so it never prints as "-0.0".
+    (value * scale).round() / scale + 0.
+}
+/// Surface `id` of `mesh` as `report` and the part say it: every
+/// orientation whose planes list it, its own area in mm² and its mean
+/// normal in setup 1's frame; or why there is no such surface.
+pub fn surface_info<'a>(
+    doc: &Document,
+    mesh: &Mesh,
+    report: &'a PartReport,
+    id: usize,
+) -> Result<SurfaceInfo<'a>, String> {
+    if id >= mesh.surfaces.len() {
+        return Err(format!("Surface {id} is not a surface of this part."));
+    }
+    let seen: Vec<Seen> = (report.orientations.iter())
+        .flat_map(|o| {
+            (o.planes.iter())
+                .filter(move |p| p.surfaces.contains(&id))
+                .map(|plane| Seen { up: o.up, plane })
+        })
+        .collect();
+    // The surface's faces in setup 1's frame, in mm.
+    let (mut area, mut sum) = (0f64, [0f64; 3]);
+    if let Some(setup1) = doc.setups.first() {
+        for t in (Geometry::new(setup1, mesh).triangles.iter()).filter(|t| t.feature == Some(id)) {
+            // Twice the area, along the normal.
+            let n = normal(&t.p).map(f64::from);
+            area += n.iter().map(|v| v * v).sum::<f64>().sqrt() / 2.;
+            sum = std::array::from_fn(|k| sum[k] + n[k]);
+        }
+    }
+    let length = sum.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let mean_normal =
+        (length > 1e-3 * 2. * area && length > 1e-9).then(|| sum.map(|v| rounded(v / length, 3)));
+    let note = seen.is_empty().then_some(
+        "No orientation lists this surface as a horizontal face: it is a wall, a slope, hidden from above, or beyond the report's plane list.",
+    );
+    Ok(SurfaceInfo {
+        surface: id,
+        surface_area: rounded(area, 2),
+        mean_normal,
+        orientations: seen,
+        note,
+    })
+}
+/// The report without the closed-surface checks: what an open mesh's
+/// surfaces and planes are (an agent's pictures and surface lists,
+/// LIO-470), and for tests that run the plan checks on open meshes.
+pub fn report_unchecked(doc: &Document, mesh: &Mesh) -> Result<PartReport, String> {
+    let machines = machines(doc);
+    let view = planning(doc);
+    let (setup1, first, stock) = basics(&view, mesh)?;
+    describe(&view, mesh, setup1, first, &stock, &machines)
+}
+/// Whether a hand machine may prepare the stock before setup 1, so a holder
+/// that cannot hold the raw stock does not stop planning.
+fn prepares(doc: &Document) -> bool {
+    machines(doc).len() > 1
+}
+/// The first thing wrong with setup 1's modelled workholding, said for the
+/// planner: the plan could never pass the export check of setup 1 with it.
+fn holding_problem(doc: &Document, mesh: Option<&Mesh>) -> Option<String> {
+    doc.holding_issues(0, mesh)
+        .into_iter()
+        .next()
+        .map(|issue| format!("Setup 1's workholding: {issue}"))
+}
+/// `v` rounded up to the hundredth, after dropping what the coordinates' own
+/// rounding (f32, about 1e-5 mm here) adds below the thousandth.
+fn up2(v: f32) -> f32 {
+    ((v * 1000.).round() / 10.).ceil() / 100.
+}
+/// Where `setup`'s work zero is on its own stock, from the model's
+/// -X/-Y/bottom corner in its axes, mm.
+pub fn work_zero(setup: &Setup, mesh: &Mesh) -> Option<[f32; 3]> {
+    let resolved = crate::stock::resolve(setup, Some(mesh)).ok()?;
+    let zero = crate::post::datum(setup, resolved.stock, mesh).ok()?;
+    let corner = resolved.part?.min;
+    Some([0, 1, 2].map(|k| r2(zero[k] - corner[k])))
+}
+/// Setup 1's workholding for the report, or None without it.
+fn workholding_report(
+    doc: &Document,
+    mesh: &Mesh,
+    setup1: &Setup,
+) -> Result<Option<WorkholdingReport>, String> {
+    let kind = match get(&setup1.p, "holding") {
+        "Vise" => "Vise",
+        "Clamps" => "Clamps",
+        // The chuck on A; a lathe's chuck is not reported.
+        "Chuck" if crate::chuck::holds(setup1) => "Chuck",
+        // A sheet's hold-down screws, whose heads are boxes like clamps.
+        _ if crate::sheet::screwed(setup1) => "Hold-down screws",
+        holding => match crate::round_hold::Kind::of(holding) {
+            Some(kind) => kind.name(),
+            None => return Ok(None),
+        },
+    };
+    let resolved = crate::stock::resolve(setup1, Some(mesh))?;
+    let (stock, corner) = (resolved.stock, resolved.part.map_or([0.; 3], |p| p.min));
+    let boxes = doc.holding_boxes(setup1, crate::holding::Gripped::whole(stock))?;
+    let chuck = match kind {
+        "Chuck" => {
+            let rig = doc.chuck_rig(setup1, stock)?;
+            Some(ChuckReport {
+                jaws: rig.jaws,
+                chuck_diameter: r2(rig.unit.chuck_diameter),
+                jaw_length: r2(rig.unit.jaw_length),
+                gripped_length: r2(rig.grip()),
+                stickout: r2(rig.stickout),
+                bar_diameter: rig.round.then(|| r2(2. * rig.inner)),
+                tailstock: match rig.tail {
+                    crate::chuck::Tail::Off => "Off the table",
+                    crate::chuck::Tail::Retracted(_) => "Retracted",
+                    crate::chuck::Tail::Supports(_) => "Supports the stock",
+                }
+                .into(),
+                a_angle: 0.,
+            })
+        }
+        _ => None,
+    };
+    // A chuck's boxes are all keep-out zones, the stock in its jaws too.
+    let boxes = match chuck {
+        Some(_) => boxes,
+        None => crate::holding::shown(&boxes, stock),
+    };
+    let gap = crate::holding::gap(setup1)?;
+    let top = boxes
+        .iter()
+        .map(|b| b.bounds.max[2])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let needed = top + gap - stock.max[2];
+    Ok(Some(WorkholdingReport {
+        kind,
+        number: own_entry(doc, setup1),
+        boxes: boxes
+            .iter()
+            .map(|b| {
+                let from_corner = |p: [f32; 3]| [0, 1, 2].map(|k| r2(p[k] - corner[k]));
+                let ([x0, y0, z0], [x1, y1, z1]) =
+                    (from_corner(b.bounds.min), from_corner(b.bounds.max));
+                [x0, y0, z0, x1, y1, z1]
+            })
+            .collect(),
+        gap: r2(gap),
+        clearance_above_stock_top: (needed > 0.).then(|| up2(needed)),
+        chuck,
+        round_bar: crate::round_hold::Kind::of(kind).map(|_| {
+            let lying = crate::stock::round_bar(setup1);
+            let bar = crate::round_hold::Bar::of(lying, stock);
+            RoundBarReport {
+                diameter: r2(bar.diameter()),
+                length: r2(bar.ends[1] - bar.ends[0]),
+                along: if lying { "X" } else { "Z" },
+            }
+        }),
+    }))
+}
+fn describe(
+    doc: &Document,
+    mesh: &Mesh,
+    setup1: &Setup,
+    first: &'static str,
+    stock: &Volume,
+    machines: &[&crate::model::Machine],
+) -> Result<PartReport, String> {
+    let mut order: Vec<&'static str> = vec![first];
+    order.extend(
+        ORIENTATIONS
+            .iter()
+            .map(|(up, _)| *up)
+            .filter(|up| *up != first),
+    );
+    let keyseat = |t: &crate::model::Tool| get(&t.p, "type") == crate::model::KEYSEAT;
+    let order_copy = order.clone();
+    let lathe = has_lathe(machines);
+    Ok(PartReport {
+        units: "mm",
+        part_size: mesh.dimensions.map(r2),
+        material: material_report(doc)?,
+        machine: machine_report(&setup1.machine)?,
+        // A job on a hand machine alone lists it too (LIO-430).
+        machines: if machines.len() > 1 || crate::manual::is_hand(&setup1.machine) {
+            (machines.iter().enumerate())
+                .map(|(i, m)| machine_entry(i + 1, m))
+                .collect::<Result<_, _>>()?
+        } else {
+            vec![]
+        },
+        work_zero: (machines.len() > 1 || crate::manual::is_hand(&setup1.machine))
+            .then(|| work_zero(setup1, mesh))
+            .flatten(),
+        tools: doc
+            .tools
+            .iter()
+            .filter_map(|t| {
+                // A lathe tool has no mill sizes: told only with a lathe.
+                if t.is_lathe() {
+                    return lathe.then(|| lathe_tool(t, machines)).flatten();
+                }
+                Some(ToolReport {
+                    number: t.number()?,
+                    name: t.name().to_string(),
+                    kind: get(&t.p, "type").to_string(),
+                    diameter: num(&t.p, "diameter")?,
+                    flutes: num(&t.p, "flutes").filter(|f| *f >= 1. && f.fract() == 0.)? as u32,
+                    flute_length: if keyseat(t) {
+                        num(&t.p, "width")?
+                    } else {
+                        num(&t.p, "length")?
+                    },
+                    stickout: num(&t.p, "stickout")?,
+                    center_cutting: if machines
+                        .iter()
+                        .any(|m| crate::manual::is_manual(m) && t.fits(m))
+                        && get(&t.p, "type") == "Flat end mill"
+                    {
+                        match get(&t.p, "center_cutting") {
+                            "Yes" => Some(true),
+                            "No" => Some(false),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    },
+                    tip_angle: (get(&t.p, "type") == "Chamfer mill")
+                        .then(|| t.tip_angle())
+                        .flatten(),
+                    tip_flat: (get(&t.p, "type") == "Chamfer mill" && t.tip_flat() > 0.)
+                        .then(|| t.tip_flat()),
+                    thread_angle: match get(&t.p, "type") {
+                        "Thread mill" => num(&t.p, "thread_angle"),
+                        "Tap" => t.tap_spec().map(|s| s.angle),
+                        _ => None,
+                    },
+                    pitches: (get(&t.p, "type") == "Thread mill")
+                        .then(|| t.thread_pitches().map(|(a, b)| [a, b]))
+                        .flatten(),
+                    reach: (get(&t.p, "type") == "Thread mill" || keyseat(t))
+                        .then(|| num(&t.p, "reach"))
+                        .flatten(),
+                    neck_diameter: keyseat(t).then(|| num(&t.p, "neck")).flatten(),
+                    teeth: (get(&t.p, "type") == "Thread mill" && t.thread_teeth() > 1)
+                        .then(|| t.thread_teeth()),
+                    thread: t.tap_spec().map(|s| s.name.to_string()),
+                    tolerance: (get(&t.p, "type") == "Reamer")
+                        .then(|| get(&t.p, "tolerance").to_string()),
+                    bore_range: (get(&t.p, "type") == "Boring head")
+                        .then(|| t.bore_range().map(|(a, b)| [a, b]))
+                        .flatten(),
+                    machines: fitting(machines, |m| t.fits(m)),
+                    ..ToolReport::default()
+                })
+            })
+            .collect(),
+        workholding_library: library_report(doc, machines),
+        workholding: match workholding_report(doc, mesh, setup1) {
+            Err(_) if machines.len() > 1 => None,
+            other => other?,
+        },
+        workholding_problem: (machines.len() > 1)
+            .then(|| holding_problem(doc, Some(mesh)))
+            .flatten(),
+        orientations: order
+            .into_iter()
+            .filter_map(|up| orientation(setup1, stock, mesh, up, MAX_HOLES))
+            .collect(),
+        rotary: rotary_report(doc, setup1),
+        sheet: sheet_report(setup1, mesh),
+        turning: if has_lathe(machines) {
+            turning_report(setup1, mesh, &order_copy)
+        } else {
+            vec![]
+        },
+    })
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::post::fixture;
+    fn block() -> (Document, Mesh) {
+        let (mut doc, mesh) = fixture::job();
+        crate::proposal::tests::aluminium(&mut doc);
+        (doc, mesh)
+    }
+    fn plane(o: &OrientationReport, depth: f32) -> &PlaneReport {
+        o.planes
+            .iter()
+            .find(|p| (p.depth_below_top - depth).abs() < 0.01)
+            .unwrap_or_else(|| panic!("no plane at depth {depth} in {}", o.up))
+    }
+    /// The example block with the starter clamp or vise on setup 1.
+    fn held(kind: &str, pairs: &[(&str, &str)]) -> (Document, Mesh) {
+        let (mut doc, mesh) = block();
+        crate::proposal::tests::hold(&mut doc, kind, pairs);
+        (doc, mesh)
+    }
+    #[test]
+    fn the_report_carries_setup_1s_clamps_gap_and_the_clearance_they_need() {
+        let (doc, mesh) = block();
+        assert_eq!(report(&doc, &mesh).unwrap().workholding, None);
+        // Without workholding the report has no `workholding` of setup 1.
+        assert!(
+            !serde_json::to_string(&report(&doc, &mesh).unwrap())
+                .unwrap()
+                .contains("\"workholding\"")
+        );
+        // The fixture's stock: the model is 120 x 80 x 40, with 4 mm above,
+        // 3 below and 2 on each side; the clamp reaches 48 mm out and 12 onto
+        // the stock, 20 wide at the middle of the side, 25 above the stock top.
+        let (mut doc, mesh) = held("Clamp", &[("clamps", "-X:0;+Y:10"), ("holding_gap", "3")]);
+        let r = report(&doc, &mesh).unwrap();
+        let w = r.workholding.as_ref().unwrap();
+        assert_eq!(w.kind, "Clamps");
+        assert_eq!(
+            w.boxes,
+            [
+                [-50., 30., 44., 10., 50., 69.],
+                [60., 70., 44., 80., 130., 69.]
+            ]
+        );
+        assert_eq!(w.gap, 3.);
+        // 69 + 3 - 44 above the stock top.
+        assert_eq!(w.clearance_above_stock_top, Some(28.));
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains(
+                "\"workholding\":{\"kind\":\"Clamps\",\"number\":2,\"boxes\":[[-50.0,30.0,44.0,10.0,50.0,69.0],"
+            ),
+            "{json}"
+        );
+        assert!(
+            json.contains("\"gap\":3.0,\"clearance_above_stock_top\":28.0}"),
+            "{json}"
+        );
+        // The report holds no name, note or id of the library entry.
+        let id = get(&doc.setups[0].p, "holder").to_string();
+        let holder = doc.workholding.iter_mut().find(|h| h.id == id).unwrap();
+        holder.p.insert("name".into(), "ZZ-SECRET-HOLDER".into());
+        holder.p.insert("notes".into(), "ZZ-SECRET-NOTE".into());
+        let json = serde_json::to_string(&report(&doc, &mesh).unwrap()).unwrap();
+        assert!(!json.contains("ZZ-SECRET") && !json.contains(&id), "{json}");
+    }
+    #[test]
+    fn the_reports_workholding_gives_the_library_number_of_setup_1s_entry() {
+        // Setup 1's vise counts among the usable entries only, so an entry
+        // of a kind the planner cannot use before it does not move it.
+        let (mut doc, mesh) = held("Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        doc.workholding
+            .insert(0, crate::holding::Holder::new("Magnet", "Magnet"));
+        let r = report(&doc, &mesh).unwrap();
+        assert_eq!(r.workholding.as_ref().unwrap().number, Some(1));
+        let value = serde_json::to_value(&r).unwrap();
+        assert_eq!(value["workholding"]["number"], 1);
+        let own = &r.workholding_library[0];
+        assert_eq!((own.number, own.kind), (1, "Vise"));
+        assert_eq!(own_entry(&doc, &doc.setups[0]), Some(1));
+        // The starter clamp is the second entry.
+        let (doc, mesh) = held("Clamp", &[("clamps", "-X:0;+Y:10")]);
+        let r = report(&doc, &mesh).unwrap();
+        assert_eq!(r.workholding.as_ref().unwrap().number, Some(2));
+        assert_eq!(r.workholding_library[1].kind, "Clamp");
+        // No holding on setup 1: no `workholding`, so no number to read.
+        let (doc, mesh) = block();
+        let r = report(&doc, &mesh).unwrap();
+        assert_eq!(own_entry(&doc, &doc.setups[0]), None);
+        assert!(r.workholding.is_none());
+        assert!(
+            !serde_json::to_string(&r)
+                .unwrap()
+                .contains("\"number\":1,\"boxes\"")
+        );
+        // Holding modelled, but the entry is not in the library: no number.
+        let (mut doc, _) = held("Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        doc.setups[0].p.insert("holder".into(), "gone".into());
+        assert_eq!(own_entry(&doc, &doc.setups[0]), None);
+        let none = WorkholdingReport {
+            kind: "Vise",
+            number: own_entry(&doc, &doc.setups[0]),
+            boxes: vec![],
+            gap: 2.,
+            clearance_above_stock_top: None,
+            chuck: None,
+            round_bar: None,
+        };
+        let json = serde_json::to_string(&none).unwrap();
+        assert!(!json.contains("number"), "{json}");
+    }
+    #[test]
+    fn the_report_lists_the_workholding_library_by_number_in_sizes_only() {
+        let (mut doc, mesh) = block();
+        // No library, no entries: the key is there and empty.
+        let r = report(&doc, &mesh).unwrap();
+        assert!(r.workholding_library.is_empty());
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"workholding_library\":[]"), "{json}");
+        // The starters, then an entry of a kind the planner cannot use, then
+        // one more clamp: numbers count the usable entries from 1, in order.
+        doc.adopt_holders();
+        let mut magnet = crate::holding::Holder::new("Magnet", "ZZ-SECRET-MAGNET");
+        magnet
+            .p
+            .insert("notes".into(), "ZZ-SECRET-MAGNET-NOTE".into());
+        doc.workholding.insert(1, magnet);
+        let mut long = crate::holding::Holder::new("Clamp", "ZZ-SECRET-LONG");
+        for (k, v) in [
+            ("length", "80"),
+            ("width", "25"),
+            ("height", "30"),
+            ("bite", "15"),
+        ] {
+            long.p.insert(k.into(), v.into());
+        }
+        long.p.insert("notes".into(), "ZZ-SECRET-LONG-NOTE".into());
+        doc.workholding.push(long);
+        for h in &mut doc.workholding {
+            h.p.insert("notes".into(), "ZZ-SECRET-NOTE".into());
+        }
+        doc.workholding[0]
+            .p
+            .insert("name".into(), "ZZ-SECRET-VISE".into());
+        let r = report(&doc, &mesh).unwrap();
+        let numbers: Vec<_> = r
+            .workholding_library
+            .iter()
+            .map(|e| (e.number, e.kind))
+            .collect();
+        assert_eq!(numbers, [(1, "Vise"), (2, "Clamp"), (3, "Clamp")]);
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(
+            json.contains(concat!(
+                "\"workholding_library\":[",
+                "{\"number\":1,\"kind\":\"Vise\",\"grip\":8.0,\"jaw_height\":30.0,",
+                "\"jaw_thickness\":20.0,\"jaw_width\":100.0,\"max_opening\":120.0},",
+                "{\"number\":2,\"kind\":\"Clamp\",\"bite\":12.0,\"height\":25.0,",
+                "\"length\":60.0,\"width\":20.0},",
+                "{\"number\":3,\"kind\":\"Clamp\",\"bite\":15.0,\"height\":30.0,",
+                "\"length\":80.0,\"width\":25.0}]"
+            )),
+            "{json}"
+        );
+        // Never a name, a note or an id.
+        assert!(!json.contains("ZZ-SECRET"), "{json}");
+        for h in &doc.workholding {
+            assert!(!json.contains(&h.id), "{json}");
+        }
+        // The planner's numbers are these entries, in this order.
+        let names: Vec<_> = library(&doc).iter().map(|h| h.kind()).collect();
+        assert_eq!(names, ["Vise", "Clamp", "Clamp"]);
+    }
+    #[test]
+    fn a_vise_is_reported_as_two_jaws_from_the_stock_bottom_and_needs_no_clearance() {
+        // The jaws on the Y sides: 20 thick, 100 wide, up to 8 above the stock
+        // bottom (3 below the model's); no clearance is needed above the stock.
+        let (doc, mesh) = held("Vise", &[("vise_axis", "Y"), ("vise_grip", "8")]);
+        let w = report(&doc, &mesh).unwrap().workholding.unwrap();
+        assert_eq!(w.kind, "Vise");
+        assert_eq!(
+            w.boxes,
+            [
+                [10., -22., -3., 110., -2., 5.],
+                [10., 82., -3., 110., 102., 5.]
+            ]
+        );
+        assert_eq!((w.gap, w.clearance_above_stock_top), (2., None));
+        let json = serde_json::to_string(&w).unwrap();
+        assert!(!json.contains("clearance_above_stock_top"), "{json}");
+    }
+    #[test]
+    fn workholding_that_cannot_be_modelled_stops_the_report_and_the_checklist() {
+        // The vise opens to 120 mm: the stock is 124 mm across X.
+        let (mut doc, mesh) = held("Vise", &[("vise_axis", "X"), ("vise_grip", "8")]);
+        let problem = "Setup 1's workholding: The stock is 124 mm across the jaws; this vise opens to 120 mm.";
+        assert_eq!(report(&doc, &mesh).unwrap_err(), problem);
+        let unmet: Vec<_> = preconditions(&doc, Some(&mesh))
+            .into_iter()
+            .filter(|p| !p.ok)
+            .map(|p| (p.label, p.hint))
+            .collect();
+        assert_eq!(
+            unmet,
+            [("Setup 1: a machine and stock", problem.to_string())]
+        );
+        doc.setups[0].p.insert("vise_axis".into(), "Y".into());
+        assert!(report(&doc, &mesh).is_ok());
+        assert!(preconditions(&doc, Some(&mesh)).iter().all(|p| p.ok));
+    }
+    #[test]
+    fn the_example_block_reports_its_top_pocket_and_holes() {
+        let (doc, mesh) = block();
+        let report = report(&doc, &mesh).unwrap();
+        assert_eq!(report.part_size, [120., 80., 40.]);
+        assert_eq!(report.units, "mm");
+        let ups: Vec<_> = report.orientations.iter().map(|o| o.up).collect();
+        assert_eq!(ups, vec!["+Z", "-Z", "+X", "-X", "+Y", "-Y"]);
+        let top = &report.orientations[0];
+        assert!(top.is_setup1 && !report.orientations[1].is_setup1);
+        assert_eq!(top.model_size, [120., 80., 40.]);
+        // fixture stock: top 4, bottom 3, sides 2
+        assert_eq!(top.stock_margin, [4., 3., 2., 2., 2., 2.]);
+        let face = plane(top, 0.);
+        assert_eq!(face.kind, "top");
+        assert_eq!(face.max_cutter_diameter, None);
+        assert_eq!(face.holes.len(), 5);
+        let through: Vec<_> = face.holes.iter().filter(|h| h.through).collect();
+        assert_eq!(through.len(), 4);
+        assert!(
+            through
+                .iter()
+                .all(|h| h.diameter == 6.6 && h.opening_diameter == 11. && h.depth == 40.)
+        );
+        // Counterbores, not countersinks.
+        assert!(face.holes.iter().all(|h| h.countersink.is_none()));
+        let blind = face.holes.iter().find(|h| !h.through).unwrap();
+        assert_eq!((blind.diameter, blind.depth), (6., 8.));
+        assert_eq!(blind.center, [42., 40.]);
+        let pocket = plane(top, 12.);
+        assert_eq!(pocket.kind, "floor");
+        assert_eq!(pocket.bbox, [16., 20., 88., 60.]);
+        // The largest the pocket generator accepts: 37.05 less its margin.
+        assert!((pocket.max_cutter_diameter.unwrap() - 36.68).abs() < 0.05);
+        assert!(pocket.openings.is_empty());
+        // A counterbore's floor is a ring round the bore, which goes on through
+        // the part: an end mill up to the counterbore's own Ø11 clears it.
+        let counterbores = plane(top, 6.);
+        assert_eq!(counterbores.surfaces.len(), 4);
+        let fit = counterbores.max_cutter_diameter.unwrap();
+        assert!(fit > 10.8 && fit < 11., "{fit}");
+        assert_eq!(counterbores.openings.len(), 4);
+        assert!(
+            counterbores
+                .openings
+                .iter()
+                .all(|o| o.depth == 34. && o.max_cutter_diameter > 6.4)
+        );
+        assert!(top.freeform_area > 100.);
+        assert!(!top.truncated);
+        assert!(!serde_json::to_string(&report).unwrap().contains("-0.0"));
+    }
+    #[test]
+    fn the_step_example_reports_its_bores_at_their_nominal_size() {
+        // The STEP helper's 42-segment circles are Ø6.582 across their chords
+        // for a Ø6.6 bore: the report gives the size at the vertices, which is
+        // the drill the planner is told to use.
+        if crate::step::skip_without_helper() {
+            return;
+        }
+        let (doc, _) = block();
+        let mesh =
+            crate::mesh::load(&crate::repo_root().join("examples/four-setup-block.step")).unwrap();
+        let report = report(&doc, &mesh).unwrap();
+        let by_up = |up: &str| report.orientations.iter().find(|o| o.up == up).unwrap();
+        let top = plane(by_up("+Z"), 0.);
+        eprintln!("step, top: {:#?}", top.holes);
+        let through: Vec<_> = top.holes.iter().filter(|h| h.through).collect();
+        assert_eq!(through.len(), 4);
+        assert!(
+            through
+                .iter()
+                .all(|h| h.diameter == 6.6 && h.opening_diameter == 11. && h.depth == 40.),
+            "{through:?}"
+        );
+        let blind = top.holes.iter().find(|h| !h.through).unwrap();
+        assert_eq!(
+            (blind.diameter, blind.opening_diameter),
+            (6., 6.),
+            "{blind:?}"
+        );
+        let bottom = plane(by_up("-Z"), 0.);
+        eprintln!("step, bottom: {:#?}", bottom.holes);
+        let bores: Vec<_> = bottom
+            .holes
+            .iter()
+            .filter(|h| h.opening_diameter == 6.6)
+            .collect();
+        assert_eq!(bores.len(), 4, "{:?}", bottom.holes);
+        assert!(
+            bores.iter().all(|h| h.diameter == 6.6 && h.through),
+            "{bores:?}"
+        );
+        // Every bore of the example reads a round nominal size.
+        for o in &report.orientations {
+            for h in o.planes.iter().flat_map(|p| &p.holes) {
+                assert_eq!(
+                    h.diameter,
+                    (h.diameter * 10.).round() / 10.,
+                    "{} {h:?}",
+                    o.up
+                );
+                assert_eq!(
+                    h.opening_diameter,
+                    (h.opening_diameter * 10.).round() / 10.,
+                    "{} {h:?}",
+                    o.up
+                );
+            }
+        }
+    }
+    #[test]
+    fn each_orientation_lists_only_what_is_visible_from_above() {
+        let (doc, mesh) = block();
+        let report = report(&doc, &mesh).unwrap();
+        let by_up = |up: &str| report.orientations.iter().find(|o| o.up == up).unwrap();
+        let bottom = by_up("-Z");
+        assert_eq!(bottom.stock_margin, [3., 4., 2., 2., 2., 2.]);
+        assert!(plane(bottom, 6.).max_cutter_diameter.unwrap() > 37.);
+        assert_eq!(plane(bottom, 0.).holes.len(), 6);
+        // The top pocket floor is not reachable from below or from the sides.
+        let top_pocket = plane(by_up("+Z"), 12.).surfaces.clone();
+        for up in ["-Z", "+X", "-X", "+Y", "-Y"] {
+            assert!(
+                by_up(up).planes.iter().all(|p| p.surfaces != top_pocket),
+                "{up}"
+            );
+        }
+        assert_eq!(by_up("+X").model_size, [40., 80., 120.]);
+        assert_eq!(plane(by_up("+X"), 0.).holes.len(), 2);
+        assert_eq!(by_up("-X").planes.len(), 1);
+        let side = by_up("-Y");
+        assert_eq!(side.model_size, [120., 40., 80.]);
+        let bore = plane(side, 0.)
+            .holes
+            .iter()
+            .find(|h| h.opening_diameter == 24.)
+            .unwrap();
+        assert!((bore.diameter - 16.).abs() < 0.02 && bore.depth == 14. && !bore.through);
+        // every surface is listed in at most one orientation
+        let mut seen = std::collections::HashSet::new();
+        for id in report
+            .orientations
+            .iter()
+            .flat_map(|o| &o.planes)
+            .flat_map(|p| &p.surfaces)
+        {
+            assert!(seen.insert(*id));
+        }
+    }
+    /// A 40 × 20 × 10 mm block, its sides cut into 1 mm strips along X so
+    /// that its top face is 80 triangles, under a separate 40 × 20 × 5 mm
+    /// slab 10 mm above it whose −X end overhangs the block's top from X 0
+    /// to `cover`.
+    fn overhung(cover: f32) -> Mesh {
+        let (y, z) = (20f32, 10f32);
+        let mut t = vec![];
+        for i in 0..40 {
+            let (a, b) = (i as f32, i as f32 + 1.);
+            quad(&mut t, [[a, 0., z], [b, 0., z], [b, y, z], [a, y, z]]);
+            quad(&mut t, [[a, 0., 0.], [a, y, 0.], [b, y, 0.], [b, 0., 0.]]);
+            quad(&mut t, [[a, 0., 0.], [b, 0., 0.], [b, 0., z], [a, 0., z]]);
+            quad(&mut t, [[b, y, 0.], [a, y, 0.], [a, y, z], [b, y, z]]);
+        }
+        quad(&mut t, [[0., y, 0.], [0., 0., 0.], [0., 0., z], [0., y, z]]);
+        quad(
+            &mut t,
+            [[40., 0., 0.], [40., y, 0.], [40., y, z], [40., 0., z]],
+        );
+        t.extend(cuboid([cover - 40., 0., 20.], [cover, y, 25.]));
+        crate::mesh::normalize(t).unwrap()
+    }
+    #[test]
+    fn a_face_is_listed_only_when_at_least_half_of_it_is_visible_from_above() {
+        let (doc, _) = block();
+        // The block's top is 15 mm below the slab's top. With 6 of its 40 mm
+        // under the slab (85% visible) and with 16 (60%), the whole face is
+        // listed; with 24 (40%) and 34 (15%) it is not.
+        for (cover, listed) in [(6., true), (16., true), (24., false), (34., false)] {
+            let report = report(&doc, &overhung(cover)).unwrap();
+            let top = &report.orientations[0];
+            assert_eq!(top.up, "+Z");
+            assert_eq!(plane(top, 0.).kind, "top");
+            let step = top
+                .planes
+                .iter()
+                .find(|p| (p.depth_below_top - 15.).abs() < 0.01);
+            assert_eq!(step.is_some(), listed, "cover {cover}: {:?}", top.planes);
+            if let Some(step) = step {
+                assert!((step.area - 800.).abs() < 0.5, "{}", step.area);
+            }
+        }
+    }
+    #[test]
+    fn coplanar_faces_a_few_microns_apart_are_one_plane_whichever_side_of_a_bucket_they_fall() {
+        let (doc, _) = block();
+        // The pairs 0.0002 mm apart cross each of the 0.002 mm boundaries.
+        for step in 0..20 {
+            let report = report(&doc, &blocks_with_tops_a_hair_apart(step)).unwrap();
+            let top = &report.orientations[0];
+            assert_eq!(top.up, "+Z");
+            assert_eq!(top.planes.len(), 1, "step {step}: {:?}", top.planes);
+            assert_eq!(top.planes[0].kind, "top");
+            assert_eq!(top.planes[0].surfaces.len(), 2);
+            assert_eq!(top.planes[0].area, 2400.);
+        }
+    }
+    /// Three 40 × 30 mm blocks, 10, 10.008 and 10.016 mm high, side by side in
+    /// the order `order` gives (an index into those three heights).
+    fn blocks_in_steps_of_8_microns(order: [usize; 3]) -> Mesh {
+        let mut t = vec![];
+        for (slot, n) in order.into_iter().enumerate() {
+            let x = slot as f32 * 50.;
+            t.extend(cuboid([x, 0., 0.], [x + 40., 30., 10. + n as f32 * 0.008]));
+        }
+        crate::mesh::normalize(t).unwrap()
+    }
+    #[test]
+    fn a_chain_of_faces_each_under_the_tolerance_apart_does_not_merge_across_the_tolerance() {
+        let (doc, _) = block();
+        let mut seen = vec![];
+        // The same three tops in every order of surface ids.
+        for order in [[0, 1, 2], [2, 1, 0], [1, 2, 0], [0, 2, 1]] {
+            let report = report(&doc, &blocks_in_steps_of_8_microns(order)).unwrap();
+            let top = &report.orientations[0];
+            assert_eq!(top.up, "+Z");
+            // 10 and 10.008 are within 0.01 mm of each other, 10.016 is not.
+            assert_eq!(top.planes.len(), 2, "{order:?}: {:?}", top.planes);
+            let high = top.planes.iter().find(|p| p.kind == "top").unwrap();
+            let low = top.planes.iter().find(|p| p.kind == "floor").unwrap();
+            assert_eq!(high.surfaces.len(), 1, "{order:?}");
+            assert_eq!(high.depth_below_top, 0.);
+            assert_eq!(low.surfaces.len(), 2, "{order:?}");
+            assert_eq!(low.depth_below_top, 0.01, "{order:?}");
+            seen.push((high.area, low.area));
+        }
+        assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+    }
+    #[test]
+    fn setup_one_must_be_square_and_keeps_its_own_rotation() {
+        let (mut doc, mesh) = block();
+        doc.setups[0].p.insert("rz".into(), "90".into());
+        assert_eq!(up_axis(&doc.setups[0]), Some("+Z"));
+        assert_eq!(rotation_for(&doc.setups[0], "+Z"), Some([0., 0., 90.]));
+        assert_eq!(rotation_for(&doc.setups[0], "-Z"), Some([180., 0., 0.]));
+        let turned = report(&doc, &mesh).unwrap();
+        assert_eq!(turned.orientations[0].model_size, [80., 120., 40.]);
+        doc.setups[0].p.insert("rx".into(), "180".into());
+        doc.setups[0].p.insert("rz".into(), "0".into());
+        assert_eq!(report(&doc, &mesh).unwrap().orientations[0].up, "-Z");
+        doc.setups[0].p.insert("rx".into(), "30".into());
+        assert!(report(&doc, &mesh).unwrap_err().contains("multiples of 90"));
+        doc.setups.clear();
+        assert!(report(&doc, &mesh).is_err());
+        for (up, rotation) in ORIENTATIONS {
+            let mut setup = Setup::new(crate::model::Machine::new(3), "G54");
+            for (k, v) in ["rx", "ry", "rz"].iter().zip(rotation) {
+                setup.p.insert((*k).into(), v.to_string());
+            }
+            assert_eq!(up_axis(&setup), Some(up));
+        }
+    }
+    #[test]
+    fn preconditions_name_what_is_missing() {
+        let (mut doc, mesh) = fixture::job();
+        let unmet = |doc: &Document, mesh: Option<&Mesh>| -> Vec<&'static str> {
+            preconditions(doc, mesh)
+                .into_iter()
+                .filter(|p| !p.ok)
+                .map(|p| p.label)
+                .collect()
+        };
+        assert_eq!(unmet(&doc, Some(&mesh)), vec!["Material"]);
+        assert_eq!(
+            preconditions(&doc, Some(&mesh))[2].hint,
+            "Choose a material on the setup page."
+        );
+        // A library with no material chosen is the same.
+        doc.adopt_materials();
+        assert_eq!(
+            preconditions(&doc, Some(&mesh))[2].hint,
+            "Choose a material on the setup page."
+        );
+        // A material without cutting data cannot be planned with.
+        let bare = crate::material::Material::new("Inconel 718");
+        let id = bare.id.clone();
+        doc.materials.push(bare);
+        assert!(doc.select_material(&id));
+        assert_eq!(unmet(&doc, Some(&mesh)), vec!["Material"]);
+        assert_eq!(
+            preconditions(&doc, Some(&mesh))[2].hint,
+            "Add cutting data to Inconel 718 on the Materials page."
+        );
+        // A name alone, with no library material behind it, is not enough.
+        doc.material_id.clear();
+        doc.material = "Aluminium 6061-T6".into();
+        assert_eq!(unmet(&doc, Some(&mesh)), vec!["Material"]);
+        crate::proposal::tests::aluminium(&mut doc);
+        assert!(unmet(&doc, Some(&mesh)).is_empty());
+        assert_eq!(
+            unmet(&doc, None),
+            vec!["Imported part", "Setup 1: a machine and stock"]
+        );
+        let mut other = doc.clone();
+        other.setups[0]
+            .machine
+            .p
+            .insert("controller".into(), "GRBL".into());
+        other.tools[1].p.insert("number".into(), "1".into());
+        other.file = None;
+        let lines = preconditions(&other, Some(&mesh));
+        assert_eq!(lines.iter().filter(|p| !p.ok).count(), 3);
+        assert!(lines[1].hint.contains("LinuxCNC") && lines[3].hint.contains("also used"));
+        other.setups[0].machine = doc.setups[0].machine.clone();
+        other.setups[0].p.insert("ry".into(), "45".into());
+        assert!(
+            preconditions(&other, Some(&mesh))[1]
+                .hint
+                .contains("multiples of 90")
+        );
+        other.setups.clear();
+        other.tools.clear();
+        let lines = preconditions(&other, Some(&mesh));
+        assert!(
+            lines[1].hint.contains("Create setup 1") && lines[3].hint.contains("at least one tool")
+        );
+    }
+    #[test]
+    fn the_report_lists_tools_machine_limits_and_serializes() {
+        let (mut doc, mesh) = block();
+        doc.tools[1].p.remove("number");
+        let report = report(&doc, &mesh).unwrap();
+        assert_eq!(
+            report.tools.iter().map(|t| t.number).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(report.tools[0].kind, "Flat end mill");
+        assert_eq!(
+            (report.machine.max_rpm, report.machine.max_feed),
+            (12000., 5000.)
+        );
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            json.contains("\"material\":{\"name\":\"Aluminium 6061-T6\",\"group\":\"Aluminium\"")
+                && json.contains("\"max_cutter_diameter\"")
+                && json.contains("\"flutes\":3")
+                && json.contains("{\"up_to_mm\":null,\"min\":0.06,\"max\":0.12}")
+        );
+        assert!(json.len() < 20_000, "{}", json.len());
+    }
+    #[test]
+    fn the_report_carries_the_materials_cutting_data() {
+        let (mut doc, mesh) = block();
+        let report = report(&doc, &mesh).unwrap();
+        let m = &report.material;
+        assert_eq!(
+            (m.name.as_str(), m.group.as_str(), m.hardness.as_str()),
+            ("Aluminium 6061-T6", "Aluminium", "95 HB")
+        );
+        assert!(m.notes.starts_with("Starting point for carbide tools"));
+        assert!(m.notes.ends_with("Flood or mist; clear chips."));
+        assert_eq!((m.vc_min_m_per_min, m.vc_max_m_per_min), (150., 300.));
+        assert_eq!(m.chip_load_mm.len(), 5);
+        let limits: Vec<_> = m.chip_load_mm.iter().map(|b| b.up_to_mm).collect();
+        assert_eq!(limits, vec![Some(3.), Some(6.), Some(10.), Some(16.), None]);
+        let band = &m.chip_load_mm[2];
+        assert_eq!((band.min, band.max), (0.03, 0.08));
+        let last = &m.chip_load_mm[4];
+        assert_eq!((last.min, last.max), (0.06, 0.12));
+        // Every tool says how many flutes it has: the chip load needs them.
+        assert_eq!(
+            report.tools.iter().map(|t| t.flutes).collect::<Vec<_>>(),
+            vec![3, 3, 3]
+        );
+        // The user's text is one cleaned line of bounded length.
+        let id = doc.material_id.clone();
+        let chosen = doc.materials.iter_mut().find(|m| m.id == id).unwrap();
+        let long = format!("Line one\n\ttwo {}", "x".repeat(600));
+        chosen.p.insert("notes".into(), long.clone());
+        chosen.p.insert("name".into(), "N".repeat(80));
+        chosen.p.insert("group".into(), "G".repeat(80));
+        chosen
+            .p
+            .insert("hardness".into(), format!("{}\u{202e}", "H".repeat(80)));
+        let m = super::report(&doc, &mesh).unwrap().material;
+        assert_eq!(m.notes, crate::proposal::clip(&long, 500));
+        assert!(m.notes.starts_with("Line one two xxx"));
+        assert_eq!(m.notes.chars().count(), 500);
+        assert_eq!(m.name, "N".repeat(60));
+        assert_eq!(m.group, "G".repeat(40));
+        assert_eq!(m.hardness, "H".repeat(40));
+    }
+    #[test]
+    fn a_report_needs_a_material_with_cutting_data() {
+        let (mut doc, mesh) = block();
+        doc.material_id.clear();
+        assert_eq!(
+            report(&doc, &mesh).unwrap_err(),
+            "Choose a material on the setup page."
+        );
+        let bare = crate::material::Material::new("Inconel 718");
+        let id = bare.id.clone();
+        doc.materials.push(bare);
+        assert!(doc.select_material(&id));
+        assert_eq!(
+            report(&doc, &mesh).unwrap_err(),
+            "Add cutting data to Inconel 718 on the Materials page."
+        );
+    }
+    #[test]
+    fn a_plane_with_more_hole_candidates_than_the_limit_lists_none() {
+        let (doc, mesh) = block();
+        let setup1 = &doc.setups[0];
+        let stock = crate::stock::resolve(setup1, Some(&mesh)).unwrap().stock;
+        let stock = Volume::new(stock, Frame::new(setup1, &mesh));
+        let full = orientation(setup1, &stock, &mesh, "+Z", MAX_HOLES).unwrap();
+        assert_eq!(plane(&full, 0.).holes.len(), 5);
+        assert!(!full.truncated);
+        let limited = orientation(setup1, &stock, &mesh, "+Z", 3).unwrap();
+        assert!(limited.truncated);
+        assert!(plane(&limited, 0.).holes.is_empty());
+    }
+    type Tri = [[f32; 3]; 3];
+    fn quad(t: &mut Vec<Tri>, p: [[f32; 3]; 4]) {
+        t.push([p[0], p[1], p[2]]);
+        t.push([p[0], p[2], p[3]]);
+    }
+    /// The four outward-facing walls of an `x` × `y` × `z` box.
+    fn walls(t: &mut Vec<Tri>, x: f32, y: f32, z: f32) {
+        quad(t, [[0., 0., 0.], [x, 0., 0.], [x, 0., z], [0., 0., z]]);
+        quad(t, [[x, y, 0.], [0., y, 0.], [0., y, z], [x, y, z]]);
+        quad(t, [[0., y, 0.], [0., 0., 0.], [0., 0., z], [0., y, z]]);
+        quad(t, [[x, 0., 0.], [x, y, 0.], [x, y, z], [x, 0., z]]);
+    }
+    /// A 40 × 30 × 20 box, with or without its top and bottom faces. The last
+    /// two triangles are the +X wall.
+    fn box_triangles(top: bool, bottom: bool) -> Vec<Tri> {
+        let mut t = vec![];
+        let (x, y, z) = (40., 30., 20.);
+        if top {
+            quad(&mut t, [[0., 0., z], [x, 0., z], [x, y, z], [0., y, z]]);
+        }
+        if bottom {
+            quad(&mut t, [[0., 0., 0.], [0., y, 0.], [x, y, 0.], [x, 0., 0.]]);
+        }
+        walls(&mut t, x, y, z);
+        t
+    }
+    fn box_mesh(top: bool, bottom: bool) -> Mesh {
+        crate::mesh::normalize(box_triangles(top, bottom)).unwrap()
+    }
+    /// A 120 × 80 × 40 box with a centred `top` × `top` square missing from
+    /// its top face and a `bottom` × `bottom` one missing from its bottom face.
+    pub(crate) fn holed(top: f32, bottom: f32) -> Mesh {
+        crate::mesh::normalize(holed_triangles([top; 2], [bottom; 2])).unwrap()
+    }
+    /// The triangles of a 120 × 80 × 40 box from the origin with a centred
+    /// rectangle (X and Y sizes) missing from its top face and another from
+    /// its bottom face, with no walls between them.
+    fn holed_triangles(top: [f32; 2], bottom: [f32; 2]) -> Vec<Tri> {
+        let (x, y, z) = (120f32, 80f32, 40f32);
+        let mut t = vec![];
+        for (h, zz, up) in [(top, z, true), (bottom, 0., false)] {
+            let (a0, a1) = ((x - h[0]) / 2., (x + h[0]) / 2.);
+            let (b0, b1) = ((y - h[1]) / 2., (y + h[1]) / 2.);
+            let quads = if h[0] > 0. {
+                vec![
+                    [[0., 0., zz], [x, 0., zz], [a1, b0, zz], [a0, b0, zz]],
+                    [[x, 0., zz], [x, y, zz], [a1, b1, zz], [a1, b0, zz]],
+                    [[x, y, zz], [0., y, zz], [a0, b1, zz], [a1, b1, zz]],
+                    [[0., y, zz], [0., 0., zz], [a0, b0, zz], [a0, b1, zz]],
+                ]
+            } else {
+                vec![[[0., 0., zz], [x, 0., zz], [x, y, zz], [0., y, zz]]]
+            };
+            for mut q in quads {
+                if !up {
+                    q.reverse();
+                }
+                quad(&mut t, q);
+            }
+        }
+        walls(&mut t, x, y, z);
+        t
+    }
+    /// A 120 × 80 × 40 box with a 40 × 30 × 6 pocket open from below, and a
+    /// centred `patch` × `patch` square missing from the top face, over the pocket.
+    pub(crate) fn pocket_box(patch: f32) -> Mesh {
+        let (x, y, z, d) = (120f32, 80f32, 40f32, 6f32);
+        let (p0, p1, q0, q1) = (40f32, 80f32, 25f32, 55f32);
+        let (a0, a1) = ((x - patch) / 2., (x + patch) / 2.);
+        let (b0, b1) = ((y - patch) / 2., (y + patch) / 2.);
+        let mut t = vec![];
+        if patch > 0. {
+            quad(&mut t, [[0., 0., z], [x, 0., z], [a1, b0, z], [a0, b0, z]]);
+            quad(&mut t, [[x, 0., z], [x, y, z], [a1, b1, z], [a1, b0, z]]);
+            quad(&mut t, [[x, y, z], [0., y, z], [a0, b1, z], [a1, b1, z]]);
+            quad(&mut t, [[0., y, z], [0., 0., z], [a0, b0, z], [a0, b1, z]]);
+        } else {
+            quad(&mut t, [[0., 0., z], [x, 0., z], [x, y, z], [0., y, z]]);
+        }
+        let down = |t: &mut Vec<Tri>, p: [[f32; 3]; 4]| quad(t, [p[3], p[2], p[1], p[0]]);
+        // The bottom face around the pocket's opening, and the pocket's ceiling.
+        down(
+            &mut t,
+            [[0., 0., 0.], [x, 0., 0.], [p1, q0, 0.], [p0, q0, 0.]],
+        );
+        down(
+            &mut t,
+            [[x, 0., 0.], [x, y, 0.], [p1, q1, 0.], [p1, q0, 0.]],
+        );
+        down(
+            &mut t,
+            [[x, y, 0.], [0., y, 0.], [p0, q1, 0.], [p1, q1, 0.]],
+        );
+        down(
+            &mut t,
+            [[0., y, 0.], [0., 0., 0.], [p0, q0, 0.], [p0, q1, 0.]],
+        );
+        down(&mut t, [[p0, q0, d], [p1, q0, d], [p1, q1, d], [p0, q1, d]]);
+        quad(
+            &mut t,
+            [[p0, q0, 0.], [p0, q0, d], [p1, q0, d], [p1, q0, 0.]],
+        );
+        quad(
+            &mut t,
+            [[p1, q0, 0.], [p1, q0, d], [p1, q1, d], [p1, q1, 0.]],
+        );
+        quad(
+            &mut t,
+            [[p1, q1, 0.], [p1, q1, d], [p0, q1, d], [p0, q1, 0.]],
+        );
+        quad(
+            &mut t,
+            [[p0, q1, 0.], [p0, q1, d], [p0, q0, d], [p0, q0, 0.]],
+        );
+        walls(&mut t, x, y, z);
+        crate::mesh::normalize(t).unwrap()
+    }
+    /// UV sphere triangles of radius `r`: many triangles meet at its poles,
+    /// and its seam's vertices are computed twice.
+    fn sphere_triangles(n: usize, m: usize, r: f32) -> Vec<Tri> {
+        let point = |i: usize, j: usize| {
+            let theta = std::f32::consts::TAU * i as f32 / n as f32;
+            let phi = std::f32::consts::PI * j as f32 / m as f32;
+            [
+                r * phi.sin() * theta.cos(),
+                r * phi.sin() * theta.sin(),
+                r * phi.cos(),
+            ]
+        };
+        let mut t = vec![];
+        for i in 0..n {
+            for j in 0..m {
+                let (a, b) = (point(i, j), point(i + 1, j));
+                let (c, d) = (point(i + 1, j + 1), point(i, j + 1));
+                if j != 0 {
+                    t.push([a, d, b]);
+                }
+                if j != m - 1 {
+                    t.push([b, d, c]);
+                }
+            }
+        }
+        t
+    }
+    fn sphere() -> Mesh {
+        crate::mesh::normalize(sphere_triangles(48, 24, 30.)).unwrap()
+    }
+    /// `t` with the longest edge of every `every`-th triangle split into
+    /// `pieces` by a fan from the opposite corner, and its neighbours left
+    /// alone: T-junctions, still closed.
+    fn split(t: &[Tri], every: usize, pieces: usize) -> Vec<Tri> {
+        let mut out = vec![];
+        for (i, p) in t.iter().enumerate() {
+            if i % every != 0 {
+                out.push(*p);
+                continue;
+            }
+            let length = |k: usize| {
+                (0..3)
+                    .map(|c| (p[k][c] - p[(k + 1) % 3][c]).powi(2))
+                    .sum::<f32>()
+            };
+            let e = (0..3)
+                .max_by(|a, b| length(*a).total_cmp(&length(*b)))
+                .unwrap();
+            let (a, b, c) = (p[e], p[(e + 1) % 3], p[(e + 2) % 3]);
+            let at = |s: usize| -> [f32; 3] {
+                let s = s as f32 / pieces as f32;
+                std::array::from_fn(|k| a[k] + (b[k] - a[k]) * s)
+            };
+            for s in 0..pieces {
+                out.push([at(s), at(s + 1), c]);
+            }
+        }
+        out
+    }
+    /// The mesh's triangles in mm in its own frame, moved by `offset`.
+    fn source(mesh: &Mesh, offset: [f32; 3]) -> Vec<Tri> {
+        let scale = mesh.display_scale();
+        mesh.faces
+            .iter()
+            .filter(|f| f.points.len() == 3)
+            .map(|f| {
+                std::array::from_fn(|i| std::array::from_fn(|k| f.points[i][k] / scale + offset[k]))
+            })
+            .collect()
+    }
+    /// `mesh` with every third triangle split at the midpoint of its longest
+    /// edge and its neighbours left alone: T-junctions everywhere, still closed.
+    fn t_junctions(mesh: &Mesh) -> Mesh {
+        crate::mesh::normalize(split(&source(mesh, [0.; 3]), 3, 2)).unwrap()
+    }
+    /// A closed cylinder (radius 30, height 20) whose caps are fans of `n`
+    /// triangles around their centres, with every third triangle split at the
+    /// midpoint of its longest edge: long open edges that meet at the centres.
+    fn fan_cylinder(n: usize) -> Vec<Tri> {
+        let at = |i: usize, z: f32| {
+            let a = std::f32::consts::TAU * (i % n) as f32 / n as f32;
+            [30. * a.cos(), 30. * a.sin(), z]
+        };
+        let mut t = vec![];
+        for i in 0..n {
+            t.push([[0., 0., 20.], at(i, 20.), at(i + 1, 20.)]);
+            t.push([[0., 0., 0.], at(i + 1, 0.), at(i, 0.)]);
+            t.push([at(i, 0.), at(i + 1, 0.), at(i + 1, 20.)]);
+            t.push([at(i, 0.), at(i + 1, 20.), at(i, 20.)]);
+        }
+        split(&t, 3, 2)
+    }
+    /// `t` with every corner moved `by` mm along a diagonal of its own, so
+    /// copies of one vertex are up to twice that apart.
+    fn jittered(t: &[Tri], by: f32) -> Vec<Tri> {
+        let step = by / 3f32.sqrt();
+        let mut seed = 7u64;
+        t.iter()
+            .map(|p| {
+                p.map(|q| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    std::array::from_fn(|k| {
+                        q[k] + if (seed >> (40 + k)) & 1 == 0 {
+                            step
+                        } else {
+                            -step
+                        }
+                    })
+                })
+            })
+            .collect()
+    }
+    /// Open edges of `t`, taken as mm.
+    fn count(t: &[Tri]) -> usize {
+        let t: Vec<_> = t.iter().map(|p| p.map(|q| q.map(f64::from))).collect();
+        closure(&t, 0.).open_edges
+    }
+    /// Open edges of `mesh`.
+    fn edges(mesh: &Mesh) -> usize {
+        let (t, largest) = mm_triangles(mesh);
+        closure(&t, largest).open_edges
+    }
+    fn not_closed(n: usize) -> String {
+        format!(
+            "The part is not a closed solid ({n} open edges), so the planner cannot check its plans against it. Repair or re-export the model."
+        )
+    }
+    const NOT_SOLID: &str = "The part is not a closed solid, so the planner cannot check its plans against it. Repair or re-export the model.";
+    const NO_VOLUME: &str = "The part encloses no volume, so the planner cannot check its plans against it. Repair or re-export the model.";
+    /// `t` turned `angles` degrees about X and then Y, scaled by `scale` and
+    /// moved by `offset`, computed exactly and rounded once to f32, as an
+    /// exporter writes it.
+    fn placed(t: &[Tri], angles: [f64; 2], scale: f64, offset: [f64; 3]) -> Vec<Tri> {
+        let [(sx, cx), (sy, cy)] = angles.map(|a| a.to_radians().sin_cos());
+        let m = [
+            [cy, sy * sx, sy * cx],
+            [0., cx, -sx],
+            [-sy, cy * sx, cy * cx],
+        ];
+        t.iter()
+            .map(|p| {
+                p.map(|q| {
+                    std::array::from_fn(|i| {
+                        ((0..3).map(|k| m[i][k] * f64::from(q[k])).sum::<f64>() * scale + offset[i])
+                            as f32
+                    })
+                })
+            })
+            .collect()
+    }
+    /// A point on a circle of radius `r` around the Z axis, at the `i`-th of
+    /// `n` steps and height `z`.
+    fn rim(r: f32, n: usize, i: usize, z: f32) -> [f32; 3] {
+        let a = std::f64::consts::TAU * (i % n) as f64 / n as f64;
+        [
+            (f64::from(r) * a.cos()) as f32,
+            (f64::from(r) * a.sin()) as f32,
+            z,
+        ]
+    }
+    /// A cylinder of radius `r` and height `h` with `n` segments whose caps
+    /// are fans from rim vertex 0, as CAD often writes a disc.
+    fn rim_fan_cylinder(r: f32, n: usize, h: f32) -> Vec<Tri> {
+        let mut t = vec![];
+        for i in 0..n {
+            let (a0, a1, b0, b1) = (
+                rim(r, n, i, 0.),
+                rim(r, n, i + 1, 0.),
+                rim(r, n, i, h),
+                rim(r, n, i + 1, h),
+            );
+            t.push([a0, a1, b1]);
+            t.push([a0, b1, b0]);
+        }
+        for k in 1..n - 1 {
+            t.push([rim(r, n, 0, h), rim(r, n, k, h), rim(r, n, k + 1, h)]);
+            t.push([rim(r, n, 0, 0.), rim(r, n, k + 1, 0.), rim(r, n, k, 0.)]);
+        }
+        t
+    }
+    /// A 5 mm tall cylinder of radius `r` with `n` segments whose caps are
+    /// fans around their centres, with every other top spoke split into
+    /// `pieces` by a fan from the rim: T-junctions along the spokes.
+    fn split_spokes(r: f32, n: usize, pieces: usize) -> Vec<Tri> {
+        let centre = [0f32, 0., 5.];
+        let mut t = vec![];
+        for i in 0..n {
+            let (a0, a1, b0, b1) = (
+                rim(r, n, i, 0.),
+                rim(r, n, i + 1, 0.),
+                rim(r, n, i, 5.),
+                rim(r, n, i + 1, 5.),
+            );
+            t.push([a0, a1, b1]);
+            t.push([a0, b1, b0]);
+            t.push([[0., 0., 0.], a1, a0]);
+            if i % 2 == 1 {
+                t.push([centre, b0, b1]);
+                continue;
+            }
+            let at = |s: usize| -> [f32; 3] {
+                let f = s as f32 / pieces as f32;
+                std::array::from_fn(|k| centre[k] + (b0[k] - centre[k]) * f)
+            };
+            for s in 0..pieces {
+                t.push([at(s), at(s + 1), b1]);
+            }
+        }
+        t
+    }
+    /// Two 40 × 30 mm blocks side by side, 10 + `step` × 0.0001 and
+    /// 10 + (`step` + 2) × 0.0001 mm high: their tops are one plane to within
+    /// 0.0002 mm. Over `step` 0 to 9 the pair crosses every 0.002 mm boundary
+    /// of the part's z values.
+    pub(crate) fn blocks_with_tops_a_hair_apart(step: u32) -> Mesh {
+        let h = |n: u32| 10. + n as f32 * 0.0001;
+        let mut t = cuboid([0., 0., 0.], [40., 30., h(step)]);
+        t.extend(cuboid([50., 0., 0.], [90., 30., h(step + 2)]));
+        crate::mesh::normalize(t).unwrap()
+    }
+    /// An outward-facing box from `lo` to `hi`.
+    fn cuboid(lo: [f32; 3], hi: [f32; 3]) -> Vec<Tri> {
+        box_triangles(true, true)
+            .iter()
+            .map(|p| p.map(|q| std::array::from_fn(|k| if q[k] > 0. { hi[k] } else { lo[k] })))
+            .collect()
+    }
+    /// `t` with every triangle's winding reversed.
+    fn reversed(t: &[Tri]) -> Vec<Tri> {
+        t.iter().map(|p| [p[0], p[2], p[1]]).collect()
+    }
+    type Tri64 = [[f64; 3]; 3];
+    /// The example block in mm with its lowest corner at the origin, scaled
+    /// so that its longest side is `length` mm, as an exporter's doubles.
+    fn cornered(mesh: &Mesh, length: f64) -> Vec<Tri64> {
+        let t = source(mesh, [0.; 3]);
+        let (mut lo, mut hi) = ([f64::INFINITY; 3], [f64::NEG_INFINITY; 3]);
+        for q in t.iter().flatten() {
+            for k in 0..3 {
+                lo[k] = lo[k].min(f64::from(q[k]));
+                hi[k] = hi[k].max(f64::from(q[k]));
+            }
+        }
+        let scale = length / (0..3).map(|k| hi[k] - lo[k]).fold(0., f64::max);
+        t.iter()
+            .map(|p| p.map(|q| std::array::from_fn(|k| (f64::from(q[k]) - lo[k]) * scale)))
+            .collect()
+    }
+    /// `split`, computed in f64 as an exporter computes it.
+    fn split64(t: &[Tri64], every: usize, pieces: usize) -> Vec<Tri64> {
+        let mut out = vec![];
+        for (i, p) in t.iter().enumerate() {
+            if i % every != 0 {
+                out.push(*p);
+                continue;
+            }
+            let length = |k: usize| dot(sub(p[(k + 1) % 3], p[k]), sub(p[(k + 1) % 3], p[k]));
+            let e = (0..3)
+                .max_by(|a, b| length(*a).total_cmp(&length(*b)))
+                .unwrap();
+            let (a, b, c) = (p[e], p[(e + 1) % 3], p[(e + 2) % 3]);
+            let at = |s: usize| -> [f64; 3] {
+                let s = s as f64 / pieces as f64;
+                std::array::from_fn(|k| a[k] + (b[k] - a[k]) * s)
+            };
+            for s in 0..pieces {
+                out.push([at(s), at(s + 1), c]);
+            }
+        }
+        out
+    }
+    /// `t` written as ASCII STL with `digits` significant digits (C's `%.6e`
+    /// for 7) and read back by the app's STL reader.
+    fn ascii_stl(t: &[Tri64], digits: usize) -> Vec<Tri> {
+        let number = |v: f64| {
+            let text = format!("{v:.*e}", digits - 1);
+            let (mantissa, exponent) = text.split_once('e').unwrap();
+            format!("{mantissa}e{:+03}", exponent.parse::<i32>().unwrap())
+        };
+        let mut s = String::from("solid part\n");
+        for p in t {
+            s.push_str("  facet normal 0 0 0\n    outer loop\n");
+            for q in p {
+                let [x, y, z] = q.map(number);
+                s.push_str(&format!("      vertex {x} {y} {z}\n"));
+            }
+            s.push_str("    endloop\n  endfacet\n");
+        }
+        s.push_str("endsolid part\n");
+        crate::mesh::stl(s.as_bytes()).unwrap()
+    }
+    /// Zero-area triangles whose corners are `step` mm apart along the line
+    /// from `p` to `q` (computed in f64 and rounded once to f32): each repeats
+    /// a corner, or, when `collinear`, has three corners on the line.
+    fn chain(p: [f64; 3], q: [f64; 3], step: f64, collinear: bool) -> Vec<Tri> {
+        let n = (dot(sub(q, p), sub(q, p)).sqrt() / step).ceil() as usize;
+        let at = |i: usize| -> [f32; 3] {
+            std::array::from_fn(|k| (p[k] + (q[k] - p[k]) * i.min(n) as f64 / n as f64) as f32)
+        };
+        if collinear {
+            (0..n)
+                .step_by(2)
+                .map(|i| [at(i), at(i + 1), at(i + 2)])
+                .collect()
+        } else {
+            (0..n).map(|i| [at(i), at(i), at(i + 1)]).collect()
+        }
+    }
+    #[test]
+    fn open_edges_are_the_edges_left_once_float_rounding_is_absorbed() {
+        let (o, a, b, c) = ([0., 0., 0.], [10., 0., 0.], [0., 10., 0.], [0., 0., 10.]);
+        let tetrahedron = |moved: [f32; 3]| vec![[moved, b, a], [o, a, c], [o, c, b], [a, b, c]];
+        assert_eq!(count(&tetrahedron(o)), 0);
+        assert_eq!(count(&[[o, a, b]]), 3);
+        // The tolerance is 8 f32 steps at the largest coordinate, or √3 times
+        // the last digit of 7 significant digits there if that is more.
+        let root3 = 3f64.sqrt();
+        for (largest, tol) in [
+            (0.5, root3 * 1e-6),
+            (10., root3 * 1e-5),
+            (99.9, 8. * 2f64.powi(-17)),
+            (120., root3 * 1e-4),
+            (1012.3, root3 * 1e-3),
+            (3000., 8. * 2f64.powi(-12)),
+        ] {
+            assert!((tolerance(largest) - tol).abs() < tol * 1e-9, "{largest}");
+        }
+        // Here it is √3 × 0.00001 mm: copies of a vertex that close are one
+        // vertex.
+        for off in [0.000001, 0.000005, 0.00001, 0.000015] {
+            assert_eq!(count(&tetrahedron([0., 0., -off])), 0, "{off}");
+        }
+        // Copies farther apart are distinct vertices: four open edges.
+        for off in [0.00002, 0.00005, 0.0005, 0.00099, 0.01] {
+            assert_eq!(count(&tetrahedron([0., 0., -off])), 4, "{off}");
+        }
+        // Copies 0.00001 mm apart in a row (joined by zero-area triangles) are
+        // welded only while the row spans at most twice the tolerance.
+        let row = |length: usize| {
+            let mut t = tetrahedron([0., 0., -0.00001 * length as f32]);
+            let z = |k: usize| [0., 0., -0.00001 * k as f32];
+            t.extend((0..length).map(|k| [z(k), z(k), z(k + 1)]));
+            t
+        };
+        assert_eq!(count(&row(3)), 0);
+        assert_eq!(count(&row(4)), 4);
+        // A zero-area triangle and a triangle written again with the same
+        // winding, from another corner, change nothing.
+        let mut t = tetrahedron(o);
+        t.extend([[o, [5., 0., 0.], a], [o, a, c], [a, c, o]]);
+        assert_eq!(count(&t), 0);
+        // A copy with the opposite winding stays: with it, the triangle's
+        // edges are used three times.
+        let mut t = tetrahedron(o);
+        t.push([o, c, a]);
+        assert_eq!(count(&t), 3);
+        // A triangle written with both windings has no open edge (the volume
+        // rule refuses it).
+        assert_eq!(count(&[[o, a, b], [o, b, a]]), 0);
+        // A T-junction: the long edge is split at the vertex in its middle,
+        // also when that vertex is within the tolerance of the edge.
+        let flat = |top: Vec<Tri>| {
+            let mut t = top;
+            t.extend([[o, b, c], [o, c, a], [a, c, b]]);
+            t
+        };
+        for m in [[5., 5., 0.], [5.000003, 5.000003, 0.]] {
+            assert_eq!(count(&flat(vec![[o, a, m], [o, m, b]])), 0, "{m:?}");
+        }
+        // Moved 0.00003 or 0.01 mm off the long edge, the vertex does not
+        // split it.
+        for m in [[5.00002, 5.00002, 0.], [5.007, 5.007, 0.]] {
+            assert_eq!(count(&flat(vec![[o, a, m], [o, m, b]])), 3, "{m:?}");
+        }
+        // Coordinates beyond 1 000 000 mm or not finite: every edge is open.
+        let far: Vec<Tri> = tetrahedron(o)
+            .iter()
+            .map(|p| p.map(|q| q.map(|v| v * 2e5)))
+            .collect();
+        assert_eq!(count(&far), 12);
+        let mut nan = tetrahedron(o);
+        nan[1][0][0] = f32::NAN;
+        assert_eq!(count(&nan), 12);
+        assert_eq!(count(&[[[1e16, 0., 0.], [1e16, 1e16, 0.], b]]), 3);
+    }
+    #[test]
+    fn the_part_must_be_a_closed_surface() {
+        let (doc, mesh) = block();
+        // The reviewers' case: matching 12 × 12 squares missing from the top
+        // and the bottom. No vertical ray crosses the gap, as in a through hole.
+        let patched = holed(12., 12.);
+        assert_eq!(edges(&patched), 8);
+        assert_eq!(report(&doc, &patched).unwrap_err(), not_closed(8));
+        // One triangle missing from a wall, which vertical rays cannot see.
+        let mut t = box_triangles(true, true);
+        t.pop();
+        let missing = crate::mesh::normalize(t).unwrap();
+        assert_eq!(edges(&missing), 3);
+        assert_eq!(report(&doc, &missing).unwrap_err(), not_closed(3));
+        // A UV sphere with T-junctions and every tenth triangle removed.
+        let holes: Vec<Tri> = split(&sphere_triangles(48, 24, 30.), 3, 2)
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| i % 10 != 0)
+            .map(|(_, p)| p)
+            .collect();
+        let holes = crate::mesh::normalize(holes).unwrap();
+        let n = edges(&holes);
+        assert!(n >= 300, "{n}");
+        assert_eq!(report(&doc, &holes).unwrap_err(), not_closed(n));
+        // The box and an open cup (radius 1, height 5) whose 10 000 rim
+        // vertices are 0.0006 mm apart: a row too fine to weld into one vertex.
+        let n = 10_000;
+        let at = |i: usize, z: f32| {
+            let a = std::f32::consts::TAU * (i % n) as f32 / n as f32;
+            [20. + a.cos(), 15. + a.sin(), z]
+        };
+        let mut t = box_triangles(true, true);
+        for i in 0..n {
+            t.push([[20., 15., 2.], at(i + 1, 2.), at(i, 2.)]);
+            t.push([at(i, 2.), at(i + 1, 2.), at(i + 1, 7.)]);
+            t.push([at(i, 2.), at(i + 1, 7.), at(i, 7.)]);
+        }
+        let cup = crate::mesh::normalize(t).unwrap();
+        assert_eq!(edges(&cup), n);
+        assert_eq!(report(&doc, &cup).unwrap_err(), not_closed(n));
+        // A UV sphere whose vertex copies are up to 0.0002 mm apart, far more
+        // than the tolerance at 30 mm (0.000017 mm): the copies are distinct
+        // vertices.
+        let soup =
+            crate::mesh::normalize(jittered(&sphere_triangles(96, 48, 30.), 0.0001)).unwrap();
+        let n = edges(&soup);
+        assert!(n > 10_000, "{n}");
+        assert_eq!(report(&doc, &soup).unwrap_err(), not_closed(n));
+        // The +X wall re-triangulated with a vertex in the middle of its top
+        // edge, which the top face does not have: a T-junction.
+        let (x, y, z) = (40., 30., 20.);
+        let mut t = box_triangles(true, true);
+        t.truncate(t.len() - 2);
+        let mid = [x, y / 2., z];
+        t.extend([
+            [[x, 0., 0.], [x, y, 0.], mid],
+            [[x, y, 0.], [x, y, z], mid],
+            [mid, [x, 0., z], [x, 0., 0.]],
+        ]);
+        let mut twice = mesh.clone();
+        twice.faces.push(mesh.faces[0].clone());
+        let closed = [
+            ("box", box_mesh(true, true)),
+            ("T-junction box", crate::mesh::normalize(t).unwrap()),
+            ("UV sphere", sphere()),
+            ("T-junction example block", t_junctions(&mesh)),
+            ("example block with a triangle written twice", twice),
+            (
+                "UV sphere with vertex copies up to 0.00001 mm apart",
+                crate::mesh::normalize(jittered(&sphere_triangles(96, 48, 30.), 0.000005)).unwrap(),
+            ),
+            (
+                "fan-capped T-junction cylinder",
+                crate::mesh::normalize(fan_cylinder(300)).unwrap(),
+            ),
+            ("example block", mesh),
+        ];
+        for (name, m) in &closed {
+            assert_eq!(edges(m), 0, "{name}");
+            assert!(report(&doc, m).is_ok(), "{name}");
+        }
+    }
+    #[test]
+    fn t_junctions_far_from_the_origin_are_closed() {
+        let (doc, mesh) = block();
+        for (offset, every, pieces) in [
+            ([412.3, -287.6, 95.1], 10, 30),
+            ([1012.3, 687.6, 0.], 10, 30),
+            ([0.; 3], 50, 100),
+        ] {
+            let m = crate::mesh::normalize(split(&source(&mesh, offset), every, pieces)).unwrap();
+            assert_eq!(edges(&m), 0, "{offset:?}");
+            assert!(report(&doc, &m).is_ok(), "{offset:?}");
+        }
+    }
+    #[test]
+    fn closedness_does_not_depend_on_where_setup_1_puts_the_part() {
+        let (mut doc, mesh) = block();
+        for (key, value) in [("tx", "500"), ("ty", "-300"), ("tz", "80")] {
+            doc.setups[0].p.insert(key.into(), value.into());
+        }
+        let tj = t_junctions(&mesh);
+        assert!(report(&doc, &mesh).is_ok());
+        assert!(report(&doc, &tj).is_ok());
+    }
+    #[test]
+    fn the_edge_test_is_quick_where_long_open_edges_meet() {
+        let t = fan_cylinder(3750);
+        assert_eq!(t.len(), 20_000);
+        let t: Vec<_> = t.iter().map(|p| p.map(|q| q.map(f64::from))).collect();
+        let c = closure(&t, 0.);
+        assert_eq!(c.open_edges, 0);
+        // The split of each open edge looks only near it: about 30 ends per
+        // open edge here (15,000 of them, with 11,272 ends), not every end
+        // for every open edge, 170 million.
+        assert!(c.looked < 64 * 3 * t.len(), "{}", c.looked);
+    }
+    #[test]
+    fn the_example_models_are_closed_surfaces() {
+        let (doc, _) = block();
+        let examples = crate::repo_root().join("examples");
+        for file in [
+            "four-setup-block.3mf",
+            "four-setup-block.step",
+            "inch-block.step",
+            "placed-assembly.step",
+            "preview-cube.obj",
+        ] {
+            if file.ends_with(".step") && crate::step::skip_without_helper() {
+                continue;
+            }
+            let mesh = crate::mesh::load(&examples.join(file)).unwrap();
+            assert_eq!(edges(&mesh), 0, "{file}");
+            assert_eq!(closed_solid(&doc.setups[0], &mesh), Ok(()), "{file}");
+        }
+    }
+    /// The solid spans through the middle of the model in `setup`'s frame,
+    /// from the model's bottom, in mm.
+    fn column(setup: &Setup, mesh: &Mesh) -> Vec<[f32; 2]> {
+        let geometry = Geometry::new(setup, mesh);
+        let index = Index::new(&geometry);
+        let b = geometry.bounds;
+        let centre = [0, 1].map(|k| (b.min[k] + b.max[k]) / 2. + 1e-4);
+        solid(&index, centre, b.max[2])
+            .iter()
+            .map(|(lo, hi)| [lo - b.min[2], hi - b.min[2]].map(|v| (v * 1000.).round() / 1000.))
+            .collect()
+    }
+    #[test]
+    fn an_inconsistent_column_is_solid_where_its_crossings_say_so() {
+        let (doc, _) = block();
+        let top = &doc.setups[0];
+        // Only the top crossing (the underside square is missing): it faces
+        // up, so the column is solid from the model's bottom up to it.
+        assert_eq!(column(top, &holed(0., 12.)), vec![[0., 40.]]);
+        // Only the bottom crossing, facing down: solid from it to the model top.
+        assert_eq!(column(top, &holed(12., 0.)), vec![[0., 40.]]);
+        // The pocket open from below, under a missing top square, turned over:
+        // only the pocket's floor, facing up, so the pocket above it is empty.
+        let flipped = oriented(top, "-Z").unwrap();
+        assert_eq!(column(&flipped, &pocket_box(12.)), vec![[0., 34.]]);
+        assert_eq!(column(top, &pocket_box(12.)), vec![[6., 40.]]);
+        // Consistent columns are unchanged.
+        assert_eq!(column(&flipped, &pocket_box(0.)), vec![[0., 34.]]);
+        assert_eq!(column(top, &holed(0., 0.)), vec![[0., 40.]]);
+    }
+    #[test]
+    fn sound_small_and_far_parts_with_t_junctions_are_closed() {
+        let (doc, mesh) = block();
+        let src = source(&mesh, [0.; 3]);
+        let lower = cuboid([0.; 3], [40., 30., 20.]);
+        // The same box on top shares the lower one's top triangles, in the
+        // opposite winding; the mirrored box beside it shares its +X wall.
+        let mut stacked = lower.clone();
+        stacked.extend(cuboid([0., 0., 20.], [40., 30., 40.]));
+        let mut beside = lower.clone();
+        beside.extend(reversed(
+            &lower
+                .iter()
+                .map(|p| p.map(|q| [80. - q[0], q[1], q[2]]))
+                .collect::<Vec<_>>(),
+        ));
+        let mut cases: Vec<(String, Vec<Tri>)> = vec![
+            (
+                "4 mm, 256-segment cylinder with rim-fanned caps, every other triangle split".into(),
+                split(&rim_fan_cylinder(2., 256, 3.), 2, 2),
+            ),
+            (
+                "1 mm, 128-segment cylinder with rim-fanned caps, every other triangle split".into(),
+                split(&rim_fan_cylinder(0.5, 128, 3.), 2, 2),
+            ),
+            (
+                "fan-capped cylinder, 1 024 segments, every other top spoke split into 100".into(),
+                split_spokes(5., 1024, 100),
+            ),
+            (
+                "example block turned 30/30 degrees at (412.3, -287.6, 95.1) mm, every 10th longest edge split into 120".into(),
+                placed(&split(&src, 10, 120), [30., 30.], 1., [412.3, -287.6, 95.1]),
+            ),
+            ("two boxes stacked, sharing a face".into(), stacked),
+            ("two boxes side by side, sharing a face".into(), beside),
+        ];
+        for length in [10., 15., 6., 4.7] {
+            cases.push((
+                format!("example block {length} mm long with T-junctions"),
+                split(&placed(&src, [0.; 2], length / 120., [0.; 3]), 3, 2),
+            ));
+        }
+        // Small parts with T-junctions, rounded where their files put them,
+        // away from the origin: the tolerance follows the file's coordinates.
+        cases.push((
+            "1 mm cylinder with T-junctions, turned 30/30 degrees at (40, -20, 10) mm".into(),
+            placed(
+                &split(&rim_fan_cylinder(0.5, 128, 3.), 3, 2),
+                [30., 30.],
+                1.,
+                [40., -20., 10.],
+            ),
+        ));
+        cases.push((
+            "example block 10 mm long with T-junctions at (412.3, -287.6, 95.1) mm".into(),
+            placed(
+                &split(&placed(&src, [0.; 2], 10. / 120., [0.; 3]), 3, 2),
+                [0.; 2],
+                1.,
+                [412.3, -287.6, 95.1],
+            ),
+        ));
+        for (name, t) in cases {
+            let m = crate::mesh::normalize(t).unwrap();
+            assert_eq!(edges(&m), 0, "{name}");
+            assert_eq!(closed_solid(&doc.setups[0], &m), Ok(()), "{name}");
+        }
+    }
+    #[test]
+    fn a_part_that_encloses_no_volume_is_refused() {
+        let (doc, _) = block();
+        let one = vec![[[0., 0., 0.], [10., 0., 5.], [0., 10., 5.]]];
+        let single = crate::mesh::normalize([one.clone(), reversed(&one)].concat()).unwrap();
+        assert_eq!(edges(&single), 0);
+        assert_eq!(report(&doc, &single).unwrap_err(), NO_VOLUME);
+        // The upper half of a UV sphere and a flat 10 x 10 grid, each written
+        // with both windings.
+        let cap: Vec<Tri> = sphere_triangles(48, 24, 30.)
+            .into_iter()
+            .filter(|p| p.iter().all(|q| q[2] > -0.001))
+            .collect();
+        let mut grid = vec![];
+        for i in 0..10 {
+            for j in 0..10 {
+                let (x, y) = (i as f32, j as f32);
+                quad(
+                    &mut grid,
+                    [
+                        [x, y, 0.],
+                        [x + 1., y, 0.],
+                        [x + 1., y + 1., 0.],
+                        [x, y + 1., 0.],
+                    ],
+                );
+            }
+        }
+        for (name, sheet) in [("hemisphere", cap), ("flat grid", grid)] {
+            let both = crate::mesh::normalize([sheet.clone(), reversed(&sheet)].concat()).unwrap();
+            assert_eq!(edges(&both), 0, "{name}");
+            assert_eq!(
+                closed_solid(&doc.setups[0], &both).unwrap_err(),
+                NO_VOLUME,
+                "{name}"
+            );
+        }
+    }
+    #[test]
+    fn coincident_faces_facing_both_ways_read_the_same_in_either_order() {
+        let (doc, _) = block();
+        let setup1 = &doc.setups[0];
+        // The reviewer's case: a 20 x 20 x 20 void (an inward box) whose top
+        // lies on the block's top face, listed before or after the block.
+        let outer = cuboid([0.; 3], [120., 80., 40.]);
+        let void = reversed(&cuboid([50., 30., 20.], [70., 50., 40.]));
+        let first = crate::mesh::normalize([void.clone(), outer.clone()].concat()).unwrap();
+        let last = crate::mesh::normalize([outer, void].concat()).unwrap();
+        let share = |m: &Mesh| inconsistent_share(&Geometry::new(setup1, m));
+        assert_eq!(share(&first), share(&last));
+        assert_eq!(column(setup1, &first), column(setup1, &last));
+        assert_eq!(closed_solid(setup1, &first), closed_solid(setup1, &last));
+        // A crossing facing down comes first: the void reads as empty under a
+        // lid of no thickness, and the part is accepted.
+        assert_eq!(column(setup1, &first), vec![[0., 20.], [40., 40.]]);
+        assert_eq!(closed_solid(setup1, &first), Ok(()));
+    }
+    #[test]
+    fn the_part_must_be_a_closed_solid() {
+        let (doc, mesh) = block();
+        assert!(report(&doc, &mesh).is_ok());
+        assert_eq!(
+            inconsistent_share(&Geometry::new(&doc.setups[0], &mesh)),
+            0.
+        );
+        assert!(report(&doc, &box_mesh(true, true)).is_ok());
+        assert_eq!(
+            report(&doc, &box_mesh(false, true)).unwrap_err(),
+            not_closed(4)
+        );
+        assert_eq!(
+            report(&doc, &box_mesh(false, false)).unwrap_err(),
+            not_closed(8)
+        );
+        // Closed, but its top faces inward, so every test ray crosses the
+        // surface inconsistently.
+        let mut t = box_triangles(true, true);
+        for p in t.iter_mut().take(2) {
+            p.swap(1, 2);
+        }
+        let flipped = crate::mesh::normalize(t).unwrap();
+        assert_eq!(edges(&flipped), 0);
+        assert_eq!(report(&doc, &flipped).unwrap_err(), NOT_SOLID);
+        // Two closed 0.1 mm cubes at opposite corners of a 100 mm square:
+        // no test ray hits either, and that counts as inconsistent.
+        let apart = crate::mesh::normalize(
+            [
+                cuboid([0.; 3], [0.1; 3]),
+                cuboid([99.9, 99.9, 0.], [100., 100., 0.1]),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        assert_eq!(edges(&apart), 0);
+        assert_eq!(
+            inconsistent_share(&Geometry::new(&doc.setups[0], &apart)),
+            1.
+        );
+        assert_eq!(report(&doc, &apart).unwrap_err(), NOT_SOLID);
+    }
+    #[test]
+    fn sound_parts_written_as_text_with_7_significant_digits_are_closed() {
+        let (doc, mesh) = block();
+        // T-junctions computed in f64 and written as ASCII STL with %.6e, so
+        // every T-vertex and edge end is rounded to 7 significant digits.
+        for (name, t) in [
+            (
+                "example block at 0-120 mm, every 10th longest edge split into 30",
+                split64(&cornered(&mesh, 120.), 10, 30),
+            ),
+            (
+                "example block 101.6 mm (4 in) long with T-junctions",
+                split64(&cornered(&mesh, 101.6), 3, 2),
+            ),
+            (
+                "example block 101.6 mm (4 in) long, every 10th longest edge split into 30",
+                split64(&cornered(&mesh, 101.6), 10, 30),
+            ),
+        ] {
+            let m = crate::mesh::normalize(ascii_stl(&t, 7)).unwrap();
+            assert_eq!(edges(&m), 0, "{name}");
+            assert_eq!(closed_solid(&doc.setups[0], &m), Ok(()), "{name}");
+        }
+    }
+    #[test]
+    fn rows_of_nearby_points_do_not_weld_an_opening_shut() {
+        let (doc, _) = block();
+        // The reviewer's 12 x 12 openings in the top and the bottom, with no
+        // walls, placed at (412.3, -287.6, 95.1) mm, where the tolerance is
+        // 0.00049 mm. Each opening's corners are joined across it in pairs by
+        // rows of zero-area triangles whose points are 0.0003 mm apart.
+        let at = [412.3, -287.6, 95.1];
+        let mut t = placed(&holed_triangles([12.; 2], [12.; 2]), [0.; 2], 1., at);
+        for z in [40., 0.] {
+            for x in [54., 66.] {
+                let p = [x + at[0], 34. + at[1], z + at[2]];
+                let q = [x + at[0], 46. + at[1], z + at[2]];
+                t.extend(chain(p, q, 0.0003, false));
+            }
+        }
+        let openings = crate::mesh::normalize(t).unwrap();
+        assert_eq!(edges(&openings), 8);
+        assert_eq!(report(&doc, &openings).unwrap_err(), not_closed(8));
+        // The reviewer's 40 x 3 mm slot through the top and the bottom at the
+        // origin, its ends bridged by collinear zero-area triangles whose
+        // points are 0.000055 mm apart.
+        let mut t = holed_triangles([40., 3.], [40., 3.]);
+        for z in [40., 0.] {
+            for x in [40., 80.] {
+                t.extend(chain([x, 38.5, z], [x, 41.5, z], 0.000055, true));
+            }
+        }
+        let slot = crate::mesh::normalize(t).unwrap();
+        assert_eq!(edges(&slot), 8);
+        assert_eq!(report(&doc, &slot).unwrap_err(), not_closed(8));
+    }
+    #[test]
+    fn a_double_sided_sheet_with_opposite_diagonals_is_refused() {
+        let (doc, _) = block();
+        // The reviewer's OBJ: 100 x 100 quads of 1 mm on z = 0.00005 (x - 50)
+        // (y - 50), each written as `f p q r s` and again as `f s r q p`. The
+        // OBJ reader fans a face from its first vertex, so the two sides use
+        // opposite diagonals and enclose about 0.08 mm³ between them.
+        let z = |x: f32, y: f32| 5e-5 * (x - 50.) * (y - 50.);
+        let mut t = vec![];
+        for i in 0..100 {
+            for j in 0..100 {
+                let (x, y) = (i as f32, j as f32);
+                let [p, q, r, s] = [[x, y], [x + 1., y], [x + 1., y + 1.], [x, y + 1.]]
+                    .map(|[x, y]| [x, y, z(x, y)]);
+                t.extend([[p, q, r], [p, r, s], [s, r, q], [s, q, p]]);
+            }
+        }
+        let sheet = crate::mesh::normalize(t).unwrap();
+        let (triangles, largest) = mm_triangles(&sheet);
+        let found = closure(&triangles, largest);
+        assert_eq!(found.open_edges, 0);
+        assert!(found.encloses_volume);
+        // Every ray meets one crossing facing down and one facing up at one
+        // height, with nothing solid on either side: inconsistent, and so
+        // solid from the bottom of the model to its top.
+        let setup1 = &doc.setups[0];
+        assert_eq!(inconsistent_share(&Geometry::new(setup1, &sheet)), 1.);
+        assert_eq!(column(setup1, &sheet), vec![[0., 0.25]]);
+        assert_eq!(report(&doc, &sheet).unwrap_err(), NOT_SOLID);
+    }
+    #[test]
+    fn a_part_far_from_its_file_origin_has_its_own_message() {
+        let (doc, _) = block();
+        let far = crate::mesh::normalize(cuboid([1.1e6, 0., 0.], [1.1e6 + 40., 30., 20.])).unwrap();
+        assert_eq!(
+            report(&doc, &far).unwrap_err(),
+            "The part lies more than 1 000 000 mm from its file origin. Move it closer to the origin and re-export it."
+        );
+        // Just inside the limit it is checked as usual.
+        let near =
+            crate::mesh::normalize(cuboid([9.9e5, 0., 0.], [9.9e5 + 40., 30., 20.])).unwrap();
+        assert_eq!(edges(&near), 0);
+        assert!(report(&doc, &near).is_ok());
+    }
+}

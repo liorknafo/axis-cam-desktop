@@ -411,9 +411,10 @@ fn programs(folder: &Path) -> BTreeMap<String, String> {
 
 #[test]
 fn an_agent_plans_the_step_fixture_end_to_end() {
-    // The STEP reader is the OCCT helper build.rs builds; a build without it
-    // (AXIS_SKIP_STEP) cannot import the fixture.
-    if option_env!("AXIS_BUILT_STEP_HELPER").is_none() {
+    // The STEP reader is the OCCT helper crates/axis-core/build.rs builds (its
+    // path is set when axis-core compiles, not for this test crate); a build
+    // without it (AXIS_SKIP_STEP) cannot import the fixture.
+    if !axis_core::step::available() {
         eprintln!("skipped: built without the STEP helper (AXIS_SKIP_STEP)");
         return;
     }

@@ -5,13 +5,30 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
 
 ## Builds
 
+- **Two crates, one workspace** (LIO-729): the app `axis-cam` (`src/`: UI,
+  machine control, runs, MCP, planner, tablet, smoke tests) and the core
+  `axis-core` (`crates/axis-core/`: model, geometry, toolpath strategies,
+  simulation, posting, analysis, proposal, plan check, storage, importers, and
+  the STEP helper's `build.rs` and `native/`). The app reaches a core module as
+  `crate::<module>` (`pub(crate) use axis_core::<module>;` in `src/main.rs`).
+  `cargo test -p axis-core` builds and runs the core's tests without the app;
+  `cargo test -p axis-cam` tests the app; plain `cargo test` at the root, or
+  `--workspace`, both (`default-members`). A filter such as `cargo test --bin
+  axis-cam -- post::` runs only the app's tests: the core's are in
+  `cargo test -p axis-core -- post::`. The core's test-only helpers the
+  app's tests use sit behind its `test-support` feature, which the app's
+  dev-dependency turns on. `cargo fmt --all` and `cargo clippy --workspace`
+  cover both. The opt-level note below (`[profile.test.package.*]`) covers
+  both crates.
+
 - **Never set `CARGO_INCREMENTAL=0`**: not on a command line, in the
-  environment or in a Cargo config. `axis-cam` is one crate of about 270,000
-  lines of code, so without incremental compilation every change compiles
-  all of it again. Measured on the Mac (LIO-729, while tests still built at
-  `opt-level` 0): after a one-line change in `src/control.rs`, `cargo test
-  --bin axis-cam --no-run` took 43 s with `CARGO_INCREMENTAL=0` and 7 s
-  without it, and the compiler's memory peaked at 7.0 GB against 3.9 GB.
+  environment or in a Cargo config. Each crate is large (the app about
+  180,000 lines of code, the core about 127,000), so without incremental
+  compilation every change compiles a whole crate again. Measured on the Mac
+  (LIO-729, while tests still built at `opt-level` 0): after a one-line
+  change in `src/control.rs`, `cargo test --bin axis-cam --no-run` took 43 s
+  with `CARGO_INCREMENTAL=0` and 7 s without it, and the compiler's memory
+  peaked at 7.0 GB against 3.9 GB.
   Switching to it also compiles the crate whole once more, and keeps a
   second test binary in `target/`.
 - Review briefs, notes and memories written before LIO-729 may still say to
@@ -27,7 +44,8 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
   after it are incremental. To start over without the incremental data,
   `cargo clean -p axis-cam` recompiles only `axis-cam`, not the dependencies.
 - Dependencies are built without debug info (`[profile.dev.package."*"]` in
-  `Cargo.toml`); `axis-cam`, the UC100 driver and uc100-server keep theirs.
+  `Cargo.toml`); `axis-cam`, `axis-core`, the UC100 driver and uc100-server
+  keep theirs.
   To step into another dependency in a debugger, turn it on for that crate
   on your own machine, not in a commit.
 - Tests build `axis-cam` at `opt-level = 1` (`[profile.test.package.axis-cam]`,
