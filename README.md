@@ -1373,9 +1373,11 @@ bar, at once when that machine is connected, or when you press
      stock before and after the operation, so a probe spot or surface the
      operation leaves as it was is offered), and the tool's Z (**Same tool,
      keep Z**, or Set Z from reference; at a tool change, when the tool in
-     the spindle is another one, only Set Z from reference). Cycle Start
-     then rapids over the step's entry and **waits there**, spindle on;
-     **Resume** feeds in.
+     the spindle is another one, only Set Z from reference). At a tool
+     change the Control page shows the **Tool change** tab instead, for the
+     tool's Z, and the work zero is kept with **Keep this work zero** in the
+     **Work zero** tab. Cycle Start then rapids over the step's entry and
+     **waits there**, spindle on; **Resume** feeds in.
    Each skip of steps and each start at one checks the setup again, keeping
    what was done and where Cycle Start starts.
 
