@@ -2650,6 +2650,16 @@ flood = { pin = 8 }
         );
         mdi(&mut a, "G10 L2 P1 X195");
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+        // Another work system active: Cycle Start says to select G54, not
+        // that X/Y work zero changed, as G54's hasn't (LIO-696).
+        let _ = a.update(Message::Machine(crate::control::Action::Wcs(1)));
+        tick_until(&mut a, 2.0, "G55", |s| s.active_wcs == 1);
+        let has = |text: &str| problems(&a).iter().any(|p| p.contains(text));
+        assert!(has("active work system is G55"), "{:?}", problems(&a));
+        assert!(!has("X/Y work zero changed"), "{:?}", problems(&a));
+        let _ = a.update(Message::Machine(crate::control::Action::Wcs(0)));
+        tick_until(&mut a, 2.0, "G54", |s| s.active_wcs == 0);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
         let _ = a.update(Message::Run(R::CycleStart));
         run_until(&mut a, 30.0, "tool run 2", |r| r.done[1]);
         let s = &conn(&a).snapshot;
