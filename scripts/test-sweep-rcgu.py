@@ -14,7 +14,8 @@ It checks that:
 * a profile folder whose Cargo lock is held, and a target folder with a file
   open below it, are left alone;
 * a build that starts and finishes while the sweep reads the binaries keeps
-  every object its binary points at;
+  every object its binary points at, also after a `cargo clean` through
+  another spelling of the path (/var for /private/var);
 * when nm fails, nothing is deleted and the sweep exits with an error.
 """
 
@@ -137,12 +138,15 @@ def main():
 
         # The same with the folder made again (cargo clean) by a build that spells
         # the path another way (/var for /private/var): its new objects stay too.
-        assert target.startswith("/private/"), target
-        hook = shlex.join(["env", f"CARGO_TARGET_DIR={target[len('/private'):]}", "sh", "-c",
-                           f"cd {shlex.quote(demo)} && cargo clean -q && cargo build -q"])
-        out = sh(sys.executable, "-I", SWEEP, "--delete", target, cwd=tmp, env={"SWEEP_RCGU_AFTER_SCAN": hook}).stdout
-        linked = [p for p in referenced(f"{target}/debug") if "/demo-" in p or "/demo." in p]
-        assert linked and all(os.path.exists(p) for p in linked), (out, [p for p in linked if not os.path.exists(p)][:3])
+        if not target.startswith("/private/"):  # TMPDIR elsewhere: no second spelling at hand
+            print("skipped: the clean-and-rebuild case needs the temporary folder under /private")
+        else:
+            hook = shlex.join(["env", f"CARGO_TARGET_DIR={target[len('/private'):]}", "sh", "-c",
+                               f"cd {shlex.quote(demo)} && cargo clean -q && cargo build -q"])
+            out = sh(sys.executable, "-I", SWEEP, "--delete", target, cwd=tmp,
+                     env={"SWEEP_RCGU_AFTER_SCAN": hook}).stdout
+            linked = [p for p in referenced(f"{target}/debug") if "/demo-" in p or "/demo." in p]
+            assert linked and all(os.path.exists(p) for p in linked), (out, [p for p in linked if not os.path.exists(p)][:3])
         edit(f"{demo}/src/main.rs", 4)
         sh("cargo", "test", "--no-run", "-q", cwd=demo)
         sh("cargo", "build", "-q", cwd=demo)

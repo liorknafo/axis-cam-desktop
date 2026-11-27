@@ -159,7 +159,8 @@ def is_macho(path):
 
 def binaries(prof):
     """The Mach-O files at the top of a profile folder and in its unit folders,
-    each file once (Cargo hard-links debug/axis-cam to its copy in deps/)."""
+    a file reached by two names (a hard link) once. On macOS Cargo copies
+    debug/axis-cam from deps/ rather than linking it, so both are read."""
     seen = set()
     for sub in ("",) + UNIT_SUBDIRS:
         for dp, dns, fns in os.walk(os.path.join(prof, sub)):
