@@ -1,11 +1,13 @@
-//! The Steps page: a setup on the manual mill shown screen by screen
-//! (`guide`), as pictures and the large numbers its DRO should read; a
-//! setup on the manual lathe as side views and dial pictures (`turning`).
+//! The Steps page: a setup on the manual mill as a short sheet (`guide`,
+//! LIO-688), where its work zero is on the stock held, then a page an
+//! operation, each feature numbered on a plan drawing and listed with its
+//! place, size and depth; a setup on the manual lathe screen by screen, as
+//! side views and dial pictures (`turning`).
 pub mod tablet;
 mod turning;
 use crate::{
     App, GuideAction, Message,
-    guide::{Guide, Limits, Pattern, Section, Step, Target},
+    guide::{Depth, Features, Guide, Section, Step},
     help::HelpButton,
     holding::Gripped,
     mesh::{Bounds, Mesh},
@@ -59,7 +61,7 @@ pub struct Shown {
     /// The vise jaws or clamps, in work coordinates, from the stock's
     /// bottom up (`holding::shown`).
     jaws: Vec<Bounds>,
-    /// For the Hold step, in a vise: its jaws at their full height and the
+    /// For the Zero page, in a vise: its jaws at their full height and the
     /// parallels under the stock, in work coordinates.
     vise: Vec<Bounds>,
     parallels: Vec<Bounds>,
@@ -67,17 +69,10 @@ pub struct Shown {
     pictures: Vec<Option<image::Handle>>,
     /// The stock in 3D as it starts, in the vise on its parallels.
     held: Option<image::Handle>,
-    /// By picture, the sizes drawn on it (the Check screen's), in its
-    /// pixels.
-    dims: Vec<Vec<Dim>>,
-    /// By step, a Tool step's picture: the stock before its operation with
-    /// the tool to scale on the spot to touch (`viewport::tool_triangles`).
-    tools: Vec<Option<image::Handle>>,
+    /// The work zero marked on `held`, in its pixels (LIO-688).
+    zero: Vec<Dim>,
     /// On the lathe: what its side views draw.
     side: Option<turning::Side>,
-    /// What its hole pages lift over (`Lifts`): the clamps or the jaws,
-    /// not the parallels `jaws` draws too (LIO-537).
-    lifts: Lifts,
 }
 /// A size drawn on a picture: a dimension line from `a` to `b` (picture
 /// pixels), with extension lines to them from the feature's points `ext`,
@@ -91,10 +86,6 @@ struct Dim {
     leader: bool,
 }
 impl Shown {
-    /// What its hole pages' lifts read (`Lifts`).
-    pub fn lifts(&self) -> Lifts {
-        self.lifts.clone()
-    }
     /// The same pictures with the guide worked out again for `doc`
     /// (`guide::again`): after a measurement or the dial check's answer.
     pub fn again(&self, doc: &Document, mesh: &Mesh) -> Result<Shown, String> {
@@ -107,10 +98,8 @@ impl Shown {
             parallels: self.parallels.clone(),
             pictures: self.pictures.clone(),
             held: self.held.clone(),
-            dims: self.dims.clone(),
-            tools: self.tools.clone(),
+            zero: self.zero.clone(),
             side: self.side.clone(),
-            lifts: self.lifts.clone(),
         })
     }
 }
@@ -124,64 +113,6 @@ fn normal(p: &[[f32; 3]]) -> [f32; 3] {
         n[2] += (a[0] - b[0]) * (a[1] + b[1]);
     }
     n
-}
-/// What a hole page's lift to a safe Z reads (LIO-449, LIO-538): the
-/// stock box before each operation of the guide, then after the last
-/// (`simulation::leftover_box`), and the vise's jaws or the clamps, each
-/// in work coordinates.
-#[derive(Debug, Clone, Default)]
-pub struct Lifts {
-    boxes: Vec<Bounds>,
-    jaws: Vec<Bounds>,
-    vise: bool,
-}
-impl Lifts {
-    /// Those of `guide`, on the part `mesh`.
-    pub fn of(doc: &Document, mesh: &Mesh, guide: &Guide) -> Lifts {
-        use crate::simulation::leftover_box;
-        let setup = &doc.setups[guide.setup];
-        let zero = guide.zero;
-        let work = |b: Bounds| b.translated(zero.map(|v| -v));
-        let mut boxes = vec![work(leftover_box(&guide.before, setup, mesh))];
-        boxes.extend(
-            guide
-                .done
-                .iter()
-                .map(|d| work(leftover_box(&d.after, setup, mesh))),
-        );
-        let jaws: Vec<Bounds> = match &guide.steps[0] {
-            Step::Hold { holding, .. } if crate::holding::modelled(setup) => {
-                let held = Gripped {
-                    stock: holding.stock.translated(zero),
-                    band: holding.band.translated(zero),
-                    bottom: holding.bottom + zero[2],
-                    girth: holding.girth,
-                };
-                (doc.holding_boxes(setup, held))
-                    .map(|b| crate::holding::shown(&b, held.stock))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|b| b.bounds)
-                    .collect()
-            }
-            _ => vec![],
-        };
-        let jaws: Vec<Bounds> = jaws.into_iter().map(work).collect();
-        let vise = matches!(&guide.steps[0], Step::Hold { vise: Some(_), .. }) && !jaws.is_empty();
-        Lifts { boxes, jaws, vise }
-    }
-    /// The DRO's Z the tool goes up to before X and Y move to a hole of
-    /// operation `op` of `doc`'s setup (`safe_z`).
-    pub fn z(&self, doc: &Document, guide: &Guide, op: usize) -> f32 {
-        let setup = &doc.setups[guide.setup];
-        let tool =
-            (setup.operations.get(op)).and_then(|o| doc.tools.iter().find(|t| t.id == o.tool));
-        lift_z(guide, tool, op, &self.boxes, &self.jaws)
-    }
-    /// What holds the stock, in a hole page's words (`holder`).
-    pub fn holder(&self) -> &'static str {
-        holder_of(self.vise, !self.jaws.is_empty())
-    }
 }
 /// The guide of setup `si` (`guide::build`) with the part's outline, the
 /// stock boxes, the jaws and the 3D pictures of the stock.
@@ -208,14 +139,34 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
             }
         }
     }
-    // The heights a hole page lifts over: the stock and the clamps or
-    // the jaws (`Lifts`), the same the MCP's steps read.
-    let lifts = Lifts::of(doc, mesh, &guide);
-    let (boxes, jaws) = (lifts.boxes.clone(), lifts.jaws.clone());
+    // The stock box before each operation, then after the last, and the
+    // vise's jaws or the clamps, each in work coordinates.
+    use crate::simulation::leftover_box;
+    let mut boxes = vec![work(leftover_box(&guide.before, setup, mesh))];
+    boxes.extend(
+        (guide.done.iter()).map(|d| work(leftover_box(&d.after, setup, mesh))),
+    );
+    let jaws: Vec<Bounds> = match &guide.steps[0] {
+        Step::Zero { holding, .. } if crate::holding::modelled(setup) => {
+            let held = Gripped {
+                stock: holding.stock.translated(zero),
+                band: holding.band.translated(zero),
+                bottom: holding.bottom + zero[2],
+                girth: holding.girth,
+            };
+            (doc.holding_boxes(setup, held))
+                .map(|b| crate::holding::shown(&b, held.stock))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|b| work(b.bounds))
+                .collect()
+        }
+        _ => vec![],
+    };
     // The parallels the setup says the stock stands on (LIO-537), under
     // the box it starts from.
     let modelled: Vec<Bounds> = match &guide.steps[0] {
-        Step::Hold { holding, .. } => {
+        Step::Zero { holding, .. } => {
             crate::parallels::boxes(setup, holding.stock.translated(zero))
                 .into_iter()
                 .map(|b| work(b.bounds))
@@ -227,7 +178,7 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
     // parallels fill what is under the stock between them: the setup's own
     // when it says where they are.
     let (vise, parallels) = match &guide.steps[0] {
-        Step::Hold {
+        Step::Zero {
             holding,
             vise: Some(v),
             ..
@@ -292,70 +243,32 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         viewport::stock_picture(&triangles, PICTURE)
     };
     let pictures: Vec<_> = (0..stock.len()).map(|i| picture(i, &held)).collect();
-    let held = if vise.is_empty() {
-        pictures[0].clone()
+    // The stock as it starts, held: in a vise, its jaws at their full
+    // height and the parallels under it.
+    let mut seen = stock[0].clone();
+    if vise.is_empty() {
+        seen.extend(held.iter().copied());
     } else {
-        let tall = solid(&[&vise[..], &parallels].concat());
-        picture(0, &tall)
-    };
-    // The sizes each operation leaves, on the picture after it, placed on
-    // the triangles that picture is made of.
-    let jaw = solid(&jaws);
-    let mut dims = vec![vec![]];
-    for (j, d) in guide.done.iter().enumerate() {
-        let mut measures = measures(doc, &guide, d, boxes[j].max[2] + zero[2]);
-        measures.retain(drawn);
-        let ends: Vec<[f32; 3]> = (measures.iter())
-            .flat_map(|m| {
-                let [ea, eb] = m.ext.unwrap_or([m.from, m.to]);
-                [m.from, m.to, ea, eb]
-            })
-            .collect();
-        let mut seen = stock[j + 1].clone();
-        seen.extend(jaw.iter().copied());
-        let points = viewport::picture_points(&seen, PICTURE, &ends);
-        dims.push(
-            (measures.iter().zip(points.chunks(4)))
-                .map(|(m, p)| Dim {
-                    a: p[0],
-                    b: p[1],
-                    ext: m.ext.map(|_| [p[2], p[3]]),
-                    label: format!("{} {}", m.axis, mm(m.value)),
-                    leader: m.leader,
-                })
-                .collect(),
-        );
+        seen.extend(solid(&[&vise[..], &parallels].concat()));
     }
-    // A new tool on the stock before its operation, standing on the
-    // highest top left (LIO-376).
-    let tools = (guide.steps.iter())
-        .map(|step| {
-            let Step::Tool {
-                op,
-                top: Some(_),
-                diameter,
-                tool,
-                ..
-            } = step
-            else {
-                return None;
-            };
-            let j = guide.done.iter().position(|d| d.op == *op)?;
-            let t = doc.tools.iter().find(|t| &t.id == tool);
-            let length = |k: &str| t.and_then(|t| num(&t.p, k)).filter(|v| *v > 0.);
-            let flutes = length("length").unwrap_or(3. * diameter);
-            let stickout = length("stickout").unwrap_or(flutes + diameter);
-            let point = t.is_some_and(|t| get(&t.p, "type").to_lowercase().contains("drill"));
-            let centre = t.and_then(|t| t.centre_drill());
-            let spot = touch_spot(&stock[j])?;
-            let mut triangles = stock[j].clone();
-            triangles.extend(viewport::tool_triangles(
-                spot, *diameter, flutes, stickout, point, centre,
-            ));
-            triangles.extend(jaw.iter().copied());
-            viewport::stock_picture(&triangles, TOOL_PICTURE)
-        })
-        .collect();
+    let held = viewport::stock_picture(&seen, PICTURE);
+    // The work zero marked on it, an arrow down onto it (LIO-688).
+    let zero_mark = match crate::lathe::is_lathe(&setup.machine) {
+        true => vec![],
+        false => {
+            let up = [zero[0], zero[1], zero[2] + 30.];
+            match viewport::picture_points(&seen, PICTURE, &[zero, up])[..] {
+                [a, b] => vec![Dim {
+                    a,
+                    b,
+                    ext: None,
+                    label: "X0 Y0 Z0".into(),
+                    leader: true,
+                }],
+                _ => vec![],
+            }
+        }
+    };
     let side = crate::lathe::is_lathe(&setup.machine).then(|| turning::side(doc, mesh, &guide));
     Ok(Shown {
         guide,
@@ -366,10 +279,8 @@ pub fn shown(doc: &Document, mesh: &Mesh, si: usize) -> Result<Shown, String> {
         parallels,
         pictures,
         held,
-        dims,
-        tools,
+        zero: zero_mark,
         side,
-        lifts,
     })
 }
 /// Where a new tool touches the top: on the highest flat face of the stock
@@ -400,379 +311,7 @@ pub(crate) fn touch_spot(triangles: &[([[f32; 3]; 3], [u8; 4])]) -> Option<[f32;
         .map(|m| [m[0], m[1], top])
 }
 
-/// A size the Check screen gives to measure (LIO-370): `value` mm along
-/// `axis` ("X", "Y", "Z" or "Ø"), said by `words` as a caliper or depth
-/// gauge reads it, and drawn on the picture from `from` to `to` (stock
-/// frame, mm): a dimension line, off the stock, with extension lines from
-/// the feature's points `ext` (LIO-379), or with `leader` an arrow onto
-/// `from`.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Measure {
-    pub axis: &'static str,
-    pub value: f32,
-    pub words: Vec<String>,
-    pub from: [f32; 3],
-    pub to: [f32; 3],
-    pub ext: Option<[[f32; 3]; 2]>,
-    pub leader: bool,
-}
-/// The sizes operation `op` of the guide (its `done` entry `d`) was to
-/// leave, as it leaves them, with the stock to leave in them; `top` is the
-/// Z of the stock's top before it (stock frame). A Box: its width from the
-/// face it is measured from, or between its walls, on each axis it has a
-/// wall on, and its depth below that top; holes: how many, their
-/// diameter and their depth from the mouth.
-pub(crate) fn measures(
-    doc: &Document,
-    g: &Guide,
-    d: &crate::guide::Done,
-    top: f32,
-) -> Vec<Measure> {
-    let Some(op) = doc.setups.get(g.setup).and_then(|s| s.operations.get(d.op)) else {
-        return vec![];
-    };
-    let (zero, s) = (g.zero, d.plan.stock);
-    let mut out = vec![];
-    match op.strategy {
-        Strategy::Box => {
-            let Ok((low, high)) = crate::cam::box_block(op, zero) else {
-                return out;
-            };
-            let allowance = crate::cam::number(op, "allowance").unwrap_or(0.);
-            let open = crate::cam::open_sides(low, high, &s);
-            let (lo, hi) = crate::cam::box_cut(low, high, &s, allowance);
-            let faces = [["left", "right"], ["front", "back"]];
-            let mut wall = None;
-            for k in 0..2 {
-                let o = 1 - k;
-                let from = match open[k] {
-                    [true, true] => continue,
-                    [true, false] => format!("from the {} face", faces[k][0]),
-                    [false, true] => format!("from the {} face", faces[k][1]),
-                    [false, false] => "between the walls".into(),
-                };
-                // Off the side of the stock the pictures see, clear of it:
-                // in front (−Y) for an X width, right (+X) for a Y width.
-                let mut a = [0., 0., top];
-                a[o] = if o == 0 {
-                    s.max[0] + OFF
-                } else {
-                    s.min[1] - OFF
-                };
-                let mut b = a;
-                (a[k], b[k]) = (lo[k], hi[k]);
-                // From the cut's end on that side: a wall's top, or an open
-                // side's face where the floor meets it.
-                let mut ext = [a, b];
-                for (end, e) in ext.iter_mut().enumerate() {
-                    e[o] = if o == 0 { hi[0] } else { lo[1] };
-                    e[2] = if open[k][end] { lo[2] } else { top };
-                }
-                // The depth beside it, a further step off, so that the two
-                // do not meet at the wall's corner.
-                let (mut at, edge) = if open[k][0] { (b, ext[1]) } else { (a, ext[0]) };
-                at[o] += if o == 0 { OFF } else { -OFF };
-                wall.get_or_insert((at, edge));
-                out.push(Measure {
-                    axis: AXES[k],
-                    value: hi[k] - lo[k],
-                    words: vec!["wide".into(), from],
-                    from: a,
-                    to: b,
-                    ext: Some(ext),
-                    leader: false,
-                });
-            }
-            // Down from where that width meets the wall, beside the wall.
-            let (at, edge) = wall.unwrap_or({
-                let at = [s.max[0] + OFF, s.min[1] - OFF, top];
-                (at, [hi[0], lo[1], top])
-            });
-            let words = if open[2][0] {
-                vec!["through".into()]
-            } else {
-                vec![
-                    "deep below the top".into(),
-                    format!("floor Z {}", dro(lo[2] - zero[2])),
-                ]
-            };
-            out.push(Measure {
-                axis: "Z",
-                value: top - lo[2],
-                words,
-                from: at,
-                to: [at[0], at[1], lo[2]],
-                ext: Some([edge, [edge[0], edge[1], lo[2]]]),
-                leader: false,
-            });
-        }
-        // A thread is tried, not measured (LIO-413).
-        Strategy::Drill if op.tapping() => {}
-        Strategy::Drill => {
-            let Some((holes, mouths, numbers)) = g.steps.iter().find_map(|st| match st {
-                Step::Holes {
-                    op: o,
-                    holes,
-                    mouths,
-                    numbers,
-                    ..
-                } if *o == d.op => Some((holes, mouths, Some(numbers))),
-                Step::Bore {
-                    op: o,
-                    holes,
-                    mouths,
-                    ..
-                } if *o == d.op => Some((holes, mouths, None)),
-                _ => None,
-            }) else {
-                return out;
-            };
-            let Some(h) = holes.first() else {
-                return out;
-            };
-            // Each cut starts Top over the material it meets (`rest::start_over`):
-            // the mouths a depth is measured from are that material's top.
-            // Fixture-pin holes start on the face itself, and are blind
-            // whatever Through says (`cam::pin_holes`).
-            let pins = op.drills_pin_holes();
-            let air = if pins {
-                0.
-            } else {
-                crate::cam::number(op, "top").unwrap_or(0.).max(0.)
-            };
-            let mouths: Vec<f32> = mouths.iter().map(|m| m - air).collect();
-            let mouth = mouths.first().copied().unwrap_or(top - zero[2]);
-            let at = [h[0] + zero[0], h[1] + zero[1], mouth + zero[2]];
-            let up = [at[0], at[1], at[2] + 2. * d.plan.radius.max(6.)];
-            let count = if holes.len() == 1 {
-                "1 hole".to_string()
-            } else {
-                format!("{} holes", holes.len())
-            };
-            out.push(Measure {
-                axis: "Ø",
-                value: 2. * d.plan.radius,
-                words: vec![count],
-                from: at,
-                to: up,
-                ext: None,
-                leader: true,
-            });
-            // Through (LIO-450): the material from the mouth to the back,
-            // where the tool's end went Breakthrough past it, less the
-            // bottom offset (`cam::drill` and the finishing cycles). A
-            // chamfer mill's or centre drill's cone never goes through.
-            let cone = (doc.tools.iter().find(|t| t.id == op.tool)).is_some_and(|t| {
-                ["Chamfer mill", crate::model::CENTRE_DRILL].contains(&get(&t.p, "type"))
-            });
-            let through = match crate::cam::breakthrough(op) {
-                Ok((true, past)) if !cone && !pins => {
-                    Some(past - crate::cam::number(op, "bottom").unwrap_or(0.))
-                }
-                _ => None,
-            };
-            // Blind, a twist drill's full diameter stops its 118° point
-            // above its tip.
-            let point = if d.plan.shape == crate::simulation::CutterShape::Drill {
-                d.plan.radius * crate::simulation::POINT_RISE
-            } else {
-                0.
-            };
-            // A cut shallower than that point never reaches the full
-            // diameter: measured to its tip, said so. Holes of one
-            // operation from mouths at several heights may be either: each
-            // kind its own size, its holes named by their DRO numbers.
-            let n = holes.len().min(mouths.len());
-            let reach = |i: usize| {
-                through.is_some() || point == 0. || mouths[i] - (holes[i][2] + point) >= 0.005
-            };
-            for full in [true, false] {
-                let these: Vec<usize> = (0..n).filter(|&i| reach(i) == full).collect();
-                let Some(&first) = these.first() else {
-                    continue;
-                };
-                let end = match (through, full) {
-                    (Some(t), _) => t,
-                    (None, true) => point,
-                    (None, false) => 0.,
-                };
-                let deep: Vec<f32> = (these.iter())
-                    .map(|&i| mouths[i] - (holes[i][2] + end))
-                    .collect();
-                let (least, most) = deep
-                    .iter()
-                    .fold((f32::MAX, f32::MIN), |(a, b), v| (a.min(*v), b.max(*v)));
-                let mut words = match through {
-                    Some(_) => vec![
-                        "through".to_string(),
-                        "check it breaks out at the back".to_string(),
-                    ],
-                    None if !full => vec![
-                        "deep from the mouth to the point's tip".to_string(),
-                        "the full Ø is not reached".to_string(),
-                    ],
-                    None if point > 0. => vec![
-                        "deep from the mouth".to_string(),
-                        "to the full Ø, not the point".to_string(),
-                    ],
-                    None => vec!["deep from the mouth".to_string()],
-                };
-                if these.len() < n {
-                    let named: Vec<String> = (these.iter())
-                        .map(|&i| {
-                            numbers
-                                .and_then(|k| k.get(i))
-                                .copied()
-                                .unwrap_or(i + 1)
-                                .to_string()
-                        })
-                        .collect();
-                    let which = if named.len() == 1 { "hole" } else { "holes" };
-                    words.insert(0, format!("{which} {}", named.join(", ")));
-                }
-                if most - least > 0.005 {
-                    words.push(format!("{}–{} by hole", mm(least), mm(most)));
-                }
-                let h = holes[first];
-                let at = [h[0] + zero[0], h[1] + zero[1], mouths[first] + zero[2]];
-                out.push(Measure {
-                    axis: "Z",
-                    value: most,
-                    words,
-                    from: at,
-                    to: [at[0], at[1], at[2] - deep[0]],
-                    ext: None,
-                    leader: false,
-                });
-            }
-        }
-        // A Slot (LIO-449): its length and width as cut, its floor below
-        // the top of the row it is cut into and on the DRO, or through;
-        // then where its centre is.
-        Strategy::Slot => {
-            let Ok(slot) = crate::slot::Slot::read(op, zero) else {
-                return out;
-            };
-            // The slot as cut: its own width less the stock to leave, also
-            // when a narrower cutter walked it (LIO-455).
-            let r = slot.width / 2. - crate::cam::number(op, "allowance").unwrap_or(0.);
-            let k = slot.axis();
-            let o = 1 - k;
-            let c: [f32; 2] = std::array::from_fn(|i| (slot.a[i] + slot.b[i]) / 2.);
-            // The material the slot starts in: the row's top.
-            let row = d.plan.rest_top.unwrap_or(slot.top);
-            let through = get(&op.p, "through") == "Yes";
-            // A through slot's bottom is the stock's (`slot::generate`).
-            let floor = if through {
-                slot.bottom
-            } else {
-                slot.bottom + crate::cam::number(op, "axial_allowance").unwrap_or(0.)
-            };
-            let point = |along: f32, across: f32, z: f32| {
-                let mut q = [0., 0., z];
-                (q[k], q[o]) = (along, across);
-                q
-            };
-            let (start, end) = (slot.a[k].min(slot.b[k]) - r, slot.a[k].max(slot.b[k]) + r);
-            // The length beside the slot, the width past its end, each with
-            // extension lines from the slot's edge.
-            let side = c[o] - r - 6.;
-            out.push(Measure {
-                axis: AXES[k],
-                value: end - start,
-                words: vec!["long".into(), "end to end".into()],
-                from: point(start, side, row),
-                to: point(end, side, row),
-                ext: Some([point(start, c[o], row), point(end, c[o], row)]),
-                leader: false,
-            });
-            let past = end + 6.;
-            let wall = slot.a[k].max(slot.b[k]);
-            out.push(Measure {
-                axis: AXES[o],
-                value: 2. * r,
-                words: vec!["wide".into()],
-                from: point(past, c[o] - r, row),
-                to: point(past, c[o] + r, row),
-                ext: Some([point(wall, c[o] - r, row), point(wall, c[o] + r, row)]),
-                leader: false,
-            });
-            let words = if through {
-                vec!["through: check the back and deburr".into()]
-            } else {
-                vec![
-                    format!("deep below the row's top Z {}", dro(row - zero[2])),
-                    format!("floor Z {}", dro(floor - zero[2])),
-                ]
-            };
-            out.push(Measure {
-                axis: "Z",
-                value: row - floor,
-                words,
-                from: point(c[k], c[o], row),
-                to: point(c[k], c[o], floor),
-                ext: None,
-                leader: false,
-            });
-            // A narrower cutter stepped the round ends (LIO-455): their
-            // radius, and the most the steps leave, listed.
-            if let Some(f) = (d.plan.slot_passes.iter())
-                .find(|p| p.kind == crate::slot::Kind::Finish && !p.joined)
-            {
-                let at = [slot.b[0], slot.b[1], row];
-                out.push(Measure {
-                    axis: "R",
-                    value: r,
-                    words: vec![
-                        "each round end, with a radius gauge".into(),
-                        format!(
-                            "at most {} standing between two steps: file or leave",
-                            dro((f.scallop * 100. - 1e-4).ceil() / 100.)
-                        ),
-                    ],
-                    from: at,
-                    to: at,
-                    ext: None,
-                    leader: false,
-                });
-            }
-            // Where it is: its centre on the DRO, listed, not drawn.
-            for i in 0..2 {
-                let at = [c[0], c[1], row];
-                out.push(Measure {
-                    axis: AXES[i],
-                    value: c[i] - zero[i],
-                    words: vec!["the slot's centre on the DRO".into()],
-                    from: at,
-                    to: at,
-                    ext: None,
-                    leader: false,
-                });
-            }
-        }
-        _ => {}
-    }
-    out
-}
-/// Whether a measure is drawn on the picture: a position (`from` and `to`
-/// the same point) is only listed (LIO-449).
-fn drawn(m: &Measure) -> bool {
-    m.from != m.to
-}
-/// How far off the stock a size is drawn, mm.
-const OFF: f32 = 16.;
-/// A DRO number: two decimals, a true minus, never −0.00.
-/// What a halved axis is set to at its + face, said from what the DRO
-/// reads there (LIO-451): "½" when `set` is half of `reads`, else "½ − 1.5"
-/// or "½ + 1.5", when the touches are not either side of the zero alike.
-fn halving(set: f32, reads: f32) -> String {
-    let off = set - reads / 2.;
-    if off.abs() < 0.005 {
-        "½".into()
-    } else {
-        format!("½ {} {}", if off > 0. { "+" } else { "−" }, mm(off.abs()))
-    }
-}
+/// A number to two decimals, a true minus, never −0.00.
 fn dro(v: f32) -> String {
     let v = if v.abs() < 0.005 { 0. } else { v };
     format!("{v:.2}").replace('-', "−")
@@ -816,11 +355,11 @@ fn warn_chip<'a>(s: impl Into<String>) -> Element<'a, Message> {
 fn chips<'a>(items: Vec<Element<'a, Message>>) -> Element<'a, Message> {
     row(items).spacing(6).wrap().vertical_spacing(6).into()
 }
-/// The Hold page's label over the setup's notes.
+/// The Zero page's label over the setup's notes.
 const SETUP_NOTES: &str = "Setup notes";
 /// What a page that leaves the supports under the part to the user adds
 /// when the setup's notes say where they go (LIO-487).
-const SEE_NOTES: &str = "the setup notes on the Hold page say where the supports go";
+const SEE_NOTES: &str = "the setup notes on the Zero page say where the supports go";
 /// A small capital label over a group.
 fn label<'a>(s: impl Into<String>) -> Element<'a, Message> {
     text(s.into().to_uppercase()).size(11).color(MUTED).into()
@@ -1510,8 +1049,11 @@ enum Shape {
     /// The round an edge finder touches: its centre and radius, labelled
     /// with its diameter.
     Round([f32; 3], f32, String),
-    /// A hole: its centre, radius, number and whether done, now or next.
-    Hole([f32; 3], f32, usize, Lit),
+    /// A hole or a round corner: its centre, radius and number.
+    Hole([f32; 3], f32, usize),
+    /// A slot from above: the centres of its round ends, its radius and
+    /// its number (LIO-688).
+    Slot([f32; 3], [f32; 3], f32, usize),
     /// A pattern the DRO leads to, its holes (centres, the DRO's order) and
     /// their radius, in the top view: the holes numbered and their order,
     /// hole 1 marked, the pitches or the circle with its centre and first
@@ -1831,34 +1373,19 @@ impl Drawing<'_> {
                         labels.put(f, s.clone(), &tries, down, INK, 13.);
                     }
                 }
-                Shape::Hole(q, r, n, state) => {
+                Shape::Hole(q, r, n) => {
                     let at = p3(*q);
-                    let body = canvas::Path::circle(at, (r * s).max(4.));
-                    let (fill, edge, w) = match state {
-                        Lit::Done => (DONE, INK, 1.),
-                        Lit::Now => (Color::WHITE, ACCENT, 2.5),
-                        Lit::Next => (Color::WHITE, INK, 1.),
-                    };
-                    if *state == Lit::Now {
-                        let zero = p([0., 0.]);
-                        f.stroke(
-                            &canvas::Path::line(Point::new(zero.x, at.y), at),
-                            dashed(ACCENT, 1.2),
-                        );
-                        f.stroke(
-                            &canvas::Path::line(Point::new(at.x, zero.y), at),
-                            dashed(ACCENT, 1.2),
-                        );
-                    }
-                    f.fill(&body, fill);
-                    f.stroke(&body, stroke(edge, w));
-                    let c = if *state == Lit::Now { ACCENT } else { MUTED };
                     let rs = (r * s).max(4.);
+                    let body = canvas::Path::circle(at, rs);
+                    f.fill(&body, Color { a: 0.18, ..ACCENT });
+                    f.stroke(&body, stroke(ACCENT, 2.));
                     let tries = [
                         (Point::new(at.x + rs + 5., at.y - 9.), Align::Left),
                         (Point::new(at.x - rs - 5., at.y - 9.), Align::Right),
+                        (Point::new(at.x - 4., at.y - rs - 20.), Align::Left),
+                        (Point::new(at.x - 4., at.y + rs + 2.), Align::Left),
                     ];
-                    labels.put(f, n.to_string(), &tries, up, c, 12.);
+                    labels.put(f, n.to_string(), &tries, up, ACCENT, 13.);
                 }
                 Shape::Pattern(pattern, holes, r, numbers) => {
                     paint_pattern(f, &mut labels, p, s, pattern, holes, *r, numbers)
@@ -1910,6 +1437,24 @@ impl Drawing<'_> {
                         (Point::new(tail.x - 8., tail.y + 6.), Align::Right),
                     ];
                     labels.put(f, s.clone(), &tries, up, ACCENT, 13.);
+                }
+                Shape::Slot(from, to, r, n) => {
+                    let (m, e) = (p3(*from), p3(*to));
+                    let rs = (r * s).max(3.);
+                    let way = canvas::Path::line(m, e);
+                    let round = |c: Color, w: f32| canvas::Stroke {
+                        line_cap: canvas::LineCap::Round,
+                        ..stroke(c, w)
+                    };
+                    f.stroke(&way, round(ACCENT, 2. * rs + 3.));
+                    f.stroke(&way, round(Color::WHITE, 2. * rs));
+                    f.stroke(&way, round(Color { a: 0.18, ..ACCENT }, 2. * rs));
+                    let at = Point::new(m.x.max(e.x), m.y.min(e.y));
+                    let tries = [
+                        (Point::new(at.x + rs + 5., at.y - rs - 9.), Align::Left),
+                        (Point::new(at.x - rs - 5., at.y - rs - 9.), Align::Right),
+                    ];
+                    labels.put(f, n.to_string(), &tries, up, ACCENT, 12.);
                 }
                 Shape::Height(top, bottom, s) => {
                     let (m, n) = (p3(*top), p3(*bottom));
@@ -1994,49 +1539,6 @@ fn under_stock<'a>(tip: f32, stock: &Bounds, notes: bool) -> Option<Element<'a, 
             said += &format!("; {SEE_NOTES}");
         }
         warn_chip(said)
-    })
-}
-/// The Check of a tapping `op`: try a screw, as a thread is not measured
-/// (LIO-413).
-fn screw_try<'a>(p: &Page<'a>, op: usize) -> Option<Element<'a, Message>> {
-    let tool = p.tool(op)?;
-    let spec = tool.tap_spec()?;
-    let (tip, mouth) = p.guide().steps.iter().find_map(|s| match s {
-        Step::Holes {
-            op: o,
-            holes,
-            mouths,
-            ..
-        } if *o == op => Some((holes.first()?[2], *mouths.first()?)),
-        _ => None,
-    })?;
-    let through = tip < part_bottom(p) - 0.005;
-    let thread = (mouth - tip) - crate::cam::tap_lead(tool) * spec.pitch;
-    let goes = if through {
-        "it goes through by hand".to_string()
-    } else {
-        format!("it goes in {} by hand", mm(thread))
-    };
-    // At a narrow window the tag goes under the value, as the lathe's
-    // readouts put theirs, not squeezed beside it (LIO-431).
-    let narrow = turning::narrow(p);
-    let face = readout(
-        Readout {
-            order: None,
-            lead: None,
-            axis: String::new(),
-            value: format!("{} screw", spec.name),
-            lock: None,
-            tags: if narrow { vec![] } else { vec![goes.clone()] },
-            lit: Lit::Next,
-            big: true,
-        },
-        None,
-    );
-    Some(if narrow {
-        column![face, muted(goes).size(12)].spacing(4).into()
-    } else {
-        face
     })
 }
 /// `Shape::Pattern` in the top view, `at` from mm to the canvas at `s` px
@@ -2767,14 +2269,10 @@ struct Page<'a> {
     key: u64,
     at: usize,
     item: usize,
-    /// On a hole, the readout reached (`App::guide_reached`).
-    reached: usize,
     /// What is typed in a lathe step's measure box (`App::guide_typed`).
     typed: Option<&'a (String, String)>,
     /// The window's width and height, which some screens fit to.
     window: (f32, f32),
-    /// When the step was opened and now, for the handwheel's beat.
-    clock: (std::time::Instant, std::time::Instant),
     setup: &'a Setup,
     /// Drawn for the shop tablet (`tablet::steps`), which types a lathe
     /// measurement in its own field: no text box in the picture (LIO-543).
@@ -2785,7 +2283,7 @@ impl<'a> Page<'a> {
         &self.shown.guide
     }
     /// The setup's notes, where it says what holds and supports the part
-    /// (LIO-487): shown on the Hold page, which pages that leave the
+    /// (LIO-487): shown on the Zero page, which pages that leave the
     /// supports under the part to the user point back to. Empty when none.
     fn notes(&self) -> &'a str {
         get(&self.setup.p, "notes").trim()
@@ -2880,18 +2378,6 @@ impl<'a> Page<'a> {
                 .into(),
         }
     }
-    /// The cuts of the passes of the operations before `op`.
-    fn cut_before(&self, op: usize) -> Vec<Shape> {
-        let first = self.done(op);
-        (self.guide().steps.iter())
-            .filter_map(|s| match s {
-                Step::Pass { op: o, cut, .. } if self.done(*o) < first => {
-                    Some(Shape::Hatch(*cut, Hatch::Earlier))
-                }
-                _ => None,
-            })
-            .collect()
-    }
 }
 
 /// How the Steps page was entered (LIO-449), said over its screen until
@@ -2914,9 +2400,9 @@ pub enum Entry {
 fn entry_line<'a>(app: &'a App, g: &Guide, at: usize) -> Option<Element<'a, Message>> {
     let setup = app.doc.setups.get(g.setup)?;
     let entry = app.steps_entry.as_ref()?;
-    let place = |at: usize, item: usize| {
+    let place = |at: usize| {
         let s = &g.sections[section_of(g, at)];
-        let p = progress(g, s, at, item);
+        let p = progress(g, s, at);
         let name = section_name(&app.doc, g, s);
         if p.is_empty() {
             name
@@ -2935,7 +2421,7 @@ fn entry_line<'a>(app: &'a App, g: &Guide, at: usize) -> Option<Element<'a, Mess
             } else {
                 format!(
                     "Resuming where these steps were left: {}",
-                    place(at, app.guide_item)
+                    place(at)
                 )
             };
             (
@@ -2951,7 +2437,7 @@ fn entry_line<'a>(app: &'a App, g: &Guide, at: usize) -> Option<Element<'a, Mess
             (
                 format!(
                     "Resuming where these steps were left: {}.",
-                    place(at, app.guide_item)
+                    place(at)
                 ),
                 (
                     format!("◀ Start {} again", section_name(&app.doc, g, s)),
@@ -2966,7 +2452,7 @@ fn entry_line<'a>(app: &'a App, g: &Guide, at: usize) -> Option<Element<'a, Mess
         } if *id == setup.id && *from < g.steps.len() => (
             format!(
                 "Opened at the start of the operation picked in planning. The steps had got to {}.",
-                place(*from, *item)
+                place(*from)
             ),
             ("Back to there ▶".to_string(), GuideAction::Resume),
         ),
@@ -3147,44 +2633,33 @@ pub(crate) fn section_of(g: &Guide, at: usize) -> usize {
         .position(|s| s.steps.contains(&at))
         .unwrap_or(0)
 }
-/// Where the place is in its section: "pass 2/4", "hole 1/4", "2/6".
-fn progress(g: &Guide, s: &Section, at: usize, item: usize) -> String {
+/// Where the place is in its section: "pass 2/4", "2/6".
+fn progress(g: &Guide, s: &Section, at: usize) -> String {
     use crate::guide::LatheStep as L;
     match &g.steps[at] {
-        Step::Slot { index, of, .. }
-        | Step::Pass { index, of, .. }
-        | Step::Lathe(L::Pass { index, of, .. } | L::ThreadPass { index, of, .. }) => {
+        Step::Lathe(L::Pass { index, of, .. } | L::ThreadPass { index, of, .. }) => {
             format!("pass {index}/{of}")
         }
-        Step::Holes { holes, .. } => format!("hole {}/{}", item + 1, holes.len()),
-        Step::Corner { index, of, .. } => format!("walk {index}/{of}"),
-        Step::Bore {
-            index, of, holes, ..
-        } if holes.len() > 1 => format!("pass {index}/{of} · hole {}/{}", item + 1, holes.len()),
-        Step::Bore { index, of, .. } => format!("pass {index}/{of}"),
         _ if s.steps.len() > 1 => format!("{}/{}", at - s.steps.start + 1, s.steps.len()),
         _ => String::new(),
     }
 }
-/// What a section's count counts: "4 passes", "1 hole". A Boring's count
-/// is its passes.
+/// What a section's count counts: on the mill its features (LIO-688),
+/// "4 holes", "1 box", "4 corners"; on the lathe "4 passes", or a
+/// drilling's "1 hole".
 fn counted(setup: &Setup, s: &Section) -> String {
-    let hole =
-        s.op.and_then(|op| setup.operations.get(op))
-            .is_some_and(|o| o.strategy == Strategy::Drill && !o.boring());
-    let corners = (s.op.and_then(|op| setup.operations.get(op)))
-        .is_some_and(|o| o.strategy == Strategy::Corner);
-    if corners {
-        return match s.count {
-            1 => "1 walk".into(),
-            n => format!("{n} walks"),
-        };
-    }
-    match (s.count, hole) {
-        (1, true) => "1 hole".into(),
-        (1, false) => "1 pass".into(),
-        (n, true) => format!("{n} holes"),
-        (n, false) => format!("{n} passes"),
+    let op = s.op.and_then(|op| setup.operations.get(op));
+    let lathe = crate::lathe::is_lathe(&setup.machine);
+    let (one, many) = match op.map(|o| o.strategy) {
+        Some(Strategy::Drill) if !lathe || !op.is_some_and(|o| o.boring()) => ("hole", "holes"),
+        Some(Strategy::Box) if !lathe => ("box", "boxes"),
+        Some(Strategy::Slot) if !lathe => ("slot", "slots"),
+        Some(Strategy::Corner) if !lathe => ("corner", "corners"),
+        _ => ("pass", "passes"),
+    };
+    match s.count {
+        1 => format!("1 {one}"),
+        n => format!("{n} {many}"),
     }
 }
 fn section_name(doc: &Document, g: &Guide, s: &Section) -> String {
@@ -3254,16 +2729,14 @@ fn guide_page<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
         key: app.guide.as_ref().map_or(0, |(k, _)| *k),
         at,
         item: app.guide_item,
-        reached: app.guide_reached,
         typed: app.guide_typed.as_ref(),
         window: (app.window_width, app.window_height),
-        clock: app.guide_clock,
         setup,
         tablet: false,
     };
     let header = head(&page, here)
         .push(space().width(Fill))
-        .push(bold(place(&app.doc, g, here, at, app.guide_item), 14).color(ACCENT));
+        .push(bold(place(&app.doc, g, here, at), 14).color(ACCENT));
     let top = row![
         bold(setup_title(setup), 16),
         muted(format!("~{} min", g.minutes.ceil())).size(13)
@@ -3301,7 +2774,7 @@ fn operations<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
             op_number(g, i).map_or("•".to_string(), |k| k.to_string())
         };
         let small = if now {
-            progress(g, s, at, app.guide_item)
+            progress(g, s, at)
         } else if s.count > 0 && !done {
             counted(setup, s)
         } else {
@@ -3346,7 +2819,7 @@ fn operations<'a>(app: &'a App, shown: &'a Shown) -> Element<'a, Message> {
 }
 /// Where the job is, in the Run page's words (LIO-431): "Setup 2 of 3 ·
 /// operation 2 of 4", then the hole or pass of the section.
-fn place(doc: &Document, g: &Guide, here: usize, at: usize, item: usize) -> String {
+fn place(doc: &Document, g: &Guide, here: usize, at: usize) -> String {
     let s = &g.sections[here];
     let mut said = format!("Setup {} of {}", g.setup + 1, doc.setups.len());
     let ops: Vec<usize> = (g.sections.iter().enumerate())
@@ -3356,7 +2829,7 @@ fn place(doc: &Document, g: &Guide, here: usize, at: usize, item: usize) -> Stri
     if let Some(k) = ops.iter().position(|i| *i == here) {
         said += &format!(" · operation {} of {}", k + 1, ops.len());
     }
-    let p = progress(g, s, at, item);
+    let p = progress(g, s, at);
     if !p.is_empty() {
         said += &format!(" · {p}");
     }
@@ -3364,52 +2837,14 @@ fn place(doc: &Document, g: &Guide, here: usize, at: usize, item: usize) -> Stri
 }
 /// The command that ends a step: "Pass done ▶", "Section done ▶" on the
 /// last step of an operation's section, else "Next ▶".
-fn next_label(g: &Guide, at: usize, item: usize) -> String {
+fn next_label(g: &Guide, at: usize) -> String {
     let s = &g.sections[section_of(g, at)];
     match &g.steps[at] {
-        Step::Slot { .. }
-        | Step::Pass { .. }
-        | Step::Lathe(crate::guide::LatheStep::Pass { .. })
+        Step::Lathe(crate::guide::LatheStep::Pass { .. })
         | Step::Lathe(crate::guide::LatheStep::ThreadPass { .. }) => "Pass done ▶".into(),
-        Step::Corner { .. } => "Walk done ▶".into(),
-        Step::Holes { holes, .. } | Step::Bore { holes, .. } if item + 1 < holes.len() => {
-            "Hole done ▶".into()
-        }
-        Step::Bore { index, of, .. } if index < of => "Pass done ▶".into(),
         _ if s.op.is_some() && at + 1 == s.steps.end => "Section done ▶".into(),
         _ => "Next ▶".into(),
     }
-}
-/// The saved limit, or the largest generated layer for Auto, with the
-/// configured feed. Face and Square condense the moves into final limits,
-/// so their screen must still carry the cutting conditions.
-fn milling_limits<'a>(p: &Page<'a>, op: usize) -> Element<'a, Message> {
-    let plan = &p.guide().done[p.done(op)].plan;
-    let set = num(&p.setup.operations[op].p, "stepdown");
-    let mut levels: Vec<f32> = plan
-        .moves
-        .iter()
-        .filter(|m| m.cutting_pass)
-        .map(|m| m.to[2])
-        .collect();
-    levels.sort_by(|a, b| b.total_cmp(a));
-    levels.dedup_by(|a, b| (*a - *b).abs() < 0.0001);
-    let mut previous = plan.rest_top.unwrap_or(plan.stock.max[2]);
-    let mut largest = 0f32;
-    for z in levels {
-        largest = largest.max(previous - z);
-        previous = z;
-    }
-    let down = set.unwrap_or_else(|| up(largest));
-    let feed = num(&p.setup.operations[op].p, "feed").unwrap_or(0.);
-    muted(format!(
-        "Maximum stepdown {} mm{} · feed {} mm/min",
-        mm(down),
-        if set.is_none() { " (Auto)" } else { "" },
-        mm(feed)
-    ))
-    .size(13)
-    .into()
 }
 /// A step's screen, in the parts `framed` lays out: its caption, the
 /// pictures, the numbers, the step's own command, whether Back is live, and
@@ -3431,1288 +2866,22 @@ fn screen<'a>(p: &Page<'a>) -> Element<'a, Message> {
 fn parts<'a>(p: &Page<'a>) -> Parts<'a> {
     let g = p.guide();
     let next = Some((
-        next_label(g, p.at, p.item),
+        next_label(g, p.at),
         Message::Guide(GuideAction::Next),
     ));
     let (title, sub, left, right): (String, &str, Element<_>, Column<_>) = match &g.steps[p.at] {
-        Step::Hold {
+        Step::Zero {
             stock,
             holding,
             vise,
-        } => {
-            let d = stock.dimensions();
-            let narrow = turning::narrow(p);
-            let mut c = vec![chip(p.doc.holding_label(p.setup)), chip("top face up")];
-            // Across the jaws, seen from the front or the right: the stock
-            // on its parallels, the jaws at their height and the grip.
-            // Without a vise, across the parallels the setup stands it on.
-            let parallels = crate::parallels::of(p.setup).ok().flatten();
-            let view = match (vise, &parallels) {
-                (Some(v), _) if v.across == 1 => 2,
-                (None, Some(par)) if par.across() == 1 => 2,
-                _ => 1,
-            };
-            let (k, top) = (VIEWS[view][0], stock.max[2]);
-            let height = stock.max[2] - stock.min[2];
-            let mut shapes: Vec<Shape> =
-                p.shown.parallels.iter().map(|b| Shape::Block(*b)).collect();
-            let mut mid = [0.; 3];
-            mid[k] = (stock.min[k] + stock.max[k]) / 2.;
-            mid[2] = top;
-            shapes.push(Shape::Down(
-                mid,
-                (height * 0.4).max(8.),
-                "THIS FACE UP".into(),
-            ));
-            if let Some(v) = vise {
-                let jaw = holding.bottom + v.grip;
-                let (mut a, mut b) = ([0.; 3], [0.; 3]);
-                // Outside the + jaw.
-                let out = stock.max[k] + v.jaw_thickness;
-                (a[k], b[k]) = (out, out);
-                (a[2], b[2]) = (jaw, holding.bottom);
-                shapes.push(Shape::Height(a, b, format!("{} in the jaws", mm(v.grip))));
-                c.push(chip(format!("jaws on the {} sides", AXES[v.across])));
-                c.push(chip(format!("{} in the jaws", mm(v.grip))));
-                let under = holding.bottom + v.grip - v.jaw_height;
-                if !p.shown.parallels.is_empty() && parallels.is_none() {
-                    c.push(chip(format!(
-                        "on parallels {} high",
-                        mm(stock.min[2] - under)
-                    )));
-                }
-            }
-            // The parallels the setup says it stands on (LIO-537): how many,
-            // how high, which way and where, and their height drawn.
-            if let Some(par) = &parallels {
-                c.push(chip(format!(
-                    "on {} parallel{} {} high",
-                    par.at.len(),
-                    if par.at.len() == 1 { "" } else { "s" },
-                    mm(par.height)
-                )));
-                c.push(chip(format!(
-                    "running {} at {}",
-                    if par.along_y {
-                        "front to back"
-                    } else {
-                        "left to right"
-                    },
-                    (par.at.iter())
-                        .map(|a| par.place(*a))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )));
-                // Just outside the + side, from the underside down to the
-                // table, labelled on its right.
-                if vise.is_none() {
-                    let (mut a, mut b) = ([0.; 3], [0.; 3]);
-                    let out = stock.max[k] + 1.;
-                    (a[k], b[k]) = (out, out);
-                    (a[2], b[2]) = (stock.min[2], stock.min[2] - par.height);
-                    shapes.push(Shape::Height(a, b, format!("{} parallels", mm(par.height))));
-                }
-            }
-            let left = column![
-                p.held_picture(FillPortion(3)),
-                p.drawing_with(view, *stock, shapes, FillPortion(2), &p.shown.vise),
-            ]
-            .spacing(6)
-            .align_x(Alignment::Center)
-            .into();
-            let right = column![label("Stock as it starts"), chips(c),];
-            // The parallels in a sentence: where they go from the stock's
-            // centre, what the halving on the Zero page finds.
-            let right = match crate::parallels::sentence(p.setup) {
-                Some(said) => right.push(text(said).size(14).color(INK)),
-                None => right,
-            };
-            let right = right.push(readout(
-                Readout {
-                    order: None,
-                    // The key before the size, one text that does not
-                    // wrap at 1024 × 700 (LIO-435).
-                    lead: Some("X × Y × Z".into()),
-                    axis: String::new(),
-                    // Narrow, the size closes up and its tag, said
-                    // again under it, goes: three sizes of 100 or more
-                    // are clipped otherwise at 1024 × 700 (LIO-487).
-                    value: [d[0], d[1], d[2]]
-                        .map(mm)
-                        .join(if narrow { "×" } else { " × " }),
-                    lock: None,
-                    tags: if narrow {
-                        vec![]
-                    } else {
-                        vec!["remaining material envelope".into()]
-                    },
-                    lit: Lit::Next,
-                    big: false,
-                },
-                None,
-            ));
-            // How the setup holds and supports the part, in its own words:
-            // a stop and the room under holes are not modelled (LIO-487),
-            // nor the parallels when the setup does not say where they are.
-            let notes = p.notes();
-            let right = if notes.is_empty() {
-                right
-            } else {
-                right.push(label(SETUP_NOTES)).push(
-                    boxed(text(notes).size(14).color(INK), false)
-                        .padding([8, 12])
-                        .width(Fill),
-                )
-            };
-            let right = right.push(muted("Dimensions bound the remaining stock; earlier pockets and recesses remain as cut.").size(13));
-            // The caption follows the holding (LIO-375).
-            let sub = match (vise, get(&p.setup.p, "holding")) {
-                (Some(_), _) => "where it goes in the vise",
-                (None, "Clamps") => "where the clamps hold it",
-                _ => "the stock as it starts",
-            };
-            ("Hold".into(), sub, left, right)
-        }
-        Step::Zero {
-            approach,
-            touch,
-            finder,
-            at,
-            round,
-            far,
             clamps,
-            blocked,
-            ..
-        } => {
-            let stock = p.shown.boxes[0];
-            let sides = [["left", "right"], ["front", "back"]];
-            let side = |k: usize| sides[k][usize::from(approach[k] > 0)];
-            // How far under the top a face is touched at `at`: 0 at the top.
-            let under = |at: [f32; 3]| {
-                let d: f32 = stock.max[2] - at[2];
-                if d > 0.5 { d } else { 0. }
-            };
-            // "touch the left face" or "touch left face 3 under top".
-            let touching = |name: &str, at: [f32; 3]| {
-                let d = under(at);
-                if d > 0. {
-                    format!("touch {name} face {} under top", mm(d))
-                } else {
-                    format!("touch the {name} face")
-                }
-            };
-            // The work Z 0 is on the top, or the top is at a height.
-            let top = touch[2].abs() < 0.005;
-            // The clamps over the stock, under the finders (LIO-458).
-            let mut shapes: Vec<Shape> = (clamps.iter())
-                .map(|(_, b)| Shape::Clamp(*b, "clamp".into()))
-                .collect();
-            // The clamps over all of the face axis `k` is touched on at its
-            // + face when `plus`, named: that axis is set from its other face
-            // alone. Said in red on the stock just inside the clamps' toes
-            // over the middle of that face.
-            let over = |k: usize, plus: bool| blocked[k][usize::from(plus)].as_deref();
-            for k in 0..2 {
-                for plus in [false, true] {
-                    if over(k, plus).is_none() {
-                        continue;
-                    }
-                    let mut w = [0., 0., stock.max[2]];
-                    w[1 - k] = (stock.min[1 - k] + stock.max[1 - k]) / 2.;
-                    let face = if plus { stock.max[k] } else { stock.min[k] };
-                    let toes = (clamps.iter()).filter(|(_, b)| b.min[k] < face && b.max[k] > face);
-                    w[k] = face;
-                    w[k] = if plus {
-                        toes.map(|(_, b)| b.min[k]).fold(w[k], f32::min) - 3.
-                    } else {
-                        toes.map(|(_, b)| b.max[k]).fold(w[k], f32::max) + 3.
-                    };
-                    shapes.push(Shape::Word(w, "under a clamp".into(), NEVER));
-                }
-            }
-            // A round touched on X and Y: the diameter the finder meets,
-            // its centre where their lines cross.
-            if round[0] && round[1] {
-                let centre = [at[1][0], at[0][1], at[0][2]];
-                let r = (at[0][0] - centre[0]).abs();
-                shapes.push(Shape::Round(centre, r, format!("Ø{} touched", mm(2. * r))));
-            }
-            // A halved axis (LIO-451): 0 on its − face, then half of what
-            // the DRO reads on its + face; else the one face's number.
-            for k in 0..2 {
-                let mut from = [0.; 2];
-                from[k] = f32::from(approach[k].signum());
-                match far[k] {
-                    Some(f) => {
-                        shapes.push(Shape::Finder(at[k], from, format!("{} 0", AXES[k])));
-                        from[k] = 1.;
-                        let read = format!(
-                            "{} {} → {}",
-                            AXES[k],
-                            dro(f.reads),
-                            halving(touch[k], f.reads)
-                        );
-                        shapes.push(Shape::Finder(f.at, from, read));
-                    }
-                    None => {
-                        let set = format!("{} {}", AXES[k], dro(touch[k]));
-                        shapes.push(Shape::Finder(at[k], from, set));
-                    }
-                }
-            }
-            // Off the middle lines, where the finders of a round or a
-            // halved axis come in: a fifth in from the left, clear of the
-            // back finder's label on a thin stock (LIO-451).
-            shapes.push(Shape::Word(
-                [
-                    stock.min[0] + (stock.max[0] - stock.min[0]) * 0.2,
-                    stock.min[1] + (stock.max[1] - stock.min[1]) * 0.75,
-                    0.,
-                ],
-                if top {
-                    "Z 0 = top".into()
-                } else {
-                    format!("top = Z {}", dro(touch[2]))
-                },
-                INK,
-            ));
-            // Each row: what to do, the axis, its number and tags.
-            let mut todo: Vec<(String, usize, String, Vec<String>)> = vec![];
-            // On clamps, where along a Y face to touch it clear of them, to
-            // a tenth (a gap between clamps can be narrow): X is set by then
-            // (LIO-458).
-            let along = |k: usize, at: [f32; 3]| -> Vec<String> {
-                if k == 1 && !clamps.is_empty() {
-                    let x = (at[0] * 10.).round() / 10. + 0.;
-                    vec![format!("at X {}, clear of the clamps", mm(x))]
-                } else {
-                    vec![]
-                }
-            };
-            for k in 0..2 {
-                let Some(f) = far[k] else {
-                    // A middle whose other face is under clamps: set from
-                    // this face alone (LIO-458).
-                    let mut tags = along(k, at[k]);
-                    let other = sides[k][usize::from(approach[k] < 0)];
-                    if let Some(names) = over(k, approach[k] < 0) {
-                        tags.push(format!("the {other} face is under the {names}"));
-                        tags.push("set from this face alone, by the stock's size".into());
-                    }
-                    todo.push((
-                        format!("{} → set", touching(side(k), at[k])),
-                        k,
-                        dro(touch[k]),
-                        tags,
-                    ));
-                    continue;
-                };
-                todo.push((
-                    format!("{} → set", touching(sides[k][0], at[k])),
-                    k,
-                    dro(0.),
-                    along(k, at[k]),
-                ));
-                // One row for the + face: what the DRO reads there first,
-                // a check, under it; then half of that, or more or less
-                // when the touches are not either side of the zero alike.
-                let reads = format!("reads about {} first, a check", dro(f.reads));
-                let half = halving(touch[k], f.reads);
-                let (how, then) = if half == "½" {
-                    ("½", "press ½ or set half of it".to_string())
-                } else {
-                    ("set", format!("set half of it {}", &half["½ ".len()..]))
-                };
-                todo.push((
-                    format!("{} → {how}", touching(sides[k][1], f.at)),
-                    k,
-                    dro(touch[k]),
-                    along(k, f.at).into_iter().chain([reads, then]).collect(),
-                ));
-            }
-            todo.push(("touch the top → set".into(), 2, dro(touch[2]), vec![]));
-            let rows = todo
-                .into_iter()
-                .enumerate()
-                .map(|(i, (what, k, value, tags))| {
-                    readout(
-                        Readout {
-                            order: Some(i as u8 + 1),
-                            lead: Some(what),
-                            axis: AXES[k].into(),
-                            value,
-                            lock: None,
-                            tags,
-                            lit: lit(i, p.item),
-                            big: false,
-                        },
-                        Some(Message::Guide(GuideAction::Reached(i))),
-                    )
-                });
-            let mut c = vec![
-                chip(format!("Ø{} edge finder", mm(*finder))),
-                warn_chip("DRO comp off"),
-            ];
-            // On a round the finder trips farthest out on its centre line,
-            // where the drawing puts it; off it the DRO reads short.
-            if round
-                .iter()
-                .chain(far.iter().flatten().map(|f| &f.round))
-                .any(|r| *r)
-            {
-                c.push(warn_chip("round: touch on its centre line"));
-            }
-            if blocked.iter().flatten().any(Option::is_some) {
-                c.push(warn_chip("a face is under a clamp"));
-            }
-            let right = column![chips(c), label("Touch, then set the DRO"),].extend(rows);
-            // A corner is picked up; a middle is found (LIO-451), from one
-            // face too when the other is under clamps (LIO-458).
-            let middle = [0, 1].map(|k| far[k].is_some() || blocked[k].iter().any(Option::is_some));
-            let sub = match (middle[0], middle[1]) {
-                (true, true) => "find the centre",
-                (true, false) if approach[1] > 0 => "find the middle of the back edge",
-                (true, false) => "find the middle of the front edge",
-                (false, true) if approach[0] > 0 => "find the middle of the right edge",
-                (false, true) => "find the middle of the left edge",
-                (false, false) => "pick up the corner",
-            };
-            ("Zero".into(), sub, p.drawing(0, stock, shapes, Fill), right)
-        }
-        Step::Tool {
+        } => zero_screen(p, stock, holding, vise.as_ref(), clamps),
+        Step::Sheet {
             op,
             tool,
             rpm,
-            diameter,
-            comp,
-            top,
-        } => {
-            // Set the parallels before drilling starts (LIO-417).
-            let tip = (g.steps.iter())
-                .filter_map(|s| match s {
-                    Step::Holes { op: o, holes, .. } if o == op => {
-                        holes.iter().map(|h| h[2]).reduce(f32::min)
-                    }
-                    _ => None,
-                })
-                .reduce(f32::min);
-            let under = tip.and_then(|tip| under_stock(tip, &p.before(*op), !p.notes().is_empty()));
-            let right = column![chips(
-                vec![
-                    chip(p.named(tool, *diameter)),
-                    chip(format!("{} rpm", rpm.round()))
-                ]
-                .into_iter()
-                .chain(under)
-                .collect()
-            ),]
-            // "Where it is ringed" only over a picture that rings it
-            // (LIO-488).
-            .extend(pick_up(
-                *top,
-                Some(match p.shown.tools.get(p.at).is_some_and(Option::is_some) {
-                    true => RINGED,
-                    false => UNRINGED,
-                }),
-            ))
-            .extend(
-                comp.map(|c| dro_tool(*diameter, c, 110.))
-                    .unwrap_or_default(),
-            );
-            // The stock as it is with the tool to scale on the spot to
-            // touch, ringed (LIO-376), filling the panel with the gear in its
-            // corner (LIO-379: beside the gear it was a third as wide).
-            let picture = p.shown.tools.get(p.at).cloned().flatten();
-            let left = match picture {
-                Some(_) => iced::widget::stack![
-                    Page::image(picture, Fill),
-                    container(gear(*rpm)).align_left(Fill).align_top(Fill)
-                ]
-                .into(),
-                None => container(gear(*rpm)).center(Fill).into(),
-            };
-            match top {
-                Some(_) => ("Tool".into(), "put it in, set the gear", left, right),
-                None => ("Gear".into(), "same tool, set the gear", left, right),
-            }
-        }
-        // A hand tap: put it in, the spindle off and free; no gear and no
-        // Z pick-up (LIO-410).
-        Step::TapIn { op, tool, top } => {
-            let d = p
-                .tool(*op)
-                .and_then(|t| num(&t.p, "diameter"))
-                .unwrap_or(0.);
-            let row = |n: u8, axis: &str, value: &str, tags: Vec<String>| {
-                readout(
-                    Readout {
-                        order: Some(n),
-                        lead: None,
-                        axis: axis.into(),
-                        value: value.into(),
-                        lock: None,
-                        tags,
-                        lit: lit(usize::from(n) - 1, p.item),
-                        big: false,
-                    },
-                    Some(Message::Guide(GuideAction::Reached(usize::from(n) - 1))),
-                )
-            };
-            let right = column![
-                chips(vec![chip(p.named(tool, d)), warn_chip("spindle off")]),
-                label("Put the tap in"),
-                row(
-                    1,
-                    "spindle",
-                    "off",
-                    vec![
-                        "neutral, or the lowest gear".into(),
-                        "free to turn by hand".into()
-                    ]
-                ),
-                row(
-                    2,
-                    "tap",
-                    "in the chuck",
-                    vec![
-                        "or in a wrench, a centre in the chuck".into(),
-                        "in its back end to keep it square".into()
-                    ]
-                ),
-            ];
-            // Z on the top, for each hole's lift to a safe Z (LIO-449). In
-            // a wrench the DRO follows the centre, not the tap: the tap and
-            // wrench come out by hand before each move.
-            let right = match top {
-                Some(top) => right
-                    .push(row(
-                        3,
-                        "Z",
-                        &dro(*top),
-                        vec![
-                            "in the chuck: touch the top with the tap's tip".into(),
-                            "in a wrench: with the centre's point".into(),
-                            "set Z".into(),
-                        ],
-                    ))
-                    .push(muted(WRENCH_LIFT).size(13)),
-                None => right,
-            };
-            let left = p.picture(p.done(*op), Fill);
-            ("Tap".into(), "put it in", left, right)
-        }
-        Step::Comp { op, comp, diameter } => {
-            let right = column![
-                chips(vec![chip(p.tool(*op).map_or("", |t| t.name()).to_string())]),
-                label("Enter in the DRO"),
-                readout(
-                    Readout {
-                        order: None,
-                        lead: None,
-                        axis: "Ø".into(),
-                        value: dro(*diameter),
-                        lock: None,
-                        tags: vec!["tool diameter".into()],
-                        lit: Lit::Now,
-                        big: false,
-                    },
-                    None,
-                ),
-                label("Set the DRO comp"),
-            ]
-            .extend((0..2).map(|k| {
-                let side = match comp[k] {
-                    1 => "+",
-                    -1 => "−",
-                    _ => "off",
-                };
-                readout(
-                    Readout {
-                        order: None,
-                        lead: Some("comp".into()),
-                        axis: AXES[k].into(),
-                        value: side.into(),
-                        lock: None,
-                        tags: vec!["edge side".into()],
-                        lit: Lit::Next,
-                        big: false,
-                    },
-                    None,
-                )
-            }));
-            let left = crate::fault::canvas(CompPicture(*comp))
-                .width(Fill)
-                .height(Fill)
-                .into();
-            (
-                "Comp".into(),
-                "same tool: its diameter and sides",
-                left,
-                right,
-            )
-        }
-        Step::Face {
-            op,
-            tool: id,
-            rpm,
-            diameter,
-            top,
-            remove,
-            to,
-            size,
-        } => {
-            let stock = p.before(*op);
-            let mut band = stock;
-            band.min[2] = *to;
-            let r = diameter / 2.;
-            let tool = [stock.min[0] + r * 0.6, stock.max[1] - r * 0.6, *to];
-            let never = Shape::Never(
-                [stock.min[0] - 4., 0., *to],
-                [stock.max[0] + 4., 0., *to],
-                format!("Z {}", dro(*to)),
-            );
-            let left = column![
-                p.drawing(
-                    0,
-                    stock,
-                    vec![Shape::Hatch(band, Hatch::Cut), Shape::Tool(tool, r, None)],
-                    FillPortion(3)
-                ),
-                p.drawing(
-                    1,
-                    stock,
-                    vec![
-                        Shape::Hatch(band, Hatch::Cut),
-                        never,
-                        Shape::Tool([tool[0], 0., *to], r, None)
-                    ],
-                    FillPortion(2)
-                ),
-            ]
-            .spacing(6)
-            .into();
-            let right = column![chips(vec![
-                chip(p.named(id, *diameter)),
-                chip(format!("{} rpm", rpm.round()))
-            ]),]
-            .extend(pick_up(*top, None))
-            // With a size, "Face to" says it: room for the size's steps.
-            .extend(size.is_none().then(|| label("Final facing depth")))
-            .push(readout(
-                Readout {
-                    order: None,
-                    lead: Some("Face to".into()),
-                    axis: "Z".into(),
-                    value: dro(*to),
-                    lock: None,
-                    // Planned on the blank's planned size: the measured
-                    // size sets the last level (LIO-487).
-                    tags: vec![match size {
-                        Some(_) => format!("about {} mm off", dro(*remove)),
-                        None => format!("{} mm off", dro(*remove)),
-                    }],
-                    lit: Lit::Now,
-                    // The size is the number to work to: room for it and
-                    // its steps at 1024 × 700.
-                    big: size.is_none(),
-                },
-                None,
-            ))
-            .push(milling_limits(p, *op))
-            .push(
-                muted(match size {
-                    Some(_) => "Work down in layers; start each layer clear of the stock.",
-                    None => {
-                        "Work down in layers to this final depth; start each layer clear of the stock."
-                    }
-                })
-                .size(13),
-            );
-            let right = match size {
-                Some(size) => {
-                    let across = match &g.steps[0] {
-                        Step::Hold { vise: Some(v), .. } => Some(v.across),
-                        _ => None,
-                    };
-                    right.extend(to_size(*size, &stock, across))
-                }
-                None => right,
-            };
-            (
-                "Face".into(),
-                if size.is_some() {
-                    "tool, cutting limits and the size to finish to"
-                } else {
-                    "tool, cutting limits and final depth"
-                },
-                left,
-                right,
-            )
-        }
-        Step::Square {
-            op,
-            tool: id,
-            rpm,
-            diameter,
-            comp,
-            top,
-            axis,
-            side,
-            to,
-            shown,
-            remove,
-            down_to,
-        } => {
-            let (k, sd) = (*axis, f32::from(*side));
-            let stock = p.before(*op);
-            let r = diameter / 2.;
-            let mut slab = stock;
-            (slab.min[k], slab.max[k]) = if sd > 0. {
-                (*to, stock.max[k])
-            } else {
-                (stock.min[k], *to)
-            };
-            slab.min[2] = *down_to;
-            let o = 1 - k;
-            let mut a = [0.; 3];
-            let mut b = [0.; 3];
-            (a[k], b[k], a[o], b[o]) = (*to, *to, stock.min[o], stock.max[o]);
-            let mut tool = [0., 0., *down_to];
-            tool[k] = to + sd * r;
-            tool[o] = (stock.min[o] + stock.max[o]) / 2.;
-            let mut word = tool;
-            word[k] = to + sd * (r * 2. + 2.);
-            // The way it feeds along the wall, conventional as its plan
-            // cuts (LIO-176).
-            let feed = feed_along(g, p.done(*op), o);
-            let along = (feed != 0.).then(|| {
-                let mut end = tool;
-                end[o] += feed * (stock.max[o] - stock.min[o]) * 0.35;
-                end
-            });
-            let view = if k == 0 { 1 } else { 2 };
-            let never = Shape::Never(
-                {
-                    let mut q = [0.; 3];
-                    q[k] = stock.min[k] - 4.;
-                    q[2] = *down_to;
-                    q
-                },
-                {
-                    let mut q = [0.; 3];
-                    q[k] = stock.max[k] + 4.;
-                    q[2] = *down_to;
-                    q
-                },
-                format!("Z {}", dro(*down_to)),
-            );
-            let mut tool_side = [0.; 3];
-            tool_side[k] = tool[k];
-            tool_side[2] = *down_to;
-            let left = column![
-                p.drawing(
-                    0,
-                    stock,
-                    vec![
-                        Shape::Hatch(slab, Hatch::Cut),
-                        Shape::Wall(a, b),
-                        Shape::Tool(tool, r, along),
-                        Shape::Word(word, format!("{} mm off", mm(*remove)), ACCENT)
-                    ],
-                    FillPortion(3)
-                ),
-                p.drawing(
-                    view,
-                    stock,
-                    vec![
-                        Shape::Hatch(slab, Hatch::Cut),
-                        never,
-                        Shape::Tool(tool_side, r, None)
-                    ],
-                    FillPortion(2)
-                ),
-            ]
-            .spacing(6)
-            .into();
-            let names = [["left", "right"], ["front", "back"]];
-            let edge = get(&p.setup.machine.p, "dro_comp") == "Yes";
-            let right = column![chips(vec![
-                chip(p.named(id, *diameter)),
-                chip(format!("{} rpm", rpm.round())),
-                chip(format!("final floor Z {}", dro(*down_to)))
-            ]),]
-            .push(milling_limits(p, *op))
-            .push(muted("Reach the final floor in depth layers; this is not a full-height side cut. Start each layer clear of the stock and feed conventionally along the wall.").size(13))
-            .extend(pick_up(*top, None))
-            .extend(dro_tool(*diameter, *comp, 70.))
-            .push(label("Cut the side to"))
-            .push(readout(
-                Readout {
-                    order: None,
-                    lead: None,
-                    axis: AXES[k].into(),
-                    value: dro(*shown),
-                    lock: None,
-                    tags: vec![
-                        format!("{} side to", names[k][usize::from(sd > 0.)]),
-                        format!(
-                            "{} mm off · {}",
-                            dro(*remove),
-                            if edge { "edge" } else { "centre" }
-                        ),
-                    ],
-                    lit: Lit::Now,
-                    big: true,
-                },
-                None,
-            ));
-            (
-                "Square".into(),
-                "cutting limits and final side position",
-                left,
-                right,
-            )
-        }
-        step @ Step::Slot { .. } => slot_screen(p, step),
-        step @ Step::Pass { .. } => pass(p, step),
-        step @ Step::Corner { .. } => corner(p, step),
-        Step::Pattern { op, pattern, same } => pattern_screen(p, *op, pattern, *same),
-        Step::Leave {
-            op,
-            from,
-            at,
-            number,
-        } => leave_screen(p, *op, *from, *at, *number),
-        Step::Holes {
-            op,
-            holes,
-            mouths,
-            uncentred,
-            pattern,
-            numbers,
-        } => {
-            // The DRO's number of each hole, drilled in this order (LIO-406).
-            let number = |n: usize| numbers.get(n).copied().unwrap_or(n + 1);
-            let stock = p.before(*op);
-            let i = p.item.min(holes.len().saturating_sub(1));
-            let r = p
-                .tool(*op)
-                .and_then(|t| num(&t.p, "diameter"))
-                .unwrap_or(4.)
-                / 2.;
-            let mut shapes = p.cut_before(*op);
-            let spotting = p.tool(*op).and_then(|t| t.centre_drill());
-            // A centre drill's hole is its cone at hole `n`'s mouth, where
-            // the material over it starts (a pocket's floor, say).
-            let cone = |n: usize, h: &[f32; 3]| {
-                spotting.map_or(r, |c| {
-                    let mouth = mouths.get(n).copied().unwrap_or(stock.max[2]);
-                    (c.pilot / 2.
-                        + (mouth - h[2] - c.pilot_length) / crate::model::CentreDrill::rise())
-                    .clamp(c.pilot / 2., c.body / 2.)
-                })
-            };
-            shapes.extend(holes.iter().enumerate().map(|(n, h)| {
-                Shape::Hole([h[0], h[1], stock.max[2]], cone(n, h), number(n), lit(n, i))
-            }));
-            let h = holes.get(i).copied().unwrap_or([0.; 3]);
-            // An axis where the hole before left it stays, locked, and is no
-            // step: the steps are what moves (LIO-405). Hole 1 moves both.
-            let before = i.checked_sub(1).and_then(|j| holes.get(j));
-            let stays = |k: usize| before.is_some_and(|b| (b[k] - h[k]).abs() <= 0.005);
-            let moving: Vec<usize> = (0..2).filter(|&k| !stays(k)).collect();
-            // The depth's step, after the axes that move.
-            let z = moving.len();
-            // X and Y: the centre, or 0 on the DRO's hole of a pattern with
-            // the centre small beside it (LIO-399).
-            let xy = |k: usize| {
-                if stays(k) {
-                    return readout(
-                        Readout {
-                            order: None,
-                            lead: None,
-                            axis: AXES[k].into(),
-                            value: "stays".into(),
-                            lock: None,
-                            tags: vec!["leave it locked".into()],
-                            lit: Lit::Done,
-                            big: false,
-                        },
-                        None,
-                    );
-                }
-                // After the lift (LIO-449).
-                let n = moving.iter().position(|&m| m == k).unwrap_or(k) + 1;
-                let (value, tags) = match pattern {
-                    Some(_) => (
-                        dro(0.),
-                        vec![
-                            format!("on the DRO's hole {}", number(i)),
-                            format!("{}\u{a0}{}", AXES[k], dro(h[k])),
-                        ],
-                    ),
-                    None => (dro(h[k]), vec!["centre".into()]),
-                };
-                readout(
-                    Readout {
-                        order: Some(n as u8 + 1),
-                        lead: None,
-                        axis: AXES[k].into(),
-                        value,
-                        lock: Some(AXES[k].into()),
-                        tags,
-                        lit: lit(n, p.reached),
-                        big: false,
-                    },
-                    Some(Message::Guide(GuideAction::Reached(n))),
-                )
-            };
-            let tapping = p.setup.operations.get(*op).is_some_and(|o| o.tapping());
-            // Up to a safe Z first, every hole: the move to it must not
-            // drag the tool through the stock or into the holding (LIO-449).
-            let lift = lift(p, *op, tapping);
-            // The depth's step, after the lift and the axes that move.
-            let z = z + 1;
-            // Every hole is cut from its mouth: the stock above it may be
-            // gone already (LIO-365).
-            let mouth = mouths.get(i).copied().unwrap_or(stock.max[2]);
-            let drilled = Bounds {
-                min: [h[0] - r, h[1] - r, h[2]],
-                max: [h[0] + r, h[1] + r, mouth],
-            };
-            // A centre drill's pilot, to its tip, under its cone, which is
-            // as wide as the hole at the top or as its body when wider.
-            let spot = p.tool(*op).and_then(|t| t.centre_drill()).map(|c| {
-                let (x, y, (q, b)) = (h[0], h[1], (c.pilot / 2., c.body / 2.));
-                let shoulder = h[2] + c.pilot_length;
-                let wide = (q + (mouth - shoulder) / crate::model::CentreDrill::rise()).min(b);
-                let rim = shoulder + (wide - q) * crate::model::CentreDrill::rise();
-                Shape::Section(vec![
-                    [x - q, y, h[2]],
-                    [x + q, y, h[2]],
-                    [x + q, y, shoulder],
-                    [x + wide, y, rim],
-                    [x + wide, y, mouth],
-                    [x - wide, y, mouth],
-                    [x - wide, y, rim],
-                    [x - q, y, shoulder],
-                ])
-            });
-            let side = vec![
-                spot.unwrap_or(Shape::Hatch(drilled, Hatch::Cut)),
-                Shape::Depth(
-                    [h[0] - 3. * r, 0., h[2]],
-                    [h[0] + 3. * r, 0., h[2]],
-                    format!("Z {}", dro(h[2])),
-                ),
-            ];
-            let left = column![
-                p.drawing(0, stock, shapes, FillPortion(3)),
-                p.drawing(1, stock, side, FillPortion(2))
-            ]
-            .spacing(6)
-            .into();
-            let rpm = p
-                .setup
-                .operations
-                .get(*op)
-                .and_then(|o| num(&o.p, "rpm"))
-                .unwrap_or(0.);
-            let depth = mouth - h[2];
-            // Tapping: by hand, the spindle holding the tap square; the
-            // depth is how many turns the tap goes in.
-            let pitch = p.tool(*op).and_then(|t| t.tap_spec()).map(|s| s.pitch);
-            if let (true, Some(pitch)) = (tapping, pitch) {
-                // Rounded down: a turn more would go past the drilled hole.
-                let turns = (depth / pitch * 10.).floor() / 10.;
-                let mut said = vec![
-                    chip(p.tool_name(*op, 2. * r)),
-                    chip("by hand · spindle off"),
-                    warn_chip("oil"),
-                    // Held square as on the lathe (LIO-410).
-                    chip("square: chuck, or wrench on a centre"),
-                ];
-                // The tap's tip comes out under the stock: a parallel there
-                // stops it, or it cuts the vise.
-                said.extend(under_stock(h[2], &stock, !p.notes().is_empty()));
-                // The depth as a hand follows it (LIO-410).
-                let through = h[2] < part_bottom(p) - 0.005;
-                let how = if through {
-                    "through: turn until it runs free".to_string()
-                } else {
-                    format!("mark the tap {} from its tip", mm(depth))
-                };
-                let right = column![
-                    chips(said),
-                    hole_label(i, holes.len(), number(i)),
-                    lift,
-                    xy(0),
-                    xy(1),
-                    readout(
-                        Readout {
-                            order: Some(z as u8 + 1),
-                            lead: None,
-                            axis: "turns".into(),
-                            value: format!("{:.1}", turns),
-                            lock: None,
-                            tags: vec![how, "½ back every turn".into()],
-                            lit: lit(z, p.reached),
-                            big: true
-                        },
-                        Some(Message::Guide(GuideAction::Reached(z)))
-                    ),
-                    tiles(
-                        (0..holes.len())
-                            .map(|n| (number(n).to_string(), None))
-                            .collect(),
-                        i,
-                        p.tablet
-                    ),
-                ];
-                ("Tap".into(), "one hole at a time, by hand", left, right)
-            } else {
-                // A reamer is fed back out: pulled out at a rapid, it scores
-                // the wall it has just cut.
-                let o = p.setup.operations.get(*op);
-                let reaming = o.is_some_and(|o| o.reaming());
-                // A centre drill goes in to its pilot's tip, its cone opened
-                // to the hole's size at the top, the body's when wider.
-                let centre = p.tool(*op).and_then(|t| t.centre_drill());
-                let feed = o.and_then(|o| num(&o.p, "feed")).unwrap_or(0.);
-                let mut said = vec![
-                    chip(p.tool_name(*op, 2. * r)),
-                    chip(format!("{} rpm", rpm.round())),
-                    chip(format!("{} mm/min", feed.round())),
-                    warn_chip("centres"),
-                ];
-                if reaming {
-                    said.push(warn_chip("feed back out"));
-                }
-                if uncentred.get(i).copied().unwrap_or(false) {
-                    said.push(warn_chip("centre drill first"));
-                }
-                said.extend(under_stock(h[2], &stock, !p.notes().is_empty()));
-                let cone = centre.map(|_| format!("cone Ø{} at the top", mm(2. * cone(i, &h))));
-                // The planned cycle, as the hand on the quill does it.
-                let cycle = o.map(|o| get(&o.p, "cycle")).unwrap_or_default();
-                let peck = o.and_then(|o| num(&o.p, "peck")).filter(|p| *p > 0.);
-                let pecking = match (cycle, peck) {
-                    ("Chip breaking", Some(peck)) => {
-                        vec![format!("peck {} mm", mm(peck)), "back off 0.5 each".into()]
-                    }
-                    ("Deep drilling", Some(peck)) => vec![
-                        format!("peck {} mm", mm(peck)),
-                        "out of the hole each".into(),
-                    ],
-                    _ => vec![],
-                };
-                if !pecking.is_empty() {
-                    said.push(chip(cycle.to_string()));
-                }
-                let right = column![
-                    chips(said),
-                    hole_label(i, holes.len(), number(i)),
-                    lift,
-                    xy(0),
-                    xy(1),
-                    readout(
-                        Readout {
-                            order: Some(z as u8 + 1),
-                            lead: None,
-                            axis: "Z".into(),
-                            value: dro(h[2]),
-                            lock: None,
-                            tags: [
-                                if centre.is_some() {
-                                    "pilot tip to"
-                                } else if reaming {
-                                    "ream to"
-                                } else {
-                                    "drill to"
-                                }
-                                .into(),
-                                format!("{} deep", mm(depth))
-                            ]
-                            .into_iter()
-                            .chain(cone)
-                            .chain(pecking)
-                            .collect(),
-                            lit: lit(z, p.reached),
-                            big: false
-                        },
-                        Some(Message::Guide(GuideAction::Reached(z)))
-                    ),
-                    tiles(
-                        (0..holes.len())
-                            .map(|n| (number(n).to_string(), None))
-                            .collect(),
-                        i,
-                        p.tablet
-                    ),
-                ];
-                let title = if centre.is_some() {
-                    "Centre drill"
-                } else if reaming {
-                    "Ream"
-                } else {
-                    "Holes"
-                };
-                (title.into(), "one hole at a time", left, right)
-            }
-        }
-        Step::Bore {
-            op,
-            index,
-            of,
-            size,
-            before,
-            dial,
-            feed_out,
-            holes,
-            mouths,
-        } => {
-            let stock = p.before(*op);
-            let i = p.item.min(holes.len().saturating_sub(1));
-            let r = size / 2.;
-            let mut shapes = p.cut_before(*op);
-            shapes.extend(
-                holes
-                    .iter()
-                    .enumerate()
-                    .map(|(n, h)| Shape::Hole([h[0], h[1], stock.max[2]], r, n + 1, lit(n, i))),
-            );
-            let h = holes.get(i).copied().unwrap_or([0.; 3]);
-            let mouth = mouths.get(i).copied().unwrap_or(stock.max[2]);
-            // The bore as this pass leaves it, over what the last one left.
-            let ring = |r: f32| Bounds {
-                min: [h[0] - r, h[1] - r, h[2]],
-                max: [h[0] + r, h[1] + r, mouth],
-            };
-            let mut side = vec![Shape::Hatch(ring(r), Hatch::Cut)];
-            if let Some(b) = before {
-                side.push(Shape::Hatch(ring(b / 2.), Hatch::Earlier));
-            }
-            side.push(Shape::Never(
-                [h[0] - 2. * r, 0., h[2]],
-                [h[0] + 2. * r, 0., h[2]],
-                format!("Z {}", dro(h[2])),
-            ));
-            let left = column![
-                p.drawing(0, stock, shapes, FillPortion(3)),
-                p.drawing(1, stock, side, FillPortion(2))
-            ]
-            .spacing(6)
-            .into();
-            let rpm = p
-                .setup
-                .operations
-                .get(*op)
-                .and_then(|o| num(&o.p, "rpm"))
-                .unwrap_or(0.);
-            let first = i == 0;
-            let mut said = vec![
-                chip(p.tool_name(*op, *size)),
-                chip(format!("{} rpm", rpm.round())),
-            ];
-            if first {
-                said.push(warn_chip("spindle off to set the head"));
-            }
-            said.push(if *feed_out {
-                chip("feed back out")
-            } else {
-                warn_chip("spindle off, then raise")
-            });
-            let mut order = 0u8;
-            let mut next = || {
-                order += 1;
-                Some(order)
-            };
-            let mut right = column![chips(said), label(format!("Pass {index} of {of}"))];
-            // Before the pass: measure what the last left, then set the
-            // head out by the difference; before the first, set it.
-            if first && let Some(b) = before {
-                right = right.push(readout(
-                    Readout {
-                        order: next(),
-                        lead: Some("measure".into()),
-                        axis: "bore".into(),
-                        value: format!("Ø{b:.2}"),
-                        lock: None,
-                        tags: vec!["what the last pass left".into()],
-                        lit: Lit::Next,
-                        big: false,
-                    },
-                    None,
-                ));
-            }
-            let out = before.map(|b| size - b);
-            let mut head_tags = match out {
-                Some(d) if first => vec![format!("out {d:.2} on Ø")],
-                Some(_) => vec!["as set".into()],
-                None if first => vec!["set to".into()],
-                None => vec!["as set".into()],
-            };
-            if let (true, Some(b)) = (first, before.filter(|_| *dial > 0.)) {
-                head_tags.push(crate::cam::boring::divisions_tag(b, *size, *dial));
-            }
-            right = right.push(readout(
-                Readout {
-                    order: if first { next() } else { None },
-                    lead: None,
-                    axis: "head".into(),
-                    value: format!("Ø{size:.2}"),
-                    lock: None,
-                    tags: head_tags,
-                    lit: if first { Lit::Next } else { Lit::Done },
-                    big: first,
-                },
-                None,
-            ));
-            // Up to a safe Z before each hole's move (LIO-449).
-            right = right.push(readout(
-                Readout {
-                    order: next(),
-                    lead: Some("up to".into()),
-                    axis: "Z".into(),
-                    value: dro(safe_z(p, *op)),
-                    lock: None,
-                    tags: vec![
-                        format!("clear of the stock and {}", holder(p)),
-                        "before X and Y move".into(),
-                    ],
-                    lit: Lit::Next,
-                    big: false,
-                },
-                None,
-            ));
-            for (axis, value, lock, tags) in [
-                ("X", h[0], Some("X"), vec!["centre".to_string()]),
-                ("Y", h[1], Some("Y"), vec!["centre".to_string()]),
-                (
-                    "Z",
-                    h[2],
-                    None,
-                    vec!["bore to".to_string(), format!("{} deep", mm(mouth - h[2]))],
-                ),
-            ] {
-                right = right.push(readout(
-                    Readout {
-                        order: next(),
-                        lead: None,
-                        axis: axis.into(),
-                        value: dro(value),
-                        lock: lock.map(String::from),
-                        tags,
-                        lit: Lit::Next,
-                        big: false,
-                    },
-                    None,
-                ));
-            }
-            if holes.len() > 1 {
-                right = right.push(tiles(
-                    (1..=holes.len()).map(|n| (n.to_string(), None)).collect(),
-                    i,
-                    p.tablet,
-                ));
-            }
-            ("Bore".into(), "set the head, then each hole", left, right)
-        }
-        Step::Check { op } => {
-            let j = p.done(*op);
-            let o = p.setup.operations.get(*op);
-            let mut c = vec![chip(format!("{} done", o.map_or("", |o| o.name())))];
-            // Holes the DRO led to: its hole function is left next, unless
-            // the next operation starts the same pattern again (LIO-488).
-            let kind = (g.steps.iter()).find_map(|s| match s {
-                Step::Holes {
-                    op: o,
-                    pattern: Some(pattern),
-                    ..
-                } if o == op => Some(match pattern {
-                    Pattern::Arc { .. } => "arc holes",
-                    Pattern::Grid { .. } => "matrix holes",
-                }),
-                _ => None,
-            });
-            let leaves = matches!(
-                g.steps.get(p.at + 1),
-                Some(Step::Leave { from, .. }) if from == op
-            ) || matches!(g.steps.get(p.at + 1), Some(Step::HandOver { .. }));
-            if let Some(kind) = kind.filter(|_| leaves) {
-                c.push(warn_chip(format!("then leave the DRO's {kind}")));
-            }
-            if let Some(a) = o
-                .filter(|o| o.strategy == Strategy::Box)
-                .and_then(|o| num(&o.p, "allowance"))
-                .filter(|a| *a > 0.)
-            {
-                c.push(chip(format!("{} mm left on the walls and floor", mm(a))));
-            }
-            // A Slot's stock to leave, said with its sizes (LIO-449).
-            if let Some(o) = o.filter(|o| o.strategy == Strategy::Slot) {
-                let left = |k: &str| num(&o.p, k).filter(|a| *a > 0.);
-                if let Some(a) = left("allowance") {
-                    c.push(chip(format!("{} mm left on the walls", mm(a))));
-                }
-                if let Some(a) = left("axial_allowance").filter(|_| get(&o.p, "through") != "Yes") {
-                    c.push(chip(format!("{} mm left on the floor", mm(a))));
-                }
-            }
-            // The sizes to measure, drawn on the picture and listed large
-            // (LIO-370).
-            let top = p.shown.boxes[j].max[2] + g.zero[2];
-            let sizes = g.done.get(j).map_or(vec![], |d| measures(p.doc, g, d, top));
-            let rows = sizes.into_iter().map(|m| {
-                readout(
-                    Readout {
-                        order: None,
-                        lead: None,
-                        axis: m.axis.into(),
-                        value: dro(m.value),
-                        lock: None,
-                        tags: m.words,
-                        lit: Lit::Next,
-                        big: true,
-                    },
-                    None,
-                )
-            });
-            // A tapped hole is tried with a screw (LIO-413).
-            let tried = o.filter(|o| o.tapping()).and_then(|_| screw_try(p, *op));
-            let tapped = tried.is_some();
-            // Round corners: the scallops filed to the line (LIO-443).
-            let filed = o
-                .filter(|o| o.strategy == Strategy::Corner)
-                .map(|_| corner_check(p, *op));
-            let right = match (tried, filed) {
-                (Some(row), _) => column![label("By hand"), row],
-                (None, Some(rows)) => column![label("By hand")].extend(rows),
-                (None, None) => column![label("Measure")].extend(rows),
-            }
-            .push(chips(c))
-            .push(label("Before"))
-            .push(p.picture(j, Length::Fixed(160.)));
-            let dims = p.shown.dims.get(j + 1).map_or(&[][..], Vec::as_slice);
-            let left = iced::widget::stack![
-                p.picture(j + 1, Fill),
-                crate::fault::canvas(Dims(dims)).width(Fill).height(Fill)
-            ]
-            .into();
-            // "try" once: the heading says it, the readout names the screw
-            // (LIO-426).
-            // A thread is tried, named as on the lathe: "Try · the thread"
-            // (LIO-437).
-            let corners = o.is_some_and(|o| o.strategy == Strategy::Corner);
-            let (title, sub) = if tapped {
-                ("Try", "the thread")
-            } else if corners {
-                ("File", "the scallops to the line")
-            } else {
-                ("Check", "measure what it left")
-            };
-            (title.into(), sub, left, right)
-        }
+            features,
+        } => sheet_screen(p, *op, tool, *rpm, features),
         Step::Lathe(step) => turning::screen(p, step),
         Step::HandOver { next: to } if p.shown.side.is_some() => {
             return turning::hand_over(p, *to);
@@ -4747,7 +2916,8 @@ fn parts<'a>(p: &Page<'a>) -> Parts<'a> {
     // The lathe's numbers take half the card at a narrow window (LIO-389).
     let split = match &g.steps[p.at] {
         Step::Lathe(_) => turning::split(p),
-        Step::Pattern { .. } if p.window.0 < 1200. => (1, 1),
+        // A table of numbers wants the room (LIO-688).
+        Step::Sheet { .. } if p.window.0 < 1200. => (1, 1),
         _ => (11, 9),
     };
     Parts {
@@ -4807,1586 +2977,421 @@ fn framed<'a>(
     .height(Fill)
     .into()
 }
-/// Where the tool is before and after the cut of pass `index` of `op`: the
-/// targets of its passes replayed.
-fn ends(g: &Guide, op: usize, index: usize) -> ([f32; 3], [f32; 3]) {
-    let mut at = [0.; 3];
-    let mut start = at;
-    for s in &g.steps {
-        if let Step::Pass {
-            op: o,
-            index: i,
-            targets,
-            ..
-        } = s
-            && *o == op
-            && *i <= index
-        {
-            for (n, t) in targets.iter().enumerate() {
-                if *i == index && n + 1 == targets.len() {
-                    start = at;
-                }
-                at[t.axis] = t.centre;
-            }
-        }
+/// Where the work zero is on axis `k` (0 X, 1 Y, 2 Z) of the stock box `s`
+/// in work coordinates, where the zero is 0 (LIO-688): on a face, midway
+/// between two, or how far from one.
+fn zero_place(s: &Bounds, k: usize) -> String {
+    let on = |v: f32| v.abs() < 0.005;
+    let (lo, hi) = (s.min[k], s.max[k]);
+    if k == 2 {
+        return match () {
+            _ if on(hi) => "the top of the stock".into(),
+            _ if on(lo) => "the bottom of the stock".into(),
+            _ if hi > 0. => format!("{} below the top of the stock", mm(hi)),
+            _ => format!("{} above the top of the stock", mm(-hi)),
+        };
     }
-    (start, at)
-}
-/// Which way (−1, +1; 0 when it does not) the first cut of the plan of
-/// the setup's `done`th operation feeds along `axis`.
-fn feed_along(g: &Guide, done: usize, axis: usize) -> f32 {
-    (g.done.get(done).into_iter())
-        .flat_map(|d| d.plan.moves.iter())
-        .find(|m| m.cutting_pass)
-        .map_or(0., |m| (m.to[axis] - m.from[axis]).signum())
-}
-/// The lines not to pass of operation `op` (tool radius `r`) where they are
-/// inside `stock`, as `view` sees them, each labelled with what the DRO
-/// reads with the tool against it (LIO-363): a line is the tool's edge on
-/// its low (−1) or high (+1) side, and the DRO reads the edge on the
-/// compensation side its targets read, or the centre with it off.
-fn never_lines(
-    g: &Guide,
-    op: usize,
-    stock: Bounds,
-    never: Limits,
-    r: f32,
-    view: [usize; 2],
-) -> Vec<Shape> {
-    let comp: [f32; 2] = std::array::from_fn(|a| {
-        (g.steps.iter())
-            .filter_map(|s| match s {
-                Step::Pass { op: o, targets, .. } if *o == op => Some(targets),
-                _ => None,
-            })
-            .flatten()
-            .find(|t| t.axis == a && t.edge)
-            .map_or(0., |t| ((t.shown - t.centre) / r).round())
-    });
-    let mut out = vec![];
-    for (axis, (lo, hi)) in [
-        (0, (never.x[0], never.x[1])),
-        (1, (never.y[0], never.y[1])),
-        (2, (never.z, f32::INFINITY)),
-    ] {
-        if !view.contains(&axis) {
-            continue;
-        }
-        let other = view[usize::from(view[0] == axis)];
-        for (v, side) in [(lo, -1.), (hi, 1.)] {
-            if v > stock.min[axis] + 0.05 && v < stock.max[axis] - 0.05 {
-                let (mut a, mut b) = ([0.; 3], [0.; 3]);
-                (a[axis], b[axis]) = (v, v);
-                (a[other], b[other]) = (stock.min[other] - 4., stock.max[other] + 4.);
-                let reads = match comp.get(axis) {
-                    Some(c) => v + (c - side) * r,
-                    None => v,
-                };
-                out.push(Shape::Never(a, b, format!("{} {}", AXES[axis], dro(reads))));
-            }
-        }
-    }
-    out
-}
-/// The most a pass lifts off the floor to return (`cam::LIFT`), with room
-/// for rounding.
-const LIFT: f32 = crate::cam::LIFT + 0.05;
-/// The heading over a hole's readouts: "Hole 2 of 6", and the DRO's hole
-/// to call up when that is another number (LIO-407).
-/// How far above the stock and its holding, mm, the tool goes at least
-/// before it moves to a hole (LIO-449); a manual-mill Drill's plan goes as
-/// high between its holes (`manual::over_holding`).
-const SAFE_ABOVE: f32 = crate::manual::SAFE_ABOVE;
-/// The DRO's Z the tool goes up to before X and Y move to a hole of `op`
-/// (LIO-449): the plan's own clearance over the stock (its highest move,
-/// the operation's "clearance"), and never less than `SAFE_ABOVE` over the
-/// stock left and the tops of the vise's jaws or the clamps.
-fn safe_z(p: &Page<'_>, op: usize) -> f32 {
-    p.shown.lifts.z(p.doc, p.guide(), op)
-}
-/// `safe_z` of operation `op` of `guide`, cut with `tool`, the stock boxes
-/// before each operation `boxes` and the jaws or clamps `jaws` in work
-/// coordinates (`Lifts`).
-fn lift_z(guide: &Guide, tool: Option<&Tool>, op: usize, boxes: &[Bounds], jaws: &[Bounds]) -> f32 {
-    let done = (guide.done.iter()).position(|d| d.op == op).unwrap_or(0);
-    let planned = (guide.done.get(done).filter(|d| d.op == op))
-        .and_then(|d| {
-            (d.plan.moves.iter())
-                .flat_map(|m| [m.from[2], m.to[2]])
-                .reduce(f32::max)
-        })
-        // A centre drill's plan is of its pilot's top, the DRO set to its
-        // tip (`Step::Holes`): its clearance reads the pilot lower.
-        .map(|z| {
-            z - guide.zero[2]
-                - tool
-                    .and_then(|t| t.centre_drill())
-                    .map_or(0., |c| c.pilot_length)
-        });
-    let before = boxes.get(done).map_or(f32::NEG_INFINITY, |b| b.max[2]);
-    let highest = (jaws.iter()).map(|j| j.max[2]).fold(before, f32::max);
-    let z = (planned.unwrap_or(f32::NEG_INFINITY)).max(highest + SAFE_ABOVE);
-    // To the micron first: the heights carry float dust (a clamp's top
-    // 25.000015 over the stock's), which `up` would read as Z 30.01.
-    up((z * 1000.).round() / 1000.)
-}
-/// A tap in a wrench on a centre (LIO-449): Z is the centre's point, which
-/// the DRO follows; the tap is in the hole, not on the quill.
-const WRENCH_LIFT: &str = "In a wrench, Z is the centre's point, not the tap's tip: before each move to a hole, turn the tap out, lift it and the wrench clear of the stock by hand, then raise the centre.";
-/// What holds the stock, in a hole page's words.
-fn holder(p: &Page<'_>) -> &'static str {
-    // The jaws drawn are the clamps' and the parallels' (LIO-537):
-    // the clamps are said only when the setup has them (`Lifts`).
-    p.shown.lifts.holder()
-}
-/// `holder`: a vise holds the stock, or clamps (`jaws`) do, or neither.
-fn holder_of(vise: bool, jaws: bool) -> &'static str {
-    if vise {
-        "the vise"
-    } else if jaws {
-        "the clamps"
-    } else {
-        "what holds it"
+    let [first, last] = [["left", "right"], ["front", "back"]][k];
+    let [on_way, back_way] = [["right of", "left of"], ["behind", "in front of"]][k];
+    match () {
+        _ if on(lo) => format!("the {first} face"),
+        _ if on(hi) => format!("the {last} face"),
+        _ if on(lo + hi) => format!("the middle, halfway between the {first} and {last} faces"),
+        _ if lo < 0. => format!("{} {on_way} the {first} face", mm(-lo)),
+        _ => format!("{} {back_way} the {first} face", mm(lo)),
     }
 }
-/// A hole page's first readout (LIO-449): Z up to `safe_z` before X and Y
-/// move, so that no move drags the tool through the stock or the holding;
-/// a tap is turned back out first.
-fn lift<'a>(p: &Page<'a>, op: usize, tapping: bool) -> Element<'a, Message> {
-    let mut tags = vec![];
-    if tapping {
-        tags.push("turn the tap back out first".to_string());
-        tags.push("in a wrench: lift the tap and wrench out by hand, then the centre".into());
-    }
-    tags.push(format!("clear of the stock and {}", holder(p)));
-    tags.push("before X and Y move".into());
-    readout(
-        Readout {
-            order: Some(1),
-            lead: Some("up to".into()),
-            axis: "Z".into(),
-            value: dro(safe_z(p, op)),
-            lock: None,
-            tags,
-            lit: lit(0, p.reached),
-            big: false,
-        },
-        Some(Message::Guide(GuideAction::Reached(0))),
-    )
-}
-fn hole_label<'a>(i: usize, of: usize, called: usize) -> Element<'a, Message> {
-    match called == i + 1 {
-        true => label(format!("Hole {} of {of}", i + 1)),
-        false => label(format!(
-            "Hole {} of {of} · call up the DRO's hole {called}",
-            i + 1
-        )),
-    }
-}
-/// An angle as the DRO takes it: "30.00°".
-fn degrees(v: f32) -> String {
-    format!("{}°", dro(v))
-}
-/// The Pattern screen (LIO-399): the numbers to type into the DRO's matrix
-/// or arc holes, large, two to a row, each the ways DROs ask for it, and
-/// the part from above with the pattern on it.
-fn pattern_screen<'a>(
+/// The zero page (LIO-688): where X0, Y0 and Z0 are on the stock, which is
+/// shown held, the zero marked on it; how it is held and the setup's notes.
+fn zero_screen<'a>(
     p: &Page<'a>,
-    op: usize,
-    pattern: &Pattern,
-    same: bool,
-) -> (
-    String,
-    &'static str,
-    Element<'a, Message>,
-    Column<'a, Message>,
-) {
-    let (holes, called): (Vec<[f32; 2]>, Vec<usize>) = match p.guide().steps.get(p.at + 1) {
-        Some(Step::Holes { holes, numbers, .. }) => (
-            holes.iter().map(|h| [h[0], h[1]]).collect(),
-            numbers.clone(),
-        ),
-        _ => (vec![], vec![]),
+    stock: &'a Bounds,
+    holding: &'a Gripped,
+    vise: Option<&'a crate::guide::Vise>,
+    clamps: &'a [(String, Bounds)],
+) -> (String, &'static str, Element<'a, Message>, Column<'a, Message>) {
+    let d = stock.dimensions();
+    let narrow = turning::narrow(p);
+    let mut c = vec![chip(p.doc.holding_label(p.setup)), chip("top face up")];
+    // Across the jaws, seen from the front or the right: the stock on its
+    // parallels, the jaws at their height and the grip. Without a vise,
+    // across the parallels the setup stands it on.
+    let parallels = crate::parallels::of(p.setup).ok().flatten();
+    let view = match (vise, &parallels) {
+        (Some(v), _) if v.across == 1 => 2,
+        (None, Some(par)) if par.across() == 1 => 2,
+        _ => 1,
     };
-    // Out of the DRO's order round the circle, one axis a move (LIO-406).
-    let out_of_order = called.iter().enumerate().any(|(j, n)| *n != j + 1);
-    let one_axis = (holes.windows(2))
-        .filter(|w| crate::guide::one_axis(w[0], w[1]))
-        .count();
-    let r = (p.tool(op).and_then(|t| num(&t.p, "diameter"))).unwrap_or(4.) / 2.;
-    // Smaller at a narrow window, where the numbers get half the card.
-    let size = if p.window.0 < 1200. { 30 } else { 40 };
+    let (k, top) = (VIEWS[view][0], stock.max[2]);
+    let mut side: Vec<Shape> = p.shown.parallels.iter().map(|b| Shape::Block(*b)).collect();
+    side.push(Shape::Word([0.; 3], "Z0".into(), ACCENT));
+    if let Some(v) = vise {
+        let jaw = holding.bottom + v.grip;
+        let (mut a, mut b) = ([0.; 3], [0.; 3]);
+        // Outside the + jaw.
+        let out = stock.max[k] + v.jaw_thickness;
+        (a[k], b[k]) = (out, out);
+        (a[2], b[2]) = (jaw, holding.bottom);
+        side.push(Shape::Height(a, b, format!("{} in the jaws", mm(v.grip))));
+        c.push(chip(format!("jaws on the {} sides", AXES[v.across])));
+        c.push(chip(format!("{} in the jaws", mm(v.grip))));
+        let under = holding.bottom + v.grip - v.jaw_height;
+        if !p.shown.parallels.is_empty() && parallels.is_none() {
+            c.push(chip(format!(
+                "on parallels {} high",
+                mm(stock.min[2] - under)
+            )));
+        }
+    }
+    // The parallels the setup says it stands on (LIO-537): how many, how
+    // high, which way and where, and their height drawn.
+    if let Some(par) = &parallels {
+        c.push(chip(format!(
+            "on {} parallel{} {} high",
+            par.at.len(),
+            if par.at.len() == 1 { "" } else { "s" },
+            mm(par.height)
+        )));
+        c.push(chip(format!(
+            "running {} at {}",
+            if par.along_y {
+                "front to back"
+            } else {
+                "left to right"
+            },
+            (par.at.iter())
+                .map(|a| par.place(*a))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+        if vise.is_none() {
+            let (mut a, mut b) = ([0.; 3], [0.; 3]);
+            let out = stock.max[k] + 1.;
+            (a[k], b[k]) = (out, out);
+            (a[2], b[2]) = (stock.min[2], stock.min[2] - par.height);
+            side.push(Shape::Height(a, b, format!("{} parallels", mm(par.height))));
+        }
+    }
+    // From above: the clamps over the stock and X0 Y0.
+    let mut plan: Vec<Shape> = (clamps.iter())
+        .map(|(_, b)| Shape::Clamp(*b, "clamp".into()))
+        .collect();
+    plan.push(Shape::Word([0., 0., top], "X0 Y0".into(), ACCENT));
+    let drawings = row![
+        p.drawing(0, *stock, plan, Fill),
+        p.drawing_with(view, *stock, side, Fill, &p.shown.vise),
+    ]
+    .spacing(6);
+    let held = iced::widget::stack![
+        p.held_picture(Fill),
+        crate::fault::canvas(Dims(&p.shown.zero)).width(Fill).height(Fill)
+    ];
+    let left = column![
+        container(held).height(FillPortion(3)),
+        container(drawings).height(FillPortion(2)),
+    ]
+    .spacing(6)
+    .align_x(Alignment::Center)
+    .into();
     let mono = Font {
         weight: iced::font::Weight::Bold,
         ..Font::MONOSPACE
     };
-    // A number to type: what it is, the number, and the other way to say it.
-    let typed = |what: &str, value: String, other: Option<String>| -> Element<'a, Message> {
-        let c = column![
-            text(what.to_string()).size(14).color(MUTED),
-            text(value)
-                .size(size)
-                .font(mono)
-                .color(INK)
-                .wrapping(text::Wrapping::None),
-        ]
-        .push(other.map(|o| text(o).size(13).color(MUTED)));
-        boxed(c.spacing(2).padding([6, 12]), false)
-            .width(Fill)
-            .into()
-    };
-    // The tool is in the header; the screen keeps its room for the numbers
-    // (LIO-404).
-    let said = same.then(|| {
-        chips(vec![warn_chip(
-            "the same pattern: start the DRO again at hole 1",
-        )])
-    });
-    let (title, sub, kind, numbers, then) = match *pattern {
-        Pattern::Grid {
-            first,
-            columns,
-            rows,
-            pitch,
-            angle,
-        } => {
-            let span =
-                |k: usize, n: usize| Some(format!("span {}", dro(pitch[k] * (n - 1) as f32)));
-            let mut c = vec![
-                typed("first hole X", dro(first[0]), None),
-                typed("first hole Y", dro(first[1]), None),
-            ];
-            if columns > 1 {
-                c.push(typed("pitch along a row", dro(pitch[0]), span(0, columns)));
-            }
-            if rows > 1 {
-                c.push(typed("pitch between rows", dro(pitch[1]), span(1, rows)));
-            }
-            c.push(typed(
-                "holes in a row × rows",
-                format!("{columns} × {rows}"),
-                None,
-            ));
-            c.push(typed(
-                "rows from +X",
-                degrees(angle),
-                Some("counter-clockwise".into()),
-            ));
-            // Square to the axes, back and forth: one axis a move (LIO-405).
-            let then = if angle == 0. {
-                "Then the DRO leads to each hole, moving one axis at a time: move it to 0.00."
-            } else {
-                "Then the DRO leads to each hole: move X and Y to 0.00."
-            };
-            (
-                "Matrix holes",
-                "type the grid into the DRO",
-                "the DRO's matrix holes",
-                c,
-                then.to_string(),
+    let mut right = column![label("Work zero")];
+    for k in 0..3 {
+        right = right.push(
+            boxed(
+                row![
+                    text(format!("{}0", AXES[k]))
+                        .size(22)
+                        .font(mono)
+                        .color(ACCENT)
+                        .width(44),
+                    text(zero_place(stock, k)).size(15).color(INK).width(Fill),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                false,
             )
-        }
-        Pattern::Arc {
-            centre,
-            diameter,
-            count,
-            first,
-            step,
-            full,
-        } => {
-            let last = (first + step * (count - 1) as f32).rem_euclid(360.);
-            let round = if full {
-                "full circle"
-            } else {
-                "part of a circle"
-            };
-            let c = vec![
-                typed("centre X", dro(centre[0]), None),
-                typed("centre Y", dro(centre[1]), None),
-                typed(
-                    "circle Ø",
-                    dro(diameter),
-                    Some(format!("radius {}", dro(diameter / 2.))),
-                ),
-                typed("holes", count.to_string(), Some(round.into())),
-                typed("first hole from +X", degrees(first), None),
-                // The angle between holes is the other way to say the last
-                // hole's: three rows fit at 1024 x 700 (LIO-404).
-                typed(
-                    "last hole from +X",
-                    degrees(last),
-                    Some(format!("or {} between holes", degrees(step))),
-                ),
-            ];
-            (
-                "Arc holes",
-                "type the arc into the DRO",
-                "the DRO's arc holes",
-                c,
-                if out_of_order {
-                    // One sentence (LIO-407).
-                    format!(
-                        "Call up each hole on the DRO in this order and move to 0.00: {one_axis} of the {} moves are along one axis.",
-                        holes.len().saturating_sub(1)
-                    )
-                } else {
-                    "Then the DRO leads to each hole: move X and Y to 0.00.".into()
-                },
-            )
-        }
-    };
-    let mut right = column![]
-        .push(said)
-        .push(label(format!("Type into {kind}")));
-    let mut numbers = numbers.into_iter();
-    while let Some(a) = numbers.next() {
-        let b = numbers.next().unwrap_or_else(|| space().width(Fill).into());
-        right = right.push(row![a, b].spacing(8));
-    }
-    // The DRO's order may not be ours: every hole is drilled alike
-    // (LIO-403, LIO-405); an arc out of its order calls each hole up.
-    let after = if out_of_order {
-        String::new()
-    } else {
-        " If the DRO takes the holes in another order, follow it: every hole is drilled alike."
-            .into()
-    };
-    // An arc out of the DRO's order, written out (LIO-407).
-    let right = right.push(out_of_order.then(|| {
-        let order: Vec<String> = called.iter().map(|n| n.to_string()).collect();
-        bold(format!("Order on the DRO: {}", order.join(" → ")), 16)
-    }));
-    let right = right.push(muted(format!("{then}{after}")).size(13));
-    let stock = p.before(op);
-    let left = p.drawing(
-        0,
-        stock,
-        vec![Shape::Pattern(pattern.clone(), holes, r, called)],
-        Fill,
-    );
-    (title.into(), sub, left, right)
-}
-/// The screen that leaves the DRO's hole function after operation `from`'s
-/// holes, before `op` moves in work coordinates (LIO-488): the function
-/// off, then X and Y read `at`, over the last hole, the DRO's hole
-/// `number`, where the hole function would read 0.00.
-fn leave_screen<'a>(
-    p: &Page<'a>,
-    op: usize,
-    from: usize,
-    at: [f32; 2],
-    number: usize,
-) -> (
-    String,
-    &'static str,
-    Element<'a, Message>,
-    Column<'a, Message>,
-) {
-    let g = p.guide();
-    let (holes, numbers, arc) = (g.steps.iter())
-        .find_map(|s| match s {
-            Step::Holes {
-                op: o,
-                holes,
-                numbers,
-                pattern,
-                ..
-            } if *o == from => Some((
-                holes.as_slice(),
-                numbers.as_slice(),
-                matches!(pattern, Some(Pattern::Arc { .. })),
-            )),
-            _ => None,
-        })
-        .unwrap_or((&[], &[], false));
-    let kind = if arc { "arc holes" } else { "matrix holes" };
-    let row = |n: u8, axis: &str, value: String, tags: Vec<String>| {
-        readout(
-            Readout {
-                order: Some(n),
-                lead: None,
-                axis: axis.into(),
-                value,
-                lock: None,
-                tags,
-                lit: lit(usize::from(n) - 1, p.item),
-                big: false,
-            },
-            Some(Message::Guide(GuideAction::Reached(usize::from(n) - 1))),
-        )
-    };
-    // In the hole function both read 0.00 over a hole; out of it, the
-    // hole's place, unless that is the work zero itself.
-    let zero = at.iter().all(|v| v.abs() < 0.005);
-    let mut y = vec!["reads".to_string()];
-    y.push(match zero {
-        false => "both 0.00 instead: still in the hole function".into(),
-        true => "the work zero: 0.00 in either mode".into(),
-    });
-    let then = match zero {
-        false => format!(
-            "If the DRO took the holes in another order, X and Y read the place of the hole it ended on. From here on every X and Y is from the work zero, and the DRO's hole {number} is no longer 0.00."
-        ),
-        true => format!(
-            "The last hole, the DRO's hole {number}, is on the work zero itself, so X and Y read 0.00 there in either mode: check that the DRO shows its plain X, Y and Z readings, not the hole function's screen. From here on every X and Y is from the work zero."
-        ),
-    };
-    let right = column![
-        label(format!("Leave the DRO's {kind}")),
-        row(
-            1,
-            kind,
-            "off".into(),
-            vec![
-                "leave the function the DRO's way".into(),
-                "it shows X, Y and Z again".into()
-            ]
-        ),
-        label("X and Y read work coordinates"),
-        row(
-            2,
-            "X",
-            dro(at[0]),
-            vec![
-                "reads".into(),
-                format!("over hole {number}, the last, not moved since")
-            ]
-        ),
-        row(3, "Y", dro(at[1]), y),
-        muted(then).size(13),
-    ];
-    let r = (p.tool(from).and_then(|t| num(&t.p, "diameter"))).unwrap_or(4.) / 2.;
-    let stock = p.before(op);
-    let last = holes.len().saturating_sub(1);
-    let shapes = (holes.iter().enumerate())
-        .map(|(n, h)| {
-            let k = numbers.get(n).copied().unwrap_or(n + 1);
-            Shape::Hole([h[0], h[1], stock.max[2]], r, k, lit(n, last))
-        })
-        .collect();
-    let left = p.drawing(0, stock, shapes, Fill);
-    ("DRO".into(), "back to work coordinates", left, right)
-}
-/// The screen of a Pass `step`.
-fn pass<'a>(
-    p: &Page<'a>,
-    step: &'a Step,
-) -> (
-    String,
-    &'static str,
-    Element<'a, Message>,
-    Column<'a, Message>,
-) {
-    let Step::Pass {
-        op,
-        index,
-        of,
-        targets,
-        cut,
-        earlier,
-        never,
-        turns_per_minute,
-    } = step
-    else {
-        unreachable!()
-    };
-    let (op, index, of, cut, never, turns): (usize, usize, usize, Bounds, Limits, f32) =
-        (*op, *index, *of, *cut, *never, *turns_per_minute);
-    let targets: &[Target] = targets;
-    let g = p.guide();
-    let stock = p.before(op);
-    let (start, end) = ends(g, op, index);
-    let r = g.done.get(p.done(op)).map_or(0., |d| d.plan.radius);
-    let k = targets.last().map_or(0, |t| t.axis);
-    let lines = |view: [usize; 2]| never_lines(g, op, stock, never, r, view);
-    let later: Vec<Shape> = (g.steps.iter())
-        .filter_map(|s| match s {
-            Step::Pass {
-                op: o,
-                index: i,
-                cut,
-                ..
-            } if *o == op && *i > index => Some(Shape::Hatch(*cut, Hatch::Later)),
-            _ => None,
-        })
-        .collect();
-    let mut shapes = p.cut_before(op);
-    shapes.extend(earlier.iter().map(|b| Shape::Hatch(*b, Hatch::Earlier)));
-    shapes.push(Shape::Hatch(cut, Hatch::Cut));
-    let side = if k == 1 { 1 } else { 2 };
-    let mut across = shapes.clone();
-    across.extend(later);
-    across.extend(lines(VIEWS[side]));
-    across.push(Shape::Tool(start, r, Some(end)));
-    shapes.extend(lines(VIEWS[0]));
-    shapes.push(Shape::Tool(start, r, Some(end)));
-    let left = column![
-        p.drawing(0, stock, shapes, FillPortion(3)),
-        p.drawing(side, stock, across, FillPortion(2)),
-        legend()
-    ]
-    .spacing(6)
-    .into();
-    // The numbers, in order.
-    // Where the tool is before the first number: where the last pass left it.
-    let mut last: [Option<f32>; 3] = match index {
-        1 => [None; 3],
-        _ => ends(g, op, index - 1).1.map(Some),
-    };
-    let mut rows = vec![];
-    let n = targets.len();
-    for (i, t) in targets.iter().enumerate() {
-        let locked: Vec<&str> = (0..3).filter(|a| t.lock[*a]).map(|a| AXES[a]).collect();
-        let mut tags = vec![];
-        let mut value = dro(t.shown);
-        if i + 1 == n {
-            let arrows = [["◀", "▶"], ["▼", "▲"], ["▼", "▲"]];
-            value = format!(
-                "{} {value}",
-                arrows[t.axis][usize::from(end[t.axis] > start[t.axis])]
-            );
-            tags.push("feed".into());
-        } else if t.axis == 2 && (t.centre - cut.min[2]).abs() < 0.005 {
-            if last[2].is_some_and(|v| v > t.centre && v - t.centre < LIFT) {
-                // Down again after the lift off the floor (LIO-382).
-                tags.push("back to the level".into());
-            } else {
-                // Down to the pass's level: how much deeper it cuts.
-                tags.push(format!("{} deeper", mm(cut.max[2] - cut.min[2])));
-                if t.feed {
-                    tags.push("plunge".into());
-                }
-            }
-        } else if t.axis == 2 && last[2].is_some_and(|v| t.centre > v && t.centre - v < LIFT) {
-            // Up off the floor so the return does not rub (LIO-176, LIO-382).
-            tags.push("off the floor".into());
-        } else if t.axis < 2 && t.feed {
-            tags.push("feed, cuts".into());
-        } else if t.axis < 2
-            && let Some(v) = last[t.axis]
-            && (v - t.centre).abs() < 1.
-        {
-            tags.push("off the wall".into());
-        }
-        if t.edge {
-            let arrows = [["←", "→"], ["↓", "↑"], ["", ""]];
-            tags.push(format!(
-                "edge {}",
-                arrows[t.axis][usize::from(t.shown > t.centre)]
-            ));
-            tags.push(format!("centre {}", dro(t.centre)));
-        } else if t.axis < 2 {
-            tags.push("centre".into());
-        }
-        last[t.axis] = Some(t.centre);
-        rows.push(readout(
-            Readout {
-                order: Some(t.order),
-                lead: None,
-                axis: AXES[t.axis].into(),
-                value,
-                lock: (!locked.is_empty()).then(|| locked.join(" ")),
-                tags,
-                lit: lit(i, p.item),
-                big: false,
-            },
-            Some(Message::Guide(GuideAction::Reached(i))),
-        ));
-    }
-    let o = p.setup.operations.get(op);
-    let rpm = o.and_then(|o| num(&o.p, "rpm")).unwrap_or(0.);
-    let feed = o.and_then(|o| num(&o.p, "feed")).unwrap_or(0.);
-    let mut c = vec![
-        chip(p.tool_name(op, 2. * r)),
-        chip(format!("{} rpm", rpm.round())),
-        chip(format!("{} mm/min", feed.round())),
-    ];
-    if targets.iter().any(|t| t.axis == 2 && t.feed) {
-        c.push(warn_chip("plunges: centre-cutting end mill"));
-    }
-    if turns > 0. {
-        let period = 60. / turns;
-        let since = p.clock.1.saturating_duration_since(p.clock.0);
-        let on = since.as_secs_f32() % period < period.min(1.) * 0.3;
-        let dot = container(space())
-            .width(10)
-            .height(10)
-            .style(move |_| container::Style {
-                background: Some(
-                    Color {
-                        a: if on { 1. } else { 0.18 },
-                        ..ACCENT
-                    }
-                    .into(),
-                ),
-                border: Border {
-                    radius: 5.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-        c.push(
-            container(
-                row![dot, text(format!("1 turn every {} s", mm(period))).size(13)]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-            )
-            .padding([4, 9])
-            .style(|_| container::Style {
-                background: Some(CHIP.into()),
-                border: Border {
-                    radius: 6.into(),
-                    ..Default::default()
-                },
-                ..Default::default()
-            })
-            .into(),
+            .padding([6, 12])
+            .width(Fill),
         );
     }
-    // The tiles of the operation's passes: their floors when each pass is
-    // a level of its own, else their numbers.
-    let passes: Vec<(usize, Bounds)> = (g.steps.iter().enumerate())
-        .filter_map(|(i, s)| match s {
-            Step::Pass { op: o, cut, .. } if *o == op => Some((i, *cut)),
-            _ => None,
-        })
-        .collect();
-    // Each tile is its pass's depth (work Z), and its row on that level
-    // when a level has more than one.
-    let level = |c: &Bounds| (c.min[2] * 100.).round() as i64;
-    let labels = (passes.iter().enumerate())
-        .map(|(n, (i, c))| {
-            let on: Vec<usize> = (0..passes.len())
-                .filter(|&m| level(&passes[m].1) == level(c))
-                .collect();
-            let s = match on.iter().position(|&m| m == n) {
-                Some(row) if on.len() > 1 => format!("{} · {}", dro(c.min[2]), row + 1),
-                _ => dro(c.min[2]),
-            };
-            (s, Some(Message::Guide(GuideAction::Go(*i))))
-        })
-        .collect();
-    let right = column![
-        chips(c),
-        label(format!("Move in this order · pass {index} of {of}"))
-    ]
-    .extend(rows)
-    .push(tiles(labels, index - 1, p.tablet));
-    (
-        format!("Pass {index} of {of}"),
-        "one screen per pass",
-        left,
-        right,
-    )
-}
-
-/// An upper bound `v` (mm) as the DRO's hundredths show it, rounded up so
-/// that it is still one: 0.0412 is "0.05", not "0.04".
-fn up(v: f32) -> f32 {
-    (v * 100. - 1e-4).ceil() / 100.
-}
-/// The Check screen's rows for a Round corners `op` (LIO-443): each corner's
-/// scallops filed to the line, and the round tried with a radius gauge.
-fn corner_check<'a>(p: &Page<'a>, op: usize) -> Vec<Element<'a, Message>> {
-    // The most each corner's last walk left, by corner.
-    let mut corners: Vec<(usize, &'static str, f32, f32)> = vec![];
-    for s in &p.guide().steps {
-        if let Step::Corner {
-            op: o,
-            corner,
-            place,
-            radius,
-            offset,
-            scallop,
-            ..
-        } = s
-            && *o == op
-            && *offset == 0.
-        {
-            match corners.iter_mut().find(|c| c.0 == *corner) {
-                Some(c) => c.3 = c.3.max(*scallop),
-                None => corners.push((*corner, place, *radius, *scallop)),
-            }
-        }
+    right = right.push(label("Stock as it starts")).push(chips(c));
+    // The parallels in a sentence: where they go from the stock's centre.
+    if let Some(said) = crate::parallels::sentence(p.setup) {
+        right = right.push(text(said).size(14).color(INK));
     }
-    let most = corners.iter().map(|c| c.3).fold(0., f32::max);
-    let mut rows = vec![readout(
+    right = right.push(readout(
         Readout {
             order: None,
-            lead: None,
-            axis: "≤".into(),
-            value: dro(up(most).max(0.01)),
+            // The key before the size, one text that does not wrap at
+            // 1024 × 700 (LIO-435).
+            lead: Some("X × Y × Z".into()),
+            axis: String::new(),
+            // Narrow, the size closes up (LIO-487).
+            value: [d[0], d[1], d[2]]
+                .map(mm)
+                .join(if narrow { "×" } else { " × " }),
             lock: None,
-            tags: vec![
-                "file the scallops to the line".into(),
-                "the most left between two steps".into(),
-            ],
+            tags: vec![],
             lit: Lit::Next,
-            big: true,
+            big: false,
         },
         None,
-    )];
-    for (n, place, r, _) in corners {
-        rows.push(readout(
-            Readout {
-                order: Some(u8::try_from(n).unwrap_or(u8::MAX)),
-                lead: None,
-                axis: "R".into(),
-                value: mm(r),
-                lock: None,
-                tags: vec![place.to_string(), "try it with a radius gauge".into()],
-                lit: Lit::Next,
-                big: false,
-            },
-            None,
-        ));
-    }
-    rows.push(
-        muted("File along the round, not across it, until the gauge shows no light; the steps' corners stand out the most, half way along each step.")
-            .size(13)
-            .into(),
-    );
-    rows
-}
-/// The screen of a Round corners walk (LIO-443): the corner close up from
-/// above with the walk on it and the tool where it is, the whole stock
-/// with the corner's place, and the DRO numbers in order.
-fn corner<'a>(
-    p: &Page<'a>,
-    step: &'a Step,
-) -> (
-    String,
-    &'static str,
-    Element<'a, Message>,
-    Column<'a, Message>,
-) {
-    let Step::Corner {
-        op,
-        index,
-        of,
-        corner,
-        corners,
-        place,
-        radius,
-        centre,
-        offset,
-        z,
-        level,
-        levels,
-        scallop,
-        points,
-        targets,
-        never,
-        turns_per_minute,
-    } = step
-    else {
-        unreachable!()
-    };
-    let op = *op;
-    let g = p.guide();
-    let r = g.done.get(p.done(op)).map_or(0., |d| d.plan.radius);
-    let stock = p.before(op);
-    // Where the tool is after each number, from the first X and Y.
-    let mut at = [f32::NAN; 3];
-    let mut places = vec![];
-    for t in targets.iter() {
-        at[t.axis] = t.centre;
-        places.push(at);
-    }
-    let i = p.item.min(targets.len().saturating_sub(1));
-    let now = places.get(i).copied().unwrap_or([0.; 3]);
-    let start = places
-        .iter()
-        .zip(targets.iter())
-        .find(|(_, t)| t.axis == 2 && t.lock[2])
-        .map_or(now, |(q, _)| *q);
-    // The walk's moves in XY, from where it goes down to where it leaves.
-    let down = targets
-        .iter()
-        .position(|t| t.axis == 2 && t.lock[2])
-        .unwrap_or(0);
-    // Only numbers: the Steps refuse a walk that goes down with no X or
-    // Y (LIO-447), and a drawing would fail on one.
-    let path: Vec<[f32; 2]> = (places[down..].iter())
-        .filter(|q| q[2] <= z + 0.001 && q.iter().all(|v| v.is_finite()))
-        .map(|q| [q[0], q[1]])
-        .collect();
-    let quarter = (0..4)
-        .find(|&q| crate::corner::WHERE[q] == *place)
-        .unwrap_or(0);
-    use std::hash::{Hash, Hasher};
-    let mut h = std::hash::DefaultHasher::new();
-    (p.key, p.at, p.item).hash(&mut h);
-    let detail = crate::fault::canvas(CornerDetail {
-        key: h.finish(),
-        centre: *centre,
-        radius: *radius,
-        offset: *offset,
-        quarter,
-        tool: r,
-        path,
-        at: (now[0].is_finite() && now[1].is_finite()).then_some([now[0], now[1]]),
-    })
-    .width(Fill)
-    .height(FillPortion(3));
-    let mut shapes = p.cut_before(op);
-    shapes.extend(never_lines(g, op, stock, *never, r, VIEWS[0]));
-    if let Some(first) = points.first() {
-        shapes.push(Shape::Tool(start, r, Some([first[0], first[1], start[2]])));
-    }
-    let left = column![detail, p.drawing(0, stock, shapes, FillPortion(2))]
-        .spacing(6)
-        .into();
-    // Which way each axis goes on the walk: the way to come to every number.
-    let way = |k: usize| {
-        let (a, b) = (points.first().map(|q| q[k]), points.last().map(|q| q[k]));
-        match (a, b) {
-            (Some(a), Some(b)) if b > a => 1,
-            (Some(a), Some(b)) if b < a => -1,
-            _ => 0,
-        }
-    };
-    let arrows = [["◀", "▶"], ["▼", "▲"], ["▼", "▲"]];
-    let feeds: Vec<usize> = (0..targets.len()).filter(|&i| targets[i].feed).collect();
-    let (first_feed, last_feed) = (feeds.first().copied(), feeds.last().copied());
-    let steps_total = feeds.len().saturating_sub(2);
-    let mut rows = vec![];
-    for (i, t) in targets.iter().enumerate() {
-        let mut tags: Vec<String> = vec![];
-        let next_same = targets
-            .get(i + 1)
-            .is_some_and(|n| n.axis == t.axis && !n.feed && !t.feed);
-        let after_same = i > 0 && targets[i - 1].axis == t.axis && !targets[i - 1].feed && !t.feed;
-        let mut value = dro(t.centre);
-        if t.feed {
-            // The way it moves from the number before (LIO-447: never
-            // against a number not known, which pointed walk 9's first
-            // feed the wrong way).
-            let from = places
-                .get(i.wrapping_sub(1))
-                .map(|q| q[t.axis])
-                .filter(|v| v.is_finite());
-            let rises = from.map_or(way(t.axis) > 0, |from| t.centre > from);
-            let arrow = arrows[t.axis][usize::from(rises)];
-            value = format!("{arrow} {value}");
-            if Some(i) == first_feed {
-                tags.push("feed in to the round's start".into());
-            } else if Some(i) == last_feed {
-                tags.push("feed out, clear of the stock".into());
-            } else {
-                let k = feeds.iter().position(|&f| f == i).unwrap_or(0);
-                tags.push(format!("step {k} of {steps_total}"));
-            }
-        } else if t.axis == 2 && t.lock[2] {
-            tags.push("down beside the stock".into());
-            tags.push(format!("level {level} of {levels}"));
-        } else if t.axis == 2 && i + 1 == targets.len() {
-            tags.push("up, clear".into());
-        } else if t.axis == 2 {
-            tags.push("up, above the stock".into());
-        } else if next_same {
-            tags.push(format!("{} mm short", mm(crate::corner::TAKE_UP)));
-        } else if after_same {
-            let arrow = arrows[t.axis][usize::from(way(t.axis) > 0)];
-            tags.push(format!("on to it {arrow}: backlash taken up"));
-        } else {
-            tags.push("clear of the stock".into());
-        }
-        rows.push(readout(
-            Readout {
-                order: Some(t.order),
-                lead: None,
-                axis: AXES[t.axis].into(),
-                value,
-                lock: t.lock[2].then(|| "Z".to_string()),
-                tags,
-                lit: lit(i, p.item),
-                big: false,
-            },
-            Some(Message::Guide(GuideAction::Reached(i))),
-        ));
-    }
-    let o = p.setup.operations.get(op);
-    let rpm = o.and_then(|o| num(&o.p, "rpm")).unwrap_or(0.);
-    let feed = o.and_then(|o| num(&o.p, "feed")).unwrap_or(0.);
-    let mut c = vec![
-        chip(p.tool_name(op, 2. * r)),
-        chip(format!("{} rpm", rpm.round())),
-        chip(format!("{} mm/min", feed.round())),
-        warn_chip("DRO comp off: centres"),
-    ];
-    if *turns_per_minute > 0. {
-        c.push(chip(format!(
-            "about {} turns a minute",
-            mm((turns_per_minute * 10.).round() / 10.)
-        )));
-    }
-    // Which way round the part the walk goes, seen from above, by its ends
-    // about the round's centre: counter-clockwise with the spindle
-    // clockwise.
-    let round_left = match (points.first(), points.last()) {
-        (Some(a), Some(b)) => {
-            (a[0] - centre[0]) * (b[1] - centre[1]) - (a[1] - centre[1]) * (b[0] - centre[0]) > 0.
-        }
-        _ => true,
-    };
-    let way_words = |k: usize| match way(k) {
-        1 => format!("{} only ever up", AXES[k]),
-        -1 => format!("{} only ever down", AXES[k]),
-        _ => format!("{} stays", AXES[k]),
-    };
-    let what = if *offset > 0. {
-        format!(
-            "{} mm off the round: takes the stock down for the last walk, at most {} mm between steps",
-            mm(*offset),
-            mm(up(*scallop))
-        )
-    } else {
-        format!(
-            "on the round: at most {} mm stands between two steps, filed to the line after",
-            dro(up(*scallop))
-        )
-    };
-    let right = column![
-        chips(c),
-        label(format!("Corner {corner} of {corners} · {place} · R{}", mm(*radius))),
-        muted(format!("Walk {index} of {of} at Z {}, {what}.", dro(*z))).size(13),
-        muted(format!(
-            "Conventional with the spindle {}: round the part {}, {}, {}. Come to every number that way, so the backlash stays taken up, and keep the quill locked.",
-            if round_left { "clockwise (M3)" } else { "counter-clockwise (M4)" },
-            if round_left { "counter-clockwise" } else { "clockwise" },
-            way_words(0),
-            way_words(1)
-        ))
-        .size(13),
-        label("Move in this order"),
-    ]
-    .extend(rows);
-    (
-        format!("Walk {index} of {of}"),
-        "one screen per walk round a corner",
-        left,
-        right,
-    )
-}
-/// A Round corners' corner close up from above (LIO-443): the part's
-/// round and its walls, the line a band keeps off it, the walk's moves one
-/// axis at a time, and the tool where it is.
-struct CornerDetail {
-    key: u64,
-    centre: [f32; 2],
-    radius: f32,
-    offset: f32,
-    quarter: usize,
-    tool: f32,
-    path: Vec<[f32; 2]>,
-    at: Option<[f32; 2]>,
-}
-impl CornerDetail {
-    fn paint(&self, f: &mut canvas::Frame) {
-        drawing_words(true);
-        let (c, r, rc) = (self.centre, self.radius, self.tool);
-        let quarter = std::f32::consts::FRAC_PI_2;
-        let unit = |t: f32| {
-            let a = quarter * self.quarter as f32 + t;
-            [a.cos(), a.sin()]
-        };
-        let (u0, u1) = (unit(0.), unit(quarter));
-        // What it shows: the walk with the tool round it, and the round.
-        let (mut lo, mut hi) = ([c[0] - r, c[1] - r], [c[0] + r, c[1] + r]);
-        for q in &self.path {
-            for k in 0..2 {
-                lo[k] = lo[k].min(q[k] - rc);
-                hi[k] = hi[k].max(q[k] + rc);
-            }
-        }
-        let size = f.size();
-        let pad = 24.;
-        let span = [(hi[0] - lo[0]).max(1.), (hi[1] - lo[1]).max(1.)];
-        let s = ((size.width - 2. * pad) / span[0]).min((size.height - 2. * pad) / span[1]);
-        let ox = (size.width - span[0] * s) / 2.;
-        let oy = size.height - (size.height - span[1] * s) / 2.;
-        let p = |q: [f32; 2]| Point::new(ox + (q[0] - lo[0]) * s, oy - (q[1] - lo[1]) * s);
-        let off = |q: [f32; 2], by: f32, u: [f32; 2]| [q[0] + by * u[0], q[1] + by * u[1]];
-        // The part: its two walls back from the round, and the round.
-        let far = span[0].max(span[1]) * 2.;
-        let part = canvas::Path::new(|b| {
-            b.move_to(p(off(off(c, r, u0), -far, u1)));
-            for i in 0..=32 {
-                let u = unit(quarter * i as f32 / 32.);
-                b.line_to(p([c[0] + r * u[0], c[1] + r * u[1]]));
-            }
-            b.line_to(p(off(off(c, r, u1), -far, u0)));
-            b.line_to(p(off(off(c, -far, u0), -far, u1)));
-            b.close();
-        });
-        f.fill(&part, PART);
-        f.stroke(&part, stroke(INK, 1.5));
-        // A band's line, outside the round.
-        if self.offset > 0. {
-            let line = canvas::Path::new(|b| {
-                for i in 0..=32 {
-                    let u = unit(quarter * i as f32 / 32.);
-                    let q = p([
-                        c[0] + (r + self.offset) * u[0],
-                        c[1] + (r + self.offset) * u[1],
-                    ]);
-                    if i == 0 { b.move_to(q) } else { b.line_to(q) }
-                }
-            });
-            f.stroke(&line, dashed(MUTED, 1.2));
-        }
-        // The round's centre and radius.
-        f.fill(&canvas::Path::circle(p(c), 2.5), INK);
-        let mut caption = Caption::new(size);
-        let at = p(off(c, r * 0.5, unit(quarter / 2.)));
-        let down = iced::Vector::new(0., 6.);
-        (caption.0).put(
-            f,
-            format!("R{}", mm(r)),
-            &[(at, Align::Center)],
-            down,
-            INK,
-            13.,
+    ));
+    // How the setup holds and supports the part, in its own words: a stop
+    // and the room under holes are not modelled (LIO-487).
+    let notes = p.notes();
+    if !notes.is_empty() {
+        right = right.push(label(SETUP_NOTES)).push(
+            boxed(text(notes).size(14).color(INK), false)
+                .padding([8, 12])
+                .width(Fill),
         );
-        // The walk: its moves, each a reading.
-        if let Some(first) = self.path.first() {
-            let walk = canvas::Path::new(|b| {
-                b.move_to(p(*first));
-                for q in &self.path[1..] {
-                    b.line_to(p(*q));
-                }
-            });
-            f.stroke(&walk, stroke(ACCENT, 1.6));
-            for q in &self.path {
-                f.fill(&canvas::Path::circle(p(*q), 2.), ACCENT);
-            }
-            if let (Some(a), Some(b)) = (self.path.first(), self.path.get(1)) {
-                arrow(f, p(*a), p(*b), ACCENT, 2.);
-            }
-        }
-        if let Some(at) = self.at {
-            let body = canvas::Path::circle(p(at), rc * s);
-            f.fill(&body, Color { a: 0.2, ..TOOL });
-            f.stroke(&body, stroke(TOOL, 1.6));
-            f.fill(&canvas::Path::circle(p(at), 2.5), TOOL);
-        }
-        caption.write(f);
     }
+    ("Zero".into(), "where X0 Y0 Z0 are on the stock", left, right)
 }
-impl canvas::Program<Message> for CornerDetail {
-    type State = (canvas::Cache, Cell<u64>);
-    fn draw(
-        &self,
-        state: &Self::State,
-        renderer: &iced::Renderer,
-        _: &Theme,
-        bounds: Rectangle,
-        _: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
-        if state.1.get() != self.key {
-            state.0.clear();
-            state.1.set(self.key);
-        }
-        vec![state.0.draw(renderer, bounds.size(), |f| self.paint(f))]
-    }
-}
-
-/// A close-up's labels, "seen from above · tool centres" in its top-left
-/// corner first in their way, written last.
-struct Caption(Labels);
-impl Caption {
-    const SAID: &str = "seen from above · tool centres";
-    const AT: Point = Point::new(8., 10.);
-    fn new(room: Size) -> Self {
-        let r = text_box(Self::SAID, Self::AT, 12., Align::Left);
-        let (taken, said) = (vec![r], vec![]);
-        Caption(Labels { room, taken, said })
-    }
-    fn write(self, f: &mut canvas::Frame) {
-        write(f, Self::SAID, Self::AT, MUTED, 12., Align::Left);
-        drawing_words(false);
-    }
-}
-/// A Slot's outline close up from above (LIO-455): the slot as cut, the
-/// line a pass leaves on its walls, the pass's moves one axis at a time,
-/// and the tool where it is.
-struct SlotDetail {
-    key: u64,
-    a: [f32; 2],
-    b: [f32; 2],
-    radius: f32,
-    left: f32,
-    tool: f32,
-    path: Vec<[f32; 2]>,
-    at: Option<[f32; 2]>,
-    /// The round ends were bored before (LIO-550): what the pass leaves is
-    /// on the straight walls only.
-    joined: bool,
-}
-impl SlotDetail {
-    /// The capsule `r` about the segment `a`–`b`, as points round it.
-    fn capsule(&self, r: f32) -> Vec<[f32; 2]> {
-        let (a, b) = (self.a, self.b);
-        let heading = (b[1] - a[1]).atan2(b[0] - a[0]);
-        let mut out = vec![];
-        for (c, from) in [
-            (b, heading - std::f32::consts::FRAC_PI_2),
-            (a, heading + std::f32::consts::FRAC_PI_2),
-        ] {
-            for i in 0..=32 {
-                let t = from + std::f32::consts::PI * i as f32 / 32.;
-                out.push([c[0] + r * t.cos(), c[1] + r * t.sin()]);
-            }
-        }
-        out
-    }
-    fn paint(&self, f: &mut canvas::Frame) {
-        drawing_words(true);
-        let (r, rc) = (self.radius, self.tool);
-        let margin = r * 0.6 + 2.;
-        let lo = [
-            self.a[0].min(self.b[0]) - r - margin,
-            self.a[1].min(self.b[1]) - r - margin,
-        ];
-        let hi = [
-            self.a[0].max(self.b[0]) + r + margin,
-            self.a[1].max(self.b[1]) + r + margin,
-        ];
-        let size = f.size();
-        let pad = 24.;
-        let span = [(hi[0] - lo[0]).max(1.), (hi[1] - lo[1]).max(1.)];
-        let s = ((size.width - 2. * pad) / span[0]).min((size.height - 2. * pad) / span[1]);
-        let ox = (size.width - span[0] * s) / 2.;
-        let oy = size.height - (size.height - span[1] * s) / 2.;
-        let p = |q: [f32; 2]| Point::new(ox + (q[0] - lo[0]) * s, oy - (q[1] - lo[1]) * s);
-        // The part round the slot, and the slot as cut.
-        let block = canvas::Path::rectangle(p([lo[0], hi[1]]), Size::new(span[0] * s, span[1] * s));
-        f.fill(&block, PART);
-        let outline = |r: f32| {
-            let points = self.capsule(r);
-            canvas::Path::new(move |b| {
-                b.move_to(p(points[0]));
-                for q in &points[1..] {
-                    b.line_to(p(*q));
-                }
-                b.close();
+/// A table of numbers: its head, then its rows, the columns sharing the
+/// width as `widths` (LIO-688).
+fn table<'a>(head: &[&str], rows: Vec<Vec<String>>, widths: &[u16]) -> Element<'a, Message> {
+    let mono = Font {
+        weight: iced::font::Weight::Bold,
+        ..Font::MONOSPACE
+    };
+    let line = |cells: Vec<Element<'a, Message>>| row(cells).spacing(8).align_y(Alignment::Center);
+    let mut c = column![line(
+        (head.iter().zip(widths))
+            .map(|(h, w)| {
+                text(h.to_string())
+                    .size(12)
+                    .color(MUTED)
+                    .width(FillPortion(*w))
+                    .into()
             })
-        };
-        let slot = outline(r);
-        f.fill(&slot, Color::WHITE);
-        f.stroke(&slot, stroke(INK, 1.5));
-        // What the pass leaves on the walls: on the straight ones only when
-        // the round ends were bored.
-        if self.left > 0.001 && self.left < r && self.joined {
-            let k = usize::from((self.b[1] - self.a[1]).abs() > (self.b[0] - self.a[0]).abs());
-            for side in [-1., 1.] {
-                let (mut u, mut v) = (self.a, self.b);
-                u[1 - k] += side * (r - self.left);
-                v[1 - k] += side * (r - self.left);
-                f.stroke(&canvas::Path::line(p(u), p(v)), dashed(MUTED, 1.2));
-            }
-        } else if self.left > 0.001 && self.left < r {
-            f.stroke(&outline(r - self.left), dashed(MUTED, 1.2));
-        }
-        // The ends' centres and radius.
-        for c in [self.a, self.b] {
-            f.fill(&canvas::Path::circle(p(c), 2.5), INK);
-        }
-        let axis = usize::from((self.b[1] - self.a[1]).abs() > (self.b[0] - self.a[0]).abs());
-        let mut label = self.b;
-        label[1 - axis] += r * 0.55;
-        let mut caption = Caption::new(size);
-        let (at, down) = (p(label), iced::Vector::new(0., 6.));
-        (caption.0).put(
-            f,
-            if self.joined {
-                format!("R{} bored", mm(r))
-            } else {
-                format!("R{}", mm(r))
-            },
-            &[(at, Align::Center)],
-            down,
-            INK,
-            13.,
-        );
-        // The pass: its moves, each a reading.
-        if let Some(first) = self.path.first() {
-            let walk = canvas::Path::new(|b| {
-                b.move_to(p(*first));
-                for q in &self.path[1..] {
-                    b.line_to(p(*q));
-                }
-            });
-            f.stroke(&walk, stroke(ACCENT, 1.6));
-            for q in &self.path {
-                f.fill(&canvas::Path::circle(p(*q), 1.6), ACCENT);
-            }
-            if let Some(b) = self.path.iter().find(|q| **q != *first) {
-                arrow(f, p(*first), p(*b), ACCENT, 2.);
-            }
-        }
-        if let Some(at) = self.at {
-            let body = canvas::Path::circle(p(at), rc * s);
-            f.fill(&body, Color { a: 0.2, ..TOOL });
-            f.stroke(&body, stroke(TOOL, 1.6));
-            f.fill(&canvas::Path::circle(p(at), 2.5), TOOL);
-        }
-        caption.write(f);
-    }
-}
-impl canvas::Program<Message> for SlotDetail {
-    type State = (canvas::Cache, Cell<u64>);
-    fn draw(
-        &self,
-        state: &Self::State,
-        renderer: &iced::Renderer,
-        _: &Theme,
-        bounds: Rectangle,
-        _: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
-        if state.1.get() != self.key {
-            state.0.clear();
-            state.1.set(self.key);
-        }
-        vec![state.0.draw(renderer, bounds.size(), |f| self.paint(f))]
-    }
-}
-
-/// Slot instructions are read directly from the validated Plan, centres
-/// with compensation off. The picture shows the slot close up with the
-/// pass on it, and the stock before the operation.
-fn slot_screen<'a>(
-    p: &Page<'a>,
-    step: &'a Step,
-) -> (
-    String,
-    &'static str,
-    Element<'a, Message>,
-    Column<'a, Message>,
-) {
-    use crate::slot::Kind;
-    let Step::Slot {
-        op,
-        index,
-        of,
-        z,
-        top,
-        a,
-        b,
-        targets,
-        entry_clear,
-        pass,
-        level,
-        levels,
-        offset,
-        left,
-        scallop,
-        points,
-        radius,
-        tool,
-        joined,
-    } = step
-    else {
-        unreachable!()
-    };
-    let walk = !matches!(pass, Kind::Sweep);
-    // Whether a walk round the slot follows this sweep at its level, or the
-    // tool lifts (a cutter so near the slot's width that only the finish
-    // walks round it).
-    let walk_follows = matches!(
-        p.guide().steps.get(p.at + 1),
-        Some(Step::Slot {
-            pass: Kind::Outline { .. },
-            ..
-        })
-    );
-    let axis = usize::from((b[1] - a[1]).abs() > (b[0] - a[0]).abs());
-    // Where the tool is after each number: a walk starts where the sweep
-    // left it, at the far end's centre.
-    let start = if walk {
-        [b[0], b[1], f32::NAN]
-    } else {
-        [f32::NAN; 3]
-    };
-    let mut at = start;
-    let mut places = vec![];
-    for t in targets.iter() {
-        at[t.axis] = t.centre;
-        places.push(at);
-    }
-    let feeds: Vec<usize> = (0..targets.len())
-        .filter(|&i| targets[i].feed && targets[i].axis < 2)
-        .collect();
-    // The steps round the ends: feeds that are neither a straight side nor
-    // the way out to the outline or back.
-    let before = |i: usize| *places.get(i.wrapping_sub(1)).unwrap_or(&start);
-    let side = |i: usize| {
-        let t = &targets[i];
-        let from = before(i)[t.axis];
-        t.axis == axis
-            && (from - t.centre).abs() >= (b[axis] - a[axis]).abs() - 0.02
-            && (b[axis] - a[axis]).abs() > 0.02
-    };
-    let steps_total = feeds
-        .iter()
-        .filter(|&&i| !side(i) && Some(&i) != feeds.first())
-        .filter(|&&i| !(matches!(pass, Kind::Finish) && Some(&i) == feeds.last()))
-        .count();
-    let arrows = [["◀", "▶"], ["▼", "▲"], ["▼", "▲"]];
-    let mut rows = column![].spacing(6);
-    let mut step_no = 0;
-    for (i, t) in targets.iter().enumerate() {
-        let from = Some(before(i)[t.axis]).filter(|v| v.is_finite());
-        let mut value = dro(t.shown);
-        let tag = if t.axis == 2 && t.feed {
-            if walk {
-                "feed down beside the centre · 25% feed".to_string()
-            } else {
-                "feed down · 25% feed".to_string()
-            }
-        } else if t.feed && !walk {
-            "feed slot · lock other axes".to_string()
-        } else if t.feed {
-            if let Some(from) = from {
-                value = format!("{} {value}", arrows[t.axis][usize::from(t.centre > from)]);
-            }
-            if *joined && Some(&i) == feeds.first() {
-                "out to the side, inside the bored end".to_string()
-            } else if Some(&i) == feeds.first() && !matches!(pass, Kind::Finish) {
-                "out to the end's tip".to_string()
-            } else if matches!(pass, Kind::Finish) && Some(&i) == feeds.last() {
-                "back to the centre, off the wall".to_string()
-            } else if matches!(pass, Kind::Finish) && Some(&i) == feeds.first() {
-                "out to the end's tip".to_string()
-            } else if side(i) {
-                "straight side".to_string()
-            } else if *joined {
-                "across inside the bored end".to_string()
-            } else {
-                step_no += 1;
-                format!("step {step_no} of {steps_total}")
-            }
-        } else if t.axis == 2 {
-            "lift / set Z clear".to_string()
-        } else {
-            "position above stock".to_string()
-        };
-        rows = rows.push(readout(
-            Readout {
-                order: Some(t.order),
-                lead: None,
-                axis: AXES[t.axis].into(),
-                value,
-                lock: None,
-                tags: vec![tag],
-                lit: lit(i, p.item),
-                big: false,
-            },
-            Some(Message::Guide(GuideAction::Reached(i))),
+            .collect()
+    )]
+    .spacing(6);
+    for r in rows {
+        c = c.push(line(
+            (r.into_iter().zip(widths))
+                .map(|(s, w)| {
+                    text(s)
+                        .size(14)
+                        .font(mono)
+                        .color(INK)
+                        .width(FillPortion(*w))
+                        .into()
+                })
+                .collect(),
         ));
     }
-    let operation = p.setup.operations.get(*op);
-    let feed = operation.and_then(|o| num(&o.p, "feed")).unwrap_or(0.);
-    let rpm = operation.and_then(|o| num(&o.p, "rpm")).unwrap_or(0.);
-    let narrow = 2. * tool < 2. * radius - 0.0001;
-    let clockwise = match (points.first(), points.get(points.len() / 4)) {
-        (Some(s), Some(q)) => {
-            let c = *b;
-            (s[0] - c[0]) * (q[1] - c[1]) - (s[1] - c[1]) * (q[0] - c[0]) < 0.
-        }
-        _ => true,
-    };
-    let what = match pass {
-        Kind::Outline { index: i, of: n } if *joined && i < n => format!(
-            "Level {level} of {levels}: straight along each side between the bored ends, the tool's centre {} mm off the centre line ({i} of {n} passes).",
-            mm(*offset)
-        ),
-        Kind::Outline { .. } if *joined => format!(
-            "Level {level} of {levels}: straight along each side between the bored ends, {} mm left on the walls for the finish.",
-            mm(*left)
-        ),
-        Kind::Finish if *joined => format!(
-            "Finish the straight walls at size on the floor: the cutter's side takes the last {} mm off each side, from one bored end to the other. The round ends are the boring's R{}: nothing is stepped round them.",
-            mm(crate::slot::FINISH.min(*offset)),
-            mm(*radius),
-        ),
-        Kind::Sweep if narrow => format!(
-            "Level {level} of {levels}: clear the middle along the centre line, X {} Y {} → X {} Y {}.",
-            dro(a[0]),
-            dro(a[1]),
-            dro(b[0]),
-            dro(b[1])
-        ),
-        Kind::Sweep => format!(
-            "Centre line X {} Y {} → X {} Y {}.",
-            dro(a[0]),
-            dro(a[1]),
-            dro(b[0]),
-            dro(b[1])
-        ),
-        Kind::Outline { index: i, of: n } if i < n => format!(
-            "Level {level} of {levels}: step out round the slot, the tool's centre {} mm off the centre line ({i} of {n} walks).",
-            mm(*offset)
-        ),
-        Kind::Outline { .. } => format!(
-            "Level {level} of {levels}: walk the outline, {} mm left on the walls for the finish.",
-            mm(*left)
-        ),
-        Kind::Finish => format!(
-            "Finish the outline at size on the floor: the cutter's side takes the last {} mm off the whole wall. The round ends come out R{} with at most {} mm standing between two steps; file or leave it.",
-            mm(crate::slot::FINISH.min(*offset)),
-            mm(*radius),
-            dro((*scallop * 100. - 1e-4).ceil() / 100.)
-        ),
-    };
-    // What is under the part: the parallels the setup says it stands on
-    // and the table under them are checked (LIO-537); else it is left to
-    // the user, and the setup's notes on the Hold page say where it goes,
-    // when it has some (LIO-487).
-    let verify = match (crate::parallels::under_the_part(p.setup), p.notes()) {
-        (Some(checked), _) => checked,
-        (None, "") => "Verify parallels, table and breakthrough clearance below the part; these are unmodeled.".to_string(),
-        (None, _) => format!("Verify parallels, table and breakthrough clearance below the part; these are unmodeled: {SEE_NOTES}."),
-    };
-    let mut right = column![
-        chips(vec![
-            chip(p.tool_name(*op, 2. * tool)),
-            chip(format!("{rpm:.0} rpm")),
-            chip(format!("Feed {feed:.0} · entry {:.0} mm/min", feed * 0.25))
-        ]),
-        warn_chip("DRO comp OFF · tool centres"),
-        label(format!("Pass {index} of {of} · Z {}", dro(*z))),
-        muted(what).size(13),
-    ]
-    .spacing(9);
-    if !walk {
-        right = right
-            .push(muted(format!("Material starts at Z {}.", dro(*top))).size(13))
-            .push(muted(if *entry_clear {"Entry was proven clear for the full diameter to final depth."} else if narrow {"Use the confirmed center-cutting end mill. Feed down at 25% cutting feed."} else {"Use the confirmed center-cutting slot drill. Feed down at 25% cutting feed; clear chips at each return."}).size(13))
-            .push(muted(format!("{} {}", if narrow && walk_follows && *joined {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Stay down at the far end: the straight passes along the sides follow at this level."} else if narrow && *joined {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Lift at the far end: the straight walls are finished once, at size, after the last level."} else if narrow && walk_follows {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Stay down at the far end: the walk round the slot follows at this level."} else if narrow {"Feed along the centre line in the indicated direction, the backlash taken up and the other axes locked. Lift at the far end: the outline is walked once, at size, after the last level."} else {"Feed the slot in the indicated direction. Take up backlash before feeding and lock the other axes. Lift before returning to the entry."}, verify)).size(13));
-    } else if *joined {
-        right = right.push(
-            muted(format!(
-                "Join the bored ends {}: from the end at X {} Y {} out to the side, straight along it to the other end's centre, across inside that bored end, and straight back along the other side. Conventional with the spindle {}. Come to every number the way its arrow points, past the backlash, and keep the quill locked.",
-                if clockwise { "clockwise" } else { "counter-clockwise" },
-                dro(b[0]),
-                dro(b[1]),
-                if clockwise { "clockwise (M3)" } else { "counter-clockwise (M4)" },
-            ))
-            .size(13),
-        );
-    } else {
-        // Each end's text, and where its last step leaves the tool.
-        let ends: Vec<(String, [f32; 2])> = [*b, *a]
-            .iter()
-            .map(|c| {
-                let along = (c[axis] - (a[axis] + b[axis]) / 2.).signum();
-                let tip = if axis == 0 { 0. } else { 90. } + if along > 0. { 0. } else { 180. };
-                let (from, to): (f32, f32) = if clockwise {
-                    (tip + 90., tip - 90.)
-                } else {
-                    (tip - 90., tip + 90.)
-                };
-                let norm = |d: f32| (d + 180.).rem_euclid(360.) - 180.;
-                let r = *radius - *left - *tool;
-                let last = [c[0] + r * to.to_radians().cos(), c[1] + r * to.to_radians().sin()];
-                let said = format!(
-                    "X {} Y {}: R {} to the tool's centre (the wall R{} less the Ø{} tool), from {}° {} to {}°",
-                    dro(c[0]),
-                    dro(c[1]),
-                    dro(*radius - *left - *tool),
-                    mm(*radius - *left),
-                    mm(2. * tool),
-                    norm(from),
-                    if clockwise { "clockwise" } else { "counter-clockwise" },
-                    norm(to)
-                );
-                (said, last)
-            })
-            .collect();
-        right = right.push(
-            muted(format!(
-                "Round the slot {} from the tip of the end at X {} Y {} and back to it: the sides straight, the round ends in steps one axis at a time ({} mm at most between two steps). Conventional with the spindle {}. Each axis turns round at the ends and sides: come to every number the way its arrow points, past the backlash, and keep the quill locked.",
-                if clockwise { "clockwise" } else { "counter-clockwise" },
-                dro(points.first().map_or(b[0], |q| q[0])),
-                dro(points.first().map_or(b[1], |q| q[1])),
-                dro((*scallop * 100. - 1e-4).ceil() / 100.),
-                if clockwise { "clockwise (M3)" } else { "counter-clockwise (M4)" },
-            ))
-            .size(13),
-        );
-        if get(&p.setup.machine.p, "dro_arc") != "No" {
-            right = right.push(
-                muted(format!(
-                    "Or step each round end on the DRO's arc function, inside the arc, angles from +X counter-clockwise: {}; {}. Leave the arc function at the end of each round end, before the straight side: X and Y then read work coordinates again, X {} Y {} after the first and X {} Y {} after the second.",
-                    ends[0].0,
-                    ends[1].0,
-                    dro(ends[0].1[0]),
-                    dro(ends[0].1[1]),
-                    dro(ends[1].1[0]),
-                    dro(ends[1].1[1]),
-                ))
-                .size(13),
-            );
-        }
-    }
-    let right = right.push(scrollable(rows).height(Fill));
-    let left = if walk || narrow {
-        let i = p.item.min(targets.len().saturating_sub(1));
-        let now = places.get(i).copied().unwrap_or([f32::NAN; 3]);
-        use std::hash::{Hash, Hasher};
-        let mut h = std::hash::DefaultHasher::new();
-        (p.key, p.at, p.item).hash(&mut h);
-        let path: Vec<[f32; 2]> = if walk { points.clone() } else { vec![*a, *b] };
-        let detail = crate::fault::canvas(SlotDetail {
-            key: h.finish(),
-            a: *a,
-            b: *b,
-            radius: *radius,
-            left: if walk { *left } else { 0. },
-            tool: *tool,
-            path,
-            at: (now[0].is_finite() && now[1].is_finite()).then_some([now[0], now[1]]),
-            joined: *joined,
-        })
+    boxed(container(c).padding([8, 12]), false)
         .width(Fill)
-        .height(FillPortion(3));
-        column![
-            detail,
-            muted("Stock before this operation").size(13),
-            p.picture(p.done(*op), FillPortion(2))
-        ]
-        .spacing(6)
-        .height(Fill)
         .into()
-    } else {
-        column![
-            muted("Stock before this operation").size(13),
-            p.picture(p.done(*op), Fill)
-        ]
-        .spacing(8)
-        .height(Fill)
-        .into()
-    };
-    (
-        "Slot".into(),
-        match pass {
-            Kind::Sweep if narrow && *joined => {
-                "the centre line, then the straight sides, a pass a screen"
-            }
-            Kind::Outline { .. } if *joined => "straight between the bored ends, a pass a screen",
-            Kind::Finish if *joined => "the straight walls at size, full depth",
-            Kind::Sweep if narrow => "the centre line, then round it, a pass a screen",
-            Kind::Sweep => "one straight cutter-centre sweep per depth",
-            Kind::Outline { .. } => "round the slot, a pass a screen",
-            Kind::Finish => "the outline at size, full depth",
-        },
-        left,
-        right,
-    )
 }
-
+/// A feature's sizes, a name and its numbers a line (LIO-688).
+fn listed<'a>(lines: Vec<(&str, String)>) -> Element<'a, Message> {
+    table(&["", ""], lines.into_iter().map(|(k, v)| vec![k.into(), v]).collect(), &[2, 7])
+}
+/// "−70.00 to 70.00".
+fn span(a: f32, b: f32) -> String {
+    format!("{} to {}", dro(a), dro(b))
+}
+/// One operation's page (LIO-688): its tool and spindle speed, and what it
+/// cuts, each feature numbered as the plan picture numbers it, with its
+/// place, size and depth.
+fn sheet_screen<'a>(
+    p: &Page<'a>,
+    op: usize,
+    tool: &str,
+    rpm: Option<f32>,
+    features: &'a Features,
+) -> (String, &'static str, Element<'a, Message>, Column<'a, Message>) {
+    let o = p.setup.operations.get(op);
+    let d = p
+        .tool(op)
+        .and_then(|t| num(&t.p, "diameter"))
+        .unwrap_or(0.);
+    let mut c = vec![
+        chip(p.named(tool, d)),
+        match rpm {
+            Some(r) => chip(format!("{} rpm", r.round())),
+            // A tap is turned by hand (LIO-410).
+            None => warn_chip("by hand, spindle off"),
+        },
+    ];
+    // A twist drill started on a flat face walks off (LIO-536), as the
+    // plan check says too.
+    if matches!(features, Features::Holes { holes, .. } if holes.iter().any(|h| h.uncentred)) {
+        c.push(warn_chip("centre drill first"));
+    }
+    // A tip that comes out under the stock has nothing under the hole
+    // (LIO-417).
+    if let Features::Holes { holes, .. } = features {
+        let tip = (holes.iter())
+            .map(|h| match h.depth {
+                Depth::Through { tip } | Depth::Blind { tip, .. } => tip,
+            })
+            .reduce(f32::min);
+        c.extend(tip.and_then(|tip| under_stock(tip, &p.before(op), !p.notes().is_empty())));
+    }
+    let stock = p.before(op);
+    let top = stock.max[2];
+    let (shapes, body, sub): (Vec<Shape>, Vec<Element<'a, Message>>, &'static str) = match features
+    {
+        Features::Holes {
+            diameter,
+            thread,
+            holes,
+        } => {
+            let size = thread.clone().unwrap_or_else(|| format!("Ø{}", mm(*diameter)));
+            let shapes = (holes.iter().enumerate())
+                .map(|(i, h)| Shape::Hole([h.at[0], h.at[1], top], diameter / 2., i + 1))
+                .collect();
+            let tip = |h: &crate::guide::Hole| match h.depth {
+                Depth::Through { tip } | Depth::Blind { tip, .. } => tip,
+            };
+            let same = |v: &dyn Fn(&crate::guide::Hole) -> f32| {
+                (holes.iter()).all(|h| (v(h) - holes.first().map_or(0., v)).abs() < 0.005)
+            };
+            // Each hole's mouth when they start at different heights.
+            let mouths = !same(&|h| h.mouth);
+            let mut head = vec!["#", "X", "Y", if thread.is_some() { "Thread" } else { "Ø" }];
+            let mut widths = vec![2, 5, 5, 5];
+            if mouths {
+                head.push("From Z");
+                widths.push(5);
+            }
+            head.push("Depth");
+            widths.push(5);
+            let rows = (holes.iter().enumerate())
+                .map(|(i, h)| {
+                    let mut r = vec![(i + 1).to_string(), dro(h.at[0]), dro(h.at[1]), size.clone()];
+                    if mouths {
+                        r.push(dro(h.mouth));
+                    }
+                    r.push(match h.depth {
+                        Depth::Through { .. } => "through".into(),
+                        Depth::Blind { deep, .. } => dro(deep),
+                    });
+                    r
+                })
+                .collect();
+            // What the depth is measured to, from where, and where the
+            // tool's tip goes.
+            let kind = match o {
+                Some(o) if o.tapping() => "Depth: from the top of the hole to the full thread",
+                Some(o) if o.boring() => "Depth: from the top of the hole to its floor",
+                _ if p.tool(op).is_some_and(|t| {
+                    ["Chamfer mill", crate::model::CENTRE_DRILL].contains(&get(&t.p, "type"))
+                }) =>
+                {
+                    "Depth: from the top of the hole to the tool's tip"
+                }
+                _ => "Depth: from the top of the hole to the full Ø, not the point",
+            };
+            let mut said = vec![kind.to_string()];
+            if let Some(h) = holes.first().filter(|_| !mouths) {
+                said.push(format!("each hole's top at Z {}", dro(h.mouth)));
+            }
+            if let Some(h) = holes.first().filter(|_| same(&tip)) {
+                said.push(format!("the tip goes to Z {}", dro(tip(h))));
+            }
+            let body = vec![
+                table(&head, rows, &widths),
+                muted(said.join("; ") + ".").size(13).into(),
+            ];
+            let sub = match o {
+                Some(o) if o.tapping() => "where each hole is tapped",
+                Some(o) if o.boring() => "where each hole is bored, to its finished size",
+                _ => "where each hole goes",
+            };
+            (shapes, body, sub)
+        }
+        Features::Box { lo, hi, through } => {
+            let cut = Bounds { min: *lo, max: *hi };
+            let middle = [(lo[0] + hi[0]) / 2., (lo[1] + hi[1]) / 2., hi[2]];
+            let shapes = vec![
+                Shape::Hatch(cut, Hatch::Cut),
+                Shape::Word(middle, "1".into(), ACCENT),
+            ];
+            let depth = if *through {
+                format!("through, from Z {}", dro(hi[2]))
+            } else {
+                format!("{} · Z {} down to {}", dro(hi[2] - lo[2]), dro(hi[2]), dro(lo[2]))
+            };
+            let body = vec![listed(vec![
+                ("#", "1".into()),
+                ("X", span(lo[0], hi[0])),
+                ("Y", span(lo[1], hi[1])),
+                ("Size", format!("{} × {}", dro(hi[0] - lo[0]), dro(hi[1] - lo[1]))),
+                ("Depth", depth),
+            ])];
+            (shapes, body, "where the box is cut")
+        }
+        Features::Slot {
+            a,
+            b,
+            width,
+            top: from,
+            floor,
+            through,
+        } => {
+            let shapes = vec![Shape::Slot([a[0], a[1], top], [b[0], b[1], top], width / 2., 1)];
+            let depth = if *through {
+                format!("through, from Z {}", dro(*from))
+            } else {
+                format!("{} · Z {} down to {}", dro(from - floor), dro(*from), dro(*floor))
+            };
+            let end = |e: &[f32; 2]| format!("X {}  Y {}", dro(e[0]), dro(e[1]));
+            let body = vec![listed(vec![
+                ("#", "1".into()),
+                ("End 1", end(a)),
+                ("End 2", end(b)),
+                ("Width", dro(*width)),
+                ("Depth", depth),
+            ])];
+            (shapes, body, "where the slot is cut")
+        }
+        Features::Corners(corners) => {
+            let shapes = (corners.iter().enumerate())
+                .map(|(i, c)| {
+                    Shape::Hole([c.centre[0], c.centre[1], top], c.radius, i + 1)
+                })
+                .collect();
+            let rows = (corners.iter().enumerate())
+                .map(|(i, c)| {
+                    vec![
+                        (i + 1).to_string(),
+                        c.place.to_string(),
+                        dro(c.centre[0]),
+                        dro(c.centre[1]),
+                        format!("R{}", mm(c.radius)),
+                    ]
+                })
+                .collect();
+            let mut body = vec![table(&["#", "Corner", "X", "Y", "R"], rows, &[2, 7, 5, 5, 4])];
+            let levels: Vec<String> = (corners.iter())
+                .map(|c| format!("Z {} down to {}", dro(c.top), dro(c.bottom)))
+                .collect();
+            let said = match levels.first() {
+                Some(first) if levels.iter().all(|l| l == first) => {
+                    format!("X and Y are each round's centre; every corner {first}.")
+                }
+                _ => format!(
+                    "X and Y are each round's centre; by corner, {}.",
+                    levels.join(", ")
+                ),
+            };
+            body.push(muted(said).size(13).into());
+            (shapes, body, "where each corner is rounded")
+        }
+    };
+    let right = column![chips(c)].extend(body);
+    let name = o.map_or(String::new(), |o| o.name().to_string());
+    (name, sub, p.drawing(0, stock, shapes, Fill), right)
+}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -6447,11 +3452,6 @@ pub(crate) mod tests {
     fn send(a: &mut App, action: GuideAction) {
         let _ = a.update(Message::Guide(action));
     }
-    /// The two texts after `lead`: the axis and the number.
-    fn after(t: &[String], lead: &str) -> Vec<String> {
-        let i = (t.iter().position(|s| s == lead)).unwrap_or_else(|| panic!("{lead} in {t:?}"));
-        t[i + 1..i + 3].to_vec()
-    }
     /// The plate's Ø32 bore through 28 on the manual mill (LIO-248):
     /// drilled Ø12, then bored with the head 1 mm a pass on the radius;
     /// the Steps page open on it.
@@ -6506,23 +3506,554 @@ pub(crate) mod tests {
         build(&mut a);
         a
     }
-    /// The plate of `guide::tests::pattern_job` with its holes `at` on the
-    /// Steps page.
-    fn pattern_app(at: &[[f32; 2]], grids: bool, arcs: bool, centred: bool) -> App {
-        let (doc, mesh) = crate::guide::tests::pattern_job(at, grids, arcs, centred);
+    /// The plate of `guide::tests::holes_job` with its holes `at`, centre
+    /// drilled first when `centred`, on the Steps page.
+    fn holes_app(at: &[[f32; 2]], centred: bool) -> App {
+        let (doc, mesh) = crate::guide::tests::holes_job(at, centred);
         on_page(doc, mesh)
     }
-    /// The Pattern steps.
-    fn patterns(a: &App) -> Vec<usize> {
+    /// The page of operation `op`: its step and what it lists.
+    fn sheet(a: &App, op: usize) -> (usize, Features) {
         (guide(a).steps.iter().enumerate())
-            .filter(|(_, s)| matches!(s, Step::Pattern { .. }))
-            .map(|(i, _)| i)
-            .collect()
+            .find_map(|(i, s)| match s {
+                Step::Sheet {
+                    op: o, features, ..
+                } if *o == op => Some((i, features.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no page for operation {op}"))
+    }
+    /// The page's texts at step `at`.
+    fn page_at(a: &mut App, at: usize) -> Vec<String> {
+        send(a, GuideAction::Go(at));
+        texts(a)
+    }
+    /// Whether `row` is in `t`, its cells one after another.
+    fn has_row(t: &[String], row: &[&str]) -> bool {
+        t.windows(row.len()).any(|w| w.iter().zip(row).all(|(a, b)| a == b))
+    }
+    /// LIO-688: a manual mill setup's Steps are a page for the work zero,
+    /// a page an operation, and the hand-over: no tool, pass, hole, pattern
+    /// or check pages. Next and Back go page by page, the place saved with
+    /// the project and no undo step.
+    #[test]
+    fn a_manual_mill_setup_is_its_zero_then_a_page_an_operation() {
+        let mut a = app("Yes");
+        let g = guide(&a);
+        let kinds: Vec<String> = (g.steps.iter())
+            .map(|s| {
+                let said = format!("{s:?}");
+                said.split([' ', '(']).next().unwrap().to_string()
+            })
+            .collect();
+        assert_eq!(kinds, ["Zero", "Sheet", "Sheet", "Sheet", "HandOver"]);
+        let names: Vec<&str> = g.sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Set up", "Face", "Step", "Holes", "Hand over"]);
+        assert!(g.sections.iter().all(|s| s.steps.len() == 1), "{g:?}");
+        // The list says what each operation cuts.
+        let t = texts(&a);
+        assert_eq!(t.iter().filter(|s| *s == "1 box").count(), 2, "{t:?}");
+        assert!(t.iter().any(|s| s == "4 holes"), "{t:?}");
+        // An operation's page heads with its name, tool and speed.
+        let t = page_at(&mut a, 3);
+        for want in ["Holes", "Ø4 Drill 4", "1600 rpm", "Section done ▶"] {
+            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+        }
+        // Nothing of the old pages on any.
+        for at in 0..g.steps.len() {
+            let t = page_at(&mut a, at);
+            for gone in [
+                "PICK UP Z WITH THE TOOL",
+                "ENTER IN THE DRO",
+                "TOUCH, THEN SET THE DRO",
+                "MEASURE",
+                "Hole done ▶",
+                "Pass done ▶",
+            ] {
+                assert!(!t.iter().any(|s| s == gone), "{gone} at {at}: {t:?}");
+            }
+            assert!(!t.iter().any(|s| s.starts_with("lock ")), "{at}: {t:?}");
+        }
+        send(&mut a, GuideAction::Go(0));
+        let edits = a.project_dirty;
+        send(&mut a, GuideAction::Next);
+        send(&mut a, GuideAction::Next);
+        assert_eq!(place(&a), 2);
+        send(&mut a, GuideAction::Back);
+        assert_eq!(place(&a), 1);
+        assert!(a.dirty && a.undo.is_none());
+        assert_eq!(a.project_dirty, edits);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("job.axis.json");
+        crate::storage::save(&path, &a.doc).unwrap();
+        let doc = crate::storage::load(&path).unwrap();
+        assert_eq!(doc.guide.get(&doc.setups[0].id), Some(&1));
+    }
+    /// LIO-688: the zero page says where X0, Y0 and Z0 are on the stock,
+    /// marks the zero on the picture of it held, and says how it is held;
+    /// not how to pick it up.
+    #[test]
+    fn the_zero_page_says_where_the_zero_is_and_marks_it_on_the_held_stock() {
+        // The job's zero is on the stock top's front-left corner.
+        let a = app("Yes");
+        assert!(matches!(guide(&a).steps[0], Step::Zero { .. }));
+        let t = texts(&a);
+        for want in [
+            "WORK ZERO",
+            "X0",
+            "the left face",
+            "Y0",
+            "the front face",
+            "Z0",
+            "the top of the stock",
+            "X × Y × Z",
+        ] {
+            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+        }
+        let shown = a.guide_at().unwrap().0;
+        assert_eq!(shown.zero.len(), 1);
+        assert_eq!(shown.zero[0].label, "X0 Y0 Z0");
+        let z = shown.zero[0].a;
+        let (w, h) = (PICTURE.0 as f32, PICTURE.1 as f32);
+        assert!(z.x > 0. && z.y > 0. && z.x < w && z.y < h, "{z:?}");
+        for gone in ["TOUCH, THEN SET THE DRO", "DRO comp off"] {
+            assert!(!t.iter().any(|s| s == gone), "{gone} in {t:?}");
+        }
+        assert!(!t.iter().any(|s| s.contains("edge finder")), "{t:?}");
+        // Its centre on the top, in a vise: halfway between the faces; the
+        // vise, its grip and the parallels.
+        let a = app_with("Yes", |d| {
+            crate::guide::tests::in_the_vise(d);
+            (d.setups[0].p).insert("origin".into(), "Stock top center".into());
+        });
+        let shown = a.guide_at().unwrap().0;
+        let Step::Zero {
+            stock,
+            holding,
+            vise: Some(v),
+            ..
+        } = shown.guide.steps[0].clone()
+        else {
+            panic!("{:?}", shown.guide.steps[0])
+        };
+        close(stock.min[0], -stock.max[0]);
+        close(stock.min[1], -stock.max[1]);
+        close(stock.max[2], 0.);
+        let t = texts(&a);
+        let grip = format!("{} in the jaws", mm(v.grip));
+        for want in [
+            "the middle, halfway between the left and right faces",
+            "the middle, halfway between the front and back faces",
+            "the top of the stock",
+            "jaws on the Y sides",
+            grip.as_str(),
+            "top face up",
+        ] {
+            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+        }
+        assert_eq!(shown.vise.len(), 2);
+        for j in &shown.vise {
+            close(j.max[2], holding.bottom + v.grip);
+            close(j.max[2] - j.min[2], v.jaw_height);
+        }
+        assert_eq!(shown.parallels.len(), 2);
+        let high = format!(
+            "on parallels {} high",
+            mm(stock.min[2] - shown.parallels[0].min[2])
+        );
+        assert!(t.contains(&high), "{high} in {t:?}");
+        // A zero off the stock's faces: how far from them.
+        let off = Bounds {
+            min: [-12.3, 5., -20.],
+            max: [87.7, 45., -2.],
+        };
+        assert_eq!(zero_place(&off, 0), "12.3 right of the left face");
+        assert_eq!(zero_place(&off, 1), "5 in front of the front face");
+        assert_eq!(zero_place(&off, 2), "2 above the top of the stock");
+    }
+    /// LIO-688: a Box's page gives where it is on X and Y from the zero,
+    /// its size, and how deep it goes from the top it meets.
+    #[test]
+    fn a_box_page_gives_its_place_size_and_depth() {
+        let mut a = app("Yes");
+        let s = a.guide_at().unwrap().0.boxes[0];
+        // The Face: the whole top, 2 off.
+        let (at, face) = sheet(&a, 0);
+        let Features::Box {
+            lo,
+            hi,
+            through: false,
+        } = face
+        else {
+            panic!("{face:?}")
+        };
+        for k in 0..2 {
+            close(lo[k], s.min[k]);
+            close(hi[k], s.max[k]);
+        }
+        close(hi[2], 0.);
+        close(lo[2], -2.);
+        let t = page_at(&mut a, at);
+        let (w, d) = (s.max[0] - s.min[0], s.max[1] - s.min[1]);
+        for want in [
+            format!("{} to {}", dro(s.min[0]), dro(s.max[0])),
+            format!("{} × {}", dro(w), dro(d)),
+            "2.00 · Z 0.00 down to −2.00".into(),
+        ] {
+            assert!(t.contains(&want), "{want} in {t:?}");
+        }
+        assert!(has_row(&t, &["#", "1"]), "{t:?}");
+        // The Step: open on −Y, its wall at Y 15.5 with 0.5 left, down to
+        // −12 with 0.5 left, from the Face's −2.
+        let (at, step) = sheet(&a, 1);
+        let Features::Box {
+            lo,
+            hi,
+            through: false,
+        } = step
+        else {
+            panic!("{step:?}")
+        };
+        close(lo[1], s.min[1]);
+        close(hi[1], 15.);
+        close(hi[2], -2.);
+        close(lo[2], -11.5);
+        let t = page_at(&mut a, at);
+        for want in [
+            format!("{} to 15.00", dro(s.min[1])),
+            "9.50 · Z −2.00 down to −11.50".into(),
+        ] {
+            assert!(t.contains(&want), "{want} in {t:?}");
+        }
+    }
+    /// LIO-688: a Drill's page lists its holes, numbered as drawn, each
+    /// with X, Y, Ø and depth; one started on a flat face is warned, as
+    /// its plan check says, and not after a centre drilling, whose page
+    /// gives the depth to its tip.
+    #[test]
+    fn a_drill_page_lists_each_hole_with_its_place_size_and_depth() {
+        let mut a = app("Yes");
+        let (at, f) = sheet(&a, 2);
+        let Features::Holes {
+            diameter,
+            thread: None,
+            holes,
+        } = f
+        else {
+            panic!("{f:?}")
+        };
+        close(diameter, 4.);
+        assert_eq!(holes.len(), 4);
+        let t = page_at(&mut a, at);
+        assert!(has_row(&t, &["#", "X", "Y", "Ø", "Depth"]), "{t:?}");
+        for (i, h) in holes.iter().enumerate() {
+            let depth = match h.depth {
+                Depth::Through { .. } => "through".to_string(),
+                Depth::Blind { deep, .. } => dro(deep),
+            };
+            let n = (i + 1).to_string();
+            let row = [n.as_str(), &dro(h.at[0]), &dro(h.at[1]), "Ø4", &depth];
+            assert!(has_row(&t, &row), "{row:?} in {t:?}");
+        }
+        assert!(t.iter().any(|s| s == "centre drill first"), "{t:?}");
+        let mut a = centred_app();
+        let (at, f) = sheet(&a, 2);
+        let Features::Holes { holes, .. } = f else {
+            panic!("{f:?}")
+        };
+        // The centre drill's pilot tip, under its cone at the top.
+        for h in &holes {
+            let Depth::Blind { deep, tip } = h.depth else {
+                panic!("{h:?}")
+            };
+            close(deep, h.mouth - tip);
+        }
+        let t = page_at(&mut a, at);
+        assert!(
+            t.iter()
+                .any(|s| s.starts_with("Depth: from the top of the hole to the tool's tip")),
+            "{t:?}"
+        );
+        assert!(!t.iter().any(|s| s == "centre drill first"), "{t:?}");
+        let (at, _) = sheet(&a, 3);
+        assert!(!page_at(&mut a, at).iter().any(|s| s == "centre drill first"));
+    }
+    /// The hole of `drilled_job` (LIO-450, LIO-688).
+    fn drilled_hole(
+        mesh: &Mesh,
+        size: &str,
+        through: bool,
+        bottom: &str,
+        air: &str,
+    ) -> crate::guide::Hole {
+        let (_, g, _) = drilled(mesh, size, through, bottom, air);
+        match &g.steps[1] {
+            Step::Sheet {
+                features: Features::Holes { holes, .. },
+                ..
+            } => holes[0].clone(),
+            s => panic!("{s:?}"),
+        }
+    }
+    /// A hole's depth as its Check measured it (LIO-450): through when it
+    /// breaks out, from the stock's top whether the cut starts there or
+    /// over it (Top); blind, from its mouth to its full Ø, the drill's
+    /// point left out, or to its tip when the cut never reaches it.
+    #[test]
+    fn a_holes_depth_is_through_or_to_its_full_diameter_from_its_mouth() {
+        let mesh = crate::cam::boring::tests::ring(6.8, 30., 18.5);
+        let mut mouth = None;
+        for air in ["0", "1.5"] {
+            let h = drilled_hole(&mesh, "6.8", true, "0", air);
+            assert!(matches!(h.depth, Depth::Through { .. }), "{air}: {h:?}");
+            close(h.mouth, *mouth.get_or_insert(h.mouth));
+        }
+        // Ø8 8 deep, its drill-point floor 2.4 lower.
+        let point = 4. * crate::simulation::POINT_RISE;
+        let section = [
+            (0., -4.),
+            (12., -4.),
+            (12., 10.),
+            (4., 10.),
+            (4., 2.),
+            (0., 2. - point),
+        ];
+        let mesh = crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
+        let h = drilled_hole(&mesh, "8", false, "0", "0");
+        let Depth::Blind { deep, tip } = h.depth else {
+            panic!("{h:?}")
+        };
+        close(deep, 8.);
+        close(h.mouth - tip, 8. + point);
+        // Stopped 9.4 over the floor, 1 into the stock: to its tip.
+        let h = drilled_hole(&mesh, "8", false, "9.4", "0");
+        let Depth::Blind { deep, tip } = h.depth else {
+            panic!("{h:?}")
+        };
+        close(deep, 1.);
+        close(h.mouth - tip, 1.);
+    }
+    /// LIO-688: a Boring's page gives each hole's finished size and depth:
+    /// no passes, head settings, dial divisions or measuring.
+    #[test]
+    fn a_boring_page_gives_the_finished_size_only() {
+        let mut a = bored_app();
+        let kinds: Vec<bool> = (guide(&a).steps.iter())
+            .map(|s| matches!(s, Step::Sheet { .. }))
+            .collect();
+        assert_eq!(kinds, [false, true, true, false]);
+        let (at, bore) = sheet(&a, 1);
+        let Features::Holes {
+            diameter,
+            thread: None,
+            holes,
+        } = bore
+        else {
+            panic!("{bore:?}")
+        };
+        close(diameter, 32.);
+        assert_eq!(holes.len(), 1);
+        let h = &holes[0];
+        let depth = match h.depth {
+            Depth::Through { .. } => "through".to_string(),
+            Depth::Blind { deep, .. } => {
+                assert!(deep > 27., "{h:?}");
+                dro(deep)
+            }
+        };
+        let t = page_at(&mut a, at);
+        let row = ["1", &dro(h.at[0]), &dro(h.at[1]), "Ø32", depth.as_str()];
+        assert!(has_row(&t, &row), "{row:?} in {t:?}");
+        for want in ["640 rpm", "1 hole"] {
+            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
+        }
+        for gone in ["divisions", "measure", "head", "pass "] {
+            assert!(!t.iter().any(|s| s.contains(gone)), "{gone} in {t:?}");
+        }
+    }
+    /// LIO-688: a Slot's page gives its two ends, its width and its depth
+    /// from the top it starts in, or through.
+    #[test]
+    fn a_slot_page_gives_its_ends_width_and_depth() {
+        for through in [false, true] {
+            let (doc, mesh) = slot_job(through, if through { "-8" } else { "-5" });
+            let mut a = on_page(doc, mesh);
+            let (at, f) = sheet(&a, 0);
+            let Features::Slot {
+                a: one,
+                b: two,
+                width,
+                top,
+                floor,
+                through: said,
+            } = f
+            else {
+                panic!("{f:?}")
+            };
+            assert_eq!(said, through);
+            close(width, 10.);
+            close(top, 0.);
+            close(floor, if through { -8. } else { -5. });
+            for (e, x) in [(one, -2.5), (two, 2.5)] {
+                close(e[0], x);
+                close(e[1], 0.);
+            }
+            let t = page_at(&mut a, at);
+            let depth = match through {
+                true => "through, from Z 0.00".to_string(),
+                false => "5.00 · Z 0.00 down to −5.00".into(),
+            };
+            for row in [
+                ["End 1", "X −2.50  Y 0.00"],
+                ["End 2", "X 2.50  Y 0.00"],
+                ["Width", "10.00"],
+                ["Depth", depth.as_str()],
+            ] {
+                assert!(has_row(&t, &row), "{row:?} in {t:?}");
+            }
+        }
+    }
+    /// LIO-688: a Round corners' page lists each corner, where it is on
+    /// the part, its round's centre and its radius.
+    #[test]
+    fn a_round_corners_page_lists_each_corner_and_its_radius() {
+        let (doc, mesh) = crate::corner::tests::plate_job("Y");
+        let setup = &doc.setups[0];
+        let corners = crate::corner::picked(setup, &mesh, &setup.operations[0]).unwrap();
+        let mut a = on_page(doc, mesh);
+        let zero = guide(&a).zero;
+        let (at, f) = sheet(&a, 0);
+        let Features::Corners(c) = f else {
+            panic!("{f:?}")
+        };
+        assert_eq!(c.len(), corners.len());
+        for (r, k) in c.iter().zip(&corners) {
+            assert_eq!(r.place, k.place());
+            close(r.radius, k.r);
+            close(r.centre[0], k.centre[0] - zero[0]);
+            close(r.centre[1], k.centre[1] - zero[1]);
+        }
+        let t = page_at(&mut a, at);
+        for (i, r) in c.iter().enumerate() {
+            let n = (i + 1).to_string();
+            let radius = format!("R{}", mm(r.radius));
+            let row = [
+                n.as_str(),
+                r.place,
+                &dro(r.centre[0]),
+                &dro(r.centre[1]),
+                radius.as_str(),
+            ];
+            assert!(has_row(&t, &row), "{row:?} in {t:?}");
+        }
+        let count = format!("{} corners", c.len());
+        assert!(t.contains(&count), "{count} in {t:?}");
+    }
+    /// The agent's read of a step says what the page says (LIO-470,
+    /// LIO-688): the zero page the stock and the setup's notes, an
+    /// operation's page each feature.
+    #[test]
+    fn the_agents_read_of_the_steps_says_what_the_page_says() {
+        let note =
+            "Face up on two 15 mm parallels at X-18 and X+18, clear of the holes. Add a stop.";
+        let a = app_with("Yes", |d| {
+            d.setups[0].p.insert("notes".into(), format!("  {note}\n"));
+        });
+        let g = guide(&a);
+        let read = crate::mcp::reads::step_detail(&a.doc, 0, &g.steps[0]);
+        assert_eq!(read["kind"], "Zero");
+        let text = read["text"].as_str().unwrap();
+        assert!(text.ends_with(&format!("Setup notes: {note}")), "{read}");
+        let (at, f) = sheet(&a, 2);
+        let Features::Holes { holes, .. } = f else {
+            panic!("{f:?}")
+        };
+        let read = crate::mcp::reads::step_detail(&a.doc, 0, &g.steps[at]);
+        assert_eq!(read["kind"], "Sheet");
+        assert!(
+            read["text"]
+                .as_str()
+                .unwrap()
+                .ends_with("at 1600 rpm: 4 hole(s), Ø4."),
+            "{read}"
+        );
+        let listed = read["features"].as_array().unwrap();
+        assert_eq!(listed.len(), holes.len());
+        for (v, h) in listed.iter().zip(&holes) {
+            close(v["x"].as_f64().unwrap() as f32, h.at[0]);
+            close(v["y"].as_f64().unwrap() as f32, h.at[1]);
+        }
+        let b = app("Yes");
+        let g = guide(&b);
+        let read = crate::mcp::reads::step_detail(&b.doc, 0, &g.steps[0]);
+        assert!(
+            !read["text"].as_str().unwrap().contains("Setup notes"),
+            "{read}"
+        );
+    }
+    /// Back and Next in one place on every page, Back dead on the first.
+    #[test]
+    fn back_and_next_are_in_one_place_on_every_screen() {
+        let mut a = app("Yes");
+        let g = guide(&a);
+        let window = Size::new(1280., 800.);
+        let bottom = Rectangle::new(Point::new(0., 400.), Size::new(1280., 400.));
+        let mut spans = vec![];
+        for at in 0..g.steps.len() {
+            send(&mut a, GuideAction::Go(at));
+            let presses = crate::ui::probe::presses(a.view(), window, bottom, 5.);
+            let span = |want: &dyn Fn(&str) -> bool| {
+                let points: Vec<Point> = (presses.iter())
+                    .filter(|(_, m)| want(&format!("{m:?}")))
+                    .map(|(p, _)| *p)
+                    .collect();
+                (!points.is_empty()).then(|| {
+                    points.iter().fold([f32::MAX, f32::MAX, 0., 0.], |b, p| {
+                        [b[0].min(p.x), b[1].min(p.y), b[2].max(p.x), b[3].max(p.y)]
+                    })
+                })
+            };
+            let next = span(&|m| m == "Guide(Next)" || m == "Guide(Open(1))");
+            spans.push((next, span(&|m| m == "Guide(Back)")));
+        }
+        assert!(spans[0].0.is_some() && spans[0].1.is_none(), "{spans:?}");
+        assert!(spans[1].1.is_some());
+        for s in &spans[1..] {
+            assert_eq!(s.0, spans[0].0, "{spans:?}");
+            assert_eq!(s.1, spans[1].1, "{spans:?}");
+        }
+    }
+    /// The job's pages at 1280 × 800 and 1024 × 700 into `AXIS_RENDER_DIR`,
+    /// with the vise, a bore, a slot and corners (LIO-688).
+    #[test]
+    #[ignore]
+    fn render_the_mill_pages() {
+        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
+        std::fs::create_dir_all(&dir).unwrap();
+        let (plate, mesh) = crate::corner::tests::plate_job("Y");
+        let (slot, slot_mesh) = slot_job(false, "-5");
+        let apps = [
+            ("job", app("Yes")),
+            ("vise", app_with("Yes", crate::guide::tests::in_the_vise)),
+            ("bore", bored_app()),
+            ("slot", on_page(slot, slot_mesh)),
+            ("corners", on_page(plate, mesh)),
+            ("grid", holes_app(&crate::guide::tests::plate_grid(), true)),
+        ];
+        for (name, mut a) in apps {
+            for at in 0..guide(&a).steps.len() {
+                for (w, h) in [(1280, 800), (1024, 700)] {
+                    (a.window_width, a.window_height) = (w as f32, h as f32);
+                    send(&mut a, GuideAction::Go(at));
+                    render(&a, (w, h), &dir.join(format!("{name}-{at}-{w}.png")));
+                }
+            }
+        }
     }
     #[test]
     fn layout_suggestion_reports_inherited_contact_as_well_as_clearance() {
         for stepped in [false, true] {
-            let (mut doc, mesh) = crate::viewport::tests::guide_tests::squared_job();
+            let (mut doc, mesh) = crate::guide::tests::squared_job();
             if stepped {
                 for (k, v) in [("y_min", "-5"), ("y_max", "5")] {
                     doc.setups[0].operations[0].p.insert(k.into(), v.into());
@@ -6590,444 +4121,6 @@ pub(crate) mod tests {
                 .any(|(_, m)| matches!(m, Message::Guide(GuideAction::Go(44))))
         );
     }
-    #[test]
-    fn condensed_face_and_square_show_saved_cutting_limits() {
-        let mut a = app_with("Yes", |doc| {
-            doc.setups[0].operations[0]
-                .p
-                .insert("stepdown".into(), "0.5".into());
-            doc.setups[0].operations[0]
-                .p
-                .insert("feed".into(), "120".into());
-        });
-        let face = guide(&a)
-            .steps
-            .iter()
-            .position(|s| matches!(s, Step::Face { .. }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(face));
-        assert!(has(&a, "Maximum stepdown 0.5 mm · feed 120 mm/min"));
-        let mut a = app_with("Yes", |doc| {
-            let mill = doc.tools[3].id.clone();
-            doc.setups[0].operations = vec![crate::guide::tests::boxed(
-                "Square",
-                &mill,
-                [123., 500., -500., 500., 0., -20.],
-                &[("allowance", "0"), ("stepdown", "0.5"), ("feed", "120")],
-            )];
-        });
-        let square = guide(&a)
-            .steps
-            .iter()
-            .position(|s| matches!(s, Step::Square { .. }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(square));
-        assert!(has(&a, "Maximum stepdown 0.5 mm · feed 120 mm/min"));
-        assert!(
-            texts(&a)
-                .iter()
-                .any(|s| s.contains("not a full-height side cut"))
-        );
-        a.window_width = 1024.;
-        let placed = crate::ui::probe::placed(a.view(), Size::new(1024., 700.));
-        let (_, bounds) = placed
-            .iter()
-            .find(|(s, _)| s == "Maximum stepdown 0.5 mm · feed 120 mm/min")
-            .unwrap();
-        assert!(
-            bounds.y + bounds.height < 580.,
-            "cutting limit below the fold: {bounds:?}"
-        );
-    }
-    #[test]
-    #[ignore = "private saved-project render: AXIS_REGRIP_FIXTURE and AXIS_RENDER_DIR"]
-    fn render_saved_squared_regrip_steps() {
-        let fixture = std::path::PathBuf::from(std::env::var_os("AXIS_REGRIP_FIXTURE").unwrap());
-        let dir = std::path::PathBuf::from(std::env::var_os("AXIS_RENDER_DIR").unwrap());
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut doc = crate::storage::load(&fixture.join("adapter-plate.axis.json")).unwrap();
-        doc.file.as_mut().unwrap().path = fixture.join("adapter-plate.step");
-        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
-        let mut a = app("Yes");
-        a.doc = doc;
-        a.imported_mesh = Some(mesh);
-        a.left_stock = crate::leftover_stock(&a.doc, a.part_mesh().unwrap(), a.left_key().unwrap());
-        let checks = crate::holding_checks(
-            &a.doc,
-            a.part_mesh().unwrap(),
-            &a.left_stock,
-            a.holding_key().unwrap(),
-        );
-        let held = checks.setups[2].as_ref().unwrap();
-        assert!(
-            !held
-                .problems
-                .iter()
-                .any(|p| p.contains("cannot be held in the vise")),
-            "{:?}",
-            held.problems
-        );
-        eprintln!("cached Setup 3 Holding problems: {:?}", held.problems);
-        for (si, expected) in [(1, [140., 20., 91.]), (2, [140., 88., 20.])] {
-            let (Some(stock), known) = a.known_stock(si) else {
-                panic!("unknown inherited stock")
-            };
-            assert!(known);
-            for (v, want) in stock.dimensions().into_iter().zip(expected) {
-                assert!((v - want).abs() < 0.005, "cached badge {stock:?}");
-            }
-            eprintln!(
-                "verified cached stock badge setup {}: {:?}",
-                si + 1,
-                stock.dimensions()
-            );
-        }
-        for si in 0..3 {
-            a.doc.active = a.doc.setups[si].id.clone();
-            build(&mut a);
-            let g = guide(&a);
-            let mut screens = vec![(format!("setup-{}-holding", si + 1), 0)];
-            if let Some(i) = g
-                .steps
-                .iter()
-                .position(|s| matches!(s, Step::Face { .. } | Step::Square { .. }))
-            {
-                screens.push((format!("setup-{}-cut", si + 1), i));
-            }
-            if si == 2 {
-                let seat = a.doc.setups[si]
-                    .operations
-                    .iter()
-                    .position(|o| o.name().contains("Seat"))
-                    .unwrap();
-                let last = g
-                    .steps
-                    .iter()
-                    .rposition(|s| matches!(s,Step::Pass{op,..} if *op==seat))
-                    .unwrap();
-                screens.push(("seat-last-pass".into(), last));
-            }
-            for (name, i) in screens {
-                send(&mut a, GuideAction::Go(i));
-                for (w, h) in [(1280, 800), (1024, 700)] {
-                    a.window_width = w as f32;
-                    render(&a, (w, h), &dir.join(format!("{name}-{w}.png")));
-                }
-                std::fs::write(dir.join(format!("{name}.txt")), texts(&a).join("\n")).unwrap();
-            }
-        }
-    }
-    #[test]
-    fn the_pattern_and_holes_screens_say_what_to_type_and_each_hole_reads_zero() {
-        use crate::guide::tests::{plate_circle, plate_grid};
-        let shows = |a: &App, wants: &[&str]| {
-            let t = texts(a);
-            for want in wants {
-                assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
-            }
-        };
-        // Hole 2's readouts: an axis that moves reads 0 on the DRO's hole 2,
-        // its centre beside; one that stays says so (LIO-405).
-        let hole_2 = |a: &mut App, at: usize| {
-            send(a, GuideAction::Go(at + 1));
-            send(a, GuideAction::Next);
-            let Step::Holes { holes, numbers, .. } = &guide(a).steps[at + 1] else {
-                panic!()
-            };
-            let t = texts(a);
-            for k in 0..2 {
-                if (holes[1][k] - holes[0][k]).abs() < 0.005 {
-                    assert_eq!(after(&t, AXES[k]), ["stays", "leave it locked"]);
-                    continue;
-                }
-                // The DRO's number of the hole drilled second (LIO-406).
-                let tag = format!(
-                    "on the DRO's hole {} · {}\u{a0}{}",
-                    numbers[1],
-                    AXES[k],
-                    dro(holes[1][k])
-                );
-                assert_eq!(after(&t, AXES[k])[0], "0.00", "{t:?}");
-                assert!(t.contains(&tag), "{tag} in {t:?}");
-            }
-            assert!(t.iter().any(|s| s.starts_with("drill to · ")), "{t:?}");
-        };
-        let mut a = pattern_app(&plate_grid(), true, false, false);
-        let at = patterns(&a)[0];
-        send(&mut a, GuideAction::Go(at));
-        let Step::Pattern {
-            pattern: Pattern::Grid { first, .. },
-            ..
-        } = guide(&a).steps[at]
-        else {
-            panic!()
-        };
-        shows(
-            &a,
-            &[
-                "Matrix holes",
-                "TYPE INTO THE DRO'S MATRIX HOLES",
-                &dro(first[0]),
-                &dro(first[1]),
-                "20.00",
-                "span 60.00",
-                "15.00",
-                "span 30.00",
-                "4 × 3",
-                "holes in a row × rows",
-                "0.00°",
-            ],
-        );
-        assert!(!texts(&a).iter().any(|s| s.contains("same pattern")));
-        hole_2(&mut a, at);
-        // A centre drilling, then its drill: the second says it is the same.
-        let mut a = pattern_app(&plate_circle(), false, true, true);
-        let at = patterns(&a);
-        assert_eq!(at.len(), 2);
-        send(&mut a, GuideAction::Go(at[1]));
-        shows(
-            &a,
-            &[
-                "Arc holes",
-                "TYPE INTO THE DRO'S ARC HOLES",
-                "the same pattern: start the DRO again at hole 1",
-                "60.00",
-                "radius 30.00",
-                "6",
-                "full circle",
-                "30.00°",
-                "330.00°",
-                "or 60.00° between holes",
-            ],
-        );
-        hole_2(&mut a, at[1]);
-    }
-    /// The Holes screen of a grid, back and forth (LIO-405): each hole asks
-    /// only for the axis that moves, the other "stays"; hole 1 and a bolt
-    /// circle's holes move both; a plain Drill's hole on the Y of the one
-    /// before keeps Y. Each starts with the lift to a safe Z, ① (LIO-449).
-    #[test]
-    fn a_hole_asks_only_for_the_axis_that_moves() {
-        use crate::guide::tests::{plate_circle, plate_grid};
-        // The numbered steps of the screen: the axis after each disc.
-        // The lift's "up to" comes between its disc and its axis.
-        let steps = |a: &App| -> Vec<(String, String)> {
-            let t: Vec<String> = texts(a).into_iter().filter(|s| s != "up to").collect();
-            (0..t.len().saturating_sub(1))
-                .filter(|&i| ["1", "2", "3", "4"].contains(&t[i].as_str()))
-                .filter(|&i| ["X", "Y", "Z"].contains(&t[i + 1].as_str()))
-                .map(|i| (t[i].clone(), t[i + 1].clone()))
-                .collect()
-        };
-        let pairs = |v: &[(&str, &str)]| -> Vec<(String, String)> {
-            v.iter()
-                .map(|(a, b)| (a.to_string(), b.to_string()))
-                .collect()
-        };
-        let mut a = pattern_app(&plate_grid(), true, false, false);
-        let holes = patterns(&a)[0] + 1;
-        send(&mut a, GuideAction::Go(holes));
-        // ① is the lift, Z up to a safe height (LIO-449).
-        assert_eq!(
-            steps(&a),
-            pairs(&[("1", "Z"), ("2", "X"), ("3", "Y"), ("4", "Z")])
-        );
-        // Hole 2: X, then Z; Y stays. Hole 5, up onto the second row: Y.
-        a.guide_item = 1;
-        assert_eq!(steps(&a), pairs(&[("1", "Z"), ("2", "X"), ("3", "Z")]));
-        assert_eq!(after(&texts(&a), "Y"), ["stays", "leave it locked"]);
-        a.guide_item = 4;
-        assert_eq!(steps(&a), pairs(&[("1", "Z"), ("2", "Y"), ("3", "Z")]));
-        assert_eq!(after(&texts(&a), "X"), ["stays", "leave it locked"]);
-        // Tapping Y lights Z, the next step.
-        send(&mut a, GuideAction::Reached(1));
-        assert_eq!(a.guide_reached, 2);
-        // A bolt circle moves both, but between two holes on one X or Y
-        // (150° and 210° on this one) that one stays, as on any Drill.
-        let mut a = pattern_app(&plate_circle(), false, true, false);
-        let at = patterns(&a)[0] + 1;
-        let Step::Holes { holes, .. } = &guide(&a).steps[at] else {
-            panic!()
-        };
-        let holes = holes.clone();
-        send(&mut a, GuideAction::Go(at));
-        for item in 0..6 {
-            a.guide_item = item;
-            let stays = |k: usize| item > 0 && (holes[item][k] - holes[item - 1][k]).abs() < 0.005;
-            let mut want = vec![("1".to_string(), "Z".to_string())];
-            for k in (0..2).filter(|&k| !stays(k)) {
-                want.push(((want.len() + 1).to_string(), AXES[k].to_string()));
-            }
-            want.push(((want.len() + 1).to_string(), "Z".to_string()));
-            assert_eq!(steps(&a), want, "hole {}", item + 1);
-            // Drilled 1, 3, 4, 6, 5, 2: all but the first and 6 to 5 keep
-            // an axis (LIO-406).
-            assert_eq!(
-                stays(0) || stays(1),
-                ![0, 4].contains(&item),
-                "hole {}",
-                item + 1
-            );
-        }
-        // A plain Drill, no pattern: a hole on the Y of the one before keeps Y.
-        let mut a = app_with("Yes", |doc| {
-            for k in ["dro_matrix", "dro_arc"] {
-                doc.setups[0].machine.p.insert(k.into(), "No".into());
-            }
-        });
-        let at = (guide(&a).steps.iter())
-            .position(|s| matches!(s, Step::Holes { pattern: None, .. }))
-            .unwrap();
-        let Step::Holes { holes, .. } = &guide(&a).steps[at] else {
-            panic!()
-        };
-        let same_y = (1..holes.len())
-            .find(|&i| (holes[i][1] - holes[i - 1][1]).abs() < 0.005)
-            .expect("two holes one after the other on one Y");
-        send(&mut a, GuideAction::Go(at));
-        a.guide_item = same_y;
-        assert_eq!(after(&texts(&a), "Y"), ["stays", "leave it locked"]);
-    }
-    /// LIO-406: the second hole drilled of the bolt circle is the DRO's
-    /// hole 3, Y staying; the Pattern screen says how many moves keep an axis.
-    #[test]
-    fn a_bolt_circle_names_each_hole_by_the_dros_number() {
-        use crate::guide::tests::plate_circle;
-        let mut a = pattern_app(&plate_circle(), false, true, false);
-        let at = patterns(&a)[0];
-        send(&mut a, GuideAction::Go(at));
-        let t = texts(&a);
-        // The order written out, the closing line one sentence (LIO-407).
-        for want in [
-            "Order on the DRO: 1 → 3 → 4 → 6 → 5 → 2",
-            "Call up each hole on the DRO in this order and move to 0.00: 4 of the 5 moves are along one axis.",
-        ] {
-            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
-        }
-        send(&mut a, GuideAction::Go(at + 1));
-        send(&mut a, GuideAction::Next);
-        let t = texts(&a);
-        let heading = "HOLE 2 OF 6 · CALL UP THE DRO'S HOLE 3".to_string();
-        assert!(t.contains(&heading), "{t:?}");
-        assert_eq!(after(&t, "Y"), ["stays", "leave it locked"]);
-        assert!(
-            t.iter().any(|s| s.starts_with("on the DRO's hole 3 · X")),
-            "{t:?}"
-        );
-    }
-    /// LIO-417: a hole's depth label is right of its line, past the hole.
-    #[test]
-    fn a_holes_depth_label_is_clear_of_the_hole() {
-        // A Ø10 hole drawn 4 px a mm round X 200: its line ±3 radii.
-        let (x, r, s) = (200., 5., 4.);
-        let (m, n) = (
-            Point::new(x - 3. * r * s, 150.),
-            Point::new(x + 3. * r * s, 150.),
-        );
-        let at = depth_label(m, n);
-        assert!(at.x > x + r * s + 4., "{at:?}");
-    }
-    /// LIO-407: an arc taken round (four from 45°) has no order line and a
-    /// plain heading.
-    #[test]
-    fn an_arc_taken_round_needs_no_order_line() {
-        let four = crate::guide::tests::circle_at([0., 0.], 60., 4, 45., 90.);
-        let mut a = pattern_app(&four, false, true, false);
-        let at = patterns(&a)[0];
-        send(&mut a, GuideAction::Go(at));
-        assert!(!texts(&a).iter().any(|s| s.starts_with("Order on the DRO")));
-        send(&mut a, GuideAction::Go(at + 1));
-        send(&mut a, GuideAction::Next);
-        let t = texts(&a);
-        assert!(t.contains(&"HOLE 2 OF 4".to_string()), "{t:?}");
-        assert!(!t.iter().any(|s| s.contains("CALL UP")), "{t:?}");
-    }
-    /// LIO-407: a pattern drawing's tag stays whole inside the drawing, at
-    /// its left, bottom, right and top edges.
-    #[test]
-    fn a_pattern_tag_stays_inside_the_drawing() {
-        let size = Size::new(400., 300.);
-        for (from, out) in [
-            (Point::new(5., 150.), [-1., 0.]),
-            (Point::new(200., 295.), [0., -1.]),
-            (Point::new(395., 150.), [1., 0.]),
-            (Point::new(200., 3.), [0., 1.]),
-        ] {
-            let r = tag_box(from, out, "rows 56.00".len(), 1., size);
-            assert!(
-                r.x >= 0.
-                    && r.y >= 0.
-                    && r.x + r.width <= size.width
-                    && r.y + r.height <= size.height,
-                "{from:?} {r:?}"
-            );
-        }
-    }
-    /// LIO-404: at 1024 x 700 every number of the Arc holes screen and its
-    /// closing line are above the buttons, with nothing to scroll.
-    #[test]
-    fn the_arc_holes_screen_fits_at_1024_by_700() {
-        use crate::guide::tests::{plate_circle, plate_grid};
-        let window = iced::Size::new(1024., 700.);
-        for (holes, grids) in [(plate_circle(), false), (plate_grid(), true)] {
-            let mut a = pattern_app(&holes, grids, !grids, false);
-            (a.window_width, a.window_height) = (window.width, window.height);
-            let at = patterns(&a)[0];
-            send(&mut a, GuideAction::Go(at));
-            let seen = crate::ui::probe::placed(a.view(), window);
-            let find = |start: &str| {
-                (seen.iter())
-                    .find(|(t, _)| t.starts_with(start))
-                    .unwrap_or_else(|| panic!("{start} in {seen:?}"))
-                    .1
-            };
-            let back = find("◀ Back");
-            // The closing line: the bolt circle's calls each hole up, as it
-            // is drilled out of the DRO's order (LIO-406).
-            let closing = if grids {
-                "Then the DRO leads"
-            } else {
-                "Call up each hole"
-            };
-            let order = if grids {
-                "first hole"
-            } else {
-                "Order on the DRO"
-            };
-            for start in [closing, "first hole", order] {
-                let r = find(start);
-                // Above the gap over the buttons, where the column ends.
-                assert!(
-                    r.y + r.height + 14. <= back.y,
-                    "{start} {r:?} over {back:?}"
-                );
-            }
-        }
-    }
-    /// The Pattern screen and the Holes screens of the 2nd, 5th and 1st
-    /// hole drilled of the plate's grid and of its bolt circle, at
-    /// 1440 × 900 and 1024 × 700, into `AXIS_RENDER_DIR`.
-    #[test]
-    #[ignore]
-    fn render_the_hole_patterns() {
-        use crate::guide::tests::{plate_circle, plate_grid};
-        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
-        std::fs::create_dir_all(&dir).unwrap();
-        for (name, holes, grids) in [("grid", plate_grid(), true), ("arc", plate_circle(), false)] {
-            let mut a = pattern_app(&holes, grids, !grids, false);
-            let step = patterns(&a)[0];
-            for (w, h) in [(1440, 900), (1024, 700)] {
-                (a.window_width, a.window_height) = (w as f32, h as f32);
-                at(&mut a, step, 0);
-                render(&a, (w, h), &dir.join(format!("{name}-pattern-{w}.png")));
-                for hole in [2, 5, 1] {
-                    at(&mut a, step + 1, hole - 1);
-                    let file = format!("{name}-holes-{hole}-{w}.png");
-                    render(&a, (w, h), &dir.join(file));
-                }
-            }
-        }
-    }
     /// LIO-563: `bored_app`'s Ø50 head, its bar reaching 40 mm below the
     /// body, bores the Ø32 hole by a toe clamp on +Y whose nose reaches 12
     /// mm onto the 64 mm stock, to Y20. The body comes down to 12 mm over
@@ -7078,94 +4171,7 @@ pub(crate) mod tests {
         );
         let (doc, mesh) = clamped("60");
         let g = crate::guide::build(&doc, &mesh, 0).unwrap();
-        assert!(g.steps.iter().any(|s| matches!(s, Step::Bore { .. })));
-    }
-    #[test]
-    fn a_bore_pass_shows_what_to_measure_the_head_setting_and_the_hole() {
-        let mut a = bored_app();
-        let g = guide(&a);
-        let passes: Vec<usize> = (g.steps.iter().enumerate())
-            .filter(|(_, s)| matches!(s, Step::Bore { .. }))
-            .map(|(i, _)| i)
-            .collect();
-        // Ø12 to Ø31.9, at most 2 mm on the diameter a pass, then Ø32.
-        assert_eq!(passes.len(), 11, "{:?}", g.steps);
-        send(&mut a, GuideAction::Go(passes[0]));
-        let t = texts(&a);
-        assert_eq!(after(&t, "head")[0], "Ø13.99", "{t:?}");
-        assert!(t.iter().any(|s| s == "set to") && !t.iter().any(|s| s == "measure"));
-        // The last pass: measure what the one before left, set the head out
-        // by the difference, then the hole and its depth.
-        send(&mut a, GuideAction::Go(passes[10]));
-        let t = texts(&a);
-        for want in [
-            "PASS 11 OF 11",
-            "11 passes",
-            "measure",
-            "Ø31.90",
-            "Ø32.00",
-            "out 0.10 on Ø · 10 divisions",
-            "spindle off to set the head",
-            "spindle off, then raise",
-            "bore to · 31 deep",
-            "640 rpm",
-        ] {
-            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
-        }
-        assert_eq!(
-            after(&t, "head"),
-            ["Ø32.00", "out 0.10 on Ø · 10 divisions"]
-        );
-    }
-    /// The head's setting on each pass of the Ø32 bore with a dial of 0.01,
-    /// 0.001" and 0.002": the rough passes are whole divisions; the last,
-    /// to the size, is whole on the 0.01 dial, and on the inch dials it is
-    /// set from the measured bore, with the count from the expected bore,
-    /// never a rounded whole count (LIO-585).
-    #[test]
-    fn the_last_bore_pass_between_divisions_says_to_set_from_the_measured_bore() {
-        for (dial, bore, last) in [
-            ("0.01", "Ø31.90", "out 0.10 on Ø · 10 divisions"),
-            (
-                "0.0254",
-                "Ø31.88",
-                "out 0.12 on Ø · (32.00 − measured) ÷ 0.0254 divisions: 4.8 from Ø31.88",
-            ),
-            (
-                "0.0508",
-                "Ø31.85",
-                "out 0.15 on Ø · (32.00 − measured) ÷ 0.0508 divisions: 2.9 from Ø31.85",
-            ),
-        ] {
-            let (doc, mesh) = bored_job(|h| {
-                h.p.insert("dial".into(), dial.into());
-            });
-            let mut a = on_page(doc, mesh);
-            let passes: Vec<usize> = (guide(&a).steps.iter().enumerate())
-                .filter(|(_, s)| matches!(s, Step::Bore { .. }))
-                .map(|(i, _)| i)
-                .collect();
-            assert_eq!(passes.len(), 11, "{dial}");
-            for (k, &at) in passes.iter().enumerate().skip(1) {
-                send(&mut a, GuideAction::Go(at));
-                let t = texts(&a);
-                let tag = &after(&t, "head")[1];
-                if k + 1 < passes.len() {
-                    let whole = tag
-                        .split(" · ")
-                        .nth(1)
-                        .and_then(|n| n.strip_suffix(" divisions"));
-                    assert!(
-                        tag.starts_with("out ") && whole.is_some_and(|n| n.parse::<u32>().is_ok()),
-                        "{dial} pass {}: {tag}",
-                        k + 1
-                    );
-                } else {
-                    assert_eq!(tag, last, "{dial}");
-                    assert_eq!(after(&t, "measure")[1], bore, "{dial}");
-                }
-            }
-        }
+        assert!(g.steps.iter().any(|s| matches!(s, Step::Sheet { op: 1, .. })));
     }
     /// `app` with an A2.5×6.3 centre drilling before its Holes, as Add
     /// would put it there.
@@ -7205,11 +4211,13 @@ pub(crate) mod tests {
         if let Some(Err(why)) = a.current_guide() {
             panic!("{why}");
         }
-        let uncentred = (guide(&a).steps.iter())
+        let uncentred: Vec<bool> = (guide(&a).steps.iter())
             .find_map(|s| match s {
-                Step::Holes {
-                    op: 4, uncentred, ..
-                } => Some(uncentred.clone()),
+                Step::Sheet {
+                    op: 4,
+                    features: Features::Holes { holes, .. },
+                    ..
+                } => Some(holes.iter().map(|h| h.uncentred).collect()),
                 _ => None,
             })
             .unwrap();
@@ -7228,195 +4236,7 @@ pub(crate) mod tests {
             "{t:?}"
         );
     }
-    /// The Holes step of operation `op`.
-    fn holes_step(a: &App, op: usize) -> usize {
-        (guide(a).steps.iter())
-            .position(|s| matches!(s, Step::Holes { op: o, .. } if *o == op))
-            .unwrap()
-    }
-    #[test]
-    fn a_centre_drill_goes_to_its_pilot_tip_and_an_uncentred_drill_is_warned() {
-        // Without a centre drilling, each hole of the drill is warned.
-        let mut a = app("Yes");
-        let at = holes_step(&a, 2);
-        send(&mut a, GuideAction::Go(at));
-        let t = texts(&a);
-        assert!(t.iter().any(|s| s == "centre drill first"), "{t:?}");
-        assert!(t.iter().any(|s| s == "Holes"), "{t:?}");
-        // With one: its own screen, to the pilot's tip, the cone at the top
-        // as wide as the body; the drill after it is not warned.
-        let mut a = centred_app();
-        let at = holes_step(&a, 2);
-        send(&mut a, GuideAction::Go(at));
-        let t = texts(&a);
-        assert!(t.iter().any(|s| s == "Centre drill"), "{t:?}");
-        let tags = t
-            .iter()
-            .find(|s| s.starts_with("pilot tip to · "))
-            .expect("pilot tip to");
-        assert!(tags.ends_with(" deep · cone Ø6.3 at the top"), "{tags}");
-        assert!(!t.iter().any(|s| s == "centre drill first"), "{t:?}");
-        let at = holes_step(&a, 3);
-        send(&mut a, GuideAction::Go(at));
-        let t = texts(&a);
-        assert!(t.iter().any(|s| s.starts_with("drill to · ")), "{t:?}");
-        assert!(!t.iter().any(|s| s == "centre drill first"), "{t:?}");
-    }
-    /// The centre drilling's Tool and Holes screens, the drill's after it,
-    /// and the drill's with no centre drilling, at 1280 × 800, into
-    /// `AXIS_RENDER_DIR`.
-    #[test]
-    #[ignore]
-    fn render_the_centre_drilling() {
-        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut a = centred_app();
-        let tool = (guide(&a).steps.iter())
-            .position(|s| matches!(s, Step::Tool { op: 2, .. }))
-            .unwrap();
-        let shots = [
-            ("centre-tool", tool, 0),
-            ("centre-hole1", holes_step(&a, 2), 0),
-            ("centre-hole3", holes_step(&a, 2), 2),
-            ("drill-centred", holes_step(&a, 3), 0),
-        ];
-        for (name, step, item) in shots {
-            at(&mut a, step, item);
-            render(&a, (1280, 800), &dir.join(format!("{name}.png")));
-        }
-        let mut a = app("Yes");
-        let step = holes_step(&a, 2);
-        at(&mut a, step, 0);
-        render(&a, (1280, 800), &dir.join("drill-uncentred.png"));
-    }
-    /// The last boring pass at 1280 × 800, in AXIS_RENDER_DIR (default
-    /// /tmp/manual-steps), with the first beside it.
-    #[test]
-    #[ignore]
-    fn render_a_bore_pass() {
-        let dir = std::path::PathBuf::from(
-            std::env::var("AXIS_RENDER_DIR").unwrap_or("/tmp/manual-steps".into()),
-        );
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut a = bored_app();
-        let passes: Vec<usize> = (guide(&a).steps.iter().enumerate())
-            .filter(|(_, s)| matches!(s, Step::Bore { .. }))
-            .map(|(i, _)| i)
-            .collect();
-        for (name, at) in [("12-bore-first", passes[0]), ("13-bore-last", passes[10])] {
-            send(&mut a, GuideAction::Go(at));
-            render(&a, (1280, 800), &dir.join(format!("{name}.png")));
-        }
-        // The last pass on a 0.001" dial, between divisions (LIO-585).
-        let (doc, mesh) = bored_job(|h| {
-            h.p.insert("dial".into(), "0.0254".into());
-        });
-        let mut a = on_page(doc, mesh);
-        send(&mut a, GuideAction::Go(passes[10]));
-        render(&a, (1280, 800), &dir.join("14-bore-last-inch-dial.png"));
-    }
-    #[test]
-    fn the_face_step_shows_the_tool_the_gear_and_the_depth_and_no_passes() {
-        let mut a = app("Yes");
-        let face = (guide(&a).steps.iter())
-            .position(|s| matches!(s, Step::Face { .. }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(face));
-        assert_eq!(place(&a), face);
-        let t = texts(&a);
-        for want in [
-            "Face to",
-            "Z",
-            "−2.00",
-            "2.00 mm off",
-            "640 rpm",
-            "Ø25 End mill 25",
-            "Section done ▶",
-        ] {
-            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
-        }
-        assert!(
-            !t.iter()
-                .any(|s| s.starts_with("Move in this order") || s == "Pass done ▶"),
-            "{t:?}"
-        );
-        // The face's tool picks up Z on the top first.
-        assert_eq!(after(&t, "touch the top → set"), ["Z", "0.00"]);
-    }
-    /// A Face that makes the part's top on a bottom at size says to
-    /// measure before the last level, to set it so the part reads its
-    /// size, and to check the size and that it is parallel (LIO-487).
-    #[test]
-    fn a_face_to_size_says_to_measure_set_the_last_level_and_check() {
-        let mut a = app_with("Yes", |d| {
-            for (k, v) in [("stock_top", "2"), ("stock_bottom", "0")] {
-                d.setups[0].p.insert(k.into(), v.into());
-            }
-        });
-        let at = (guide(&a).steps.iter())
-            .position(|s| matches!(s, Step::Face { .. }))
-            .unwrap();
-        let Step::Face {
-            size: Some(size), ..
-        } = guide(&a).steps[at]
-        else {
-            panic!("{:?}", guide(&a).steps[at])
-        };
-        send(&mut a, GuideAction::Go(at));
-        let size = dro(size);
-        let t = texts(&a);
-        let check = format!("Then check {size} at both ends: the top parallel to the bottom.");
-        for want in [
-            "Finish to".to_string(),
-            size.clone(),
-            "top to bottom".into(),
-            "about 2.00 mm off".into(),
-            "Before the last level, measure it at the left and right ends; if they differ, seat the part again.".into(),
-            format!("For the last level, go down from the Z just cut by what it reads over {size}."),
-            check.clone(),
-        ] {
-            assert!(t.contains(&want), "{want} in {t:?}");
-        }
-        // The planned depth is still there, as where it ends about.
-        assert_eq!(after(&t, "Face to"), ["Z", "−2.00"]);
-        // The check after the last level is in sight at 1024 × 700, above
-        // the buttons.
-        (a.window_width, a.window_height) = (1024., 700.);
-        let placed = crate::ui::probe::placed(a.view(), Size::new(1024., 700.));
-        let on = |s: &str| (placed.iter()).find(|(t, _)| t == s).map(|(_, r)| *r);
-        let (check, done) = (
-            on(&check).expect("the check"),
-            on("Section done ▶").expect("done"),
-        );
-        assert!(check.y + check.height < done.y, "{check:?} {done:?}");
-        // In a vise, measured at the ends out of its jaws: with the jaws on
-        // the X sides, the front and back (LIO-487).
-        for (axis, ends) in [("X", "front and back"), ("Y", "left and right")] {
-            let mut a = app_with("Yes", |d| {
-                for (k, v) in [("stock_top", "2"), ("stock_bottom", "0")] {
-                    d.setups[0].p.insert(k.into(), v.into());
-                }
-                crate::guide::tests::in_the_vise(d);
-                d.setups[0].p.insert("vise_axis".into(), axis.into());
-                d.settle_holding(0);
-            });
-            let at = (guide(&a).steps.iter())
-                .position(|s| matches!(s, Step::Face { size: Some(_), .. }))
-                .expect("a face to size");
-            send(&mut a, GuideAction::Go(at));
-            let want = format!(
-                "Before the last level, measure it at the {ends} ends; if they differ, seat the part again."
-            );
-            assert!(texts(&a).contains(&want), "{want} in {:?}", texts(&a));
-        }
-        // A face on stock with more under the part: the depth alone.
-        let mut a = app("Yes");
-        send(&mut a, GuideAction::Go(at));
-        let t = texts(&a);
-        assert!(t.iter().any(|s| s == "2.00 mm off"), "{t:?}");
-        assert!(!t.iter().any(|s| s == "Finish to"), "{t:?}");
-    }
-    /// The Hold page shows the setup's notes, which say what supports the
+    /// The Zero page shows the setup's notes, which say what supports the
     /// part and where; none without (LIO-487). A slot's page, which leaves
     /// what is under the part to the user, points back to them.
     #[test]
@@ -7426,7 +4246,7 @@ pub(crate) mod tests {
         let a = app_with("Yes", |d| {
             d.setups[0].p.insert("notes".into(), format!("  {note}\n"));
         });
-        assert!(matches!(guide(&a).steps[place(&a)], Step::Hold { .. }));
+        assert!(matches!(guide(&a).steps[place(&a)], Step::Zero { .. }));
         let t = texts(&a);
         let i = (t.iter().position(|s| s == "SETUP NOTES")).expect("the notes' label");
         assert_eq!(t[i + 1], note);
@@ -7440,747 +4260,8 @@ pub(crate) mod tests {
         let a = app("Yes");
         assert!(!texts(&a).iter().any(|s| s == "SETUP NOTES"));
     }
-    /// The agent's read of a step says what the page says (LIO-470): a Face
-    /// to size its measured finish, the Hold page the setup's notes.
-    #[test]
-    fn the_agents_read_of_the_steps_says_what_the_page_says() {
-        let a = app_with("Yes", |d| {
-            for (k, v) in [("stock_top", "2"), ("stock_bottom", "0")] {
-                d.setups[0].p.insert(k.into(), v.into());
-            }
-        });
-        let g = guide(&a);
-        let at = (g.steps.iter())
-            .position(|s| matches!(s, Step::Face { .. }))
-            .unwrap();
-        let Step::Face {
-            size: Some(size), ..
-        } = g.steps[at]
-        else {
-            panic!("{:?}", g.steps[at])
-        };
-        let read = crate::mcp::reads::step_detail(&a.doc, &g, 0, &g.steps[at]);
-        let text = read["text"].as_str().unwrap();
-        let size = dro(size);
-        for want in [
-            "about 2 mm off".to_string(),
-            "Before the last level, measure it at the left and right ends; if they differ, seat the part again.".into(),
-            format!("For the last level, go down from the Z just cut by what it reads over {size}."),
-            format!("Then check {size} at both ends: the top parallel to the bottom."),
-        ] {
-            assert!(text.contains(&want), "{want} in {text}");
-        }
-        assert!(!text.contains("taking off"), "{text}");
-        // A Face with no size keeps its depth.
-        let b = app("Yes");
-        let g = guide(&b);
-        let at = (g.steps.iter())
-            .position(|s| matches!(s, Step::Face { size: None, .. }))
-            .expect("the example's Face has no size");
-        let read = crate::mcp::reads::step_detail(&b.doc, &g, 0, &g.steps[at]);
-        let text = read["text"].as_str().unwrap();
-        assert!(
-            text.contains("taking off") && !text.contains("about"),
-            "{read}"
-        );
-        // The Hold step carries the setup's notes, and none when it has none.
-        let note =
-            "Face up on two 15 mm parallels at X-18 and X+18, clear of the holes. Add a stop.";
-        let c = app_with("Yes", |d| {
-            d.setups[0].p.insert("notes".into(), format!("  {note}\n"));
-        });
-        let g = guide(&c);
-        let read = crate::mcp::reads::step_detail(&c.doc, &g, 0, &g.steps[0]);
-        assert_eq!(read["kind"], "Hold");
-        assert!(
-            read["text"]
-                .as_str()
-                .unwrap()
-                .ends_with(&format!("Setup notes: {note}")),
-            "{read}"
-        );
-        let g = guide(&b);
-        let read = crate::mcp::reads::step_detail(&b.doc, &g, 0, &g.steps[0]);
-        assert!(
-            !read["text"].as_str().unwrap().contains("Setup notes"),
-            "{read}"
-        );
-    }
-    #[test]
-    fn a_new_tool_picks_up_z_on_the_top_the_operations_before_left() {
-        let mut a = app("Yes");
-        let g = guide(&a);
-        let tools: Vec<usize> = (g.steps.iter().enumerate())
-            .filter(|(_, s)| matches!(s, Step::Tool { .. }))
-            .map(|(i, _)| i)
-            .collect();
-        // The Holes' drill, after the 2 mm face.
-        assert_eq!(tools.len(), 1);
-        for i in tools {
-            send(&mut a, GuideAction::Go(i));
-            let t = texts(&a);
-            assert!(t.iter().any(|s| s == "PICK UP Z WITH THE TOOL"), "{t:?}");
-            assert_eq!(after(&t, "touch the top → set"), ["Z", "−2.00"]);
-        }
-        // The Step keeps the Face's mill and its Z: its first screen is
-        // the DRO's diameter and sides, with no pick-up; nor does a Square
-        // after the Face pick up (LIO-368).
-        let comp = (guide(&a).steps.iter())
-            .position(|s| matches!(s, Step::Comp { op: 1, .. }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(comp));
-        let t = texts(&a);
-        assert!(t.iter().any(|s| s == "ENTER IN THE DRO"), "{t:?}");
-        assert!(t.iter().any(|s| s == "25.00"), "{t:?}");
-        for t in [t, texts(&squared("Yes"))] {
-            assert!(!t.iter().any(|s| s == "PICK UP Z WITH THE TOOL"), "{t:?}");
-        }
-    }
-    /// The job with the stock's +X side squared 1 mm first (step 3).
-    fn squared(dro: &str) -> App {
-        let mut a = app_with(dro, |doc| {
-            let mill = doc.tools[3].id.clone();
-            let b = [123., 500., -500., 500., 0., -30.];
-            let square =
-                crate::guide::tests::boxed("Square right side", &mill, b, &[("allowance", "0")]);
-            doc.setups[0].operations.insert(1, square);
-        });
-        assert!(matches!(guide(&a).steps[3], Step::Square { .. }));
-        send(&mut a, GuideAction::Go(3));
-        a
-    }
-    #[test]
-    fn the_hold_step_draws_the_vise_its_grip_and_parallels() {
-        let a = app_with("Yes", crate::guide::tests::in_the_vise);
-        let shown = a.guide_at().unwrap().0;
-        let Step::Hold {
-            stock,
-            holding,
-            vise: Some(v),
-        } = shown.guide.steps[0]
-        else {
-            panic!()
-        };
-        let t = texts(&a);
-        let grip = format!("{} in the jaws", mm(v.grip));
-        for want in ["jaws on the Y sides", grip.as_str(), "top face up"] {
-            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
-        }
-        // The jaws reach from the grip down by their height, the parallels
-        // from there up to the stock's bottom, between the jaws.
-        assert_eq!(shown.vise.len(), 2);
-        for j in &shown.vise {
-            close(j.max[2], holding.bottom + v.grip);
-            close(j.max[2] - j.min[2], v.jaw_height);
-        }
-        assert_eq!(shown.parallels.len(), 2);
-        for b in &shown.parallels {
-            close(b.max[2], stock.min[2]);
-            close(b.min[2], holding.bottom + v.grip - v.jaw_height);
-            assert!(b.min[1] > stock.min[1] && b.max[1] < stock.max[1], "{b:?}");
-        }
-        let high = format!(
-            "on parallels {} high",
-            mm(stock.min[2] - shown.parallels[0].min[2])
-        );
-        assert!(t.contains(&high), "{high} in {t:?}");
-        // Without a vise: no jaws, no parallels.
-        let a = app("Yes");
-        let shown = a.guide_at().unwrap().0;
-        assert!(shown.vise.is_empty() && shown.parallels.is_empty());
-    }
     fn close(a: f32, b: f32) {
         assert!((a - b).abs() < 1e-3, "{a} != {b}");
-    }
-    #[test]
-    fn the_square_step_feeds_along_its_wall_as_its_plan_cuts() {
-        // Squaring the +X side: its arrow runs along Y (LIO-176), the way
-        // its plan feeds, with the material on its left (conventional).
-        let a = squared("Yes");
-        let g = guide(&a);
-        let Step::Square { op, .. } = g.steps[3] else {
-            panic!()
-        };
-        let i = g.done.iter().position(|d| d.op == op).unwrap();
-        let feed = feed_along(&g, i, 1);
-        assert!(feed != 0., "no feed along Y");
-        let cut = g.done[i]
-            .plan
-            .moves
-            .iter()
-            .find(|m| m.cutting_pass)
-            .unwrap();
-        assert_eq!(feed, (cut.to[1] - cut.from[1]).signum());
-    }
-    #[test]
-    fn the_square_step_shows_the_dro_diameter_and_comp_side() {
-        let t = texts(&squared("Yes"));
-        for want in [
-            "ENTER IN THE DRO",
-            "Ø",
-            "25.00",
-            "comp X −",
-            "123.00",
-            "right side to",
-        ] {
-            assert!(t.iter().any(|s| s.contains(want)), "{want} in {t:?}");
-        }
-        // Without compensation: the centre, and no diameter to enter.
-        let t = texts(&squared("No"));
-        assert!(t.iter().any(|s| s == "DRO comp off: centres"), "{t:?}");
-        assert!(t.iter().any(|s| s == "135.50"), "{t:?}");
-        assert!(!t.iter().any(|s| s.contains("comp X")), "{t:?}");
-    }
-    #[test]
-    fn the_zero_step_sets_each_touch_less_the_edge_finders_radius() {
-        let mut a = app("Yes");
-        send(&mut a, GuideAction::Go(1));
-        let t = texts(&a);
-        for want in [
-            "Ø10 edge finder",
-            "DRO comp off",
-            "touch the left face → set",
-            "touch the front face → set",
-            "touch the top → set",
-        ] {
-            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
-        }
-        // Each number follows its touch: X −5, Y −5, Z 0.
-        assert_eq!(after(&t, "touch the left face → set"), ["X", "−5.00"]);
-        assert_eq!(after(&t, "touch the front face → set"), ["Y", "−5.00"]);
-        assert_eq!(after(&t, "touch the top → set"), ["Z", "0.00"]);
-        // A corner is picked up, one face an axis.
-        assert!(has(&a, "pick up the corner"));
-        assert!(
-            !t.iter().any(|s| s.contains("reads") || s.contains('½')),
-            "{t:?}"
-        );
-    }
-    /// The rows of the Zero page from "TOUCH, THEN SET THE DRO" on: each
-    /// row's order (or ✓ when reached), lead, axis, number and tags.
-    fn zero_rows(t: &[String]) -> Vec<String> {
-        let i = (t.iter().position(|s| s == "TOUCH, THEN SET THE DRO")).unwrap();
-        let end = (t.iter().position(|s| s == "◀ Back")).unwrap();
-        t[i + 1..end].to_vec()
-    }
-    #[test]
-    fn the_zero_page_draws_the_clamps_and_says_where_to_touch_clear_of_them() {
-        use crate::guide::tests::on_clamps;
-        // The 124 × 120 block's centre zero, toe clamps on its front and
-        // back at their middles (LIO-458): Y is touched clear of them, at
-        // an X the DRO already reads.
-        let mut a = app_with("Yes", |doc| {
-            doc.setups[0].operations.drain(..2);
-            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
-            on_clamps(doc, "-Y:0;+Y:0", "20");
-        });
-        send(&mut a, GuideAction::Go(1));
-        let Step::Zero {
-            clamps, blocked, ..
-        } = &guide(&a).steps[1]
-        else {
-            panic!()
-        };
-        assert_eq!(clamps.len(), 2);
-        assert!(blocked.iter().flatten().all(Option::is_none));
-        let rows = zero_rows(&texts(&a));
-        let i = rows
-            .iter()
-            .position(|s| s == "touch the front face → set")
-            .unwrap();
-        assert_eq!(
-            rows[i + 1..i + 4],
-            ["Y", "0.00", "at X −39.3, clear of the clamps"]
-        );
-        let i = rows
-            .iter()
-            .position(|s| s == "touch the back face → ½")
-            .unwrap();
-        assert!(
-            rows[i + 3].starts_with("at X −39.3, clear of the clamps · reads about"),
-            "{rows:?}"
-        );
-        // X is touched as without them.
-        assert_eq!(after(&rows, "touch the left face → set"), ["X", "0.00"]);
-        assert!(!rows.iter().any(|s| s.contains("under")), "{rows:?}");
-        // A strap over the whole front: that face is named under it, Y is
-        // set on the back alone, and the page warns.
-        let mut a = app_with("Yes", |doc| {
-            doc.setups[0].operations.drain(..2);
-            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
-            on_clamps(doc, "-Y:0", "140");
-        });
-        send(&mut a, GuideAction::Go(1));
-        let t = texts(&a);
-        assert!(has(&a, "a face is under a clamp"), "{t:?}");
-        assert!(has(&a, "find the centre"), "{t:?}");
-        let rows = zero_rows(&t);
-        let i = rows
-            .iter()
-            .position(|s| s == "touch the back face → set")
-            .unwrap();
-        assert_eq!(
-            rows[i + 1..i + 4],
-            [
-                "Y",
-                "65.00",
-                "at X 0, clear of the clamps · the front face is under the clamp on -Y (offset 0) · set from this face alone, by the stock's size"
-            ]
-        );
-        assert!(!rows.iter().any(|s| s.contains("front face →")), "{rows:?}");
-        assert!(
-            !rows.iter().any(|s| s.contains("Y") && s.contains("½")),
-            "{rows:?}"
-        );
-        // In the vise, no clamps and no word of them.
-        let mut a = app_with("Yes", |doc| {
-            doc.setups[0].operations.drain(..2);
-            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
-        });
-        send(&mut a, GuideAction::Go(1));
-        let Step::Zero { clamps, .. } = &guide(&a).steps[1] else {
-            panic!()
-        };
-        assert!(clamps.is_empty());
-        assert!(!texts(&a).iter().any(|s| s.contains("clamp")));
-    }
-    #[test]
-    fn a_centre_zero_is_found_by_halving_each_axis_between_its_faces() {
-        // The 124 × 120 block with its zero at the top's centre (LIO-451).
-        let mut a = app_with("Yes", |doc| {
-            doc.setups[0].operations.drain(..2);
-            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
-        });
-        send(&mut a, GuideAction::Go(1));
-        let t = texts(&a);
-        assert!(has(&a, "find the centre"), "{t:?}");
-        assert!(!has(&a, "pick up the corner"), "{t:?}");
-        // X: 0 on the left, then on the right, where the DRO reads 124 +
-        // Ø10 (a check), ½ makes it 67; then Y the same over 120; then Z on
-        // the top. In order 1 to 5.
-        assert_eq!(
-            zero_rows(&t),
-            [
-                "1",
-                "touch the left face → set",
-                "X",
-                "0.00",
-                "2",
-                "touch the right face → ½",
-                "X",
-                "67.00",
-                "reads about 134.00 first, a check · press ½ or set half of it",
-                "3",
-                "touch the front face → set",
-                "Y",
-                "0.00",
-                "4",
-                "touch the back face → ½",
-                "Y",
-                "65.00",
-                "reads about 130.00 first, a check · press ½ or set half of it",
-                "5",
-                "touch the top → set",
-                "Z",
-                "0.00",
-            ]
-        );
-        // Each row reached in turn is ticked, the next one is lit.
-        for n in 0..5 {
-            send(&mut a, GuideAction::Reached(n));
-            let rows = zero_rows(&texts(&a));
-            let ticks = rows.iter().filter(|s| *s == "✓").count();
-            assert_eq!(ticks, n + 1, "{rows:?}");
-            if n < 4 {
-                assert!(rows.contains(&(n + 2).to_string()), "{rows:?}");
-            }
-        }
-        // The middle of the front edge: X halved, Y on the front face.
-        let mut a = app_with("Yes", |doc| {
-            doc.setups[0].operations.drain(..2);
-            (doc.setups[0].p).insert("origin".into(), "Stock top front".into());
-        });
-        send(&mut a, GuideAction::Go(1));
-        let t = texts(&a);
-        assert!(has(&a, "find the middle of the front edge"), "{t:?}");
-        let rows = zero_rows(&t);
-        assert_eq!(after(&rows, "touch the left face → set"), ["X", "0.00"]);
-        assert_eq!(after(&rows, "touch the right face → ½"), ["X", "67.00"]);
-        assert_eq!(after(&rows, "touch the front face → set"), ["Y", "−5.00"]);
-        assert!(!rows.iter().any(|s| s.contains("back")), "{rows:?}");
-        assert!(rows.contains(&"4".to_string()) && !rows.contains(&"5".to_string()));
-    }
-    #[test]
-    fn a_halved_axis_whose_touches_are_off_centre_says_how_far_from_half() {
-        // The touches' middle 1.5 mm off the zero on X (a face only in the
-        // jaws, touched on what stands out above them): the + face is set
-        // to half the reading less 1.5, not with ½.
-        let mut a = app_with("Yes", |doc| {
-            doc.setups[0].operations.drain(..2);
-            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
-        });
-        let Some((_, Ok(shown))) = &mut a.guide else {
-            panic!()
-        };
-        let shown = Arc::get_mut(shown).unwrap();
-        let Step::Zero { touch, .. } = &mut shown.guide.steps[1] else {
-            panic!()
-        };
-        touch[0] -= 1.5;
-        send(&mut a, GuideAction::Go(1));
-        let rows = zero_rows(&texts(&a));
-        let i = (rows.iter().position(|s| s == "touch the right face → set")).unwrap();
-        assert_eq!(
-            rows[i + 1..i + 4],
-            [
-                "X",
-                "65.50",
-                "reads about 134.00 first, a check · set half of it − 1.5"
-            ]
-        );
-        assert_eq!(after(&rows, "touch the back face → ½"), ["Y", "65.00"]);
-    }
-    #[test]
-    fn the_drawing_and_the_row_say_the_same_halving() {
-        // Half the reading; or more or less, the same in both (LIO-451).
-        assert_eq!(halving(72.5, 145.), "½");
-        assert_eq!(halving(72., 147.), "½ − 1.5");
-        assert_eq!(halving(75., 147.), "½ + 1.5");
-    }
-    /// The Zero pages after an earlier setup cut a notch in the +X face's
-    /// top, cut that face back 3 mm (touches not either side of the zero
-    /// alike) or skimmed it 0.1 mm, at 1440 × 1000 and 1024 × 700, into
-    /// `AXIS_RENDER_DIR`.
-    #[test]
-    #[ignore]
-    fn render_the_zero_after_earlier_cuts() {
-        let dir = std::path::PathBuf::from(std::env::var("AXIS_RENDER_DIR").unwrap());
-        std::fs::create_dir_all(&dir).unwrap();
-        for (name, cut) in [
-            ("notch", [67., 80., -10., 10., 0., -12.]),
-            ("cut-back-plus", [67., 80., -50., 50., 0., -16.]),
-            ("cut-back-minus", [-80., -67., -50., 50., 0., -16.]),
-            ("skim-plus", [69.9, 80., -50., 50., 0., -16.]),
-        ] {
-            let (mut doc, mesh) = crate::viewport::tests::guide_tests::after_a_cut(cut);
-            doc.file = Some(crate::model::ModelFile {
-                name: "squared.3mf".into(),
-                path: "squared.3mf".into(),
-                format: "3mf".into(),
-                bytes: 1,
-                thickness: None,
-            });
-            let temp = tempfile::tempdir().unwrap();
-            let mut a = App::from_workspace(temp.path().join("workspace.json"), None);
-            a.test_dir = Some(temp);
-            a.doc = doc;
-            a.imported_mesh = Some(mesh);
-            a.page = Page::Control;
-            build(&mut a);
-            let id = a.doc.active.clone();
-            a.doc.guide.insert(id, 1);
-            for (w, h) in [(1440, 1000), (1024, 700)] {
-                (a.window_width, a.window_height) = (w as f32, h as f32);
-                render(&a, (w, h), &dir.join(format!("zero-{name}-{w}.png")));
-            }
-        }
-    }
-    #[test]
-    fn a_pass_shows_its_number_and_its_readouts_in_order() {
-        let mut a = app("Yes");
-        let g = guide(&a);
-        let first = (g.steps.iter())
-            .position(|s| matches!(s, Step::Pass { .. }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(first));
-        let Step::Pass { targets, of, .. } = &g.steps[first] else {
-            panic!()
-        };
-        let t = texts(&a);
-        assert!(t.contains(&format!("Pass 1 of {of}")), "{t:?}");
-        // The setup carries its machine's name: said once in the title and
-        // once in the list (LIO-382; "Manual Mill on the Manual Mill").
-        assert!(t.iter().any(|s| s == "Manual Mill · steps"), "{t:?}");
-        // In the list it is "1 Manual Mill · by hand", as the Run page's (LIO-431).
-        assert_eq!(
-            t.iter().filter(|s| *s == "1 Manual Mill · by hand").count(),
-            1,
-            "{t:?}"
-        );
-        assert!(!t.iter().any(|s| s.contains(" on the ")), "{t:?}");
-        assert!(t.contains(&format!("pass 1/{of}")), "{t:?}");
-        // Every readout's number, the cut's with its direction, in order.
-        let shown: Vec<usize> = (targets.iter())
-            .map(|g| {
-                let n = dro(g.shown);
-                (t.iter())
-                    .position(|s| s == &n || s.ends_with(&format!(" {n}")))
-                    .unwrap_or_else(|| panic!("{n} in {t:?}"))
-            })
-            .collect();
-        assert!(shown.windows(2).all(|w| w[0] < w[1]), "{shown:?}");
-        assert!(t.iter().any(|s| s == "Pass done ▶"));
-        assert!(t.iter().any(|s| s.starts_with("1 turn every")), "{t:?}");
-        // The feed runs toward +X (conventional: the step's wall on the left).
-        let feed = dro(targets.last().unwrap().shown);
-        assert!(t.contains(&format!("▶ {feed}")), "{t:?}");
-        // The edge readouts carry their centre.
-        let edge = targets.iter().find(|g| g.edge).unwrap();
-        assert!(
-            t.iter()
-                .any(|s| s.contains(&format!("centre {}", dro(edge.centre)))),
-            "{t:?}"
-        );
-        // Down to the level: how much deeper it cuts, from the faced top at
-        // −2 to −6.75; not how far from the retract height.
-        assert_eq!(
-            t.iter().filter(|s| s.starts_with("4.75 deeper")).count(),
-            1,
-            "{t:?}"
-        );
-        assert!(!t.iter().any(|s| s.contains(" down")), "{t:?}");
-        // The tiles are the passes' depths, one row on each level (LIO-366).
-        for tile in ["−6.75", "−11.50"] {
-            assert!(t.iter().any(|s| s == tile), "{tile} in {t:?}");
-        }
-        // Tapping a readout lights the next.
-        send(&mut a, GuideAction::Reached(0));
-        assert_eq!(a.guide_item, 1);
-    }
-    #[test]
-    fn the_check_screen_gives_the_sizes_to_measure_on_and_beside_the_picture() {
-        let mut a = app("Yes");
-        let g = guide(&a);
-        let checks: Vec<usize> = (g.steps.iter().enumerate())
-            .filter(|(_, s)| matches!(s, Step::Check { .. }))
-            .map(|(i, _)| i)
-            .collect();
-        // The Step: 15 wide from the front face, 9.5 below the faced top.
-        send(&mut a, GuideAction::Go(checks[0]));
-        let t = texts(&a);
-        for want in [
-            "15.00",
-            "wide · from the front face",
-            "9.50",
-            "deep below the top · floor Z −11.50",
-        ] {
-            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
-        }
-        // The Holes: 4 of Ø4, drilled with Through off to the back 42 below
-        // their mouths on the faced top: 40.8 to the full Ø, over the
-        // point (LIO-450).
-        send(&mut a, GuideAction::Go(checks[1]));
-        let t = texts(&a);
-        for want in [
-            "4.00",
-            "4 holes",
-            "40.80",
-            "deep from the mouth · to the full Ø, not the point",
-        ] {
-            assert!(t.iter().any(|s| s == want), "{want} in {t:?}");
-        }
-        // Drawn on the pictures after them, inside the picture.
-        let shown = a.guide_at().unwrap().0;
-        let labels = |i: usize| -> Vec<String> {
-            for d in &shown.dims[i] {
-                for q in [d.a, d.b] {
-                    assert!(
-                        (0. ..=960.).contains(&q.x) && (0. ..=640.).contains(&q.y),
-                        "{d:?}"
-                    );
-                }
-            }
-            shown.dims[i].iter().map(|d| d.label.clone()).collect()
-        };
-        assert_eq!(labels(2), ["Y 15", "Z 9.5"]);
-        assert_eq!(labels(3), ["Ø 4", "Z 40.8"]);
-        // The labels' tags overlap neither each other nor any dimension
-        // line, in the picture's panel at 1440 × 900 and at 1024 × 700
-        // (LIO-379: "Z 9.5" lay on "Y 15"); the step's sizes have extension
-        // lines from the step.
-        assert!(shown.dims[2].iter().all(|d| d.ext.is_some()));
-        for size in [Size::new(640., 600.), Size::new(420., 470.)] {
-            for i in [2, 3] {
-                let placed = dim_tags(&shown.dims[i], size);
-                for (n, (a, b, _, r)) in placed.iter().enumerate() {
-                    for (m, (.., o)) in placed.iter().enumerate() {
-                        let on = (0..=20).any(|t| {
-                            let t = t as f32 / 20.;
-                            let q = Point::new(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t);
-                            q.x > o.x && q.x < o.x + o.width && q.y > o.y && q.y < o.y + o.height
-                        });
-                        assert!(!on, "{size:?} {i}: tag {m} on line {n}");
-                        if m != n {
-                            assert!(r.intersection(o).is_none(), "{size:?} {i}: {r:?} {o:?}");
-                        }
-                    }
-                }
-            }
-        }
-    }
-    #[test]
-    fn a_new_tool_is_drawn_to_scale_on_the_highest_top() {
-        // To scale: the cutting part as wide as the tool.
-        for d in [4., 25.] {
-            let tool = viewport::tool_triangles([0., 0., 10.], d, 20., 40., d < 10., None);
-            let (lo, hi) = (tool.iter())
-                .flat_map(|(t, _)| t.iter())
-                // Below the shank, less the ring round the spot.
-                .filter(|p| p[2] < 29.9 && (p[2] - 10.05).abs() > 0.001)
-                .fold((f32::MAX, f32::MIN), |(a, b), p| (a.min(p[0]), b.max(p[0])));
-            close(hi - lo, d);
-        }
-        // A step 2 mm down along the front: the spot is on the higher top.
-        let low = Bounds {
-            min: [0., 0., 0.],
-            max: [100., 15., 8.],
-        };
-        let high = Bounds {
-            min: [0., 15., 0.],
-            max: [100., 60., 10.],
-        };
-        let mut stock = viewport::box_triangles(low, viewport::BLOCK);
-        stock.extend(viewport::box_triangles(high, viewport::BLOCK));
-        let spot = touch_spot(&stock).unwrap();
-        assert!(spot[2] == 10. && spot[1] > 15., "{spot:?}");
-        // On the guide's job every new tool has its picture.
-        let a = app("Yes");
-        let shown = a.guide_at().unwrap().0;
-        for (i, s) in shown.guide.steps.iter().enumerate() {
-            let new = matches!(s, Step::Tool { top: Some(_), .. });
-            assert_eq!(shown.tools[i].is_some(), new, "{i} {s:?}");
-        }
-    }
-    /// LIO-488: after the DRO's matrix holes, the Check says to leave the
-    /// hole function, and the next operation in work coordinates starts on
-    /// the screen that leaves it and checks X and Y read the last hole's
-    /// place; a drill after its centre drill on the same pattern goes on.
-    #[test]
-    fn the_dro_leaves_its_hole_function_before_work_coordinates() {
-        const NOTE: &str = "then leave the DRO's matrix holes";
-        let mut a = app_with("Yes", |d| d.setups[0].operations.swap(1, 2));
-        let g = guide(&a);
-        let check = (g.steps.iter())
-            .position(|s| matches!(s, Step::Check { op: 1 }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(check));
-        shows(&a, &[NOTE]);
-        let Some(Step::Leave { at, number, .. }) = g.steps.get(check + 1).cloned() else {
-            panic!("{:?}", g.steps.get(check + 1))
-        };
-        send(&mut a, GuideAction::Go(check + 1));
-        shows(
-            &a,
-            &[
-                "DRO",
-                "back to work coordinates",
-                "LEAVE THE DRO'S MATRIX HOLES",
-                "matrix holes",
-                "off",
-                "leave the function the DRO's way · it shows X, Y and Z again",
-                "X AND Y READ WORK COORDINATES",
-                &dro(at[0]),
-                &dro(at[1]),
-                &format!("reads · over hole {number}, the last, not moved since"),
-                "reads · both 0.00 instead: still in the hole function",
-            ],
-        );
-        // Its new tool comes next; the Step's own Check says nothing of holes.
-        assert!(matches!(g.steps[check + 2], Step::Tool { op: 2, .. }));
-        let last = (g.steps.iter())
-            .rposition(|s| matches!(s, Step::Check { op: 2 }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(last));
-        assert!(!has(&a, NOTE));
-        // Holes last in the setup: the Check says it before the hand-over.
-        let mut a = app("Yes");
-        let check = (guide(&a).steps.iter())
-            .position(|s| matches!(s, Step::Check { op: 2 }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(check));
-        shows(&a, &[NOTE]);
-        // A centre drill's Check, its drill on the same pattern next: no note.
-        let mut a = pattern_app(&crate::guide::tests::plate_grid(), true, false, true);
-        let check = (guide(&a).steps.iter())
-            .position(|s| matches!(s, Step::Check { op: 0 }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(check));
-        assert!(!has(&a, NOTE), "{:?}", texts(&a));
-    }
-    /// LIO-488: a Tool page says "where it is ringed" only over a picture
-    /// that rings the spot; with no spot, no picture, and the words say
-    /// where to touch without one.
-    #[test]
-    fn the_tool_page_names_the_ring_only_over_its_picture() {
-        let mut a = app("Yes");
-        let tool = (guide(&a).steps.iter())
-            .position(|s| matches!(s, Step::Tool { top: Some(_), .. }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(tool));
-        assert!(has(&a, RINGED), "{:?}", texts(&a));
-        assert!(!has(&a, UNRINGED));
-        let (key, Ok(shown)) = a.guide.clone().unwrap() else {
-            panic!()
-        };
-        let mut blank = shown.again(&a.doc, a.part_mesh().unwrap()).unwrap();
-        blank.tools[tool] = None;
-        a.guide = Some((key, Ok(Arc::new(blank))));
-        let t = texts(&a);
-        assert!(!t.iter().any(|s| s.contains("ringed")), "{t:?}");
-        shows(&a, &["touch the top → set", "Z", UNRINGED]);
-        // With no spot on the stock, `shown` draws no picture: a top of
-        // near-flat slivers, none level within a hundredth of its highest
-        // corner, as main's touch_spot reads it.
-        let slivers = [([[0., 0., 10.02], [10., 0., 10.], [0., 10., 10.]], [0; 4])];
-        assert_eq!(touch_spot(&slivers), None);
-    }
-    #[test]
-    fn back_and_next_are_in_one_place_on_every_screen() {
-        let mut a = app("Yes");
-        let g = guide(&a);
-        let first = |want: fn(&Step) -> bool| g.steps.iter().position(want).unwrap();
-        let screens = [
-            0,
-            first(|s| matches!(s, Step::Pass { .. })),
-            first(|s| matches!(s, Step::Check { .. })),
-            g.steps.len() - 1,
-        ];
-        let window = Size::new(1280., 800.);
-        let bottom = Rectangle::new(Point::new(0., 400.), Size::new(1280., 400.));
-        let mut spans = vec![];
-        for at in screens {
-            send(&mut a, GuideAction::Go(at));
-            let presses = crate::ui::probe::presses(a.view(), window, bottom, 5.);
-            // Where pressing gives what `want` matches: (x min, y min, x
-            // max, y max), None when nowhere.
-            let span = |want: &dyn Fn(&str) -> bool| {
-                let points: Vec<Point> = (presses.iter())
-                    .filter(|(_, m)| want(&format!("{m:?}")))
-                    .map(|(p, _)| *p)
-                    .collect();
-                (!points.is_empty()).then(|| {
-                    points.iter().fold([f32::MAX, f32::MAX, 0., 0.], |b, p| {
-                        [b[0].min(p.x), b[1].min(p.y), b[2].max(p.x), b[3].max(p.y)]
-                    })
-                })
-            };
-            let next = span(&|m| m == "Guide(Next)" || m == "Guide(Open(1))");
-            spans.push((next, span(&|m| m == "Guide(Back)")));
-        }
-        // Next (or Go to the next setup) in one place; Back beside it, dead
-        // on the first screen.
-        assert!(spans[0].0.is_some() && spans[0].1.is_none(), "{spans:?}");
-        for s in &spans[1..] {
-            assert_eq!(s.0, spans[0].0, "{spans:?}");
-            assert_eq!(s.1, spans[1].1, "{spans:?}");
-        }
-        assert!(spans[1].1.is_some());
-        // Back from the Holes' Check lands on its last hole.
-        let check = (g.steps.iter()).rposition(|s| matches!(s, Step::Check { .. }));
-        send(&mut a, GuideAction::Go(check.unwrap()));
-        send(&mut a, GuideAction::Back);
-        assert!(matches!(g.steps[place(&a)], Step::Holes { .. }));
-        assert_eq!(a.guide_item, 3);
     }
     #[test]
     fn a_setup_that_cannot_be_shown_names_its_operation_and_opens_it() {
@@ -8218,81 +4299,6 @@ pub(crate) mod tests {
         assert_eq!((a.page, a.selected), (Page::Work, None));
     }
     #[test]
-    fn the_hold_caption_follows_the_holding_and_a_holes_readouts_light_in_turn() {
-        // No holding modelled, then a vise (LIO-375).
-        let a = app("Yes");
-        assert!(has(&a, "the stock as it starts") && !has(&a, "where it goes in the vise"));
-        let a = app_with("Yes", crate::guide::tests::in_the_vise);
-        assert!(has(&a, "where it goes in the vise"));
-        // Tapping X on a Holes screen lights Y and keeps the hole.
-        let mut a = app("Yes");
-        let holes = (guide(&a).steps.iter())
-            .position(|s| matches!(s, Step::Holes { .. }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(holes));
-        send(&mut a, GuideAction::Next);
-        assert_eq!((a.guide_item, a.guide_reached), (1, 0));
-        send(&mut a, GuideAction::Reached(0));
-        assert_eq!((a.guide_item, a.guide_reached), (1, 1));
-        // Hole done: the next hole, from its first readout.
-        send(&mut a, GuideAction::Next);
-        assert_eq!((a.guide_item, a.guide_reached), (2, 0));
-    }
-    #[test]
-    fn a_holes_depth_is_counted_from_its_mouth() {
-        // A Box takes the top down to Z −3 over the two holes left of X 30.
-        let mut a = app_with("Yes", |doc| {
-            let mill = doc.tools[3].id.clone();
-            let b = [-500., 30., -500., 500., 0., -3.5];
-            let low = crate::guide::tests::boxed("Low", &mill, b, &[("stepdown", "5")]);
-            doc.setups[0].operations[0] = low;
-            doc.setups[0].operations.remove(1);
-        });
-        let g = guide(&a);
-        let (at, holes, mouths) = (g.steps.iter().enumerate())
-            .find_map(|(i, s)| match s {
-                Step::Holes { holes, mouths, .. } => Some((i, holes.clone(), mouths.clone())),
-                _ => None,
-            })
-            .unwrap();
-        assert!(
-            mouths.iter().any(|m| (m - mouths[0]).abs() > 1.),
-            "{mouths:?}"
-        );
-        send(&mut a, GuideAction::Go(at));
-        for (i, (h, m)) in holes.iter().zip(&mouths).enumerate() {
-            a.guide_item = i;
-            let deep = format!("{} deep", mm(m - h[2]));
-            assert!(texts(&a).iter().any(|s| s.contains(&deep)), "{i} {deep}");
-        }
-    }
-    /// The job's Step as a Ø8 slot 30 × 8 in the stock in front of the
-    /// part (X 55..85, Y 4..12, 5 deep), as on the manual block demo's
-    /// "Through slot": with the comp off its lines read X 59 and 81, and
-    /// Y 8 twice, 8 mm apart.
-    fn slot_the_block(doc: &mut Document) {
-        let mut mill = Tool::new("End mill 8", "Flat end mill", "8");
-        let machine = doc.setups[0].machine.id.clone();
-        for (k, v) in [("length", "30"), ("stickout", "40"), ("machines", &machine)] {
-            mill.p.insert(k.into(), v.into());
-        }
-        let b = [55., 85., 4., 12., 0., -5.];
-        let fields = [("stepdown", "5"), ("allowance", "0")];
-        let slot = crate::guide::tests::boxed("Through slot", &mill.id, b, &fields);
-        doc.setups[0].operations[1] = slot;
-        doc.tools.push(mill);
-    }
-    /// The slot made one as wide as its Ø8 mill (X 55..63), open on the
-    /// front, as the demo's "Open slot across the bottom": with the comp
-    /// off both its sides read X 59 (LIO-545).
-    fn slot_as_wide_as_its_cutter(doc: &mut Document) {
-        slot_the_block(doc);
-        let p = &mut doc.setups[0].operations[1].p;
-        for (k, v) in [("x_max", "63"), ("y_min", "-500")] {
-            p.insert(k.into(), v.into());
-        }
-    }
-    #[test]
     fn no_two_words_of_a_steps_drawing_lie_on_each_other() {
         let dir = tempfile::tempdir().unwrap();
         // A slot close up: a Ø12 mill in a 16.5 wide counterbore.
@@ -8319,21 +4325,23 @@ pub(crate) mod tests {
         };
         let (plate, mesh) = crate::corner::tests::plate_job("Y");
         let apps = [
-            ("block", app_with("No", slot_the_block)),
-            ("open slot", app_with("No", slot_as_wide_as_its_cutter)),
+            ("block", app("Yes")),
+            ("vise", app_with("Yes", crate::guide::tests::in_the_vise)),
             ("corners", on_page(plate, mesh)),
             ("slot", slot),
+            ("bore", bored_app()),
             (
                 "grid",
-                pattern_app(&crate::guide::tests::plate_grid(), true, false, false),
+                holes_app(&crate::guide::tests::plate_grid(), false),
             ),
             (
                 "circle",
-                pattern_app(&crate::guide::tests::plate_circle(), false, true, true),
+                holes_app(&crate::guide::tests::plate_circle(), true),
             ),
         ];
-        // The screens with labelled drawings of the cut.
-        const KINDS: [&str; 5] = ["Pass", "Slot", "Corner", "Holes", "Pattern"];
+        // The screens with labelled drawings: the zero page and each
+        // operation's (LIO-688).
+        const KINDS: [&str; 2] = ["Zero", "Sheet"];
         // No two words of a drawing on each other, nor one said twice side
         // by side (LIO-545), nor one across a line not to pass
         // or the stock's outline, but on a white tag (LIO-546).
@@ -8399,176 +4407,6 @@ pub(crate) mod tests {
         for kind in KINDS {
             assert!(seen.contains(kind), "{kind} not drawn: {seen:?}");
         }
-    }
-    #[test]
-    fn a_do_not_pass_line_reads_what_the_dro_reads_with_the_tool_at_it() {
-        // The labels of the Step's lines in the top view, Ø25 cutter.
-        let labels = |a: App| -> Vec<String> {
-            let shown = a.guide_at().unwrap().0;
-            let never = (shown.guide.steps.iter())
-                .find_map(|s| match s {
-                    Step::Pass { op: 1, never, .. } => Some(*never),
-                    _ => None,
-                })
-                .unwrap();
-            never_lines(&shown.guide, 1, shown.boxes[1], never, 12.5, [0, 1])
-                .into_iter()
-                .filter_map(|s| match s {
-                    Shape::Never(_, _, label) => Some(label),
-                    _ => None,
-                })
-                .collect()
-        };
-        // Comp X +, closed at X 20.5 and 99.5: the low wall reads its edge
-        // a diameter on (it said X 20.50, 25 mm into the wall); the high one
-        // and the +Y wall read as they are, the comp on their side.
-        let closed = labels(app_with("Yes", crate::guide::tests::close_the_step));
-        assert_eq!(closed, ["X 45.50", "X 99.50", "Y 15.00"]);
-        // Comp off: the centre, a radius off the wall.
-        assert_eq!(labels(app("No")), ["Y 2.50"]);
-    }
-    #[test]
-    fn a_pass_that_plunges_warns_of_a_centre_cutting_end_mill() {
-        let mut a = app_with("Yes", crate::guide::tests::pocket_the_step);
-        let g = guide(&a);
-        let passes: Vec<usize> = (g.steps.iter().enumerate())
-            .filter(|(_, s)| matches!(s, Step::Pass { op: 1, .. }))
-            .map(|(i, _)| i)
-            .collect();
-        let warning = "plunges: centre-cutting end mill";
-        for (n, i) in passes.into_iter().enumerate() {
-            send(&mut a, GuideAction::Go(i));
-            let t = texts(&a);
-            assert_eq!(t.iter().any(|s| s == warning), n % 2 == 0, "{n} {t:?}");
-            // The pocket's first row lies on its −Y wall's allowance: the
-            // second goes back along it, with no room to come off a wall.
-            if n % 2 == 1 {
-                assert!(t.iter().any(|s| s.contains("feed, cuts")), "{t:?}");
-                // Its lift off the floor and back down say so; it was a
-                // bare Z, then "1 deeper" (LIO-382).
-                for tag in ["off the floor", "back to the level"] {
-                    assert_eq!(t.iter().filter(|s| *s == tag).count(), 1, "{tag} {t:?}");
-                }
-                assert!(!t.iter().any(|s| s.ends_with(" deeper")), "{t:?}");
-            }
-        }
-        // The open-ended Step drops outside the stock, and the Step closed
-        // at both ends comes in across its open front: no warning.
-        for mut a in [
-            app("Yes"),
-            app_with("Yes", crate::guide::tests::close_the_step),
-        ] {
-            let first = (guide(&a).steps.iter())
-                .position(|s| matches!(s, Step::Pass { .. }))
-                .unwrap();
-            send(&mut a, GuideAction::Go(first));
-            assert!(!texts(&a).iter().any(|s| s == warning));
-        }
-    }
-    #[test]
-    fn next_and_back_move_the_place_and_it_is_saved_without_an_undo_step() {
-        let mut a = app("Yes");
-        assert_eq!(place(&a), 0);
-        assert!(has(&a, "Hold"));
-        let edits = a.project_dirty;
-        send(&mut a, GuideAction::Next);
-        send(&mut a, GuideAction::Next);
-        assert_eq!(place(&a), 2);
-        send(&mut a, GuideAction::Back);
-        assert_eq!(place(&a), 1);
-        assert!(has(&a, "Zero"));
-        assert!(a.dirty && a.undo.is_none());
-        assert_eq!(a.project_dirty, edits);
-        // At the Holes, Next and Back go hole by hole first.
-        let g = guide(&a);
-        let holes = (g.steps.iter())
-            .position(|s| matches!(s, Step::Holes { .. }))
-            .unwrap();
-        send(&mut a, GuideAction::Go(holes));
-        send(&mut a, GuideAction::Next);
-        assert_eq!((place(&a), a.guide_item), (holes, 1));
-        assert!(has(&a, "HOLE 2 OF 4"));
-        send(&mut a, GuideAction::Back);
-        send(&mut a, GuideAction::Back);
-        assert_eq!((place(&a), a.guide_item), (holes - 1, 0));
-        // The place goes with the project.
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("job.axis.json");
-        crate::storage::save(&path, &a.doc).unwrap();
-        let doc = crate::storage::load(&path).unwrap();
-        assert_eq!(doc.guide.get(&doc.setups[0].id), Some(&(holes - 1)));
-    }
-    #[test]
-    fn a_drill_step_says_the_cycle_its_pecks_and_feed() {
-        // The Holes' drill as planned: its feed, and the pecks of each cycle
-        // with how far the quill comes back between them.
-        for (cycle, back) in [
-            ("Chip breaking", Some("back off 0.5 each")),
-            ("Deep drilling", Some("out of the hole each")),
-            ("Drilling", None),
-        ] {
-            let mut a = app_with("Yes", |doc| {
-                let op = (doc.setups[0].operations.iter_mut())
-                    .find(|o| o.strategy == Strategy::Drill)
-                    .unwrap();
-                op.p.insert("cycle".into(), cycle.into());
-                op.p.insert("peck".into(), "3".into());
-                op.p.insert("feed".into(), "150".into());
-            });
-            let holes = (guide(&a).steps.iter())
-                .position(|s| matches!(s, Step::Holes { .. }))
-                .unwrap();
-            send(&mut a, GuideAction::Go(holes));
-            if let Ok(dir) = std::env::var("AXIS_RENDER_DIR") {
-                let path = std::path::Path::new(&dir).join(format!("drill-{cycle}.png"));
-                render(&a, (1280, 800), &path);
-            }
-            let t = texts(&a);
-            assert!(has(&a, "150 mm/min"), "{t:?}");
-            match back {
-                Some(back) => {
-                    let line = format!("drill to · 42 deep · peck 3 mm · {back}");
-                    assert!(has(&a, &line) && has(&a, cycle), "{t:?}");
-                }
-                None => assert!(has(&a, "drill to · 42 deep"), "{t:?}"),
-            }
-        }
-    }
-    #[test]
-    fn a_section_opens_at_its_first_unfinished_step_and_the_bar_shows_progress() {
-        let mut a = app("Yes");
-        let g = guide(&a);
-        let names: Vec<&str> = g.sections.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["Set up", "Face", "Step", "Holes", "Hand over"]);
-        send(&mut a, GuideAction::Section(2));
-        assert_eq!(place(&a), g.sections[2].steps.start);
-        // The Step: Tool, its two passes (one row a level, LIO-366), Check.
-        assert!(has(&a, "1/4"), "{:?}", texts(&a));
-        // Two passes on: the bar and the header say where.
-        send(&mut a, GuideAction::Next);
-        send(&mut a, GuideAction::Next);
-        let t = texts(&a);
-        // The list says it on its line, the header after where the job is
-        // (LIO-431).
-        assert_eq!(t.iter().filter(|s| *s == "pass 2/2").count(), 1, "{t:?}");
-        assert!(
-            t.iter()
-                .any(|s| s.starts_with("Setup 1 of ") && s.ends_with(" · pass 2/2")),
-            "{t:?}"
-        );
-        // The sections ahead show their counts, the next setup is last.
-        // Each with what it counts (LIO-377).
-        assert!(t.contains(&"Holes".to_string()) && t.contains(&"4 holes".to_string()));
-        assert!(
-            t.contains(&format!("→ {}", a.doc.setups[1].name())),
-            "{t:?}"
-        );
-        // Tapping the section the place is in keeps it; another starts it.
-        let at = place(&a);
-        send(&mut a, GuideAction::Section(2));
-        assert_eq!(place(&a), at);
-        send(&mut a, GuideAction::Section(1));
-        assert_eq!(place(&a), g.sections[1].steps.start);
     }
     #[test]
     fn the_page_shows_without_a_controller_and_says_when_it_is_not_ready() {
@@ -8660,577 +4498,6 @@ pub(crate) mod tests {
         a.doc.guide.insert(id, at);
         a.guide_item = item;
     }
-    /// The spindle adapter plate's setup 3, face up under toe clamps on
-    /// its long sides (`-Y:0;+Y:0`): its Zero screen at 1280 × 800 into
-    /// `AXIS_RENDER_DIR`, with its touches in `zero.txt` (LIO-458).
-    /// `AXIS_ADAPTER_PLATE` names a folder with copies of the plate's
-    /// project, adapter-plate.axis.json, and its part, adapter-plate.step.
-    #[test]
-    #[ignore = "private adapter acceptance; headless only"]
-    fn render_the_adapter_plates_clamped_zero() {
-        let (Ok(plate), Ok(out)) = (
-            std::env::var("AXIS_ADAPTER_PLATE"),
-            std::env::var("AXIS_RENDER_DIR"),
-        ) else {
-            eprintln!("skipped: set AXIS_ADAPTER_PLATE and AXIS_RENDER_DIR");
-            return;
-        };
-        let (plate, out) = (std::path::Path::new(&plate), std::path::Path::new(&out));
-        std::fs::create_dir_all(out).unwrap();
-        let mut doc = crate::storage::load(&plate.join("adapter-plate.axis.json")).unwrap();
-        let step = plate.join("adapter-plate.step");
-        if let Some(f) = doc.file.as_mut() {
-            f.path = step.clone();
-        }
-        let mesh = crate::mesh::load(&step).unwrap();
-        doc.active = doc.setups[2].id.clone();
-        let dir = tempfile::tempdir().unwrap();
-        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
-        a.doc = doc;
-        a.imported_mesh = Some(mesh);
-        a.page = crate::Page::Control;
-        build(&mut a);
-        let id = a.doc.setups[2].id.clone();
-        a.doc.guide.insert(id, 1);
-        a.guide_item = 0;
-        let g = guide(&a);
-        std::fs::write(
-            out.join("zero.txt"),
-            format!("{:#?}\n{}", g.steps[1], texts(&a).join("\n")),
-        )
-        .unwrap();
-        render(&a, (1280, 800), &out.join("setup3-zero.png"));
-        // Clamps 55.6 wide at −31.7 and 33.9 on the front, its Box
-        // operations alone: X 0.6 to 1.6 is all of the front clear for the
-        // Ø5 finder, between two of its samples.
-        let mut wide = (a.doc.workholding.iter())
-            .find(|h| h.id == get(&a.doc.setups[2].p, "holder"))
-            .unwrap()
-            .clone();
-        wide.id = "clamp-55.6".into();
-        wide.p.insert("width".into(), "55.6".into());
-        a.doc.workholding.push(wide);
-        let s = &mut a.doc.setups[2];
-        s.operations.truncate(2);
-        s.p.insert("holder".into(), "clamp-55.6".into());
-        s.p.insert("clamps".into(), "-Y:-31.7;-Y:33.9;+Y:0".into());
-        build(&mut a);
-        if let Some((_, Err(e))) = &a.guide {
-            panic!("{e}");
-        }
-        let id = a.doc.setups[2].id.clone();
-        a.doc.guide.insert(id, 1);
-        std::fs::write(
-            out.join("zero-narrow-gap.txt"),
-            format!("{:#?}\n{}", guide(&a).steps[1], texts(&a).join("\n")),
-        )
-        .unwrap();
-        render(&a, (1280, 800), &out.join("setup3-zero-narrow-gap.png"));
-        // A face with no stretch clear: the 124 × 120 test block's front
-        // under one strap 140 wide (the plate's own cuts would run into
-        // such a strap).
-        let mut a = app_with("Yes", |doc| {
-            doc.setups[0].operations.drain(..2);
-            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
-            crate::guide::tests::on_clamps(doc, "-Y:0;+Y:-30", "140");
-        });
-        send(&mut a, GuideAction::Go(1));
-        render(
-            &a,
-            (1280, 800),
-            &out.join("block-zero-front-under-a-strap.png"),
-        );
-    }
-    #[test]
-    #[ignore = "private adapter acceptance; headless only"]
-    fn render_manual_capsule_adapter_steps() {
-        let (mut doc, mesh, dir) = crate::slot::tests::adapter();
-        doc.active = doc.setups[2].id.clone();
-        let mut a = App::from_workspace(dir.join("render-state.axis.json"), None);
-        a.doc = doc;
-        a.imported_mesh = Some(mesh);
-        a.page = crate::Page::Control;
-        a.window_width = 1440.;
-        a.window_height = 1000.;
-        build(&mut a);
-        let guide = a.guide_at().unwrap().0.guide.clone();
-        let mut text = String::new();
-        for op in 7..15 {
-            for last in [false, true] {
-                let indices = guide
-                    .steps
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| matches!(s,Step::Slot{op:o,..} if *o==op).then_some(i))
-                    .collect::<Vec<_>>();
-                let at = if last {
-                    *indices.last().unwrap()
-                } else {
-                    indices[0]
-                };
-                a.doc.guide.insert(a.doc.setups[2].id.clone(), at);
-                a.guide_item = 0;
-                let strings = crate::ui::probe::texts(a.view(), Size::new(1440., 1000.));
-                assert!(
-                    strings.iter().any(|s| s.contains("DRO comp OFF")),
-                    "{strings:?}"
-                );
-                text += &format!(
-                    "OP {op} {}\n{}\n",
-                    if last { "last" } else { "first" },
-                    strings.join("\n")
-                );
-                render(
-                    &a,
-                    (1440, 1000),
-                    &dir.join(format!(
-                        "steps-{op:02}-{}.png",
-                        if last { "last" } else { "first" }
-                    )),
-                );
-            }
-        }
-        std::fs::write(dir.join("rendered-steps.txt"), text).unwrap();
-    }
-    /// A sweep says what comes after it (LIO-455 review): with a walk round
-    /// the slot at its level, stay down; with a cutter so near the slot's
-    /// width that only the finish walks round it, lift.
-    #[test]
-    fn a_slot_sweep_says_whether_to_stay_down_or_lift() {
-        for (width, length, stays) in [("16.5", "21.5", true), ("12.2", "17.2", false)] {
-            let mesh = crate::mesh::normalize(crate::slot::tests::counterbore(
-                (60., 50., 20.),
-                length.parse().unwrap(),
-                width.parse().unwrap(),
-                2.,
-                false,
-            ))
-            .unwrap();
-            let mut doc = crate::slot::tests::job(
-                &mesh,
-                "12",
-                &[
-                    ("slot_width", width),
-                    ("slot_length", length),
-                    ("z_top", "0"),
-                    ("z_bottom", "-2"),
-                    ("through", "No"),
-                    ("stepdown", "1"),
-                ],
-            );
-            doc.active = doc.setups[0].id.clone();
-            doc.file = Some(crate::model::ModelFile {
-                name: "counterbore.stl".into(),
-                path: std::path::PathBuf::from("counterbore.stl"),
-                format: "stl".into(),
-                bytes: 1,
-                thickness: None,
-            });
-            let dir = tempfile::tempdir().unwrap();
-            let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
-            a.doc = doc;
-            a.imported_mesh = Some(mesh);
-            a.page = crate::Page::Control;
-            build(&mut a);
-            let guide = a.guide_at().unwrap().0.guide.clone();
-            let at = (guide.steps.iter())
-                .position(|s| {
-                    matches!(
-                        s,
-                        Step::Slot {
-                            pass: crate::slot::Kind::Sweep,
-                            ..
-                        }
-                    )
-                })
-                .unwrap();
-            let id = a.doc.setups[0].id.clone();
-            a.doc.guide.insert(id, at);
-            a.guide_item = 0;
-            let t = texts(&a);
-            let has = |w: &str| t.iter().any(|s| s.contains(w));
-            assert_eq!(has("Stay down at the far end"), stays, "{width}: {t:?}");
-            assert_eq!(has("Lift at the far end"), !stays, "{width}: {t:?}");
-            if !stays {
-                continue;
-            }
-            // The walk's other way, on the DRO's arc function, leaves it
-            // after each round end, where the walk's own readings are
-            // (LIO-488).
-            let at = (guide.steps.iter())
-                .position(|s| {
-                    matches!(
-                        s,
-                        Step::Slot {
-                            pass: crate::slot::Kind::Outline { .. },
-                            ..
-                        }
-                    )
-                })
-                .unwrap();
-            let Step::Slot {
-                a: start,
-                b: end,
-                radius,
-                left,
-                tool,
-                points,
-                ..
-            } = &guide.steps[at]
-            else {
-                panic!()
-            };
-            a.doc.guide.insert(a.doc.setups[0].id.clone(), at);
-            let t = texts(&a);
-            let or = (t.iter())
-                .find(|s| s.starts_with("Or step each round end on the DRO's arc function"))
-                .unwrap_or_else(|| panic!("{t:?}"));
-            assert!(
-                or.contains("Leave the arc function at the end of each round end"),
-                "{or}"
-            );
-            let r = radius - left - tool;
-            for c in [end, start] {
-                let said = points.iter().any(|p| {
-                    ((p[0] - c[0]).hypot(p[1] - c[1]) - r).abs() < 0.01
-                        && or.contains(&format!("X {} Y {}", dro(p[0]), dro(p[1])))
-                });
-                assert!(said, "{c:?} r {r}: {or}");
-            }
-        }
-    }
-    /// LIO-550: a Slot whose round ends are bored only joins them, and its
-    /// pages say so: a level's walk is four straight readings (out to the
-    /// side inside the bored end, along it, across, back along the other
-    /// side), the finish the straight walls at size; nothing steps round an
-    /// end, nor offers the DRO's arc function.
-    #[test]
-    fn a_slot_joining_bored_ends_reads_as_a_few_straight_moves() {
-        let mesh = crate::mesh::normalize(crate::slot::tests::counterbore(
-            (60., 50., 20.),
-            21.5,
-            16.5,
-            2.,
-            false,
-        ))
-        .unwrap();
-        let mut doc = crate::slot::tests::job(
-            &mesh,
-            "12",
-            &[
-                ("slot_width", "16.5"),
-                ("slot_length", "21.5"),
-                ("z_top", "0"),
-                ("z_bottom", "-2"),
-                ("through", "No"),
-                ("stepdown", "1"),
-                ("slot_ends", crate::slot::ENDS[2]),
-            ],
-        );
-        doc.active = doc.setups[0].id.clone();
-        doc.file = Some(crate::model::ModelFile {
-            name: "counterbore.stl".into(),
-            path: std::path::PathBuf::from("counterbore.stl"),
-            format: "stl".into(),
-            bytes: 1,
-            thickness: None,
-        });
-        let dir = tempfile::tempdir().unwrap();
-        let mut a = App::from_workspace(dir.path().join("workspace.json"), None);
-        a.doc = doc;
-        a.imported_mesh = Some(mesh);
-        a.page = crate::Page::Control;
-        build(&mut a);
-        let guide = a.guide_at().unwrap().0.guide.clone();
-        let id = a.doc.setups[0].id.clone();
-        let slots: Vec<usize> = (guide.steps.iter().enumerate())
-            .filter_map(|(i, s)| matches!(s, Step::Slot { .. }).then_some(i))
-            .collect();
-        // Two levels, each the centre line and one walk; then the finish.
-        assert_eq!(slots.len(), 5);
-        let mut seen = [false; 3];
-        for &at in &slots {
-            let Step::Slot {
-                pass,
-                targets,
-                joined,
-                ..
-            } = &guide.steps[at]
-            else {
-                panic!()
-            };
-            assert!(joined);
-            let xy = targets.iter().filter(|t| t.axis < 2 && t.feed).count();
-            a.doc.guide.insert(id.clone(), at);
-            a.guide_item = 0;
-            let t = texts(&a);
-            let has = |w: &str| t.iter().any(|s| s.contains(w));
-            assert!(!has("step 1 of"), "{t:?}");
-            assert!(!has("arc function"), "{t:?}");
-            assert!(!has("end's tip"), "{t:?}");
-            match pass {
-                crate::slot::Kind::Sweep => {
-                    seen[0] = true;
-                    assert_eq!(xy, 1);
-                    assert!(has("the straight passes along the sides follow"), "{t:?}");
-                }
-                crate::slot::Kind::Outline { .. } => {
-                    seen[1] = true;
-                    assert_eq!(xy, 4, "{targets:?}");
-                    for w in [
-                        "straight along each side between the bored ends",
-                        "Join the bored ends clockwise",
-                        "out to the side, inside the bored end",
-                        "straight side",
-                        "across inside the bored end",
-                        "straight between the bored ends, a pass a screen",
-                    ] {
-                        assert!(has(w), "{w}: {t:?}");
-                    }
-                }
-                crate::slot::Kind::Finish => {
-                    seen[2] = true;
-                    // Out, along, across, along, back to the centre.
-                    assert_eq!(xy, 5, "{targets:?}");
-                    for w in [
-                        "Finish the straight walls at size on the floor",
-                        "nothing is stepped round them",
-                        "back to the centre, off the wall",
-                        "the straight walls at size, full depth",
-                    ] {
-                        assert!(has(w), "{w}: {t:?}");
-                    }
-                }
-            }
-        }
-        assert_eq!(seen, [true; 3]);
-        // The Check lists no stepped round ends to gauge.
-        let shown = a.guide_at().unwrap().0;
-        let top = shown.boxes[0].max[2] + guide.zero[2];
-        let m = measures(&a.doc, &guide, &guide.done[0], top);
-        assert!(m.iter().all(|x| x.axis != "R"), "{m:?}");
-    }
-    /// LIO-488 review: when the last hole is the work zero itself, both
-    /// readings are 0.00 in either mode, and the screen says so.
-    #[test]
-    fn leaving_the_hole_function_on_the_work_zero_says_both_read_0() {
-        let mut a = app_with("Yes", |d| d.setups[0].operations.swap(1, 2));
-        let g = guide(&a);
-        let at = (g.steps.iter())
-            .position(|s| matches!(s, Step::Leave { .. }))
-            .unwrap();
-        let Step::Leave {
-            op, from, number, ..
-        } = g.steps[at]
-        else {
-            panic!()
-        };
-        let mut zeroed = g.clone();
-        zeroed.steps[at] = Step::Leave {
-            op,
-            from,
-            at: [0., 0.],
-            number,
-        };
-        let (key, Ok(shown)) = a.guide.clone().unwrap() else {
-            panic!()
-        };
-        let mut moved = shown.again(&a.doc, a.part_mesh().unwrap()).unwrap();
-        moved.guide = zeroed;
-        a.guide = Some((key, Ok(Arc::new(moved))));
-        send(&mut a, GuideAction::Go(at));
-        let t = texts(&a);
-        assert!(
-            t.contains(&"reads · the work zero: 0.00 in either mode".to_string()),
-            "{t:?}"
-        );
-        assert!(
-            !t.iter()
-                .any(|s| s.contains("no longer 0.00") || s.contains("still in the hole function")),
-            "{t:?}"
-        );
-        assert!(
-            t.iter()
-                .any(|s| s.contains("not the hole function's screen")),
-            "{t:?}"
-        );
-    }
-    /// The redesigned adapter's counterbores with a Ø12 (LIO-455): its
-    /// Steps pages rendered from a private copy of the STEP, the tool, a
-    /// level's sweep and walk, the finish and the Check, at the first
-    /// reading and part way round a walk.
-    #[test]
-    #[ignore = "requires the private copy of the redesigned adapter STEP (AXIS_LIO455_FIXTURE)"]
-    fn render_redesigned_adapter_counterbore_steps() {
-        let (mut doc, mesh, dir) = crate::slot::tests::redesigned();
-        doc.active = doc.setups[0].id.clone();
-        if let Err(e) = shown(&doc, &mesh, 0) {
-            panic!("{e}");
-        }
-        let mut a = App::from_workspace(dir.join("render-state.axis.json"), None);
-        a.doc = doc;
-        a.imported_mesh = Some(mesh);
-        a.page = crate::Page::Control;
-        a.window_width = 1440.;
-        a.window_height = 1000.;
-        build(&mut a);
-        let guide = a.guide_at().unwrap().0.guide.clone();
-        let id = a.doc.setups[0].id.clone();
-        let find = |f: &dyn Fn(&Step) -> bool| {
-            guide
-                .steps
-                .iter()
-                .position(f)
-                .unwrap_or_else(|| panic!("no such step in {:#?}", guide.steps.len()))
-        };
-        use crate::slot::Kind;
-        let pages = [
-            ("01-tool", find(&|s| matches!(s, Step::Tool { .. })), 0),
-            (
-                "02-level-1-sweep",
-                find(&|s| {
-                    matches!(
-                        s,
-                        Step::Slot {
-                            op: 0,
-                            pass: Kind::Sweep,
-                            level: 1,
-                            ..
-                        }
-                    )
-                }),
-                0,
-            ),
-            (
-                "03-level-1-outline",
-                find(&|s| {
-                    matches!(
-                        s,
-                        Step::Slot {
-                            op: 0,
-                            pass: Kind::Outline { .. },
-                            level: 1,
-                            ..
-                        }
-                    )
-                }),
-                0,
-            ),
-            (
-                "04-level-1-outline-walking",
-                find(&|s| {
-                    matches!(
-                        s,
-                        Step::Slot {
-                            op: 0,
-                            pass: Kind::Outline { .. },
-                            level: 1,
-                            ..
-                        }
-                    )
-                }),
-                9,
-            ),
-            (
-                "05-finish",
-                find(&|s| {
-                    matches!(
-                        s,
-                        Step::Slot {
-                            op: 0,
-                            pass: Kind::Finish,
-                            ..
-                        }
-                    )
-                }),
-                0,
-            ),
-            (
-                "06-finish-walking",
-                find(&|s| {
-                    matches!(
-                        s,
-                        Step::Slot {
-                            op: 0,
-                            pass: Kind::Finish,
-                            ..
-                        }
-                    )
-                }),
-                30,
-            ),
-            ("07-check", find(&|s| matches!(s, Step::Check { op: 0 })), 0),
-        ];
-        let mut text = String::new();
-        for (name, at, item) in pages {
-            a.doc.guide.insert(id.clone(), at);
-            a.guide_item = item;
-            let strings = crate::ui::probe::texts(a.view(), Size::new(1440., 1000.));
-            text += &format!(
-                "PAGE {name} (step {at}, item {item})\n{}\n\n",
-                strings.join("\n")
-            );
-            render(&a, (1440, 1000), &dir.join(format!("{name}.png")));
-        }
-        std::fs::write(dir.join("rendered-steps.txt"), text).unwrap();
-    }
-    /// Every hole page starts with Z up to a safe height, a DRO reading,
-    /// before X and Y move (LIO-449): the plan's clearance over the stock,
-    /// above the jaws too; the depth comes after the axes.
-    #[test]
-    fn every_hole_page_lifts_to_a_safe_z_before_x_and_y_move() {
-        let mut a = app("Yes");
-        let shown = a.guide_at().unwrap().0;
-        let g = shown.guide.clone();
-        let id = a.doc.setups[0].id.clone();
-        let mut seen = 0;
-        for (at, step) in g.steps.iter().enumerate() {
-            let Step::Holes { op, holes, .. } = step else {
-                continue;
-            };
-            let j = g.done.iter().position(|d| d.op == *op).unwrap();
-            let o = &a.doc.setups[0].operations[*op];
-            // The operation's clearance over the setup's stock top, in work Z.
-            let clear = (g.done[j].plan.stock.max[2] - g.zero[2])
-                + num(&o.p, "top").unwrap_or(0.)
-                + num(&o.p, "clearance").unwrap();
-            let top = shown.boxes[j].max[2];
-            let jaws = (shown.jaws.iter()).map(|b| b.max[2]).fold(top, f32::max);
-            let safe = clear.max(jaws + SAFE_ABOVE);
-            assert!(safe >= top + SAFE_ABOVE - 1e-4 && safe >= jaws + SAFE_ABOVE - 1e-4);
-            // The MCP's steps read it the same (`Lifts`), the guide's own
-            // or one worked out for it.
-            let mesh = a.part_mesh().unwrap();
-            let lifts = [shown.lifts(), Lifts::of(&a.doc, mesh, &g)];
-            for l in &lifts {
-                assert_eq!(dro(l.z(&a.doc, &g, *op)), dro(safe));
-                assert_eq!(l.holder(), lifts[0].holder());
-            }
-            let clear_of = format!("clear of the stock and {}", lifts[0].holder());
-            for item in 0..holes.len() {
-                a.doc.guide.insert(id.clone(), at);
-                a.guide_item = item;
-                a.guide_reached = 0;
-                let t = texts(&a);
-                assert_eq!(after(&t, "up to"), ["Z", &dro(safe)], "hole {item}: {t:?}");
-                let lift = t.iter().position(|s| s == "up to").unwrap();
-                // Its order: 1, then the axes, then the depth.
-                assert_eq!(t[lift - 1], "1", "{t:?}");
-                let axes = t.iter().position(|s| s == "X" || s == "Y").unwrap();
-                assert!(lift < axes, "{t:?}");
-                assert!(t.iter().any(|s| s.contains("before X and Y move")), "{t:?}");
-                assert!(
-                    t.iter().any(|s| s.starts_with(&clear_of)),
-                    "{clear_of}: {t:?}"
-                );
-                // The lift is the first readout lit; reached, the axes are.
-                send(&mut a, GuideAction::Reached(0));
-                assert_eq!(a.guide_reached, 1);
-                seen += 1;
-            }
-        }
-        assert!(seen >= 2, "{seen} hole pages");
-    }
     /// A Slot (LIO-445) on the 40 × 30 × 8 slotted plate in the vise, cut
     /// blind to `bottom` or through (LIO-449).
     pub(crate) fn slot_job(through: bool, bottom: &str) -> (Document, crate::mesh::Mesh) {
@@ -9290,44 +4557,6 @@ pub(crate) mod tests {
             on("-12; 12", "0.2"),
             Err("Slot 15x10: the tool goes 0.30 mm past the 0.2 mm parallels the part stands on, into the table or vise under them. Reduce the depth or the breakthrough.".into())
         );
-    }
-    /// A Slot's Check page gives what to measure (LIO-449): its length and
-    /// width, its floor below the row's top and on the DRO, or through and
-    /// to check the back; and where its centre is, listed, not drawn.
-    #[test]
-    fn a_slots_check_gives_its_sizes_depth_and_place() {
-        for through in [false, true] {
-            let (doc, mesh) = slot_job(through, if through { "-8" } else { "-5" });
-            let shown = shown(&doc, &mesh, 0).unwrap();
-            let g = &shown.guide;
-            assert!(g.steps.iter().any(|s| matches!(s, Step::Check { op: 0 })));
-            let top = shown.boxes[0].max[2] + g.zero[2];
-            let m = measures(&doc, g, &g.done[0], top);
-            let row = |axis: &str, value: f32| {
-                (m.iter())
-                    .find(|x| x.axis == axis && (x.value - value).abs() < 0.01)
-                    .unwrap_or_else(|| panic!("{axis} {value} in {m:?}"))
-            };
-            assert!(row("X", 15.).words.contains(&"long".to_string()));
-            assert!(row("Y", 10.).words.contains(&"wide".to_string()));
-            let depth = row("Z", if through { 8. } else { 5. });
-            if through {
-                assert_eq!(depth.words, ["through: check the back and deburr"]);
-            } else {
-                assert_eq!(
-                    depth.words,
-                    ["deep below the row's top Z 0.00", "floor Z −5.00"]
-                );
-            }
-            // Its centre on the DRO: listed, not drawn.
-            for axis in ["X", "Y"] {
-                let at = row(axis, 0.);
-                assert_eq!(at.words, ["the slot's centre on the DRO"]);
-                assert!(!drawn(at));
-            }
-            assert_eq!(m.iter().filter(|x| drawn(x)).count(), 3);
-            assert_eq!(shown.dims[1].len(), 3, "{:?}", shown.dims[1]);
-        }
     }
     /// The Check page's depth of a drilled hole on the manual mill
     /// (LIO-450): `mesh` drilled with a Ø`size` drill, through with 2.5 of
@@ -9428,192 +4657,6 @@ pub(crate) mod tests {
             "{off}"
         );
     }
-    /// `drilled`'s one depth, drawn from the mouth down as far as it says.
-    fn drilled_depth(mesh: &Mesh, size: &str, through: bool, bottom: &str, air: &str) -> Measure {
-        let (doc, g, top) = drilled(mesh, size, through, bottom, air);
-        let m = measures(&doc, &g, &g.done[0], top);
-        let deep = m.into_iter().find(|x| x.axis == "Z").unwrap();
-        assert!(
-            (deep.from[2] - deep.to[2] - deep.value).abs() < 0.01,
-            "{deep:?}"
-        );
-        deep
-    }
-    /// A through hole's Check says through, with the material's thickness
-    /// at the hole, not how far the drill's tip went past its back
-    /// (LIO-450): the adapter plate's Ø6.8 through 18.5.
-    #[test]
-    fn a_through_holes_check_says_through_and_the_thickness_not_the_tips_depth() {
-        let mesh = crate::cam::boring::tests::ring(6.8, 30., 18.5);
-        // From the stock's top, the cut starting there or 1.5 over it (Top):
-        // the same mouth, drawn from the same height.
-        let mut mouth = None;
-        for air in ["0", "1.5"] {
-            let deep = drilled_depth(&mesh, "6.8", true, "0", air);
-            assert!((deep.value - 18.5).abs() < 0.01, "{air}: {deep:?}");
-            assert_eq!(deep.words, ["through", "check it breaks out at the back"]);
-            let at = *mouth.get_or_insert(deep.from[2]);
-            assert!((deep.from[2] - at).abs() < 0.01, "{air}: {deep:?}");
-        }
-    }
-    /// A blind hole's Check gives its depth from the mouth to its full
-    /// diameter, the drill's 118° point below it left out (LIO-450): a Ø8
-    /// hole 8 deep, its drill-point floor 2.4 lower; and to the tip, saying
-    /// so, when the cut is too shallow to reach the full diameter.
-    #[test]
-    fn a_blind_holes_check_gives_its_full_diameter_depth_without_the_point() {
-        let point = 4. * crate::simulation::POINT_RISE;
-        let section = [
-            (0., -4.),
-            (12., -4.),
-            (12., 10.),
-            (4., 10.),
-            (4., 2.),
-            (0., 2. - point),
-        ];
-        let mesh = crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
-        let deep = drilled_depth(&mesh, "8", false, "0", "0");
-        assert!((deep.value - 8.).abs() < 0.01, "{deep:?}");
-        assert_eq!(
-            deep.words,
-            ["deep from the mouth", "to the full Ø, not the point"]
-        );
-        // Stopped 9.4 over the floor, 1 into the stock: the point only, its
-        // full Ø never reached; measured to its tip, down, not −1.4.
-        let deep = drilled_depth(&mesh, "8", false, "9.4", "0");
-        assert!((deep.value - 1.).abs() < 0.01, "{deep:?}");
-        assert!(deep.to[2] < deep.from[2], "{deep:?}");
-        assert_eq!(
-            deep.words,
-            [
-                "deep from the mouth to the point's tip",
-                "the full Ø is not reached"
-            ]
-        );
-    }
-    /// One Drill's holes from mouths at two heights (LIO-450): those whose
-    /// cut reaches the full Ø give that depth, those too shallow for it
-    /// their tip's, each named by its DRO hole number. The blind Ø8 job
-    /// with a second hole whose mouth is 1 over its tip.
-    #[test]
-    fn a_drills_holes_that_do_and_do_not_reach_the_full_diameter_are_told_apart() {
-        let point = 4. * crate::simulation::POINT_RISE;
-        let section = [
-            (0., -4.),
-            (12., -4.),
-            (12., 10.),
-            (4., 10.),
-            (4., 2.),
-            (0., 2. - point),
-        ];
-        let mesh = crate::mesh::normalize(crate::cam::tests::revolved(&section)).unwrap();
-        let (doc, mut g, top) = drilled(&mesh, "8", false, "0", "0");
-        for st in &mut g.steps {
-            if let Step::Holes {
-                holes,
-                mouths,
-                numbers,
-                ..
-            } = st
-            {
-                let h = holes[0];
-                holes.push([h[0] + 20., h[1], h[2]]);
-                mouths.push(h[2] + 1.);
-                *numbers = vec![1, 2];
-            }
-        }
-        let m = measures(&doc, &g, &g.done[0], top);
-        let deep: Vec<&Measure> = m.iter().filter(|x| x.axis == "Z").collect();
-        assert_eq!(deep.len(), 2, "{m:?}");
-        assert!((deep[0].value - 8.).abs() < 0.01, "{m:?}");
-        assert_eq!(
-            deep[0].words,
-            [
-                "hole 1",
-                "deep from the mouth",
-                "to the full Ø, not the point"
-            ]
-        );
-        assert!((deep[1].value - 1.).abs() < 0.01, "{m:?}");
-        assert_eq!(
-            deep[1].words,
-            [
-                "hole 2",
-                "deep from the mouth to the point's tip",
-                "the full Ø is not reached"
-            ]
-        );
-        for d in deep {
-            assert!((d.from[2] - d.to[2] - d.value).abs() < 0.01, "{d:?}");
-        }
-    }
-    /// A Drill of fixture-pin holes on the manual mill (LIO-450): 7 deep
-    /// for 6 mm pins, from the face, to the full Ø; blind whatever Through
-    /// says and with or without a Top offset, which `cam::pin_holes` uses
-    /// neither of.
-    #[test]
-    fn a_pin_holes_check_gives_its_full_diameter_depth_from_the_face() {
-        use crate::cam::boring::tests::{drill, drilling, job, ring};
-        let mesh = ring(6.8, 30., 18.5);
-        let mut mouth = None;
-        for (air, through) in [("0", "No"), ("1.5", "No"), ("0", "Yes"), ("1.5", "Yes")] {
-            let mut manual = crate::manual::defaults();
-            for (k, v) in [
-                ("pins", "0 0; 50 0"),
-                ("pin_diameter", "4"),
-                ("pin_height", "6"),
-            ] {
-                manual.p.insert(k.into(), v.into());
-            }
-            let mut tool = drill("4.1");
-            tool.p.insert("machines".into(), manual.id.clone());
-            let mut op = drilling(&mesh, &tool, "Drilling");
-            for (k, v) in [
-                ("holes", crate::model::DRILL_HOLES[1]),
-                ("rpm", "640"),
-                ("feed", "60"),
-                ("top", air),
-                ("through", through),
-            ] {
-                op.p.insert(k.into(), v.into());
-            }
-            let (mut doc, _) = job(&mesh, manual, vec![(tool, op)]);
-            let setup = &mut doc.setups[0];
-            for (k, v) in [
-                ("stock_top", "0"),
-                ("stock_left", "20"),
-                ("stock_right", "20"),
-            ] {
-                setup.p.insert(k.into(), v.into());
-            }
-            let frame = crate::volume::Frame::new(setup, &mesh);
-            let points = [[-25., 0., 0.], [25., 0., 0.]].map(|p| frame.unmap(p));
-            let (o, d) = (frame.unmap([0.; 3]), frame.unmap([0., 0., -1.]));
-            let pin = &mut setup.operations[0].p;
-            pin.insert("pin_points".into(), crate::post::pin_holes_text(&points));
-            let axis = format!("{} {} {}", d[0] - o[0], d[1] - o[1], d[2] - o[2]);
-            pin.insert("pin_axis".into(), axis);
-            let shown = shown(&doc, &mesh, 0).unwrap();
-            let g = &shown.guide;
-            let top = shown.boxes[0].max[2] + g.zero[2];
-            let m = measures(&doc, g, &g.done[0], top);
-            let deep = m.iter().find(|x| x.axis == "Z").unwrap();
-            let case = format!("Top {air}, Through {through}");
-            assert!((deep.value - 7.).abs() < 0.01, "{case}: {deep:?}");
-            assert_eq!(
-                deep.words,
-                ["deep from the mouth", "to the full Ø, not the point"],
-                "{case}"
-            );
-            assert!(
-                (deep.from[2] - deep.to[2] - 7.).abs() < 0.01,
-                "{case}: {deep:?}"
-            );
-            // From the face, the same with Top or without.
-            let at = *mouth.get_or_insert(deep.from[2]);
-            assert!((deep.from[2] - at).abs() < 0.01, "{case}: {deep:?}");
-        }
-    }
     /// Steps entered from planning (LIO-449): at the start of the operation
     /// picked there, saying where the steps had got to, one press from it;
     /// with none picked, where they were left, saying so; the line goes
@@ -9625,8 +4668,9 @@ pub(crate) mod tests {
         let id = a.doc.setups[0].id.clone();
         let si = a.doc.index();
         let last = g.steps.len() - 1;
+        // The Step, the second operation: a page of its own (LIO-688).
         let k = (g.sections.iter())
-            .position(|s| s.op.is_some() && s.steps.len() > 1)
+            .position(|s| s.op == Some(1))
             .unwrap();
         let (picked, start) = (g.sections[k].op.unwrap(), g.sections[k].steps.start);
         // Picked, the place at the hand-over: the operation's start.
@@ -9648,25 +4692,12 @@ pub(crate) mod tests {
         send(&mut a, GuideAction::Resume);
         assert_eq!(place(&a), last);
         assert_eq!(a.steps_entry, None);
-        // Entered by MACHINE's page, the place in the picked operation:
-        // kept, and said to be resumed.
-        a.doc.guide.insert(id.clone(), start + 1);
+        // Entered by MACHINE's page at the picked operation's page: kept,
+        // nothing to say.
+        a.doc.guide.insert(id.clone(), start);
         a.page = Page::Work;
         let _ = a.update(Message::Page(Page::Control));
-        assert_eq!(place(&a), start + 1);
-        assert!(matches!(&a.steps_entry, Some(Entry::Resumed { .. })));
-        let t = texts(&a);
-        assert!(
-            t.iter()
-                .any(|s| s.starts_with("Resuming where these steps were left:")),
-            "{t:?}"
-        );
-        // Its button starts the operation again; the line goes.
-        let again = (t.iter()).find(|s| s.starts_with("◀ Start ") && s.ends_with(" again"));
-        assert!(again.is_some(), "{t:?}");
-        send(&mut a, GuideAction::Go(start));
-        assert_eq!(a.steps_entry, None);
-        assert!(!texts(&a).iter().any(|s| s.starts_with("Resuming")));
+        assert_eq!((place(&a), a.steps_entry.clone()), (start, None));
         // Picked, but the steps are not there yet (a fresh job): kept at
         // the start, none skipped unasked; the picked one a press away.
         a.doc.guide.insert(id.clone(), 0);
@@ -9699,319 +4730,24 @@ pub(crate) mod tests {
         a.selected = None;
         let _ = a.update(Message::Page(Page::Control));
         assert_eq!(a.steps_entry, None);
-        // Nothing picked, part way: resumed, said; the next step drops it.
-        a.doc.guide.insert(id.clone(), start + 1);
+        // Nothing picked, part way: resumed, said; its button starts that
+        // operation again, and the next step drops the line.
+        a.doc.guide.insert(id.clone(), start);
         a.page = Page::Work;
         let _ = a.update(Message::Page(Page::Control));
-        assert_eq!(place(&a), start + 1);
+        assert_eq!(place(&a), start);
         assert!(matches!(&a.steps_entry, Some(Entry::Resumed { .. })));
-        send(&mut a, GuideAction::Next);
-        assert_eq!(a.steps_entry, None);
-    }
-    /// The left list follows the place only when it moves to another
-    /// section (LIO-449): the handwheel's beat on a pass, every 100 ms, and
-    /// a readout reached leave it where the hand scrolled it.
-    #[test]
-    fn the_operations_list_is_not_snapped_back_while_a_pass_beats() {
-        let mut a = app("Yes");
-        let g = guide(&a);
-        let pass = (g.steps.iter())
-            .position(
-                |s| matches!(s, Step::Pass { turns_per_minute, .. } if *turns_per_minute > 0.),
-            )
-            .unwrap();
-        a.doc.guide.insert(a.doc.setups[0].id.clone(), pass);
-        let beat = a.update(Message::Guide(GuideAction::Beat(std::time::Instant::now())));
-        assert_eq!(beat.units(), 0);
-        assert_eq!(a.update(Message::Guide(GuideAction::Reached(0))).units(), 0);
-        // Another section: the list follows.
-        let here = section_of(&g, pass);
-        let other = (0..g.sections.len()).find(|i| *i != here).unwrap();
+        let t = texts(&a);
         assert!(
-            a.update(Message::Guide(GuideAction::Section(other)))
-                .units()
-                > 0
-        );
-        assert_eq!(section_of(&g, place(&a)), other);
-    }
-    /// LIO-449 on a private copy of the finished adapter plate
-    /// (`AXIS_ADAPTER_COPY`: a folder with adapter-plate.axis.json and its
-    /// .step): the hole pages, the TapIn page, the Slots' Check pages and
-    /// the page entered from planning, as PNGs and texts in that folder.
-    #[test]
-    #[ignore = "private adapter copy: AXIS_ADAPTER_COPY"]
-    fn render_the_adapter_plate_lio_449() {
-        let dir = std::path::PathBuf::from(std::env::var_os("AXIS_ADAPTER_COPY").unwrap());
-        let mut doc = crate::storage::load(&dir.join("adapter-plate.axis.json")).unwrap();
-        doc.file.as_mut().unwrap().path = dir.join("adapter-plate.step");
-        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
-        doc.active = doc.setups[2].id.clone();
-        let mut a = App::from_workspace(dir.join("render-state.axis.json"), None);
-        a.doc = doc;
-        a.imported_mesh = Some(mesh);
-        a.window_width = 1440.;
-        a.window_height = 1000.;
-        let size = Size::new(1440., 1000.);
-        let id = a.doc.setups[2].id.clone();
-        a.page = crate::Page::Control;
-        build(&mut a);
-        let g = guide(&a);
-        let mut said = String::new();
-        let mut shot = |a: &App, name: &str| {
-            let t = crate::ui::probe::texts(a.view(), size);
-            said += &format!("== {name}\n{}\n", t.join(" | "));
-            render(a, (1440, 1000), &dir.join(format!("{name}.png")));
-            t
-        };
-        let ops = a.doc.setups[2].operations.clone();
-        let named = |s: &str| ops.iter().position(|o| o.name().starts_with(s)).unwrap();
-        for (name, op) in [
-            ("centre", named("Centre drill")),
-            ("drill", named("Drill 6.8")),
-            ("tap", named("Hand tap")),
-        ] {
-            let at = (g.steps.iter())
-                .position(|s| matches!(s, Step::Holes { op: o, .. } if *o == op))
-                .unwrap();
-            for item in 0..2 {
-                a.doc.guide.insert(id.clone(), at);
-                a.guide_item = item;
-                let t = shot(&a, &format!("{name}-hole-{}", item + 1));
-                assert!(t.iter().any(|s| s == "up to"), "{t:?}");
-            }
-            if name == "tap" {
-                let tap_in = (g.steps.iter())
-                    .position(|s| matches!(s, Step::TapIn { op: o, .. } if *o == op))
-                    .unwrap();
-                a.doc.guide.insert(id.clone(), tap_in);
-                a.guide_item = 0;
-                shot(&a, "tap-in");
-            }
-        }
-        for (name, op) in [
-            (
-                "check-counterbore-ll",
-                named("Counterbore 18x13 lower left"),
-            ),
-            (
-                "check-counterbore-ul",
-                named("Counterbore 18x13 upper left"),
-            ),
-            ("check-through-ul", named("Through slot 13x8 upper left")),
-        ] {
-            let at = (g.steps.iter())
-                .position(|s| matches!(s, Step::Check { op: o } if *o == op))
-                .unwrap();
-            a.doc.guide.insert(id.clone(), at);
-            a.guide_item = 0;
-            shot(&a, name);
-        }
-        // Entered from planning with the drill picked, the place at the
-        // hand-over: at the drill's start, the hand-over one press away.
-        let last = g.steps.len() - 1;
-        a.doc.guide.insert(id.clone(), last);
-        a.page = crate::Page::Work;
-        a.selected = Some(named("Drill 6.8"));
-        let _ = a.update(Message::Guide(GuideAction::Open(2)));
-        shot(&a, "entry-picked");
-        assert_eq!(
-            place(&a),
-            g.sections
-                .iter()
-                .find(|s| s.op == a.selected)
-                .unwrap()
-                .steps
-                .start
-        );
-        send(&mut a, GuideAction::Resume);
-        shot(&a, "entry-back-there");
-        // A fresh start with a later operation picked: kept at Set up.
-        a.doc.guide.insert(id.clone(), 0);
-        a.page = crate::Page::Work;
-        let _ = a.update(Message::Guide(GuideAction::Open(2)));
-        assert_eq!(place(&a), 0);
-        shot(&a, "entry-ahead");
-        // Again with nothing picked, the place mid-way: resuming, said.
-        a.page = crate::Page::Work;
-        a.selected = None;
-        let mid = (g.steps.iter())
-            .position(|s| matches!(s, Step::Slot { index: 3, .. }))
-            .unwrap();
-        a.doc.guide.insert(id.clone(), mid);
-        let _ = a.update(Message::Guide(GuideAction::Open(2)));
-        shot(&a, "entry-resumed");
-        std::fs::write(dir.join("lio-449.txt"), said).unwrap();
-    }
-    /// LIO-450 on a private copy of the adapter plate (`AXIS_ADAPTER_COPY`):
-    /// the Ø6.8 drill's Check page says through the 18.5 of the plate under
-    /// the seat, not the 21 its tip goes, as a PNG and its texts.
-    #[test]
-    #[ignore = "private adapter copy: AXIS_ADAPTER_COPY"]
-    fn render_the_adapter_plate_drill_check_lio_450() {
-        let dir = std::path::PathBuf::from(std::env::var_os("AXIS_ADAPTER_COPY").unwrap());
-        let mut doc = crate::storage::load(&dir.join("adapter-plate.axis.json")).unwrap();
-        doc.file.as_mut().unwrap().path = dir.join("adapter-plate.step");
-        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
-        doc.active = doc.setups[2].id.clone();
-        let mut a = App::from_workspace(dir.join("render-state.axis.json"), None);
-        a.doc = doc;
-        a.imported_mesh = Some(mesh);
-        a.window_width = 1440.;
-        a.window_height = 1000.;
-        let id = a.doc.setups[2].id.clone();
-        a.page = crate::Page::Control;
-        build(&mut a);
-        let g = guide(&a);
-        let op = (a.doc.setups[2].operations.iter())
-            .position(|o| o.name().starts_with("Drill 6.8"))
-            .unwrap();
-        let at = (g.steps.iter())
-            .position(|s| matches!(s, Step::Check { op: o } if *o == op))
-            .unwrap();
-        a.doc.guide.insert(id, at);
-        a.guide_item = 0;
-        let t = crate::ui::probe::texts(a.view(), Size::new(1440., 1000.));
-        std::fs::write(dir.join("drill-check.txt"), t.join("\n")).unwrap();
-        render(&a, (1440, 1000), &dir.join("drill-check.png"));
-        let m = (t.iter().position(|s| s == "MEASURE")).unwrap_or_else(|| panic!("{t:?}"));
-        assert_eq!(
-            t[m..m + 7],
-            [
-                "MEASURE",
-                "Ø",
-                "6.80",
-                "4 holes",
-                "Z",
-                "18.50",
-                "through · check it breaks out at the back"
-            ],
+            t.iter()
+                .any(|s| s.starts_with("Resuming where these steps were left:")),
             "{t:?}"
         );
-        assert!(!t.iter().any(|s| s == "21.00"), "{t:?}");
-    }
-    /// LIO-451 on a private copy of the adapter plate (`AXIS_ADAPTER_COPY`):
-    /// each setup's Zero page, first row and the last row lit, as PNGs and
-    /// texts, and every other step of each setup (`later-steps.txt`), so
-    /// that a change to how zero is found can be shown to leave them alone.
-    #[test]
-    #[ignore = "private adapter copy: AXIS_ADAPTER_COPY"]
-    fn render_the_adapter_plate_zero_lio_451() {
-        let dir = std::path::PathBuf::from(std::env::var_os("AXIS_ADAPTER_COPY").unwrap());
-        let mut doc = crate::storage::load(&dir.join("adapter-plate.axis.json")).unwrap();
-        doc.file.as_mut().unwrap().path = dir.join("adapter-plate.step");
-        let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
-        let mut a = App::from_workspace(dir.join("render-state.axis.json"), None);
-        a.doc = doc;
-        a.imported_mesh = Some(mesh);
-        a.window_width = 1440.;
-        a.window_height = 1000.;
-        a.page = crate::Page::Control;
-        let (mut said, mut later) = (String::new(), String::new());
-        for si in 0..a.doc.setups.len() {
-            let id = a.doc.setups[si].id.clone();
-            a.doc.active = id.clone();
-            build(&mut a);
-            let g = guide(&a);
-            let at = (g.steps.iter())
-                .position(|s| matches!(s, Step::Zero { .. }))
-                .unwrap();
-            for (i, s) in g.steps.iter().enumerate() {
-                if i != at {
-                    later += &format!("setup {} step {i}: {s:?}\n", si + 1);
-                }
-            }
-            said += &format!("== setup {} {:?}\n", si + 1, g.steps[at]);
-            for item in [0, 9] {
-                a.doc.guide.insert(id.clone(), at);
-                a.guide_item = item;
-                let name = format!("zero-setup-{}-item-{item}", si + 1);
-                let t = crate::ui::probe::texts(a.view(), Size::new(1440., 1000.));
-                said += &format!("-- {name}\n{}\n", t.join(" | "));
-                render(&a, (1440, 1000), &dir.join(format!("{name}.png")));
-            }
-            // The smallest window the app is laid out for: all five rows.
-            a.guide_item = 0;
-            (a.window_width, a.window_height) = (1024., 700.);
-            let t = crate::ui::probe::texts(a.view(), Size::new(1024., 700.));
-            assert!(t.iter().any(|s| s == "touch the top → set"), "{t:?}");
-            render(
-                &a,
-                (1024, 700),
-                &dir.join(format!("zero-setup-{}-1024.png", si + 1)),
-            );
-            (a.window_width, a.window_height) = (1440., 1000.);
-        }
-        std::fs::write(dir.join("zero.txt"), said).unwrap();
-        std::fs::write(dir.join("later-steps.txt"), later).unwrap();
-    }
-    /// The Steps page at 1280 × 800, one PNG per kind of step, in
-    /// /tmp/manual-steps.
-    #[test]
-    #[ignore]
-    fn render_the_steps() {
-        let dir = std::path::Path::new("/tmp/manual-steps");
-        std::fs::create_dir_all(dir).unwrap();
-        let mut a = app("Yes");
-        let steps = a.guide_at().unwrap().0.guide.steps.clone();
-        let first = |name: &str| {
-            (steps.iter())
-                .position(|s| format!("{s:?}").starts_with(name))
-                .unwrap()
-        };
-        let shots = [
-            ("01-hold", first("Hold"), 0),
-            ("02-zero", first("Zero"), 1),
-            ("03-face", first("Face"), 0),
-            ("05-tool", first("Tool"), 0),
-            ("06-pass", first("Pass") + 1, 1),
-            ("07-holes", first("Holes"), 1),
-            ("08-check", first("Check"), 0),
-            ("09-handover", first("HandOver"), 0),
-        ];
-        for (name, step, item) in shots {
-            at(&mut a, step, item);
-            render(&a, (1280, 800), &dir.join(format!("{name}.png")));
-        }
-        let a = squared("Yes");
-        render(&a, (1280, 800), &dir.join("04-square.png"));
-        // In a vise on the manual mill: the jaws in the pictures.
-        let mut a = app_with("Yes", crate::guide::tests::in_the_vise);
-        let shown = a.guide_at().unwrap().0;
-        let Step::Hold { stock, .. } = shown.guide.steps[0] else {
-            panic!()
-        };
-        let held = Gripped::whole(stock.translated(shown.guide.zero));
-        let found = a.doc.holding_boxes(&a.doc.setups[0], held);
-        assert!(
-            !shown.jaws.is_empty(),
-            "no jaws: {found:?} {:?}",
-            a.doc.setups[0].p
-        );
-        at(&mut a, 0, 0);
-        render(&a, (1280, 800), &dir.join("10-hold-vise.png"));
-        at(&mut a, 5, 2);
-        render(&a, (1280, 800), &dir.join("11-pass-vise.png"));
-        // Behind the part, closed on −Y: the same tool, other sides.
-        let mut a = app_with("Yes", |doc| {
-            let mill = doc.tools[3].id.clone();
-            let b = [-500., 500., 104.5, 500., 0., -12.];
-            let back = crate::guide::tests::boxed("Back step", &mill, b, &[("stepdown", "5")]);
-            doc.setups[0].operations.insert(2, back);
-        });
-        let comp = (a.guide_at().unwrap().0.guide.steps.iter())
-            .position(|s| matches!(s, Step::Comp { .. }))
-            .unwrap();
-        at(&mut a, comp, 0);
-        render(&a, (1280, 800), &dir.join("12-comp.png"));
-        // A pocket: a plunge, then feeds across.
-        let mut a = app_with("Yes", crate::guide::tests::pocket_the_step);
-        let first = (a.guide_at().unwrap().0.guide.steps.iter())
-            .position(|s| matches!(s, Step::Pass { .. }))
-            .unwrap();
-        at(&mut a, first, 3);
-        render(&a, (1280, 800), &dir.join("13-pass-plunge.png"));
-        at(&mut a, first + 1, 2);
-        render(&a, (1280, 800), &dir.join("14-pass-across.png"));
+        let again = (t.iter()).find(|s| s.starts_with("◀ Start ") && s.ends_with(" again"));
+        assert!(again.is_some(), "{t:?}");
+        send(&mut a, GuideAction::Next);
+        assert_eq!(a.steps_entry, None);
+        assert!(!texts(&a).iter().any(|s| s.starts_with("Resuming")));
     }
 
     // ---- The lathe ----
@@ -10129,10 +4865,10 @@ pub(crate) mod tests {
             render(&a, (1280, 800), &dir.join(format!("{i:02}.png")));
         }
     }
-    /// The manual mill's Hold, Zero and first Tool screens of the shaft
-    /// turned on the lathe and then drilled by hand
-    /// (`guide::tests::turned_then_drilled_by_hand`), and the Hold and
-    /// Zero of `guide::tests::short_part_in_soft_jaws`, at 1280 × 800, into
+    /// The manual mill's Zero and drilling pages of the shaft turned on the
+    /// lathe and then drilled by hand
+    /// (`guide::tests::turned_then_drilled_by_hand`), and the Zero of
+    /// `guide::tests::short_part_in_soft_jaws`, at 1280 × 800, into
     /// `AXIS_RENDER_DIR`.
     #[test]
     #[ignore]
@@ -10141,30 +4877,27 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let (job, mesh) = crate::guide::tests::turned_then_drilled_by_hand();
         let mut a = lathe_app_of(job, mesh, |d| d.active = d.setups[1].id.clone());
-        let tool = (guide(&a).steps.iter())
-            .position(|s| matches!(s, Step::Tool { .. }))
+        let drill = (guide(&a).steps.iter())
+            .position(|s| matches!(s, Step::Sheet { .. }))
             .unwrap();
-        for (name, step) in [("hold", 0), ("zero", 1), ("tool", tool)] {
+        for (name, step) in [("zero", 0), ("drill", drill)] {
             let id = a.doc.setups[1].id.clone();
             a.doc.guide.insert(id, step);
             render(&a, (1280, 800), &dir.join(format!("mill-{name}.png")));
         }
-        // Its zero on the top's centre: each axis halved across the Ø30
-        // (LIO-451).
+        // Its zero on the top's centre.
         (a.doc.setups[1].p).insert("origin".into(), "Stock top center".into());
         build(&mut a);
         let id = a.doc.setups[1].id.clone();
-        a.doc.guide.insert(id, 1);
+        a.doc.guide.insert(id, 0);
         render(&a, (1280, 800), &dir.join("mill-zero-centre.png"));
-        // The short part in soft jaws: touched on its Ø20 above them.
+        // The short part in soft jaws.
         let (doc, mesh, report, plan) = crate::guide::tests::short_part_in_soft_jaws();
         let job = crate::proposal::build(&doc, &mesh, &report, &plan).unwrap();
         let mut a = lathe_app_of(job, mesh, |d| d.active = d.setups[1].id.clone());
-        for (name, step) in [("hold", 0), ("zero", 1)] {
-            let id = a.doc.setups[1].id.clone();
-            a.doc.guide.insert(id, step);
-            render(&a, (1280, 800), &dir.join(format!("short-{name}.png")));
-        }
+        let id = a.doc.setups[1].id.clone();
+        a.doc.guide.insert(id, 0);
+        render(&a, (1280, 800), &dir.join("short-zero.png"));
     }
     use crate::guide::LatheStep as L;
     /// The index of the `n`th step (from 0) that `pick` is true of.
@@ -10879,13 +5612,6 @@ pub(crate) mod tests {
             );
             let gap = crate::holding::gap(&doc.setups[0]).unwrap();
             assert!(crate::holding::hits(&plan, &boxes, gap).is_empty());
-            // Its Holes page says so: up to Z 30.00 over the stock's top, the
-            // work zero, before X and Y move.
-            let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
-            let lifts = crate::steps::Lifts::of(&doc, &mesh, &guide);
-            let z = lifts.z(&doc, &guide, 2) + guide.zero[2] - plan.stock.max[2];
-            assert_eq!(format!("{z:.3}"), "30.000");
-            assert_eq!(lifts.holder(), "the clamps");
             // The operation as saved keeps its own clearance.
             assert_eq!(num(&doc.setups[0].operations[2].p, "clearance"), Some(15.));
             // A clearance of its own above them is kept.
@@ -10910,76 +5636,28 @@ pub(crate) mod tests {
         use crate::slot::*;
         use crate::surface::Selection;
 
+        /// A Slot cut with a narrower cutter has one page (LIO-688): the
+        /// slot as cut, its ends' centres 21.5 − 16.5 apart, its width and
+        /// its depth.
         #[test]
-        fn a_narrower_cutters_steps_give_each_pass_its_dro_numbers_and_the_check_the_round() {
+        fn a_narrower_cutters_slot_page_gives_the_slot_as_cut() {
             let (doc, mesh) = adapter_counterbore(false);
             let shown = crate::steps::shown(&doc, &mesh, 0).unwrap();
-            let g = &shown.guide;
-            let slots: Vec<&crate::guide::Step> = (g.steps.iter())
-                .filter(|s| matches!(s, crate::guide::Step::Slot { .. }))
-                .collect();
-            assert_eq!(slots.len(), 37);
-            // Where the tool is, from step to step.
-            let mut at = [f32::NAN; 2];
-            for s in &slots {
-                let crate::guide::Step::Slot {
-                    targets,
-                    pass,
-                    points,
-                    ..
-                } = s
-                else {
-                    unreachable!()
-                };
-                assert!(!targets.is_empty());
-                if *pass != Kind::Sweep {
-                    // Each of its readings is a number on the page, in order.
-                    let feeds: Vec<[f32; 2]> = {
-                        let mut out = vec![];
-                        for t in targets.iter().filter(|t| t.axis < 2) {
-                            at[t.axis] = t.centre;
-                            if t.feed {
-                                out.push(at);
-                            }
-                        }
-                        out
-                    };
-                    for p in points {
-                        assert!(
-                            feeds
-                                .iter()
-                                .any(|q| (q[0] - p[0]).abs() < 1e-4 && (q[1] - p[1]).abs() < 1e-4),
-                            "{pass:?}: {p:?}"
-                        );
-                    }
-                    // The walk is closed: it ends where it starts, at the end's tip.
-                    assert_eq!(points.first(), points.last());
-                    // Out to the walk's tip on the DRO's hundredths: 2.5 + 2.05 for
-                    // the outline, + 2.25 for the finish.
-                    let tip = if *pass == Kind::Finish { 4.75 } else { 4.55 };
-                    assert!(
-                        (points[0][0] - tip).abs() < 1e-4,
-                        "{pass:?} {:?}",
-                        points[0]
-                    );
-                } else {
-                    for t in targets.iter().filter(|t| t.axis < 2) {
-                        at[t.axis] = t.centre;
-                    }
-                }
-            }
-            let top = shown.boxes[0].max[2] + g.zero[2];
-            let m = crate::steps::measures(&doc, g, &g.done[0], top);
-            let find = |axis: &str, v: f32| {
-                m.iter()
-                    .find(|x| x.axis == axis && (x.value - v).abs() < 0.001)
-                    .unwrap_or_else(|| panic!("{axis} {v} in {m:?}"))
+            let crate::guide::Features::Slot {
+                a,
+                b,
+                width,
+                top,
+                floor,
+                through,
+            } = crate::guide::tests::features(&shown.guide, 0)
+            else {
+                panic!("{:?}", shown.guide.steps)
             };
-            find("X", 21.5);
-            find("Y", 16.5);
-            find("Z", 8.9);
-            let r = find("R", 8.25);
-            assert!(r.words[1].contains("0.05"), "{:?}", r.words);
+            assert!(!through);
+            assert!((width - 16.5).abs() < 1e-3, "{width}");
+            assert!(((b[0] - a[0]).hypot(b[1] - a[1]) - 5.).abs() < 1e-3, "{a:?} {b:?}");
+            assert!((top - floor - 8.9).abs() < 1e-3, "{top} {floor}");
         }
 
         /// The user's own adapter project, a private copy in `AXIS_ADAPTER_COPY`

@@ -415,7 +415,7 @@ pub fn centres(op: &Operation) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::guide::{Step, build, tests::job};
+    use crate::guide::{build, tests::job};
     use crate::model::{CENTRE_DRILL, CENTRE_ON_CNC};
 
     /// A centre drill of pilot Ø`pilot` × `reach` under a Ø`body` body,
@@ -763,20 +763,16 @@ mod tests {
         let (ops, _) = needed_for(&doc, 0, None, |o| o.id == holes);
         assert_eq!(ops.iter().map(|(i, _)| *i).collect::<Vec<_>>(), [2]);
     }
-    /// The holes and the uncentred flags of the Holes step of operation
-    /// `oi` in `guide`.
+    /// The holes (centres and the Z the tip goes to) and the uncentred
+    /// flags on the page of operation `oi` in `guide`.
     fn holes_of(guide: &crate::guide::Guide, oi: usize) -> (Vec<[f32; 3]>, Vec<bool>) {
-        (guide.steps.iter())
-            .find_map(|s| match s {
-                Step::Holes {
-                    op,
-                    holes,
-                    uncentred,
-                    ..
-                } if *op == oi => Some((holes.clone(), uncentred.clone())),
-                _ => None,
+        (crate::guide::tests::holes_of_op(guide, oi).iter())
+            .map(|h| {
+                let (crate::guide::Depth::Through { tip } | crate::guide::Depth::Blind { tip, .. }) =
+                    h.depth;
+                ([h.at[0], h.at[1], tip], h.uncentred)
             })
-            .unwrap()
+            .unzip()
     }
     #[test]
     fn the_steps_set_a_centre_drill_to_its_pilot_tip_and_find_the_holes_centred() {
@@ -804,11 +800,6 @@ mod tests {
         }
         // The drill after it finds every hole centred.
         assert_eq!(holes_of(&guide, ci + 1).1, [false; 4]);
-        // Each has its own tool change.
-        let changes = (guide.steps.iter())
-            .filter(|s| matches!(s, Step::Tool { op, .. } if *op == ci || *op == ci + 1))
-            .count();
-        assert_eq!(changes, 2);
     }
     #[test]
     fn the_plan_check_reports_a_manual_drill_on_a_flat_face() {

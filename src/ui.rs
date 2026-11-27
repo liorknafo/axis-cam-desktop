@@ -8468,14 +8468,6 @@ fn wizard_at(app: &App, at: usize) -> Element<'_, Message> {
                 &["Yes", "No"],
                 t,
             ));
-            // The DRO's own hole functions, Yes until set to No (LIO-399).
-            for (key, label) in [
-                ("dro_matrix", "DRO has matrix holes (a grid)"),
-                ("dro_arc", "DRO has arc holes"),
-            ] {
-                let on = if get(p, key) == "No" { "No" } else { "Yes" };
-                form = form.push(choice_value(p, on, key, label, &["Yes", "No"], t));
-            }
             form = form
                 .push(field(p, "edge_finder", "Edge finder diameter · mm", t))
                 .push(field(p, "pass_time", "Time per pass · s", t))

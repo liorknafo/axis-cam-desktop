@@ -6,9 +6,9 @@
 //! section's header (drawn too) and the place, the step's caption, and
 //! Back and the step's own command.
 //!
-//! A screen is a step at one item: a hole of a Holes or Bore step, as Next
-//! and Back walk them here; other steps have one, its first readout lit.
-//! Its numbers are drawn once more for each readout reached in turn, and
+//! A screen is a step, its first readout lit (the manual mill's pages have
+//! none: a zero page, then a page an operation, LIO-688). A lathe step's
+//! numbers are drawn once more for each readout reached in turn, and
 //! where each readout and tile sits on them goes along: a tap there shows
 //! the next lit, or goes to that pass, as a click does here (LIO-525).
 use super::*;
@@ -70,15 +70,17 @@ pub struct SectionSteps {
 }
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Screen {
-    /// The step of the guide and its item (hole).
+    /// The step of the guide.
     pub step: usize,
+    /// Always 0 since the manual mill's hole pages went (LIO-688): kept for
+    /// the tablet's reader.
     pub item: usize,
     pub section: usize,
     pub title: String,
     pub sub: String,
-    /// Where the job is, "Setup 1 of 4 · operation 2 of 5 · hole 1/4".
+    /// Where the job is, "Setup 1 of 4 · operation 2 of 5".
     pub place: String,
-    /// The place in its section, "hole 1/4", or empty.
+    /// The place in its section, a lathe's "pass 2/4", or empty.
     pub progress: String,
     /// The command that ends the screen, "Pass done ▶"; none on the last.
     pub next: Option<String>,
@@ -187,16 +189,14 @@ fn fill(
     let g = &shown.guide;
     let setup = &doc.setups[si];
     out.minutes = g.minutes;
-    let page = |at: usize, item: usize, reached: usize| Page {
+    let page = |at: usize, item: usize| Page {
         doc,
         shown,
         key: 0,
         at,
         item,
-        reached,
         typed: None,
         window: WINDOW,
-        clock: (std::time::Instant::now(), std::time::Instant::now()),
         setup,
         tablet: true,
     };
@@ -204,18 +204,10 @@ fn fill(
         files.entry(png.path.clone()).or_insert(bytes);
         png
     };
-    // A screen's pictures and numbers drawn, `reached` readouts reached:
-    // a hole's by its own count, another step's by the item, as
-    // `App::guide` keeps them.
-    let pictures = |at: usize, item: usize, reached: usize| {
-        let holes = matches!(
-            &g.steps[at],
-            Step::Holes { holes, .. } | Step::Bore { holes, .. } if !holes.is_empty()
-        );
-        let p = match holes {
-            true => page(at, item, reached),
-            false => page(at, reached, 0),
-        };
+    // A screen's pictures and numbers drawn, `reached` readouts reached,
+    // as `App::guide_item` keeps them.
+    let pictures = |at: usize, reached: usize| {
+        let p = page(at, reached);
         let Parts {
             title,
             sub,
@@ -234,8 +226,8 @@ fn fill(
     };
     // One screen: its words, and its pictures and numbers drawn, once more
     // for each readout reached.
-    let draw = |k: usize, at: usize, item: usize| {
-        let (picture, numbers, taps, (title, sub, next, back)) = pictures(at, item, 0);
+    let draw = |k: usize, at: usize| {
+        let (picture, numbers, taps, (title, sub, next, back)) = pictures(at, 0);
         let readouts = (taps.iter())
             .filter_map(|t| match t.1 {
                 Message::Guide(GuideAction::Reached(n)) => Some(n + 1),
@@ -246,7 +238,7 @@ fn fill(
         let mut pngs = vec![picture.1, numbers.1];
         let reached: Vec<_> = (1..=readouts)
             .map(|n| {
-                let (picture, numbers, taps, _) = pictures(at, item, n);
+                let (picture, numbers, taps, _) = pictures(at, n);
                 pngs.extend([picture.1, numbers.1]);
                 (picture.0, numbers.0, taps)
             })
@@ -280,12 +272,12 @@ fn fill(
         };
         let screen = Screen {
             step: at,
-            item,
+            item: 0,
             section: k,
             title,
             sub: sub.into(),
-            place: place(doc, g, k, at, item),
-            progress: progress(g, &g.sections[k], at, item),
+            place: place(doc, g, k, at),
+            progress: progress(g, &g.sections[k], at),
             next,
             opens,
             back,
@@ -298,17 +290,10 @@ fn fill(
         };
         (screen, pngs, taps, reached)
     };
-    // Every screen, a hole of a Holes or Bore step each, drawn on every
-    // core: the tablet waits for them.
-    let jobs: Vec<(usize, usize, usize)> = (g.sections.iter().enumerate())
+    // Every screen, a step each, drawn on every core: the tablet waits for
+    // them.
+    let jobs: Vec<(usize, usize)> = (g.sections.iter().enumerate())
         .flat_map(|(k, s)| s.steps.clone().map(move |at| (k, at)))
-        .flat_map(|(k, at)| {
-            let items = match &g.steps[at] {
-                Step::Holes { holes, .. } | Step::Bore { holes, .. } => holes.len().max(1),
-                _ => 1,
-            };
-            (0..items).map(move |item| (k, at, item))
-        })
         .collect();
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let mut drawn_screens: Vec<_> = std::thread::scope(|scope| {
@@ -317,7 +302,7 @@ fn fill(
                 let (jobs, draw) = (&jobs, &draw);
                 scope.spawn(move || {
                     let drawn = (jobs.iter().enumerate().skip(t).step_by(threads))
-                        .map(|(i, &(k, at, item))| (i, draw(k, at, item)))
+                        .map(|(i, &(k, at))| (i, draw(k, at)))
                         .collect::<Vec<_>>();
                     // The words the drawings wrote on this thread, for the
                     // tests on the caller's (LIO-545).
@@ -347,7 +332,7 @@ fn fill(
                 let (reached, screen) = match m {
                     Message::Guide(GuideAction::Reached(n)) => (Some(n), None),
                     Message::Guide(GuideAction::Go(at)) => {
-                        (None, Some(jobs.iter().position(|j| (j.1, j.2) == (at, 0))?))
+                        (None, Some(jobs.iter().position(|j| j.1 == at)?))
                     }
                     _ => return None,
                 };
@@ -390,7 +375,7 @@ fn fill(
             .rposition(|x| x.section == k)
             .map_or(first, |i| i + 1);
         let (head, size, _) = tall(
-            head(&page(s.steps.start, 0, 0), k).into(),
+            head(&page(s.steps.start, 0), k).into(),
             CARD + 200.,
             true,
         );
@@ -593,21 +578,21 @@ mod tests {
         let mine = &steps.setups[0];
         assert_eq!(mine.setup, a.doc.setups[0].id);
         assert!(mine.problem.is_none());
-        assert!(mine.screens.len() > mine.sections.len(), "{mine:#?}");
-        let (mut tiles, mut reached) = (vec![], 0);
+        // The manual mill's pages, a screen each (LIO-688): the zero, an
+        // operation each, the hand-over.
+        let (shown, _) = a.guide_at().unwrap();
+        assert_eq!(mine.screens.len(), shown.guide.steps.len(), "{mine:#?}");
+        let titles: Vec<&str> = mine.screens.iter().map(|s| s.title.as_str()).collect();
+        assert_eq!(titles, ["Zero", "Face", "Step", "Holes", "Hand over"]);
         for (k, s) in mine.screens.iter().enumerate() {
             let (shown, at) = a.guide_at().unwrap();
-            assert_eq!((s.step, s.item), (at, a.guide_item), "screen {k}");
+            assert_eq!((s.step, s.item), (at, 0), "screen {k}");
             let g = &shown.guide;
             let section = section_of(g, at);
             assert_eq!(s.section, section);
-            assert_eq!(
-                s.place,
-                place(&a.doc, g, section, at, a.guide_item),
-                "screen {k}"
-            );
+            assert_eq!(s.place, place(&a.doc, g, section, at), "screen {k}");
             if k + 1 < mine.screens.len() {
-                assert_eq!(s.next, Some(next_label(g, at, a.guide_item)));
+                assert_eq!(s.next, Some(next_label(g, at)));
             }
             assert_eq!(s.back, k > 0);
             for png in [&s.picture, &s.numbers] {
@@ -616,35 +601,8 @@ mod tests {
                 assert_eq!([info.width, info.height], png.size);
                 assert!(info.width > 400 && info.height > 40, "{png:?}");
             }
-            // Each readout's tap shows the screen as the page draws it once
-            // that readout is reached; the boxes stay where they were.
-            let readouts: Vec<usize> = s.taps.iter().filter_map(|t| t.reached).collect();
-            assert_eq!(
-                readouts,
-                (0..s.reached.len()).collect::<Vec<_>>(),
-                "screen {k}"
-            );
-            let holes = s.progress.starts_with("hole ");
-            for (n, r) in s.reached.iter().enumerate() {
-                let _ = a.update(Message::Guide(GuideAction::Reached(n)));
-                let state = (a.guide_item, a.guide_reached);
-                assert_eq!(state, if holes { (s.item, n + 1) } else { (n + 1, 0) });
-                assert_ne!(r.numbers, s.numbers, "screen {k}, readout {n}");
-                assert!(files.contains_key(&r.numbers.path) && files.contains_key(&r.picture.path));
-                let boxes = |t: &[Tap]| t.iter().map(|t| t.rect).collect::<Vec<_>>();
-                assert_eq!(boxes(&r.taps), boxes(&s.taps), "screen {k}, readout {n}");
-            }
-            for t in &s.taps {
-                let [x, y, w, h] = t.rect;
-                assert!(
-                    x + w <= s.numbers.size[0] && y + h <= s.numbers.size[1],
-                    "{t:?}"
-                );
-                assert!(h >= 30, "a finger can find it: {t:?}");
-                assert!(t.reached.is_some() != t.screen.is_some());
-                tiles.extend(t.screen);
-            }
-            reached += s.reached.len();
+            // Nothing to tap through: no readouts, no pass tiles.
+            assert!(s.taps.is_empty() && s.reached.is_empty(), "screen {k}");
             let _ = a.update(Message::Guide(GuideAction::Next));
         }
         // Each section starts where a press on it goes.
@@ -653,22 +611,8 @@ mod tests {
             let (_, at) = a.guide_at().unwrap();
             let first = &mine.screens[s.screens[0]];
             assert_eq!((first.step, first.item), (at, 0), "{}", s.name);
+            assert_eq!(s.screens[1] - s.screens[0], 1, "{}", s.name);
             assert!(files.contains_key(&s.head.path));
-        }
-        // Holes have a screen each; the numbers are drawn whole.
-        let holes = mine
-            .screens
-            .iter()
-            .filter(|s| s.progress.starts_with("hole "))
-            .count();
-        assert!(holes > 1, "{mine:#?}");
-        assert!(reached > holes, "every hole's readouts are drawn reached");
-        // A pass's tile goes to that pass, a step's first screen.
-        assert!(!tiles.is_empty());
-        for j in tiles {
-            let pass = &mine.screens[j];
-            assert_eq!(pass.item, 0);
-            assert!(pass.title.starts_with("Pass "), "{}", pass.title);
         }
         assert!(mine.screens.iter().all(|s| !s.asks));
         assert!(mine.screens.last().unwrap().opens.is_some());
@@ -753,10 +697,8 @@ mod tests {
                 key: 0,
                 at,
                 item: 0,
-                reached: 0,
                 typed: None,
                 window: WINDOW,
-                clock: (std::time::Instant::now(), std::time::Instant::now()),
                 setup: &a.doc.setups[0],
                 tablet,
             };
@@ -792,10 +734,8 @@ mod tests {
                 key: 0,
                 at,
                 item: 0,
-                reached: 0,
                 typed: None,
                 window: WINDOW,
-                clock: (std::time::Instant::now(), std::time::Instant::now()),
                 setup: &a.doc.setups[0],
                 tablet,
             };
@@ -835,103 +775,38 @@ mod tests {
         }
     }
 
-    /// Every screen of `doc`'s first setup, each hole of a Holes or Bore
-    /// step, laid out as the tablet draws its numbers: their width, and
-    /// their texts with where each is.
+    /// Every screen of `doc`'s first setup laid out as the tablet draws its
+    /// numbers: their width, and their texts with where each is.
     fn tablet_numbers(doc: &Document, mesh: &Mesh) -> Vec<(f32, Vec<(String, Rectangle)>)> {
         let shown = super::shown(doc, mesh, 0).unwrap();
         let mut screens = vec![];
-        for (at, step) in shown.guide.steps.iter().enumerate() {
-            let items = match step {
-                Step::Holes { holes, .. } | Step::Bore { holes, .. } => holes.len().max(1),
-                _ => 1,
+        for at in 0..shown.guide.steps.len() {
+            let p = Page {
+                doc,
+                shown: &shown,
+                key: 0,
+                at,
+                item: 0,
+                typed: None,
+                window: WINDOW,
+                setup: &doc.setups[0],
+                tablet: true,
             };
-            for item in 0..items {
-                let p = Page {
-                    doc,
-                    shown: &shown,
-                    key: 0,
-                    at,
-                    item,
-                    reached: 0,
-                    typed: None,
-                    window: WINDOW,
-                    clock: (std::time::Instant::now(), std::time::Instant::now()),
-                    setup: &doc.setups[0],
-                    tablet: true,
-                };
-                let parts = parts(&p);
-                let (_, width) = widths(parts.split);
-                let numbers = scrollable(parts.right.spacing(10)).into();
-                let placed = crate::ui::probe::placed(numbers, Size::new(width, 2400.));
-                screens.push((width, placed));
-            }
+            let parts = parts(&p);
+            let (_, width) = widths(parts.split);
+            let numbers = scrollable(parts.right.spacing(10)).into();
+            let placed = crate::ui::probe::placed(numbers, Size::new(width, 2400.));
+            screens.push((width, placed));
         }
         screens
     }
 
-    /// A readout's tag on the tablet's numbers reads whole (LIO-588): beside
-    /// its number on one line, or under it, never squeezed into a column a
-    /// few letters wide nor cut off at the page's right edge. A bore with a
-    /// 0.001" dial: its "what the last pass left" and "out 1.98 on Ø · 78
-    /// divisions" have no room beside the number at the tablet's width.
-    /// Every text of every screen of it, of a drilling and of a slot stays
-    /// within the page.
+    /// Every text of the tablet's numbers stays within the page (LIO-588),
+    /// the manual mill's tables of holes, boxes and slots too (LIO-688).
     #[test]
-    fn the_tablets_numbers_read_every_tag_whole() {
+    fn the_tablets_numbers_stay_within_the_page() {
         use crate::steps::tests::{bored_job, drilled_job, slot_job};
-        // A tag's one line, at its size.
-        let tag = crate::ui::probe::placed(text("out").size(12).into(), Size::new(400., 400.));
-        let one_line = tag[0].1.height;
-        let (bore, ring) = bored_job(|h| {
-            h.p.insert("dial".into(), "0.0254".into());
-        });
-        // Its passes: each tag after the head's setting and the bore to
-        // measure.
-        let mut tags = 0;
-        for (width, placed) in tablet_numbers(&bore, &ring) {
-            let at = |s: &str| placed.iter().position(|(t, _)| t == s);
-            let readouts = [at("head").map(|i| i + 1), at("bore").map(|i| i + 1)];
-            for value in readouts.into_iter().flatten() {
-                let ((v, vb), (tag, tb)) = (&placed[value], &placed[value + 1]);
-                let beside = tb.height <= one_line + 0.5 && tb.x >= vb.x + vb.width;
-                let under = tb.y >= vb.y + vb.height - 0.5;
-                assert!(
-                    beside || under,
-                    "{tag:?} squeezed beside {v} at {width}: {tb:?}, {v} at {vb:?}"
-                );
-                assert!(
-                    tb.x + tb.width <= width + 0.5,
-                    "{tag:?} past {width}: {tb:?}"
-                );
-                tags += 1;
-            }
-        }
-        assert!(tags >= 20, "{tags} tags");
-        // A Tap's Check: the screw to try, wider than the page in one line.
-        let screw = readout(
-            Readout {
-                order: None,
-                lead: None,
-                axis: String::new(),
-                value: "M8×1.25 screw".into(),
-                lock: None,
-                tags: vec![],
-                lit: Lit::Next,
-                big: true,
-            },
-            None,
-        );
-        // At the numbers' width of a mill's screen (`parts` splits it 11:9).
-        let width = widths((11, 9)).1;
-        let placed = crate::ui::probe::placed(screw, Size::new(width, 600.));
-        let (_, b) = (placed.iter())
-            .find(|(s, _)| s == "M8×1.25 screw")
-            .unwrap_or_else(|| panic!("the screw in {placed:?}"));
-        assert!(
-            b.x + b.width <= width + 0.5,
-            "the screw past {width}: {b:?}"
-        );
+        let (bore, ring) = bored_job(|_| {});
         let hole = crate::cam::boring::tests::ring(6.8, 30., 18.5);
         // Through, on parallels clear of the hole, as
         // `a_through_drill_is_checked_against_the_parallels_and_the_table_under_them`.
@@ -947,9 +822,18 @@ mod tests {
             s.insert(k.into(), v.into());
         }
         let (slot, slotted) = slot_job(false, "-5");
-        for (doc, mesh) in [(&bore, &ring), (&drilled, &hole), (&slot, &slotted)] {
+        let (plate, corners) = crate::corner::tests::plate_job("Y");
+        let job = crate::steps::tests::app("Yes");
+        let block = job.part_mesh().unwrap().clone();
+        for (doc, mesh) in [
+            (&bore, &ring),
+            (&drilled, &hole),
+            (&slot, &slotted),
+            (&plate, &corners),
+            (&job.doc, &block),
+        ] {
             let screens = tablet_numbers(doc, mesh);
-            assert!(screens.len() > 3, "{}", screens.len());
+            assert!(screens.len() > 2, "{}", screens.len());
             for (width, placed) in screens {
                 for (s, b) in &placed {
                     assert!(
@@ -961,10 +845,12 @@ mod tests {
         }
     }
 
-    /// The tablet's numbers of `AXIS_RENDER_PROJECT` (a copy), as
+    /// The tablet's screens of `AXIS_RENDER_PROJECT` (a copy), as
     /// `save_for_tablet` draws them, into `AXIS_RENDER_DIR`: setup
     /// `AXIS_RENDER_SETUP` (an index, else every hand setup), each screen's
-    /// numbers `<setup>-<step>-<item>.png` (LIO-588).
+    /// numbers `<setup>-<step>-numbers.png` and pictures
+    /// `<setup>-<step>-picture.png`, and each section's header
+    /// `<setup>-<step>-head.png` (LIO-588, LIO-688).
     #[test]
     #[ignore]
     fn render_a_projects_tablet_numbers() {
@@ -983,8 +869,15 @@ mod tests {
                 continue;
             }
             for screen in &s.screens {
-                let name = format!("{si}-{:02}-{}.png", screen.step, screen.item);
-                std::fs::write(dir.join(name), &files[&screen.numbers.path]).unwrap();
+                for (what, png) in [("numbers", &screen.numbers), ("picture", &screen.picture)] {
+                    let name = format!("{si}-{:02}-{what}.png", screen.step);
+                    std::fs::write(dir.join(name), &files[&png.path]).unwrap();
+                }
+            }
+            for section in &s.sections {
+                let step = s.screens[section.screens[0]].step;
+                let name = format!("{si}-{step:02}-head.png");
+                std::fs::write(dir.join(name), &files[&section.head.path]).unwrap();
             }
         }
     }

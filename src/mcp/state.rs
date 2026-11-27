@@ -132,13 +132,8 @@ pub const NOT_WORK_STATE: &[(&str, &str)] = &[
         "guide_item",
         "the readout the Steps page is at within its step: not saved",
     ),
-    (
-        "guide_reached",
-        "the hole the Steps page is at within its step: not saved",
-    ),
     ("steps_entry", VIEW),
     ("steps_pending", JOB),
-    ("guide_clock", VIEW),
     ("ready", WORKED),
     ("ready_job", JOB),
     ("holding_note", WORKED),

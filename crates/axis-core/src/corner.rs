@@ -1664,102 +1664,6 @@ pub mod tests {
             assert_eq!(hits.is_empty(), clear, "across {across}: {hits:?}");
         }
     }
-    #[test]
-    fn the_plates_steps_walk_each_corner_by_numbers_and_end_filed() {
-        use crate::guide::{Step, build};
-        let (doc, mesh) = plate_job("Y");
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let walks: Vec<&Step> = guide
-            .steps
-            .iter()
-            .filter(|s| matches!(s, Step::Corner { .. }))
-            .collect();
-        assert!(walks.len() >= 4, "{}", walks.len());
-        // The section counts its walks.
-        let section = guide.sections.iter().find(|s| s.op == Some(0)).unwrap();
-        assert_eq!(section.count, walks.len());
-        let mut seen = HashSet::new();
-        for (k, w) in walks.iter().enumerate() {
-            let Step::Corner {
-                index,
-                of,
-                corner,
-                corners,
-                radius,
-                centre,
-                offset,
-                z,
-                scallop,
-                points,
-                targets,
-                ..
-            } = w
-            else {
-                unreachable!()
-            };
-            assert_eq!((*index, *of, *corners), (k + 1, walks.len(), 4));
-            seen.insert(*corner);
-            assert!((radius - 5.).abs() < 0.01);
-            // Work coordinates: the corners' centres at ±62, ±39.
-            assert!(
-                (centre[0].abs() - 62.).abs() < 0.01 && (centre[1].abs() - 39.).abs() < 0.01,
-                "{centre:?}"
-            );
-            assert!(*z < 0. && *z >= -20.001);
-            if *offset == 0. {
-                assert!(*scallop <= 0.05 + 1e-6, "{scallop}");
-            }
-            // Each target moves one axis to a hundredth; the walk's feeds
-            // are the readings, then out.
-            for t in targets {
-                assert!(
-                    ((t.centre * 100.).round() / 100. - t.centre).abs() < 2e-3,
-                    "{t:?}"
-                );
-                assert!(!t.edge && t.shown == t.centre);
-            }
-            let feeds: Vec<&crate::guide::Target> = targets.iter().filter(|t| t.feed).collect();
-            assert_eq!(feeds.len(), points.len() + 1);
-            for (t, p) in feeds.iter().zip(points) {
-                assert!((t.centre - p[t.axis]).abs() < 1e-3, "{t:?} {p:?}");
-            }
-            // Down once to the level, locked, before the first feed.
-            let down = targets
-                .iter()
-                .position(|t| t.axis == 2 && t.lock[2])
-                .unwrap();
-            assert!((targets[down].centre - z).abs() < 1e-3);
-            assert!(down < targets.iter().position(|t| t.feed).unwrap());
-            // The backlash taken up: the axis read before going down is
-            // first a millimetre short, then on it, the way the walk goes.
-            let (a, b) = (&targets[down - 2], &targets[down - 1]);
-            let along = if (points[0][0] - points.last().unwrap()[0]).abs() > 0.5
-                && (points[0][1] - points.last().unwrap()[1]).abs() > 0.5
-            {
-                b.axis
-            } else {
-                unreachable!()
-            };
-            if a.axis == along {
-                let way = (points.last().unwrap()[along] - points[0][along]).signum();
-                assert!(
-                    ((b.centre - a.centre) - way * TAKE_UP).abs() < 1e-3,
-                    "{a:?} {b:?}"
-                );
-            }
-        }
-        assert_eq!(seen.len(), 4);
-        // Then the scallops are filed.
-        let last = guide
-            .sections
-            .iter()
-            .find(|s| s.op == Some(0))
-            .unwrap()
-            .steps
-            .end
-            - 1;
-        assert!(matches!(guide.steps[last], Step::Check { op: 0 }));
-    }
     /// The most material the tool sweeping `path` leaves proud of the round,
     /// by brute force: along each of `rays` normals out of it, stepped out
     /// 0.0005 mm at a time to the first point within `rc` of the path, then
@@ -1987,129 +1891,24 @@ pub mod tests {
         }
         (doc, mesh)
     }
-    /// A walk's DRO numbers as the Steps say them: "X-77.00", a feed "fX…".
-    fn rows(targets: &[crate::guide::Target]) -> Vec<String> {
-        (targets.iter())
-            .map(|t| {
-                format!(
-                    "{}{}{:.2}",
-                    if t.feed { "f" } else { "" },
-                    ["X", "Y", "Z"][t.axis],
-                    t.centre
-                )
-            })
-            .collect()
-    }
+    /// The adapter plate's setup 3: every walk passes the check the Steps
+    /// make of it (LIO-447), and its page lists its four R5 corners at the
+    /// corners' centres, ±62, ±39 in work coordinates (LIO-688).
     #[test]
-    fn every_walk_of_the_adapter_plate_enters_safely_one_way_and_draws() {
-        use crate::guide::{Step, build};
+    fn every_walk_of_the_adapter_plate_passes_and_its_page_lists_the_corners() {
         let (doc, mesh) = adapter_plate_setup_3();
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let walks: Vec<&Step> = (guide.steps.iter())
-            .filter(|s| matches!(s, Step::Corner { .. }))
-            .collect();
-        // Four corners, two levels of 10 mm, a band 2.22 mm off the round
-        // and the round: 16 walks, as on the saved plate.
-        assert_eq!(walks.len(), 16);
-        let (stock, zero) = (guide.done[0].plan.stock, guide.zero);
-        let top = stock.max[2] - zero[2];
-        for w in &walks {
-            let Step::Corner {
-                index,
-                place,
-                radius,
-                centre,
-                offset,
-                z,
-                level,
-                scallop,
-                points,
-                targets,
-                ..
-            } = w
-            else {
-                unreachable!()
-            };
-            let r = rows(targets);
-            // The numbers the walk's page draws, from its first: every one
-            // known, so the drawing has no NaN (walk 9 had no X).
-            let mut at = [f32::NAN; 3];
-            let first = targets.iter().position(|t| t.feed).unwrap();
-            for t in &targets[..first] {
-                at[t.axis] = t.centre;
-            }
-            assert!(at.iter().all(|v| v.is_finite()), "walk {index}: {r:?}");
-            // Up above the stock first; there the axis it feeds in along set
-            // beside the stock, the other a millimetre short and then on to
-            // the first reading the walk's way; down to the level; in.
-            let way = |k: usize| (points[points.len() - 1][k] - points[0][k]).signum();
-            let [up, safe, short, on, down] = &targets[..5] else {
-                unreachable!()
-            };
+        let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
+        assert_eq!(guide.done[0].plan.corner_walks.len(), 16);
+        let crate::guide::Features::Corners(c) = crate::guide::tests::features(&guide, 0) else {
+            panic!("{:?}", guide.steps)
+        };
+        assert_eq!(c.len(), 4);
+        for r in c {
+            assert!((r.radius - 5.).abs() < 0.01, "{r:?}");
             assert!(
-                up.axis == 2 && up.centre >= top + 10.,
-                "walk {index}: {r:?}"
+                (r.centre[0].abs() - 62.).abs() < 0.01 && (r.centre[1].abs() - 39.).abs() < 0.01,
+                "{r:?}"
             );
-            assert!(
-                safe.axis < 2 && short.axis == 1 - safe.axis,
-                "walk {index}: {r:?}"
-            );
-            assert_eq!(on.axis, short.axis, "walk {index}: {r:?}");
-            assert!(
-                ((on.centre - short.centre) - way(on.axis) * TAKE_UP).abs() < 1e-3,
-                "walk {index}: {r:?}"
-            );
-            assert!((on.centre - points[0][on.axis]).abs() < 1e-3);
-            // The tool goes down with its side clear of the stock.
-            let edge = safe.centre.abs() - 5.;
-            let half = [stock.max[0] - stock.min[0], stock.max[1] - stock.min[1]][safe.axis] / 2.;
-            assert!(edge >= half + 1.9, "walk {index}: {r:?}");
-            assert!(down.axis == 2 && down.lock[2] && (down.centre - z).abs() < 1e-3);
-            // Every feed the walk's one way on its axis, in and out too.
-            let mut was = [safe.centre, on.centre];
-            if safe.axis == 1 {
-                was = [on.centre, safe.centre];
-            }
-            for t in targets[5..].iter().filter(|t| t.feed) {
-                assert!(
-                    (t.centre - was[t.axis]).signum() == way(t.axis),
-                    "walk {index}: {r:?}"
-                );
-                was[t.axis] = t.centre;
-            }
-            assert!(
-                crate::corner::walk_problem(
-                    targets,
-                    points,
-                    *z,
-                    (
-                        [stock.min[0] - zero[0], stock.min[1] - zero[1]],
-                        [stock.max[0] - zero[0], stock.max[1] - zero[1]],
-                        top
-                    ),
-                    &Round {
-                        centre: *centre,
-                        radius: *radius,
-                        quarter: WHERE.iter().position(|p| p == place).unwrap(),
-                        tool: 5.,
-                        offset: *offset,
-                        scallop: *scallop,
-                    }
-                )
-                .is_none()
-            );
-            // Walk 9: the front left corner's band at Z −10, from X −77.
-            if *index == 9 {
-                assert_eq!(*place, WHERE[2]);
-                assert_eq!((*level, (offset * 100.).round()), (1, 222.));
-                assert_eq!(
-                    r[..6],
-                    [
-                        "Z15.00", "X-77.00", "Y-38.00", "Y-39.00", "Z-10.00", "fX-74.22"
-                    ],
-                    "{r:?}"
-                );
-            }
         }
     }
     /// A 134 × 88 × 20 plate whose back right is stepped: two R5 outside
@@ -2179,27 +1978,13 @@ pub mod tests {
             let (plan, made) = walks(setup, &setup.operations[0], &doc.tools[0], &mesh).unwrap();
             assert_eq!(plan.corner_walks, made);
             assert!(made.iter().any(|w| w.offset > 15.), "{spindle}");
-            // And the Steps say so, every number finite.
+            // And the Steps follow, a corner each on its page (LIO-688).
             let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
-            let steps: Vec<_> = (guide.steps.iter())
-                .filter_map(|s| match s {
-                    crate::guide::Step::Corner {
-                        corner,
-                        offset,
-                        scallop,
-                        ..
-                    } => Some((*corner, *offset, *scallop)),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(steps.len(), made.len());
-            for (k, (w, s)) in made.iter().zip(&steps).enumerate() {
-                assert_eq!(s.0, w.corner + 1, "{spindle}: walk {}", k + 1);
-                assert!(
-                    (s.1 - w.offset).abs() < 0.02 && s.2.is_finite(),
-                    "{spindle}: {s:?}"
-                );
-            }
+            let crate::guide::Features::Corners(c) = crate::guide::tests::features(&guide, 0)
+            else {
+                panic!("{:?}", guide.steps)
+            };
+            assert_eq!(c.len(), 2, "{spindle}");
         }
     }
     /// A two-height plate (LIO-447 review): 134 × 88 to Z 10 with R5
@@ -2251,36 +2036,21 @@ pub mod tests {
             let setup = &doc.setups[0];
             let (plan, made) = walks(setup, &setup.operations[0], &doc.tools[0], &mesh).unwrap();
             assert_eq!(plan.corner_walks, made);
-            // The Steps follow, each walk round the corner it was made
-            // round: its radius, its height, its offset.
+            // The Steps follow (the walks pass their check), and the page
+            // lists each corner with its own radius and height (LIO-688).
             let guide =
                 crate::guide::build(&doc, &mesh, 0).unwrap_or_else(|e| panic!("{spindle}: {e}"));
-            let steps: Vec<_> = (guide.steps.iter())
-                .filter_map(|s| match s {
-                    crate::guide::Step::Corner {
-                        corner,
-                        radius,
-                        offset,
-                        z,
-                        scallop,
-                        ..
-                    } => Some((*corner, *radius, *offset, *z, *scallop)),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(steps.len(), made.len(), "{spindle}");
-            for (k, (w, s)) in made.iter().zip(&steps).enumerate() {
-                let c = &corners[w.corner];
-                assert_eq!(s.0, w.corner + 1, "{spindle}: walk {}", k + 1);
-                assert!((s.1 - c.r).abs() < 1e-3, "{spindle}: walk {}: {s:?}", k + 1);
-                assert!(
-                    (s.2 - w.offset).abs() < 0.02 && s.4.is_finite(),
-                    "{spindle}: {s:?}"
-                );
-                assert!((s.3 - w.z).abs() < 1e-3);
+            let crate::guide::Features::Corners(listed) = crate::guide::tests::features(&guide, 0)
+            else {
+                panic!("{:?}", guide.steps)
+            };
+            assert_eq!(listed.len(), corners.len(), "{spindle}");
+            for (r, c) in listed.iter().zip(&corners) {
+                assert!((r.radius - c.r).abs() < 1e-3, "{spindle}: {r:?}");
+                assert!((r.bottom - (c.bottom - guide.zero[2])).abs() < 1e-3, "{r:?}");
             }
-            assert!(steps.iter().any(|s| (s.1 - 3.).abs() < 1e-3));
-            assert!(steps.iter().any(|s| (s.1 - 5.).abs() < 1e-3));
+            assert!(listed.iter().any(|r| (r.radius - 3.).abs() < 1e-3));
+            assert!(listed.iter().any(|r| (r.radius - 5.).abs() < 1e-3));
         }
     }
     /// Walk 9's numbers as the Steps gave them before LIO-447.
@@ -2428,19 +2198,15 @@ pub mod tests {
         let si = (doc.setups.iter())
             .position(|s| s.operations.iter().any(|o| o.strategy == Strategy::Corner))
             .unwrap();
+        let oi = (doc.setups[si].operations.iter())
+            .position(|o| o.strategy == Strategy::Corner)
+            .unwrap();
         let guide = crate::guide::build(&doc, &mesh, si).unwrap();
-        let walks: Vec<_> = (guide.steps.iter())
-            .filter_map(|s| match s {
-                crate::guide::Step::Corner { targets, .. } => Some(rows(targets)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(walks.len(), 16);
-        assert_eq!(
-            walks[8][..6],
-            [
-                "Z15.00", "X-77.00", "Y-38.00", "Y-39.00", "Z-10.00", "fX-74.22"
-            ]
-        );
+        let done = guide.done.iter().find(|d| d.op == oi).unwrap();
+        assert_eq!(done.plan.corner_walks.len(), 16);
+        let crate::guide::Features::Corners(c) = crate::guide::tests::features(&guide, oi) else {
+            panic!("{:?}", guide.steps)
+        };
+        assert_eq!(c.len(), 4);
     }
 }

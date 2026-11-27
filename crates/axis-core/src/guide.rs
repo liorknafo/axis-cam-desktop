@@ -1,9 +1,12 @@
-//! The step guide of a setup on a manual mill or a manual lathe: what to do
-//! at the hand-fed machine, screen by screen, with the numbers its DRO (the
-//! mill) or its dials (the lathe, which has no DRO) should read. It is made
-//! from the setup's simulated plans, so every number is a move the app
-//! checked. Every coordinate a step shows is a work coordinate (the stock
-//! frame less the work zero); `Guide::zero` converts the kept plans.
+//! The step guide of a setup on a manual mill or a manual lathe. On the mill
+//! it is a short sheet (LIO-688): where the work zero is on the stock, then
+//! one page per operation listing what it cuts, each hole, box, slot or
+//! corner with its place, size and depth; the machinist works out the
+//! moves. On the lathe it goes screen by screen, with the numbers its dials
+//! (it has no DRO) should read. It is made from the setup's simulated
+//! plans, so every number is one the app checked. Every coordinate a step
+//! shows is a work coordinate (the stock frame less the work zero);
+//! `Guide::zero` converts the kept plans.
 use crate::{
     cam::{box_block, box_cut, open_sides},
     holding::{Gripped, Layout},
@@ -39,15 +42,7 @@ pub struct Target {
     /// that sets an axis for the last time before the cut, that axis.
     pub lock: [bool; 3],
 }
-/// The lowest Z and the extreme X and Y the tool's edge reaches in an
-/// operation's feeds: the numbers not to pass.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Limits {
-    pub x: [f32; 2],
-    pub y: [f32; 2],
-    pub z: f32,
-}
-/// A vise as the Hold step draws it: its jaws close across axis `across`
+/// A vise as the Zero page draws it: its jaws close across axis `across`
 /// (0 X, 1 Y) and grip `grip` mm of the stock up from `Gripped::bottom`;
 /// its jaw plates are `jaw_height` tall and `jaw_thickness` thick.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,264 +52,103 @@ pub struct Vise {
     pub jaw_height: f32,
     pub jaw_thickness: f32,
 }
-/// The second touch of an axis the Zero step halves (LIO-451): where the
-/// edge finder touches the + face (work coordinates, `contact`), whether
-/// what it touches is round there, and what the DRO reads there after
-/// the − face was set to 0: the width between the touches plus the
-/// finder's diameter, a check on the blank, not a number to type.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Far {
-    pub at: [f32; 3],
-    pub round: bool,
-    pub reads: f32,
-}
-/// How near a face is to the part's to be the part's own (mm): a Face's
-/// floor on the part's top, the stock's bottom on the part's bottom.
-const SIZE_ON: f32 = 0.01;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Step {
-    /// The stock box the setup starts from, what the vise or clamps hold,
-    /// and the vise when it is one.
-    Hold {
+    /// Where the work zero is (LIO-688): the stock box the setup starts
+    /// from, in work coordinates, so that X0 Y0 Z0 is where it sits on it;
+    /// what the vise or clamps hold, the vise when it is one, and the
+    /// clamps over the stock (labelled, work coordinates).
+    Zero {
         stock: Bounds,
         holding: Gripped,
         vise: Option<Vise>,
-    },
-    /// The work zero, `corner` on the DRO, picked up with an edge finder of
-    /// diameter `finder` and the DRO's compensation off. An axis whose zero
-    /// is on a face touches that face (`approach`: −1 the − face from
-    /// outside it, +1 the + face) and is set there to `touch`, the face
-    /// less or plus the finder's radius. An axis whose zero is at the
-    /// middle is halved (LIO-451): it touches its − face (`approach` −1) and
-    /// is set to 0 there, then touches its + face (`far`), where the DRO
-    /// reads about the stock's width plus the finder's diameter, and is set
-    /// there to `touch`, half of that reading, which puts 0 midway whatever
-    /// the blank's real size. Z touches the top, set to `touch[2]`. `at` is
-    /// where each of X and Y is first touched (work coordinates,
-    /// `contact`), which `touch` is set from: on the box's face at the
-    /// top's height when the face reaches it, lower where earlier setups
-    /// cut the top of the face back, and on the outermost material above
-    /// the holding's jaws when that face is only in them; `round` whether
-    /// what it touches is round there (turned), so that the touch is true
-    /// only on its centre line, where it stands out farthest.
-    ///
-    /// On clamps, `clamps` are their boxes (labelled, work coordinates)
-    /// and each touch is clear of them, moved along its face when one is
-    /// over the spot it would have (LIO-458). `blocked` (by axis, at its −
-    /// face and its + face) names the clamps over all of one face of an
-    /// axis whose zero is at the middle: that axis is not halved but set
-    /// from its other face alone (`approach`, no `far`), by the stock's
-    /// size. A face that must be touched and is all under clamps gives no
-    /// guide (`UNDER_CLAMPS`).
-    Zero {
-        corner: [f32; 3],
-        approach: [i8; 2],
-        touch: [f32; 3],
-        finder: f32,
-        at: [[f32; 3]; 2],
-        round: [bool; 2],
-        far: [Option<Far>; 2],
         clamps: Vec<(String, Bounds)>,
-        blocked: [[Option<String>; 2]; 2],
     },
-    /// Set the gear to `rpm` for the tool `tool` (an id). With `top`, a new
-    /// tool: put it in, touch the stock's top with it and set Z to `top`
-    /// (the top before the operation, work Z); without, the tool is in
-    /// already and only its gear changes. With `comp`, enter `diameter` in
-    /// the DRO and set X and Y to `comp` (0 off: centres).
-    Tool {
+    /// One operation on one page (LIO-688): its tool and spindle speed
+    /// (none for a hand tap) and the features it cuts, numbered as the
+    /// plan picture numbers them.
+    Sheet {
         op: usize,
         tool: String,
-        rpm: f32,
-        diameter: f32,
-        comp: Option<[i8; 2]>,
-        top: Option<f32>,
+        rpm: Option<f32>,
+        features: Features,
     },
-    /// A hand tap `tool` (an id) for the tapping `op`: put it in, the
-    /// spindle off and free to turn; no gear (LIO-410). With `top`, Z is
-    /// set on the stock's top with the tap's tip, as for a new tool, so
-    /// that each hole's lift to a safe Z is a DRO reading (LIO-449).
-    TapIn {
-        op: usize,
-        tool: String,
-        top: Option<f32>,
-    },
-    /// Same tool and gear: enter its `diameter` in the DRO and set the
-    /// compensation sides `comp`, not set before or changed.
-    Comp {
-        op: usize,
-        comp: [i8; 2],
-        diameter: f32,
-    },
-    /// One pass of a Box, 1-based `index` of `of`. `cut` is what it sweeps
-    /// out of the stock, `earlier` what the operation's passes before it did.
-    Pass {
-        op: usize,
-        index: usize,
-        of: usize,
-        targets: Vec<Target>,
-        cut: Bounds,
-        earlier: Vec<Bounds>,
-        never: Limits,
-        turns_per_minute: f32,
-    },
-    /// A facing Box (open on all four sides): face the top down to `to`,
-    /// taking off `remove`; the user plans the passes. A new tool picks up Z
-    /// on the top first, set to `top`, as on a Tool step.
-    ///
-    /// With `size`, the face cut is the part's own top and the stock's
-    /// bottom is at the part's bottom already: the part's finished size
-    /// along Z, which the last level is measured to rather than taken off
-    /// by `remove`, as a sawn blank is never the size planned (LIO-487).
-    Face {
-        op: usize,
-        tool: String,
-        rpm: f32,
-        diameter: f32,
-        top: Option<f32>,
-        remove: f32,
-        to: f32,
-        size: Option<f32>,
-    },
-    /// A squaring Box (one closed X or Y side, the wall, and a slab off it
-    /// one row wide): cut the stock's `side` (−1 or +1) of `axis` to `to`
-    /// (the wall as cut, with its allowance), which the DRO reads as `shown`
-    /// (the edge with compensation, else the centre), taking off `remove`,
-    /// down to `down_to` (the floor as cut). With the DRO's compensation on,
-    /// enter `diameter` and set `axis` to its side in `comp` (toward the
-    /// wall; the other axis 0); all 0 with it off. A new tool picks up Z on
-    /// the top first, set to `top`, as on a Tool step.
-    Square {
-        op: usize,
-        tool: String,
-        rpm: f32,
-        diameter: f32,
-        comp: [i8; 2],
-        top: Option<f32>,
-        axis: usize,
-        side: i8,
-        to: f32,
-        shown: f32,
-        remove: f32,
-        down_to: f32,
-    },
-    /// The holes of a Drill in the order drilled: X and Y (centres) and the
-    /// Z each is drilled to; and, by hole, the Z its cut starts at: its
-    /// mouth, where a tap's turns are counted from. A centre drill's Z is
-    /// its pilot's tip. By hole, whether a twist drill starts it on a flat
-    /// face, with nothing before it to centre it (`uncentred`). With a
-    /// `pattern` the DRO leads to (LIO-399), each is reached when X and Y
-    /// read 0, and `numbers` are the DRO's hole numbers in the order
-    /// drilled: an arc's mirrored holes are taken one axis a move, out of
-    /// the DRO's order round the circle (LIO-406). Without, 1, 2, 3…
-    Holes {
-        op: usize,
-        holes: Vec<[f32; 3]>,
-        mouths: Vec<f32>,
-        uncentred: Vec<bool>,
-        pattern: Option<Pattern>,
-        numbers: Vec<usize>,
-    },
-    /// What to type into the DRO for the holes of `op`, which are all one
-    /// `pattern`; `same` when the operation before used the same one (a
-    /// centre drill before its drill): start it again at hole 1.
-    Pattern {
-        op: usize,
-        pattern: Pattern,
-        same: bool,
-    },
-    /// The first screen of `op` after operation `from`, whose holes the
-    /// DRO led to with its matrix or arc holes (LIO-488): leave the hole
-    /// function, and X and Y read work coordinates again, `at` (work X, Y)
-    /// over the last hole drilled, the DRO's hole `number`. Not before an
-    /// operation that starts the same pattern again.
-    Leave {
-        op: usize,
-        from: usize,
-        at: [f32; 2],
-        number: usize,
-    },
-    /// One pass of a Boring (1-based `index` of `of`): the boring head set
-    /// to `size` (Ø mm), from `before` (what the last pass left, or None
-    /// before the first: set it to `size`), turning out `dial` mm on the
-    /// diameter a division; then each hole of `holes` (X and Y centres and
-    /// the Z it is bored to; `mouths` the Z its cut starts at) bored and
-    /// left with the spindle stopped, or fed back out when `feed_out`.
-    Bore {
-        op: usize,
-        index: usize,
-        of: usize,
-        size: f32,
-        before: Option<f32>,
-        dial: f32,
-        feed_out: bool,
-        holes: Vec<[f32; 3]>,
-        mouths: Vec<f32>,
-    },
-    /// One walk of a Round corners (1-based `index` of `of`), round corner
-    /// `corner` of `corners` (1-based), at `place` on the part, of radius
-    /// `radius` about `centre` (work X, Y), `offset` outside the round (0:
-    /// on it, the last walk there), at work Z `z`, level `level` of
-    /// `levels`. `targets` are its DRO numbers in order, tool centres (the
-    /// DRO's compensation off): the way to the start clear of the stock,
-    /// the backlash taken up, down, in, the steps, out and up; `points` the
-    /// walk's readings from the first on the round's start to its last; it
-    /// leaves at most `scallop` proud of the round (or of the line `offset`
-    /// out).
-    Corner {
-        op: usize,
-        index: usize,
-        of: usize,
-        corner: usize,
-        corners: usize,
-        place: &'static str,
-        radius: f32,
-        centre: [f32; 2],
-        offset: f32,
-        z: f32,
-        level: usize,
-        levels: usize,
-        scallop: f32,
-        points: Vec<[f32; 2]>,
-        targets: Vec<Target>,
-        never: Limits,
-        turns_per_minute: f32,
-    },
-    /// A Slot's pass, the exact plan's one-axis centre readings: a sweep
-    /// along its centre line, or a walk round it (LIO-455).
-    Slot {
-        op: usize,
-        index: usize,
-        of: usize,
-        z: f32,
-        top: f32,
-        a: [f32; 2],
-        b: [f32; 2],
-        targets: Vec<Target>,
-        entry_clear: bool,
-        /// What the pass does, with its level, its offset from the centre
-        /// line, what it leaves on the walls, the most its steps leave and
-        /// its readings (`slot::Pass`).
-        pass: crate::slot::Kind,
-        level: usize,
-        levels: usize,
-        offset: f32,
-        left: f32,
-        scallop: f32,
-        points: Vec<[f32; 2]>,
-        /// The round ends' radius as cut, and the tool's radius.
-        radius: f32,
-        tool: f32,
-        /// Both round ends were bored to the width before it: the walks
-        /// only join them, straight (LIO-550, `slot::Pass::joined`).
-        joined: bool,
-    },
-    /// The stock after the operation.
-    Check { op: usize },
     /// The stock leaves for setup `next` (none for the last setup).
     HandOver { next: Option<usize> },
     /// A step at the manual lathe.
     Lathe(LatheStep),
+}
+/// How deep a hole goes (LIO-688).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Depth {
+    /// Through the stock; the tool's tip at work Z `tip`.
+    Through { tip: f32 },
+    /// `deep` mm below its mouth: a twist drill's to its full diameter, a
+    /// tap's to its full thread, a bore's to its floor, a centre drill's
+    /// or a cut too shallow for its point to its tip; the tool's tip at
+    /// work Z `tip`.
+    Blind { deep: f32, tip: f32 },
+}
+/// A hole of a Drill, a Tap or a Boring: its centre (work X, Y), the work
+/// Z of its mouth, how deep it goes, and whether a twist drill starts it on
+/// a flat face with nothing before it to centre it (`uncentred`, a plan
+/// check).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hole {
+    pub at: [f32; 2],
+    pub mouth: f32,
+    pub depth: Depth,
+    pub uncentred: bool,
+}
+/// A Round corners' corner: where it is on the part, the centre of its
+/// round (work X, Y), its radius, and the work Z it goes from and to.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Rounded {
+    pub place: &'static str,
+    pub centre: [f32; 2],
+    pub radius: f32,
+    pub top: f32,
+    pub bottom: f32,
+}
+/// What an operation's page lists (LIO-688). Work coordinates throughout.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Features {
+    /// Holes of one size: Ø `diameter` (a Boring's finished size), or a
+    /// tap's `thread`, "M8×1.25".
+    Holes {
+        diameter: f32,
+        thread: Option<String>,
+        holes: Vec<Hole>,
+    },
+    /// A Box as it cuts: `lo`..`hi` on X and Y within the stock, from the
+    /// top it meets (`hi[2]`) down to its floor (`lo[2]`), or `through`.
+    Box {
+        lo: [f32; 3],
+        hi: [f32; 3],
+        through: bool,
+    },
+    /// A Slot: the centres of its round ends `a` and `b`, its width as cut,
+    /// the top it starts in and its floor, or `through`.
+    Slot {
+        a: [f32; 2],
+        b: [f32; 2],
+        width: f32,
+        top: f32,
+        floor: f32,
+        through: bool,
+    },
+    /// Round corners' corners, in the order cut.
+    Corners(Vec<Rounded>),
+}
+impl Features {
+    /// How many features the page numbers.
+    pub fn count(&self) -> usize {
+        match self {
+            Features::Holes { holes, .. } => holes.len(),
+            Features::Box { .. } | Features::Slot { .. } => 1,
+            Features::Corners(c) => c.len(),
+        }
+    }
 }
 /// A number set on one of the lathe's dials: `lathe::dial` of `distance`.
 #[derive(Debug, Clone, PartialEq)]
@@ -731,37 +565,21 @@ pub struct Guide {
     /// The enabled operations in order.
     pub done: Vec<Done>,
 }
-/// What a Box is on the hand-fed mill (`cam::open_sides`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Kind {
-    Face,
-    /// The closed side, the wall, is on `axis`, on its − side when `low`.
-    Square {
-        axis: usize,
-        low: bool,
-    },
-    Other,
-}
-/// A Box with its sides `open` that cuts `lo`..`hi` (`cam::box_cut`) with a
-/// tool of radius `r`: facing when all four X and Y sides are open;
-/// squaring when exactly one is closed (the wall; its ends along the wall
-/// are then open) and the slab off the wall is at most `r` wide, so one row
-/// per level takes it, whatever its floor; otherwise passes.
-fn kind(open: [[bool; 2]; 3], lo: [f32; 3], hi: [f32; 3], r: f32) -> Kind {
+/// Whether a Box with its sides `open` that cuts `lo`..`hi`
+/// (`cam::box_cut`) with a tool of radius `r` is cut in passes: not a
+/// facing (all four X and Y sides open), nor a squaring (exactly one
+/// closed, the wall, and the slab off it at most `r` wide, one row a level
+/// whatever its floor).
+fn in_passes(open: [[bool; 2]; 3], lo: [f32; 3], hi: [f32; 3], r: f32) -> bool {
     let closed: Vec<(usize, bool)> = (0..2)
         .flat_map(|k| [(k, true), (k, false)])
         .filter(|&(k, low)| !open[k][usize::from(!low)])
         .collect();
     match closed[..] {
-        [] => Kind::Face,
-        [(axis, low)] if hi[axis] - lo[axis] <= r + crate::cam::ON => Kind::Square { axis, low },
-        _ => Kind::Other,
+        [] => false,
+        [(axis, _)] => hi[axis] - lo[axis] > r + crate::cam::ON,
+        _ => true,
     }
-}
-/// The DRO's compensation side on X and Y: toward the box's closed side,
-/// + when both or neither are closed.
-fn comp_sides(open: [[bool; 2]; 3]) -> [i8; 2] {
-    std::array::from_fn(|k| if open[k] == [false, true] { -1 } else { 1 })
 }
 /// The one axis a manual move changes.
 fn moved(m: &Move) -> Result<usize, String> {
@@ -769,119 +587,6 @@ fn moved(m: &Move) -> Result<usize, String> {
         [k] => Ok(k),
         _ => Err("A move on the manual mill changes more than one axis.".into()),
     }
-}
-/// The targets of `legs` (axis, stock-frame end, a feed), the last of them
-/// the cut, as the DRO shows them.
-fn targets(legs: &[(usize, f32, bool)], zero: [f32; 3], comp: [i8; 2], r: f32) -> Vec<Target> {
-    let last = legs.len() - 1;
-    let cut = legs[last].0;
-    (legs.iter().enumerate())
-        .map(|(i, &(axis, at, feed))| {
-            let centre = at - zero[axis];
-            let side = comp.get(axis).copied().unwrap_or(0);
-            let lock = std::array::from_fn(|k| match i == last {
-                true => k != axis,
-                false => k == axis && k != cut && legs[i + 1..].iter().all(|l| l.0 != k),
-            });
-            Target {
-                order: u8::try_from(i + 1).unwrap_or(u8::MAX),
-                axis,
-                centre,
-                shown: centre + f32::from(side) * r,
-                edge: side != 0,
-                feed,
-                lock,
-            }
-        })
-        .collect()
-}
-/// One Pass step per cut of a Box's `plan`.
-fn passes(
-    op: usize,
-    plan: &Plan,
-    zero: [f32; 3],
-    comp: [i8; 2],
-    machine: &Machine,
-) -> Result<Vec<Step>, String> {
-    let (r, s) = (plan.radius, plan.stock);
-    let work = |b: Bounds| b.translated(zero.map(|v| -v));
-    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-    for m in plan.moves.iter().filter(|m| m.motion == Motion::Feed) {
-        for p in [m.from, m.to] {
-            for k in 0..3 {
-                (lo[k], hi[k]) = (lo[k].min(p[k]), hi[k].max(p[k]));
-            }
-        }
-    }
-    let never = Limits {
-        x: [lo[0] - r - zero[0], hi[0] + r - zero[0]],
-        y: [lo[1] - r - zero[1], hi[1] + r - zero[1]],
-        z: lo[2] - zero[2],
-    };
-    let cuts: Vec<&Move> = plan.moves.iter().filter(|m| m.cutting_pass).collect();
-    let top = plan.rest_top.unwrap_or(s.max[2]);
-    let (mut steps, mut earlier, mut legs) = (vec![], vec![], vec![]);
-    for m in plan.moves.iter().filter(|m| m.motion != Motion::Dwell) {
-        let axis = moved(m)?;
-        legs.push((axis, m.to[axis], m.motion == Motion::Feed));
-        if !m.cutting_pass {
-            continue;
-        }
-        if steps.is_empty() {
-            // Where the tool is before the first pass is not known: the axes
-            // the plan does not move from its start are set before the plunge.
-            let before = &legs[..legs.len() - 1];
-            let missing: Vec<(usize, f32, bool)> = (0..3)
-                .filter(|&k| before.iter().all(|l| l.0 != k))
-                .map(|k| (k, m.from[k], false))
-                .collect();
-            let at = before
-                .iter()
-                .rposition(|l| l.0 == 2)
-                .unwrap_or(before.len());
-            legs.splice(at..at, missing);
-        }
-        let targets = targets(&legs, zero, comp, r);
-        legs.clear();
-        // From the level above (or the top of the material) down to this one.
-        let above = cuts
-            .iter()
-            .map(|c| c.to[2])
-            .filter(|z| *z > m.to[2])
-            .fold(top, f32::min);
-        let cut = Bounds {
-            min: std::array::from_fn(|k| match k {
-                2 => m.to[2],
-                _ => m.from[k].min(m.to[k]) - r,
-            }),
-            max: std::array::from_fn(|k| match k {
-                2 => above,
-                _ => m.from[k].max(m.to[k]) + r,
-            }),
-        };
-        let cut = work(Bounds {
-            min: std::array::from_fn(|k| cut.min[k].max(s.min[k])),
-            max: std::array::from_fn(|k| cut.max[k].min(s.max[k])),
-        });
-        steps.push(Step::Pass {
-            op,
-            index: steps.len() + 1,
-            of: cuts.len(),
-            targets,
-            cut,
-            earlier: earlier.clone(),
-            never,
-            turns_per_minute: manual::turns(machine, axis, m.feed),
-        });
-        earlier.push(cut);
-    }
-    Ok(steps)
-}
-/// The holes of a Drill's `plan` in the order drilled: centre and depth.
-/// The Z, from `zero`, each hole's cut starts at, in `holes`' order: the
-/// top of its first cutting move.
-fn mouths(plan: &Plan, zero: [f32; 3]) -> Vec<f32> {
-    mouths_of(&plan.moves, zero)
 }
 /// `mouths` of the holes `moves` cut.
 fn mouths_of(moves: &[Move], zero: [f32; 3]) -> Vec<f32> {
@@ -895,10 +600,6 @@ fn mouths_of(moves: &[Move], zero: [f32; 3]) -> Vec<f32> {
         }
     }
     out.into_iter().map(|(_, z)| z).collect()
-}
-/// `turns` to a tenth, rounded down, a hair over a whole tenth kept.
-fn tenths_down(turns: f32) -> f32 {
-    (turns * 10. + 1e-3).floor() / 10.
 }
 /// Whether the mouth of the hole Ø`d` at `at` (stock frame), drilled from
 /// as high as `top` down to `bottom`, is opened in `before` so that a twist
@@ -957,396 +658,6 @@ pub(crate) fn opened(
 /// How many rings round a hole's axis `opened` looks at, evenly out to its
 /// rim.
 const RINGS: usize = 4;
-fn holes(plan: &Plan, zero: [f32; 3]) -> Vec<[f32; 3]> {
-    holes_of(&plan.moves, zero)
-}
-/// Within this, mm, two holes share an X or a Y: the move between them is
-/// along one axis.
-const SAME_AXIS: f32 = 0.005;
-/// Whether the move between `a` and `b` is along one axis.
-pub fn one_axis(a: [f32; 2], b: [f32; 2]) -> bool {
-    (0..2).any(|k| (a[k] - b[k]).abs() <= SAME_AXIS)
-}
-/// The order to drill an arc's holes `at` (centres in the DRO's order, round
-/// the circle), as indices of `at`: from hole 1, next the hole left that
-/// shares this one's Y (a move along X), else its X, the nearer of two,
-/// else the nearest left. Used only when it has more one-axis moves than
-/// going round (LIO-406).
-// ponytail: the DRO is taken to count counter-clockwise from its first
-// hole; if the owner's counts the other way the numbers mirror, and every
-// hole is still drilled once.
-fn drill_order(at: &[[f32; 2]]) -> Vec<usize> {
-    let moves = |o: &[usize]| {
-        (o.windows(2))
-            .filter(|w| one_axis(at[w[0]], at[w[1]]))
-            .count()
-    };
-    let round: Vec<usize> = (0..at.len()).collect();
-    let mut order = vec![0];
-    let mut left: Vec<usize> = (1..at.len()).collect();
-    while let Some(&here) = order.last()
-        && !left.is_empty()
-    {
-        let p = at[here];
-        let near = |j: usize| (at[j][0] - p[0]).hypot(at[j][1] - p[1]);
-        let rank = |j: usize| match (at[j][1] - p[1]).abs() <= SAME_AXIS {
-            true => 0,
-            false if (at[j][0] - p[0]).abs() <= SAME_AXIS => 1,
-            false => 2,
-        };
-        let pick = (0..left.len())
-            .min_by(|&a, &b| {
-                let (a, b) = (left[a], left[b]);
-                rank(a).cmp(&rank(b)).then(near(a).total_cmp(&near(b)))
-            })
-            .unwrap_or(0);
-        order.push(left.remove(pick));
-    }
-    if moves(&order) > moves(&round) {
-        order
-    } else {
-        round
-    }
-}
-/// `v` in `order`.
-fn reordered<T: Clone>(v: &[T], order: &[usize]) -> Vec<T> {
-    order.iter().filter_map(|&j| v.get(j).cloned()).collect()
-}
-/// A pattern of holes a DRO leads to by itself (LIO-399): its matrix holes
-/// (a grid) or its arc holes. Work coordinates; mm, and degrees from +X
-/// counter-clockwise; rounded to 0.01.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Pattern {
-    /// `columns` holes a row and `rows` rows: `first` the first hole,
-    /// `pitch` along a row and between the rows, the rows at `angle`. The
-    /// order: row by row from the first hole, back and forth, each row the
-    /// opposite way from the one before, so that square to the axes every
-    /// move to the next hole is along one axis (LIO-405).
-    Grid {
-        first: [f32; 2],
-        columns: usize,
-        rows: usize,
-        pitch: [f32; 2],
-        angle: f32,
-    },
-    /// `count` holes on the circle Ø`diameter` round `centre`, the first at
-    /// angle `first`, each one `step` on counter-clockwise; `full` all the
-    /// way round. The DRO's order: from the first, counter-clockwise.
-    Arc {
-        centre: [f32; 2],
-        diameter: f32,
-        count: usize,
-        first: f32,
-        step: f32,
-        full: bool,
-    },
-}
-/// How far a hole may be off its place in a pattern, mm: the centres come
-/// from the part's mesh.
-const ON_PATTERN: f32 = 0.02;
-fn hundredths(v: f32) -> f32 {
-    (v * 100.).round() / 100. + 0.
-}
-/// How far a hole may be from where the numbers as shown put it, mm.
-const SHOWN_OFF: f32 = 0.05;
-/// The pattern of `holes` (centres and depths, work coordinates) the DRO
-/// leads to (`pattern`), when all of them go to the same Z to 0.01.
-// ponytail: the DRO's order of the holes is not known (row by row each the
-// same way, or back and forth), so holes of unequal depth go one by one,
-// lest the DRO's hole N get another hole's depth (LIO-403). Lift it when the
-// owner's DRO order is known.
-fn level_pattern(holes: &[[f32; 3]], grids: bool, arcs: bool) -> Option<(Pattern, Vec<usize>)> {
-    let z = hundredths(holes.first()?[2]);
-    if holes.iter().any(|h| hundredths(h[2]) != z) {
-        return None;
-    }
-    let xy: Vec<[f32; 2]> = holes.iter().map(|h| [h[0], h[1]]).collect();
-    pattern(&xy, grids, arcs)
-}
-/// Where the DRO puts each hole of `p`, in its order, from its numbers as
-/// shown: each hole a pitch, or an angle between holes, on from the last.
-fn places(p: &Pattern) -> Vec<[f32; 2]> {
-    match *p {
-        Pattern::Grid {
-            first,
-            columns,
-            rows,
-            pitch,
-            angle,
-        } => {
-            let (s, c) = angle.to_radians().sin_cos();
-            (0..rows)
-                .flat_map(|r| {
-                    (0..columns).map(move |k| {
-                        let k = if r % 2 == 1 { columns - 1 - k } else { k };
-                        let (u, v) = (k as f32 * pitch[0], r as f32 * pitch[1]);
-                        [first[0] + u * c - v * s, first[1] + u * s + v * c]
-                    })
-                })
-                .collect()
-        }
-        Pattern::Arc {
-            centre,
-            diameter,
-            count,
-            first,
-            step,
-            ..
-        } => (0..count)
-            .map(|j| {
-                let t = (first + j as f32 * step).to_radians();
-                [
-                    centre[0] + diameter / 2. * t.cos(),
-                    centre[1] + diameter / 2. * t.sin(),
-                ]
-            })
-            .collect(),
-    }
-}
-/// The one pattern the hole centres `holes` (work coordinates) make all
-/// together, of those the DRO has (`grids`, `arcs`), with the holes'
-/// indices in the DRO's order; None for fewer than three holes, or when the
-/// numbers as shown put a hole more than 0.05 mm off (LIO-402). Four holes
-/// on a square are a grid and a circle: the grid when square to the axes,
-/// else the circle, a bolt circle of four (LIO-402).
-pub fn pattern(holes: &[[f32; 2]], grids: bool, arcs: bool) -> Option<(Pattern, Vec<usize>)> {
-    if holes.len() < 3 {
-        return None;
-    }
-    let shown = |found: Option<(Pattern, Vec<usize>)>| {
-        found.filter(|(p, order)| {
-            (places(p).iter().zip(order))
-                .all(|(q, &h)| (q[0] - holes[h][0]).hypot(q[1] - holes[h][1]) <= SHOWN_OFF)
-        })
-    };
-    let as_grid = if grids { shown(grid(holes)) } else { None };
-    let as_arc = if arcs { shown(arc(holes)) } else { None };
-    match (as_grid, as_arc) {
-        (
-            Some((Pattern::Grid { angle, .. }, _)),
-            Some(round @ (Pattern::Arc { full: true, .. }, _)),
-        ) if angle != 0. => Some(round),
-        (Some(found), _) => Some(found),
-        (None, found) => found,
-    }
-}
-/// `holes` as one grid: its rows along the direction of a pair of holes,
-/// the longest pairs first, as their direction is the truest.
-// ponytail: every pair's direction is tried, cubic in the holes; a Drill
-// has tens. Bin the directions first if hundreds of holes get slow.
-fn grid(holes: &[[f32; 2]]) -> Option<(Pattern, Vec<usize>)> {
-    let n = holes.len();
-    let d = |&(a, b): &(usize, usize)| (holes[b][0] - holes[a][0]).hypot(holes[b][1] - holes[a][1]);
-    let mut pairs: Vec<(usize, usize)> = (0..n)
-        .flat_map(|a| (a + 1..n).map(move |b| (a, b)))
-        .collect();
-    pairs.sort_by(|x, y| d(y).total_cmp(&d(x)));
-    let mut tried: Vec<f32> = vec![];
-    pairs.into_iter().find_map(|(a, b)| {
-        let (dx, dy) = (holes[b][0] - holes[a][0], holes[b][1] - holes[a][1]);
-        let turn = dy.atan2(dx).rem_euclid(std::f32::consts::PI);
-        let near = |t: &f32| {
-            let off = (t - turn).abs();
-            off.min(std::f32::consts::PI - off) < 1e-3
-        };
-        if tried.iter().any(near) {
-            return None;
-        }
-        tried.push(turn);
-        grid_along(holes, [turn.cos(), turn.sin()])
-    })
-}
-/// The ranks of `values` with those within 0.2 mm of the one before as one,
-/// and how many ranks.
-fn ranks(values: &[f32]) -> (Vec<usize>, usize) {
-    let mut by: Vec<usize> = (0..values.len()).collect();
-    by.sort_by(|a, b| values[*a].total_cmp(&values[*b]));
-    let mut rank = vec![0; values.len()];
-    let mut r = 0;
-    for w in 1..by.len() {
-        if values[by[w]] - values[by[w - 1]] > 10. * ON_PATTERN {
-            r += 1;
-        }
-        rank[by[w]] = r;
-    }
-    (rank, r + 1)
-}
-/// `holes` as a grid with its rows roughly along the unit vector `u`.
-fn grid_along(holes: &[[f32; 2]], u: [f32; 2]) -> Option<(Pattern, Vec<usize>)> {
-    let n = holes.len();
-    let dot = |p: [f32; 2], q: [f32; 2]| p[0] * q[0] + p[1] * q[1];
-    let along: Vec<f32> = holes.iter().map(|p| dot(*p, u)).collect();
-    let across: Vec<f32> = holes.iter().map(|p| dot(*p, [-u[1], u[0]])).collect();
-    let (mut i, mut c) = ranks(&along);
-    let (mut k, mut r) = ranks(&across);
-    if c * r != n {
-        return None;
-    }
-    let mut seen = vec![false; n];
-    for h in 0..n {
-        let at = k[h] * c + i[h];
-        if std::mem::replace(&mut seen[at], true) {
-            return None;
-        }
-    }
-    // A full grid: the least-squares pitch on each index alone.
-    let fit = |idx: &[usize]| -> [f32; 2] {
-        let m = idx.iter().sum::<usize>() as f32 / n as f32;
-        let ss: f32 = idx.iter().map(|&j| (j as f32 - m).powi(2)).sum();
-        if ss == 0. {
-            return [0.; 2];
-        }
-        std::array::from_fn(|a| {
-            let pm = holes.iter().map(|p| p[a]).sum::<f32>() / n as f32;
-            (idx.iter().zip(holes))
-                .map(|(&j, p)| (j as f32 - m) * (p[a] - pm))
-                .sum::<f32>()
-                / ss
-        })
-    };
-    let (mut pa, mut pb) = (fit(&i), fit(&k));
-    // Rows along the pitch nearer X; a column alone is a row.
-    let len = |v: [f32; 2]| v[0].hypot(v[1]);
-    if c == 1 || (r > 1 && pb[0].abs() / len(pb) > pa[0].abs() / len(pa)) {
-        (i, k, c, r, pa, pb) = (k, i, r, c, pb, pa);
-    }
-    // The rows run toward +X, or +Y when upright within the 0.1° a mesh's
-    // centres can turn them (their angle over −89.9° and up to 90.1°); the
-    // rows after the first go counter-clockwise of them, square to them.
-    let turned = pa[1].atan2(pa[0]).to_degrees();
-    if !(-89.9..=90.1).contains(&turned) {
-        pa = pa.map(|v| -v);
-        i.iter_mut().for_each(|j| *j = c - 1 - *j);
-    }
-    let ua = pa.map(|v| v / len(pa));
-    let ub = [-ua[1], ua[0]];
-    let mut across = dot(pb, ub);
-    if across < 0. {
-        across = -across;
-        k.iter_mut().for_each(|j| *j = r - 1 - *j);
-    }
-    let pb = ub.map(|v| v * across);
-    let mean = |idx: &[usize]| idx.iter().sum::<usize>() as f32 / n as f32;
-    let (mi, mk) = (mean(&i), mean(&k));
-    let first: [f32; 2] = std::array::from_fn(|a| {
-        holes.iter().map(|p| p[a]).sum::<f32>() / n as f32 - mi * pa[a] - mk * pb[a]
-    });
-    let off = |h: usize| {
-        let at: [f32; 2] =
-            std::array::from_fn(|a| first[a] + i[h] as f32 * pa[a] + k[h] as f32 * pb[a]);
-        (at[0] - holes[h][0]).hypot(at[1] - holes[h][1])
-    };
-    if (0..n).any(|h| off(h) > ON_PATTERN) {
-        return None;
-    }
-    // Back and forth: the odd rows the other way (LIO-405).
-    // ponytail: no setting for the DRO's order; add one if the owner's DRO
-    // goes each row from the same end.
-    let mut order: Vec<usize> = (0..n).collect();
-    order.sort_by_key(|&h| (k[h], if k[h] % 2 == 1 { c - 1 - i[h] } else { i[h] }));
-    // Square to the axes within 0.02° reads 0 (LIO-402).
-    let turned = pa[1].atan2(pa[0]).to_degrees();
-    let angle = if turned.abs() <= 0.02 {
-        0.
-    } else {
-        hundredths(turned)
-    };
-    // A lone line along Y is one hole a row, the rows up it: a DRO whose
-    // matrix holes take no angle does it so (LIO-402).
-    let pattern = if r == 1 && (turned - 90.).abs() <= 0.02 {
-        Pattern::Grid {
-            first: first.map(hundredths),
-            columns: 1,
-            rows: c,
-            pitch: [0., hundredths(len(pa))],
-            angle: 0.,
-        }
-    } else {
-        Pattern::Grid {
-            first: first.map(hundredths),
-            columns: c,
-            rows: r,
-            pitch: [len(pa), across].map(hundredths),
-            angle,
-        }
-    };
-    Some((pattern, order))
-}
-/// `holes` as one arc: on the circle that fits them best, at even angles,
-/// all the way round or along part of it (at least four holes, as any three
-/// lie on some circle (LIO-402), and 10° from the first to the last, not a
-/// line).
-fn arc(holes: &[[f32; 2]]) -> Option<(Pattern, Vec<usize>)> {
-    let n = holes.len();
-    // The algebraic (Kåsa) fit, about the holes' middle.
-    let m: [f64; 2] =
-        std::array::from_fn(|a| holes.iter().map(|p| f64::from(p[a])).sum::<f64>() / n as f64);
-    let (mut uu, mut uv, mut vv, mut r1, mut r2) = (0., 0., 0., 0., 0.);
-    for p in holes {
-        let (u, v) = (f64::from(p[0]) - m[0], f64::from(p[1]) - m[1]);
-        (uu, uv, vv) = (uu + u * u, uv + u * v, vv + v * v);
-        r1 += u * (u * u + v * v) / 2.;
-        r2 += v * (u * u + v * v) / 2.;
-    }
-    let det = uu * vv - uv * uv;
-    if det.abs() < 1e-9 * (uu * vv).max(1e-12) {
-        return None;
-    }
-    let (cu, cv) = ((r1 * vv - r2 * uv) / det, (r2 * uu - r1 * uv) / det);
-    let radius = (cu * cu + cv * cv + (uu + vv) / n as f64).sqrt() as f32;
-    let centre = [(m[0] + cu) as f32, (m[1] + cv) as f32];
-    // Each hole's angle, 0 to 360; one under 0 by no more than a hole may
-    // be off its place is taken as 0.
-    let hair = (ON_PATTERN / radius.max(ON_PATTERN)).to_degrees();
-    let angle = |p: [f32; 2]| {
-        let a = (p[1] - centre[1]).atan2(p[0] - centre[0]).to_degrees();
-        if a < -hair { a + 360. } else { a.max(0.) }
-    };
-    let mut by: Vec<usize> = (0..n).collect();
-    by.sort_by(|a, b| angle(holes[*a]).total_cmp(&angle(holes[*b])));
-    let gap = |j: usize| {
-        let next = angle(holes[by[(j + 1) % n]]);
-        (next - angle(holes[by[j]])).rem_euclid(360.)
-    };
-    let widest = (0..n).max_by(|a, b| gap(*a).total_cmp(&gap(*b)))?;
-    // All the way round, from the hole at the least angle; else from the
-    // hole after the widest gap.
-    let tries = [
-        (true, 0, 360. / n as f32),
-        (
-            false,
-            (widest + 1) % n,
-            (360. - gap(widest)) / (n - 1) as f32,
-        ),
-    ];
-    tries.into_iter().find_map(|(full, start, step)| {
-        if !full && (n < 4 || step * ((n - 1) as f32) < 10.) {
-            return None;
-        }
-        let order: Vec<usize> = (0..n).map(|j| by[(start + j) % n]).collect();
-        let a0 = angle(holes[order[0]]);
-        let first = (order.iter().enumerate())
-            .map(|(j, &h)| (angle(holes[h]) - a0).rem_euclid(360.) + a0 - j as f32 * step)
-            .sum::<f32>()
-            / n as f32;
-        let fits = order.iter().enumerate().all(|(j, &h)| {
-            let t = (first + j as f32 * step).to_radians();
-            let at = [centre[0] + radius * t.cos(), centre[1] + radius * t.sin()];
-            (at[0] - holes[h][0]).hypot(at[1] - holes[h][1]) <= ON_PATTERN
-        });
-        fits.then(|| {
-            let pattern = Pattern::Arc {
-                centre: centre.map(hundredths),
-                diameter: hundredths(2. * radius),
-                count: n,
-                first: hundredths(first).rem_euclid(360.),
-                step: hundredths(step),
-                full,
-            };
-            (pattern, order)
-        })
-    })
-}
 /// `holes` of the holes `moves` cut.
 fn holes_of(moves: &[Move], zero: [f32; 3]) -> Vec<[f32; 3]> {
     let mut holes: Vec<[f32; 3]> = vec![];
@@ -1865,11 +1176,6 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
     let stock = done[0].1.stock;
     let zero = crate::post::datum(setup, stock, mesh)?;
     let work = |b: Bounds| b.translated(zero.map(|v| -v));
-    let dro = get(&machine.p, "dro_comp") == "Yes";
-    // The DRO's own hole functions (LIO-399).
-    // Yes unless set to No, so a pattern needs nothing set up.
-    let grids = get(&machine.p, "dro_matrix") != "No";
-    let arcs = get(&machine.p, "dro_arc") != "No";
     let tool_time = num(&machine.p, "tool_time").unwrap_or(0.);
 
     // Set up.
@@ -1888,16 +1194,14 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         }
         _ => None,
     };
-    let origin = get(&setup.p, "origin");
-    let found = crate::post::references(origin)
-        .zip(crate::post::touch_point(origin, stock))
+    let found = crate::post::references(get(&setup.p, "origin"))
         .ok_or("Choose a work zero for the setup.")?;
     let finder = num(&machine.p, "edge_finder")
         .filter(|d| *d > 0.)
         .ok_or("Enter the edge finder's diameter on the manual mill.")?;
-    let approach = found.0.map(|a| if a == At::Max { 1 } else { -1 });
+    let approach = found.map(|a| if a == At::Max { 1 } else { -1 });
     // A zero at the middle is found by halving between both faces.
-    let halve = found.0.map(|a| a == At::Mid);
+    let halve = found.map(|a| a == At::Mid);
     // The finder touches clear above what the holding's jaws reach: a
     // vise's grip above where the stock stands, soft jaws' or a collet's
     // above the bar's bottom (a V-block holds a bar from below).
@@ -1916,9 +1220,9 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         Err(why) if get(&setup.p, "holding") == "Clamps" => return Err(why),
         _ => vec![],
     };
-    // Where axis `k` is touched from its + side when `plus`: clear above
-    // the jaws, else just above them; with the clamps over all of that
-    // face, named, when they are.
+    // Whether the edge finder reaches the face axis `k` is found on, its +
+    // face when `plus`: clear above the jaws, else just above them; with
+    // the clamps over all of that face, named, when they are.
     let touch = |k: usize, plus: bool| {
         let near = |clear: f32| {
             let above = jaws.map_or(f32::NEG_INFINITY, |top| top + clear);
@@ -1928,22 +1232,19 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
             .or_else(|| near(FINDER_LEAST))
             .ok_or(NOT_CLEAR)?;
         let names: Vec<&str> = t.under.iter().map(|&i| clamps[i].label.as_str()).collect();
-        let under = (!names.is_empty()).then(|| crate::post::listed(&names));
-        Ok::<_, &str>(((t.at, t.round), under))
+        Ok::<_, &str>((!names.is_empty()).then(|| crate::post::listed(&names)))
     };
     // A face under clamps: "the front face (the clamp on -Y (offset 0))".
     let face = |k: usize, plus: bool, names: &str| {
         let side = [["left", "right"], ["front", "back"]][k][usize::from(plus)];
         format!("the {side} face ({names})")
     };
-    // By axis, at its − face and its + face: the clamps over all of that
-    // face, named, when the axis is found from its other face alone.
-    let mut blocked: [[Option<String>; 2]; 2] = Default::default();
-    let mut approach = approach;
-    let mut touched = [([0.; 3], false); 2];
-    let mut far: [Option<Far>; 2] = [None; 2];
+    // The page says where the zero is, not how to find it (LIO-688), but a
+    // zero the edge finder cannot reach is still refused: a face it must
+    // touch above the jaws and clear of the clamps; a middle needs one of
+    // its two faces (LIO-451, LIO-458).
     for k in 0..2 {
-        let (first, under) = touch(k, approach[k] > 0)?;
+        let under = touch(k, approach[k] > 0)?;
         if !halve[k] {
             if let Some(names) = under {
                 return Err(format!(
@@ -1951,97 +1252,45 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                     face(k, approach[k] > 0, &names)
                 ));
             }
-            touched[k] = first;
             continue;
         }
-        // A halved axis with one face under clamps is set from the other
-        // alone, by the stock's size; with both, it cannot be found.
-        let (second, over) = touch(k, true)?;
-        match (under, over) {
-            (Some(minus), Some(plus)) => {
-                return Err(format!(
-                    "{UNDER_CLAMPS} on {} or {}. Move a clamp along its side so that the finder can touch one of them, or choose a work zero on faces the clamps leave clear.",
-                    face(k, false, &minus),
-                    face(k, true, &plus)
-                ));
-            }
-            (Some(minus), None) => {
-                approach[k] = 1;
-                touched[k] = second;
-                blocked[k][0] = Some(minus);
-            }
-            (None, Some(plus)) => {
-                touched[k] = first;
-                blocked[k][1] = Some(plus);
-            }
-            (None, None) => {
-                let (at, round) = second;
-                touched[k] = first;
-                far[k] = Some(Far {
-                    at: std::array::from_fn(|i| at[i] - zero[i]),
-                    round,
-                    // Set to 0 with the finder's centre a radius outside
-                    // the − face, read with it a radius outside the + face.
-                    reads: at[k] - touched[k].0[k] + finder,
-                });
-            }
+        if let (Some(minus), Some(plus)) = (under, touch(k, true)?) {
+            return Err(format!(
+                "{UNDER_CLAMPS} on {} or {}. Move a clamp along its side so that the finder can touch one of them, or choose a work zero on faces the clamps leave clear.",
+                face(k, false, &minus),
+                face(k, true, &plus)
+            ));
         }
     }
-    let mut steps = vec![
-        Step::Hold {
-            stock: work(stock),
-            holding: Gripped {
-                stock: work(held.stock),
-                band: work(held.band),
-                bottom: held.bottom - zero[2],
-                girth: held.girth,
-            },
-            vise,
+    let mut steps = vec![Step::Zero {
+        stock: work(stock),
+        holding: Gripped {
+            stock: work(held.stock),
+            band: work(held.band),
+            bottom: held.bottom - zero[2],
+            girth: held.girth,
         },
-        Step::Zero {
-            corner: std::array::from_fn(|k| found.1[k] - zero[k]),
-            approach,
-            // Set to the face it touches, less or plus the finder's radius;
-            // a halved axis at its + face, to where the finder's centre is
-            // there: half the reading when the touches are either side of
-            // the zero alike.
-            touch: std::array::from_fn(|k| match (approach.get(k), far.get(k)) {
-                (_, Some(Some(f))) => f.at[k] + finder / 2.,
-                (Some(1), _) => touched[k].0[k] + finder / 2. - zero[k],
-                (Some(_), _) => touched[k].0[k] - finder / 2. - zero[k],
-                (None, _) => stock.max[2] - zero[2],
-            }),
-            finder,
-            at: std::array::from_fn(|k| std::array::from_fn(|i| touched[k].0[i] - zero[i])),
-            round: touched.map(|(_, round)| round),
-            far,
-            clamps: (clamps.iter())
-                .map(|c| (c.label.clone(), work(c.bounds)))
-                .collect(),
-            blocked,
-        },
-    ];
+        vise,
+        clamps: (clamps.iter())
+            .map(|c| (c.label.clone(), work(c.bounds)))
+            .collect(),
+    }];
     let mut sections = vec![Section {
         name: "Set up".into(),
         op: None,
-        steps: 0..2,
+        steps: 0..1,
         count: 0,
         minutes: 0.,
     }];
 
-    // One section per operation.
+    // One page per operation.
     let mut last_tool: Option<&str> = None;
-    // The tool, rpm and compensation sides the last operation left set.
-    let mut set: Option<(&str, f32, Option<[i8; 2]>)> = None;
     let mut done_ops = vec![];
-    // The hole pattern of the operation before, and of this one.
-    let mut next_pattern: Option<Pattern> = None;
     for ((oi, plan), after) in done.into_iter().zip(afters) {
-        let last_pattern = next_pattern.take();
         let op = &setup.operations[oi];
-        // No step of any operation cuts into the parallels the stock stands
-        // on, or past their height into the table under them (LIO-537), as
-        // the plan check and the export refuse it.
+        // No operation cuts into the parallels the stock stands on, or past
+        // their height into the table under them (LIO-537), as the plan
+        // check and the export refuse it.
         let gap = crate::holding::gap(setup).unwrap_or_default();
         if let Some(why) = crate::parallels::refusal(
             setup,
@@ -2056,143 +1305,46 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         }
         let tool = op.tool.as_str();
         let rpm = num(&op.p, "rpm").unwrap_or(0.);
-        let (r, first) = (plan.radius, steps.len());
-        let diameter = 2. * r;
+        let r = plan.radius;
         let changed = last_tool.replace(tool) != Some(tool);
         let minutes = plan.duration / 60. + if changed { tool_time } else { 0. };
-        let mut count = 0;
         // The stock before this operation.
         let earlier = done_ops.last().map_or(&before, |d: &Done| &d.after);
         let left = simulation::leftover_box(earlier, setup, mesh);
-        // Where a new tool picks up Z: the highest top left. A tool already
-        // in keeps its Z (LIO-368).
-        let top = changed.then_some(left.max[2] - zero[2]);
-        // The screen that sets the tool, gear and DRO for this operation:
-        // all of them for a new tool; with the same tool only what changes,
-        // a gear with the DRO when it changes too, else the DRO alone (its
-        // diameter and sides; nothing with its compensation off), or none.
-        let tap = op.tapping();
-        // The DRO's compensation this tool and gear leave on, when on.
-        let comp_on = matches!(set, Some((t, s, Some(c))) if t == tool && s == rpm && c != [0; 2]);
-        let mut sides = |comp: [i8; 2], steps: &mut Vec<Step>| {
-            // A tap is turned by hand: its own screen, no gear (LIO-410);
-            // a new one picks up Z for the lifts between holes (LIO-449).
-            if tap {
-                steps.push(Step::TapIn {
-                    op: oi,
-                    tool: tool.into(),
-                    top,
-                });
-                set = Some((tool, rpm, Some(comp)));
-                return;
-            }
-            let tool_step = |comp: Option<[i8; 2]>| Step::Tool {
-                op: oi,
-                tool: tool.into(),
-                rpm,
-                diameter,
-                comp,
-                top,
-            };
-            match set {
-                Some((t, s, c)) if t == tool => {
-                    let dro = c != Some(comp) && comp != [0; 2];
-                    if s != rpm {
-                        steps.push(tool_step(dro.then_some(comp)));
-                    } else if dro {
-                        steps.push(Step::Comp {
-                            op: oi,
-                            comp,
-                            diameter,
-                        });
-                    }
-                }
-                _ => steps.push(tool_step(Some(comp))),
-            }
-            set = Some((tool, rpm, Some(comp)));
-        };
-        match op.strategy {
+        let features = match op.strategy {
             Strategy::Box => {
                 let (low, high) = box_block(op, zero)?;
                 let open = open_sides(low, high, &plan.stock);
                 let allowance = crate::cam::number(op, "allowance")?;
                 let (lo, hi) = box_cut(low, high, &plan.stock, allowance);
-                let comp = if dro { comp_sides(open) } else { [0; 2] };
-                match kind(open, lo, hi, r) {
-                    Kind::Face => {
-                        // The part's top cut, on a bottom already at size:
-                        // a size to measure to (LIO-487). Not with an
-                        // allowance, however small: it is left on purpose.
-                        let part = simulation::part_box(setup, mesh);
-                        let on = |a: f32, b: f32| (a - b).abs() <= SIZE_ON;
-                        let size = (allowance <= 0.
-                            && on(plan.target, part.max[2])
-                            && on(left.min[2], part.min[2]))
-                        .then_some(part.max[2] - part.min[2]);
-                        steps.push(Step::Face {
-                            size,
-                            op: oi,
-                            tool: tool.into(),
-                            rpm,
-                            diameter,
-                            top,
-                            remove: plan.rest_top.unwrap_or(stock.max[2]) - plan.target,
-                            to: plan.target - zero[2],
-                        });
-                        set = Some((tool, rpm, None));
+                // The hand-fed mill moves one axis at a time: a Box cut in
+                // passes with a move along two is no box to cut by hand.
+                if in_passes(open, lo, hi, r) {
+                    for m in plan.moves.iter().filter(|m| m.motion != Motion::Dwell) {
+                        moved(m)?;
                     }
-                    Kind::Square { axis, low } => {
-                        let side: i8 = if low { 1 } else { -1 };
-                        // The cut nearest the wall: its centre, and its edge on the wall.
-                        let centres = (plan.moves.iter())
-                            .filter(|m| m.motion == Motion::Feed)
-                            .flat_map(|m| [m.from[axis], m.to[axis]]);
-                        let centre = match low {
-                            true => centres.fold(f32::INFINITY, f32::min),
-                            false => centres.fold(f32::NEG_INFINITY, f32::max),
-                        };
-                        let wall = centre - f32::from(side) * r;
-                        steps.push(Step::Square {
-                            op: oi,
-                            tool: tool.into(),
-                            rpm,
-                            diameter,
-                            comp: std::array::from_fn(|k| if k == axis { comp[k] } else { 0 }),
-                            top,
-                            axis,
-                            side,
-                            to: wall - zero[axis],
-                            shown: (if dro { wall } else { centre }) - zero[axis],
-                            remove: if low {
-                                left.max[axis] - wall
-                            } else {
-                                wall - left.min[axis]
-                            },
-                            down_to: plan.target - zero[2],
-                        });
-                        set = Some((tool, rpm, None));
-                    }
-                    Kind::Other => {
-                        sides(comp, &mut steps);
-                        let passes = passes(oi, &plan, zero, comp, machine)?;
-                        count = passes.len();
-                        steps.extend(passes);
-                        steps.push(Step::Check { op: oi });
-                    }
+                }
+                // On X and Y within the stock before it, from the top it
+                // meets there.
+                Features::Box {
+                    lo: std::array::from_fn(|k| {
+                        let v = if k == 2 { lo[2] } else { lo[k].max(left.min[k]) };
+                        v - zero[k]
+                    }),
+                    hi: std::array::from_fn(|k| {
+                        let v = if k == 2 { hi[2].min(left.max[2]) } else { hi[k].min(left.max[k]) };
+                        v - zero[k]
+                    }),
+                    through: open[2][0],
                 }
             }
             Strategy::Drill if op.boring() => {
-                sides([0; 2], &mut steps);
                 // The head's body is far wider than the bore (LIO-563): set
-                // down beside a clamp it hits it, which the pages would not
-                // show. They are refused as a slot's are. Only the head's
-                // ways down and up at each hole count: between holes the
-                // pages have it lifted clear of the stock and the clamps
-                // first, whatever height the plan travels at.
+                // down beside a clamp it hits it. Refused as a slot's are.
+                // Only the head's ways down and up at each hole count.
                 let boxes = doc
                     .holding_boxes(setup, held)
                     .map_err(|e| format!("{}: workholding cannot be checked: {e}", op.name()))?;
-                let gap = crate::holding::gap(setup).unwrap_or_default();
                 let at_holes: Vec<_> = (plan.moves.iter())
                     .filter(|m| (m.to[0] - m.from[0]).hypot(m.to[1] - m.from[1]) < 1e-4)
                     .map(|m| (m.from, m.to))
@@ -2208,44 +1360,32 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                         hit.label
                     ));
                 }
-                // Each pass's moves: from its stop to the next pass's.
-                let passes: Vec<(usize, f32)> = (plan.stops.iter())
+                // The finished size, the last pass's, and the holes as it
+                // bores them: no passes or head settings (LIO-688).
+                let (at, size) = (plan.stops.iter())
                     .filter_map(|s| Some((s.at, s.size?)))
-                    .collect();
-                let head = doc.tools.iter().find(|t| t.id == op.tool);
-                let dial = head.and_then(|t| num(&t.p, "dial")).unwrap_or(0.);
-                let feed_out = head
-                    .is_some_and(|t| get(&t.p, "bore_retract") == crate::model::BORE_RETRACTS[1]);
-                count = passes.len();
-                for (k, &(at, size)) in passes.iter().enumerate() {
-                    let end = passes.get(k + 1).map_or(plan.moves.len(), |p| p.0);
-                    let moves = &plan.moves[at..end];
-                    steps.push(Step::Bore {
-                        op: oi,
-                        index: k + 1,
-                        of: passes.len(),
-                        size,
-                        before: k.checked_sub(1).map(|j| passes[j].1),
-                        dial,
-                        feed_out,
-                        holes: holes_of(moves, zero),
-                        mouths: mouths_of(moves, zero),
-                    });
+                    .last()
+                    .unwrap_or((0, 2. * r));
+                let moves = &plan.moves[at.min(plan.moves.len())..];
+                let holes = holes_of(moves, zero);
+                let uncentred = vec![false; holes.len()];
+                Features::Holes {
+                    diameter: size,
+                    thread: None,
+                    holes: hole_rows(doc, op, &plan, &holes, &mouths_of(moves, zero), &uncentred),
                 }
-                steps.push(Step::Check { op: oi });
             }
             Strategy::Drill => {
-                sides([0; 2], &mut steps);
-                let mut holes = holes(&plan, zero);
-                count = holes.len();
-                let mouths = mouths(&plan, zero);
-                let centre =
-                    (doc.tools.iter().find(|t| t.id == op.tool)).and_then(|t| t.centre_drill());
-                // A centre drill is set to its pilot's tip, the plan's point
-                // being the pilot's top.
-                if let Some(c) = centre {
+                let mut holes = holes_of(&plan.moves, zero);
+                let mouths = mouths_of(&plan.moves, zero);
+                let tool = doc.tools.iter().find(|t| t.id == op.tool);
+                // A centre drill goes down to its pilot's tip, the plan's
+                // point being the pilot's top.
+                if let Some(c) = tool.and_then(|t| t.centre_drill()) {
                     holes.iter_mut().for_each(|h| h[2] -= c.pilot_length);
                 }
+                // A twist drill started on a flat face walks off: a plan
+                // check (`plan_check`), not said on the page.
                 let uncentred: Vec<bool> = holes
                     .iter()
                     .map(|h| {
@@ -2254,164 +1394,68 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                                 earlier,
                                 frame,
                                 [h[0] + zero[0], h[1] + zero[1]],
-                                diameter,
+                                2. * r,
                                 left.max[2],
                                 h[2] + zero[2],
                             )
                     })
                     .collect();
-                // ponytail: one pattern an operation, all its holes or none;
-                // several would need the holes split into patterns first.
-                let found = level_pattern(&holes, grids, arcs);
-                let mut numbers: Vec<usize> = (1..=holes.len()).collect();
-                let (holes, mouths, uncentred, pattern) = match found {
-                    Some((pattern, round)) => {
-                        steps.push(Step::Pattern {
-                            op: oi,
-                            pattern: pattern.clone(),
-                            same: last_pattern.as_ref() == Some(&pattern),
-                        });
-                        // An arc's mirrored holes one axis a move (LIO-406).
-                        let drilled = match pattern {
-                            Pattern::Arc { .. } => {
-                                let at: Vec<[f32; 2]> =
-                                    round.iter().map(|&j| [holes[j][0], holes[j][1]]).collect();
-                                drill_order(&at)
-                            }
-                            Pattern::Grid { .. } => (0..round.len()).collect(),
-                        };
-                        numbers = drilled.iter().map(|j| j + 1).collect();
-                        let order: Vec<usize> = drilled.iter().map(|&j| round[j]).collect();
-                        (
-                            reordered(&holes, &order),
-                            reordered(&mouths, &order),
-                            reordered(&uncentred, &order),
-                            Some(pattern),
-                        )
-                    }
-                    None => (holes, mouths, uncentred, None),
-                };
-                next_pattern = pattern.clone();
-                steps.push(Step::Holes {
-                    op: oi,
-                    holes,
-                    mouths,
-                    uncentred,
-                    pattern,
-                    numbers,
-                });
-                steps.push(Step::Check { op: oi });
+                let thread = (op.tapping())
+                    .then(|| tool.and_then(|t| t.tap_spec()))
+                    .flatten();
+                Features::Holes {
+                    diameter: 2. * r,
+                    thread: thread.map(|s| s.name.to_string()),
+                    holes: hole_rows(doc, op, &plan, &holes, &mouths, &uncentred),
+                }
             }
             Strategy::Slot => {
-                sides([0; 2], &mut steps);
-                if comp_on {
-                    steps.push(Step::Comp {
-                        op: oi,
-                        comp: [0; 2],
-                        diameter,
-                    });
-                }
                 let boxes = doc
                     .holding_boxes(setup, held)
                     .map_err(|e| format!("{}: workholding cannot be checked: {e}", op.name()))?;
-                let gap = crate::holding::gap(setup).unwrap_or_default();
                 if let Some(hit) =
                     crate::holding::hits(&plan, &boxes, gap + crate::post::blend(machine)).first()
                 {
                     return Err(crate::holding::message(op.name(), hit, gap, zero));
                 }
                 let slot = crate::slot::Slot::read(op, zero)?;
-                let entry_clear = get(
-                    &doc.tools
-                        .iter()
-                        .find(|t| t.id == op.tool)
-                        .ok_or("Slot tool missing")?
-                        .p,
-                    "center_cutting",
-                ) != "Yes";
-                let radius = slot.width / 2. - num(&op.p, "allowance").unwrap_or(0.);
-                let passes = &plan.slot_passes;
-                if passes.is_empty() {
+                doc.tools
+                    .iter()
+                    .find(|t| t.id == op.tool)
+                    .ok_or("Slot tool missing")?;
+                if plan.slot_passes.is_empty() {
                     return Err(format!("{}: the Slot's passes are missing.", op.name()));
                 }
-                count = passes.len();
-                for (i, pass) in passes.iter().enumerate() {
-                    let mut targets = vec![];
-                    if i == 0 {
-                        // First put Z above the stock, independent of wherever
-                        // the operator left the axes before starting the plan.
-                        targets.push(Target {
-                            order: 1,
-                            axis: 2,
-                            centre: plan.moves[0].from[2] - zero[2],
-                            shown: plan.moves[0].from[2] - zero[2],
-                            edge: false,
-                            feed: false,
-                            lock: [false; 3],
-                        });
-                    }
-                    for m in plan.moves[pass.moves.clone()]
-                        .iter()
-                        .filter(|m| m.motion != Motion::Dwell)
-                    {
-                        let axis = moved(m)?;
-                        let v = m.to[axis] - zero[axis];
-                        targets.push(Target {
-                            order: u8::try_from(targets.len() + 1).unwrap_or(u8::MAX),
-                            axis,
-                            centre: v,
-                            shown: v,
-                            edge: false,
-                            feed: m.motion == Motion::Feed,
-                            lock: std::array::from_fn(|k| m.cutting_pass && k != axis),
-                        });
-                    }
-                    steps.push(Step::Slot {
-                        op: oi,
-                        index: i + 1,
-                        of: count,
-                        z: pass.z,
-                        top: plan.rest_top.unwrap_or(stock.max[2]) - zero[2],
-                        a: [slot.a[0] - zero[0], slot.a[1] - zero[1]],
-                        b: [slot.b[0] - zero[0], slot.b[1] - zero[1]],
-                        targets,
-                        entry_clear,
-                        pass: pass.kind,
-                        level: pass.level,
-                        levels: pass.levels,
-                        offset: pass.offset,
-                        left: pass.left,
-                        scallop: pass.scallop,
-                        points: pass.points.clone(),
-                        radius,
-                        tool: plan.radius,
-                        joined: pass.joined,
-                    });
+                // As cut: its own width less the stock to leave, its floor
+                // with the stock left on it, a through slot's the stock's
+                // bottom (`slot::generate`); from the top of the material
+                // it starts in.
+                let through = get(&op.p, "through") == "Yes";
+                let floor = if through {
+                    slot.bottom
+                } else {
+                    slot.bottom + crate::cam::number(op, "axial_allowance").unwrap_or(0.)
+                };
+                let allowance = crate::cam::number(op, "allowance").unwrap_or(0.);
+                Features::Slot {
+                    a: [slot.a[0] - zero[0], slot.a[1] - zero[1]],
+                    b: [slot.b[0] - zero[0], slot.b[1] - zero[1]],
+                    width: slot.width - 2. * allowance,
+                    top: plan.rest_top.unwrap_or(slot.top) - zero[2],
+                    floor: floor - zero[2],
+                    through,
                 }
-                steps.push(Step::Check { op: oi });
             }
             Strategy::Corner => {
-                // Tool centres, as the walk is worked out: the compensation
-                // off, said so when the operation before left it on.
-                sides([0; 2], &mut steps);
-                if comp_on {
-                    steps.push(Step::Comp {
-                        op: oi,
-                        comp: [0; 2],
-                        diameter,
-                    });
-                }
-                // Walks that reach into the vise or the clamps are no steps
-                // to follow: said, as the planning page says them (LIO-443).
-                // Nor are they where the workholding is not one that can be
-                // checked: a vise too small for the stock, a deleted holder.
+                // Walks that reach into the vise or the clamps are refused,
+                // as the planning page says them (LIO-443), and so are
+                // they where the workholding cannot be checked.
                 let boxes = doc.holding_boxes(setup, held).map_err(|e| {
                     format!(
                         "{}: the workholding cannot be checked against the walks: {e}",
                         op.name()
                     )
                 })?;
-                let gap = crate::holding::gap(setup).unwrap_or_default();
                 let reach = gap + crate::post::blend(machine);
                 if let Some(hit) = crate::holding::hits(&plan, &boxes, reach).first() {
                     return Err(format!(
@@ -2422,199 +1466,36 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 let corners = crate::corner::picked(setup, mesh, op)?;
                 #[cfg(test)]
                 let plan = tests::faulted(op, &plan);
-                // The walks as the plan made them, each with its corner.
-                let walks = &plan.corner_walks;
-                if walks.is_empty() {
-                    return Err(format!(
-                        "{}: its walks are not known. {}",
-                        op.name(),
-                        crate::corner::BROKEN
-                    ));
-                }
-                count = walks.len();
-                for (k, w) in walks.iter().enumerate() {
-                    let at = (k + 1, walks.len());
-                    let (Some(c), Some(moves)) =
-                        (corners.get(w.corner), plan.moves.get(w.moves.clone()))
-                    else {
-                        return Err(format!(
-                            "{}: walk {} of {}: its corner or its moves are not the plan's. {}",
-                            op.name(),
-                            at.0,
-                            at.1,
-                            crate::corner::BROKEN
-                        ));
-                    };
-                    let offset = crate::corner::shown_offset(w, c, plan.radius, zero);
-                    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-                    for m in moves.iter().filter(|m| m.motion == Motion::Feed) {
-                        for p in [m.from, m.to] {
-                            for k in 0..3 {
-                                (lo[k], hi[k]) = (lo[k].min(p[k]), hi[k].max(p[k]));
-                            }
-                        }
-                    }
-                    let legs: Vec<&Move> =
-                        moves.iter().filter(|m| m.motion != Motion::Dwell).collect();
-                    let mut targets = vec![];
-                    for m in &legs {
-                        // A move of no number, or along two axes, is no DRO
-                        // row: refused as the walk's, which the plan checks
-                        // report (LIO-447).
-                        let axis = (m.from.iter().chain(&m.to).all(|v| v.is_finite()))
-                            .then(|| moved(m).ok())
-                            .flatten()
-                            .ok_or_else(|| {
-                                crate::corner::broken(
-                                    op.name(),
-                                    at,
-                                    c.place(),
-                                    "a move of it is not a number or goes along two axes at once",
-                                )
-                            })?;
-                        let centre = m.to[axis] - zero[axis];
-                        let down =
-                            axis == 2 && m.to[2] < m.from[2] && (m.to[2] - lo[2]).abs() < 1e-4;
-                        targets.push(Target {
-                            order: 0,
-                            axis,
-                            centre,
-                            shown: centre,
-                            edge: false,
-                            feed: m.motion == Motion::Feed,
-                            // The quill locked at the level for the walk.
-                            lock: [false, false, down],
-                        });
-                    }
-                    // Each walk's screen stands alone: Z up above the stock,
-                    // then X and Y where it goes down, said even when the
-                    // walk before left the tool there already (LIO-447:
-                    // walk 9 of the adapter plate went down with no X).
-                    let down = targets.iter().position(|t| t.axis == 2 && t.lock[2]);
-                    if let (Some(down), Some(start)) = (down, legs.first().map(|m| m.from)) {
-                        let said: Vec<usize> = (targets[..down].iter()).map(|t| t.axis).collect();
-                        let first_z = said.iter().position(|&k| k == 2);
-                        let mut ahead = vec![];
-                        for axis in [2, 0, 1] {
-                            // Z must come before X and Y are set; X and Y
-                            // before the tool goes down.
-                            let needed = if axis == 2 {
-                                first_z.is_none_or(|i| said[..i].iter().any(|&k| k < 2))
-                            } else {
-                                !said.contains(&axis)
-                            };
-                            if needed {
-                                let centre = start[axis] - zero[axis];
-                                ahead.push(Target {
-                                    order: 0,
-                                    axis,
-                                    centre,
-                                    shown: centre,
-                                    edge: false,
-                                    feed: false,
-                                    lock: [false; 3],
-                                });
-                            }
-                        }
-                        targets.splice(0..0, ahead);
-                    }
-                    for (i, t) in targets.iter_mut().enumerate() {
-                        t.order = u8::try_from(i + 1).unwrap_or(u8::MAX);
-                    }
-                    let points: Vec<[f32; 2]> = (w.stair.points.iter())
-                        .map(|p| [p[0] as f32, p[1] as f32])
-                        .collect();
-                    let s = plan.stock;
-                    if let Some(why) = crate::corner::walk_problem(
-                        &targets,
-                        &points,
-                        w.z,
-                        (
-                            [s.min[0] - zero[0], s.min[1] - zero[1]],
-                            [s.max[0] - zero[0], s.max[1] - zero[1]],
-                            s.max[2] - zero[2],
-                        ),
-                        &crate::corner::Round {
+                walks_checked(op, &plan, &corners, zero)?;
+                Features::Corners(
+                    (corners.iter())
+                        .map(|c| Rounded {
+                            place: c.place(),
                             centre: [c.centre[0] - zero[0], c.centre[1] - zero[1]],
                             radius: c.r,
-                            quarter: c.quarter,
-                            tool: plan.radius,
-                            offset,
-                            scallop: w.stair.scallop as f32,
-                        },
-                    ) {
-                        return Err(crate::corner::broken(
-                            op.name(),
-                            (k + 1, walks.len()),
-                            c.place(),
-                            &why,
-                        ));
-                    }
-                    let feed = moves.iter().find(|m| m.motion == Motion::Feed);
-                    steps.push(Step::Corner {
-                        op: oi,
-                        index: k + 1,
-                        of: walks.len(),
-                        corner: w.corner + 1,
-                        corners: corners.len(),
-                        place: c.place(),
-                        radius: c.r,
-                        centre: [c.centre[0] - zero[0], c.centre[1] - zero[1]],
-                        offset,
-                        z: w.z,
-                        level: w.level,
-                        levels: w.levels,
-                        scallop: w.stair.scallop as f32,
-                        points,
-                        targets,
-                        never: Limits {
-                            x: [lo[0] - r - zero[0], hi[0] + r - zero[0]],
-                            y: [lo[1] - r - zero[1], hi[1] + r - zero[1]],
-                            z: lo[2] - zero[2],
-                        },
-                        turns_per_minute: feed.map_or(0., |m| {
-                            manual::turns(machine, moved(m).unwrap_or(0), m.feed)
-                        }),
-                    });
-                }
-                steps.push(Step::Check { op: oi });
+                            top: c.top - zero[2],
+                            bottom: c.bottom - zero[2],
+                        })
+                        .collect(),
+                )
             }
             other => return Err(format!("{} does not run on a manual mill.", other.name())),
-        }
-        // After holes the DRO led to, it leaves its hole function before
-        // this operation moves in work coordinates; one that starts the same
-        // pattern again goes on in it (LIO-488).
-        let again = (steps[first..].iter()).any(|s| matches!(s, Step::Pattern { same: true, .. }));
-        if last_pattern.is_some() && !again {
-            let last = (steps[..first].iter().rev()).find_map(|s| match s {
-                Step::Holes {
-                    op,
-                    holes,
-                    numbers,
-                    pattern: Some(_),
-                    ..
-                } => Some((*op, *holes.last()?, *numbers.last()?)),
-                _ => None,
-            });
-            if let Some((from, h, number)) = last {
-                steps.insert(
-                    first,
-                    Step::Leave {
-                        op: oi,
-                        from,
-                        at: [h[0], h[1]],
-                        number,
-                    },
-                );
-            }
-        }
+        };
+        let n = steps.len();
         sections.push(Section {
             // A Thread as a Thread (LIO-419).
             name: crate::threading::shown_name(op, &doc.tools),
             op: Some(oi),
-            steps: first..steps.len(),
-            count,
+            steps: n..n + 1,
+            count: features.count(),
             minutes,
+        });
+        steps.push(Step::Sheet {
+            op: oi,
+            tool: tool.into(),
+            // A tap is turned by hand, the spindle off (LIO-410).
+            rpm: (!op.tapping()).then_some(rpm),
+            features,
         });
         done_ops.push(Done {
             op: oi,
@@ -2642,6 +1523,189 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
         before,
         done: done_ops,
     })
+}
+/// The holes of a drilling, tapping or boring `op` (its `plan`): `holes`
+/// their centres and the work Z the tool's tip goes to, `mouths` the work Z
+/// each cut starts at, `uncentred` by hole (LIO-688). How deep each goes is
+/// what its Check measured (LIO-450): through when the operation breaks
+/// out (a cone or a fixture pin's hole never does); else from the mouth,
+/// which a cut starts Top over (`rest::start_over`), a fixture pin's on the
+/// face itself (`cam::pin_holes`), down to where the hole is its full size:
+/// a twist drill's point above its tip, a tap's lead above its tip; a cone,
+/// a flat-bottomed bore or a cut too shallow for its point, to its tip.
+fn hole_rows(
+    doc: &Document,
+    op: &Operation,
+    plan: &Plan,
+    holes: &[[f32; 3]],
+    mouths: &[f32],
+    uncentred: &[bool],
+) -> Vec<Hole> {
+    let pins = op.drills_pin_holes();
+    let air = if pins {
+        0.
+    } else {
+        crate::cam::number(op, "top").unwrap_or(0.).max(0.)
+    };
+    let tool = doc.tools.iter().find(|t| t.id == op.tool);
+    let cone = tool.is_some_and(|t| {
+        ["Chamfer mill", crate::model::CENTRE_DRILL].contains(&get(&t.p, "type"))
+    });
+    let through = matches!(crate::cam::breakthrough(op), Ok((true, _))) && !cone && !pins;
+    let full = if cone {
+        0.
+    } else if op.tapping() {
+        tool.and_then(|t| Some(crate::cam::tap_lead(t) * t.tap_spec()?.pitch))
+            .unwrap_or(0.)
+    } else if plan.shape == simulation::CutterShape::Drill {
+        plan.radius * POINT_RISE
+    } else {
+        0.
+    };
+    (holes.iter().zip(mouths).zip(uncentred))
+        .map(|((h, m), u)| {
+            let (mouth, tip) = (m - air, h[2]);
+            let deep = match mouth - tip - full {
+                d if d >= 0.005 => d,
+                _ => mouth - tip,
+            };
+            Hole {
+                at: [h[0], h[1]],
+                mouth,
+                depth: match through {
+                    true => Depth::Through { tip },
+                    false => Depth::Blind { deep, tip },
+                },
+                uncentred: *u,
+            }
+        })
+        .collect()
+}
+/// Whether a Round corners' walks, as `plan` made them round `corners`,
+/// can be followed on the hand-fed mill (LIO-447): each move a number along
+/// one axis, with X and Y set where it goes down and the walk's one way
+/// (`corner::walk_problem`). The page lists the corners only (LIO-688),
+/// but a walk the plan broke is still refused, and the plan checks say so.
+fn walks_checked(
+    op: &Operation,
+    plan: &Plan,
+    corners: &[crate::corner::Corner],
+    zero: [f32; 3],
+) -> Result<(), String> {
+    let walks = &plan.corner_walks;
+    if walks.is_empty() {
+        return Err(format!(
+            "{}: its walks are not known. {}",
+            op.name(),
+            crate::corner::BROKEN
+        ));
+    }
+    for (k, w) in walks.iter().enumerate() {
+        let at = (k + 1, walks.len());
+        let (Some(c), Some(moves)) = (corners.get(w.corner), plan.moves.get(w.moves.clone()))
+        else {
+            return Err(format!(
+                "{}: walk {} of {}: its corner or its moves are not the plan's. {}",
+                op.name(),
+                at.0,
+                at.1,
+                crate::corner::BROKEN
+            ));
+        };
+        let offset = crate::corner::shown_offset(w, c, plan.radius, zero);
+        let lowest = (moves.iter())
+            .filter(|m| m.motion == Motion::Feed)
+            .flat_map(|m| [m.from[2], m.to[2]])
+            .fold(f32::INFINITY, f32::min);
+        let legs: Vec<&Move> = moves.iter().filter(|m| m.motion != Motion::Dwell).collect();
+        let mut targets = vec![];
+        for m in &legs {
+            // A move of no number, or along two axes, is no DRO row.
+            let axis = (m.from.iter().chain(&m.to).all(|v| v.is_finite()))
+                .then(|| moved(m).ok())
+                .flatten()
+                .ok_or_else(|| {
+                    crate::corner::broken(
+                        op.name(),
+                        at,
+                        c.place(),
+                        "a move of it is not a number or goes along two axes at once",
+                    )
+                })?;
+            let centre = m.to[axis] - zero[axis];
+            let down = axis == 2 && m.to[2] < m.from[2] && (m.to[2] - lowest).abs() < 1e-4;
+            targets.push(Target {
+                order: 0,
+                axis,
+                centre,
+                shown: centre,
+                edge: false,
+                feed: m.motion == Motion::Feed,
+                // The quill locked at the level for the walk.
+                lock: [false, false, down],
+            });
+        }
+        // Each walk stands alone: Z up above the stock, then X and Y where
+        // it goes down, even when the walk before left the tool there
+        // already (LIO-447: walk 9 of the adapter plate went down with no
+        // X).
+        let down = targets.iter().position(|t| t.axis == 2 && t.lock[2]);
+        if let (Some(down), Some(start)) = (down, legs.first().map(|m| m.from)) {
+            let said: Vec<usize> = (targets[..down].iter()).map(|t| t.axis).collect();
+            let first_z = said.iter().position(|&k| k == 2);
+            let mut ahead = vec![];
+            for axis in [2, 0, 1] {
+                // Z must come before X and Y are set; X and Y before the
+                // tool goes down.
+                let needed = if axis == 2 {
+                    first_z.is_none_or(|i| said[..i].iter().any(|&k| k < 2))
+                } else {
+                    !said.contains(&axis)
+                };
+                if needed {
+                    let centre = start[axis] - zero[axis];
+                    ahead.push(Target {
+                        order: 0,
+                        axis,
+                        centre,
+                        shown: centre,
+                        edge: false,
+                        feed: false,
+                        lock: [false; 3],
+                    });
+                }
+            }
+            targets.splice(0..0, ahead);
+        }
+        for (i, t) in targets.iter_mut().enumerate() {
+            t.order = u8::try_from(i + 1).unwrap_or(u8::MAX);
+        }
+        let points: Vec<[f32; 2]> = (w.stair.points.iter())
+            .map(|p| [p[0] as f32, p[1] as f32])
+            .collect();
+        let s = plan.stock;
+        if let Some(why) = crate::corner::walk_problem(
+            &targets,
+            &points,
+            w.z,
+            (
+                [s.min[0] - zero[0], s.min[1] - zero[1]],
+                [s.max[0] - zero[0], s.max[1] - zero[1]],
+                s.max[2] - zero[2],
+            ),
+            &crate::corner::Round {
+                centre: [c.centre[0] - zero[0], c.centre[1] - zero[1]],
+                radius: c.r,
+                quarter: c.quarter,
+                tool: plan.radius,
+                offset,
+                scallop: w.stair.scallop as f32,
+            },
+        ) {
+            return Err(crate::corner::broken(op.name(), at, c.place(), &why));
+        }
+    }
+    Ok(())
 }
 /// `v` to the thousandth of a mm.
 fn mm(v: f32) -> f32 {
@@ -3310,21 +2374,8 @@ pub mod tests {
         guide.steps[range]
             .iter()
             .map(|s| match s {
-                Step::Hold { .. } => "Hold",
                 Step::Zero { .. } => "Zero",
-                Step::Tool { .. } => "Tool",
-                Step::TapIn { .. } => "TapIn",
-                Step::Comp { .. } => "Comp",
-                Step::Pass { .. } => "Pass",
-                Step::Corner { .. } => "Corner",
-                Step::Slot { .. } => "Slot",
-                Step::Face { .. } => "Face",
-                Step::Square { .. } => "Square",
-                Step::Holes { .. } => "Holes",
-                Step::Pattern { .. } => "Pattern",
-                Step::Leave { .. } => "Leave",
-                Step::Bore { .. } => "Bore",
-                Step::Check { .. } => "Check",
+                Step::Sheet { .. } => "Sheet",
                 Step::HandOver { .. } => "HandOver",
                 Step::Lathe(l) => l.title(),
             })
@@ -3333,44 +2384,23 @@ pub mod tests {
     pub fn close(a: f32, b: f32) {
         assert!((a - b).abs() < 1e-3, "{a} != {b}");
     }
-    /// The Pass steps' targets with their pass's number.
-    fn targets(guide: &Guide) -> Vec<(usize, &Target)> {
+    /// What operation `op`'s page lists.
+    pub(crate) fn features(guide: &Guide, op: usize) -> &Features {
         (guide.steps.iter())
-            .filter_map(|s| match s {
-                Step::Pass { index, targets, .. } => Some((*index, targets)),
+            .find_map(|s| match s {
+                Step::Sheet {
+                    op: o, features, ..
+                } if *o == op => Some(features),
                 _ => None,
             })
-            .flat_map(|(i, t)| t.iter().map(move |t| (i, t)))
-            .collect()
+            .unwrap_or_else(|| panic!("no page for operation {op}: {:?}", guide.steps))
     }
-    /// `cols` × `rows` holes from `first`, `pitch` apart, the rows at
-    /// `angle`° from +X, row by row back and forth.
-    pub(crate) fn grid_at(
-        first: [f32; 2],
-        cols: usize,
-        rows: usize,
-        pitch: [f32; 2],
-        angle: f32,
-    ) -> Vec<[f32; 2]> {
-        places(&Pattern::Grid {
-            first,
-            columns: cols,
-            rows,
-            pitch,
-            angle,
-        })
-    }
-    /// `n` holes on the circle Ø`d` round `centre`, from `first`° each
-    /// `step`° on counter-clockwise.
-    pub fn circle_at(centre: [f32; 2], d: f32, n: usize, first: f32, step: f32) -> Vec<[f32; 2]> {
-        places(&Pattern::Arc {
-            centre,
-            diameter: d,
-            count: n,
-            first,
-            step,
-            full: false,
-        })
+    /// The holes operation `op`'s page lists.
+    pub(crate) fn holes_of_op(guide: &Guide, op: usize) -> &[Hole] {
+        match features(guide, op) {
+            Features::Holes { holes, .. } => holes,
+            f => panic!("{f:?}"),
+        }
     }
     /// Check actual continuous sweeps on both finished planes, through the
     /// full blank thickness and length: no ledge within the 8 mm jaw band.
@@ -3398,7 +2428,7 @@ pub mod tests {
             );
             assert!(issues.is_empty(), "{issues:?}");
             let guide = build(doc, mesh, si).unwrap();
-            let Step::Hold { stock, .. } = guide.steps[0] else {
+            let Step::Zero { stock, .. } = guide.steps[0] else {
                 panic!()
             };
             for (v, want) in stock.dimensions().into_iter().zip(expected) {
@@ -3468,249 +2498,10 @@ pub mod tests {
             squared_acceptance(&trial, &mesh);
         }
     }
-    #[test]
-    fn grids_and_arcs_of_holes_are_found_to_the_hundredth_in_the_dros_order() {
-        // Out of order and up to 0.002 off, as a mesh's centres are.
-        let jumble = |v: &[[f32; 2]]| {
-            let mut v = v.to_vec();
-            v.reverse();
-            v.rotate_left(1);
-            for (j, p) in v.iter_mut().enumerate() {
-                p[0] += 0.002 * ((j % 3) as f32 - 1.);
-                p[1] -= 0.002 * (j % 2) as f32;
-            }
-            v
-        };
-        let found = |holes: &[[f32; 2]], grids: bool, arcs: bool| {
-            let given = jumble(holes);
-            let (p, order) = pattern(&given, grids, arcs)?;
-            // In the DRO's order, the holes as made.
-            for (a, b) in reordered(&given, &order).iter().zip(holes) {
-                assert!((a[0] - b[0]).hypot(a[1] - b[1]) < 0.02, "{a:?} {b:?}");
-            }
-            Some(p)
-        };
-        let grid = |first, columns, rows, pitch, angle| {
-            Some(Pattern::Grid {
-                first,
-                columns,
-                rows,
-                pitch,
-                angle,
-            })
-        };
-        // A 3 × 4 grid, and turned 30° round its first hole.
-        for angle in [0., 30.] {
-            let holes = grid_at([10., 20.], 4, 3, [15., 10.], angle);
-            let want = grid([10., 20.], 4, 3, [15., 10.], angle);
-            assert_eq!(found(&holes, true, true), want);
-            assert_eq!(found(&holes, false, true), None);
-        }
-        // A line of four along Y: 1 hole a row × 4 rows at 0° (LIO-402);
-        // along X: 4 × 1; slanted: a row at its angle.
-        let up = grid_at([5., 5.], 1, 4, [0., 12.5], 0.);
-        assert_eq!(
-            found(&up, true, false),
-            grid([5., 5.], 1, 4, [0., 12.5], 0.)
-        );
-        let along = grid_at([5., 5.], 4, 1, [12.5, 0.], 0.);
-        assert_eq!(
-            found(&along, true, false),
-            grid([5., 5.], 4, 1, [12.5, 0.], 0.)
-        );
-        let slant = grid_at([5., 5.], 4, 1, [12.5, 0.], 60.);
-        assert_eq!(
-            found(&slant, true, false),
-            grid([5., 5.], 4, 1, [12.5, 0.], 60.)
-        );
-        // Square to the axes within 0.02° reads 0.00° (LIO-402).
-        let hair = grid_at([10., 20.], 4, 3, [15., 10.], 0.015);
-        assert_eq!(
-            found(&hair, true, true),
-            grid([10., 20.], 4, 3, [15., 10.], 0.)
-        );
-        // Back and forth: one axis between holes one after the other
-        // (LIO-405). The jumble above checks the order as made.
-        let order = grid_at([0., 0.], 4, 3, [10., 10.], 0.);
-        for w in order.windows(2) {
-            let moved = (0..2).filter(|&k| (w[0][k] - w[1][k]).abs() > 1e-3).count();
-            assert_eq!(moved, 1, "{w:?}");
-        }
-        assert_eq!(
-            (order[3], order[4], order[7], order[8]),
-            ([30., 0.], [30., 10.], [0., 10.], [0., 20.])
-        );
-        // A bolt circle of six, and an arc of four over 90°.
-        let bolts = circle_at([50., 40.], 80., 6, 15., 60.);
-        let arc = |centre, diameter, count, first, step, full| {
-            Some(Pattern::Arc {
-                centre,
-                diameter,
-                count,
-                first,
-                step,
-                full,
-            })
-        };
-        assert_eq!(
-            found(&bolts, true, true),
-            arc([50., 40.], 80., 6, 15., 60., true)
-        );
-        assert_eq!(found(&bolts, true, false), None);
-        // Part of a circle fits the noise less tightly than the whole.
-        let part = circle_at([-20., 10.], 50., 4, 10., 30.);
-        let Some(Pattern::Arc {
-            centre,
-            diameter,
-            count: 4,
-            first,
-            step,
-            full: false,
-        }) = found(&part, false, true)
-        else {
-            panic!()
-        };
-        let near = |a: f32, b: f32| (a - b).abs() <= 0.03;
-        let all = [centre[0], centre[1], diameter, first, step];
-        for (got, want) in all.into_iter().zip([-20., 10., 50., 10., 30.]) {
-            assert!(near(got, want), "{all:?}");
-        }
-        // A square of four: a grid when the DRO has grids, else an arc.
-        let square = grid_at([0., 0.], 2, 2, [40., 40.], 0.);
-        assert_eq!(
-            found(&square, true, true),
-            grid([0., 0.], 2, 2, [40., 40.], 0.)
-        );
-        // As an arc it starts at the corner at 45°, the back-right one.
-        let round = circle_at([20., 20.], 40. * std::f32::consts::SQRT_2, 4, 45., 90.);
-        assert!(round.iter().all(|p| {
-            square
-                .iter()
-                .any(|q| (p[0] - q[0]).hypot(p[1] - q[1]) < 1e-3)
-        }));
-        assert_eq!(
-            found(&round, false, true),
-            arc([20., 20.], 56.57, 4, 45., 90., true)
-        );
-        // No pattern: a ragged set, two holes, one hole; a grid one hole
-        // short; three in a line unevenly.
-        let ragged = [[0., 0.], [10., 0.], [25., 3.], [7., 19.]];
-        let short = &grid_at([0., 0.], 3, 3, [10., 10.], 0.)[..8];
-        // Three holes in an isosceles triangle: on a circle, but three
-        // prove no arc short of all the way round (LIO-402). A pitch that is
-        // no whole hundredth adds up: 31 holes over 100 mm end 0.1 off.
-        let isosceles = [[0., 0.], [20., 0.], [10., 5.]];
-        let thirds = grid_at([0., 0.], 31, 1, [100. / 30., 0.], 0.);
-        for holes in [
-            &ragged[..],
-            &ragged[..2],
-            &ragged[..1],
-            short,
-            &[[0., 0.], [10., 0.], [25., 0.]][..],
-            &isosceles[..],
-            &thirds[..],
-        ] {
-            assert_eq!(found(holes, true, true), None, "{holes:?}");
-        }
-        // Three all the way round are an arc.
-        let three = circle_at([0., 0.], 40., 3, 90., 120.);
-        assert_eq!(
-            found(&three, true, true),
-            arc([0., 0.], 40., 3, 90., 120., true)
-        );
-        // Four on a circle at 0°, 90°, 180°, 270°: a bolt circle of four,
-        // not a grid turned 45° (LIO-402); a grid when the DRO has no arcs.
-        let four = circle_at([0., 0.], 50., 4, 0., 90.);
-        assert_eq!(
-            found(&four, true, true),
-            arc([0., 0.], 50., 4, 0., 90., true)
-        );
-        // (In the grid's order, not the circle's.)
-        assert!(matches!(
-            pattern(&four, true, false),
-            Some((Pattern::Grid { angle, .. }, _)) if (angle.abs() - 45.).abs() < 0.05
-        ));
-    }
-    #[test]
-    fn mirrored_arc_holes_are_taken_one_axis_a_move() {
-        let order =
-            |at: &[[f32; 2]]| -> Vec<usize> { drill_order(at).iter().map(|j| j + 1).collect() };
-        let moves = |at: &[[f32; 2]]| {
-            let o = drill_order(at);
-            (o.windows(2))
-                .filter(|w| one_axis(at[w[0]], at[w[1]]))
-                .count()
-        };
-        // Six on Ø60 from 30°: 30, 150, 210, 330, then 270, 90.
-        let six = circle_at([0., 0.], 60., 6, 30., 60.);
-        assert_eq!(order(&six), [1, 3, 4, 6, 5, 2]);
-        assert_eq!(moves(&six), 4);
-        // Four at 0°, 90°, 180°, 270°: across, then the other pair.
-        let four = circle_at([0., 0.], 50., 4, 0., 90.);
-        assert_eq!(order(&four), [1, 3, 2, 4]);
-        assert_eq!(moves(&four), 2);
-        // Four from 45° (one axis a move already) and five from 17° (no
-        // mirrored pair) go round as before.
-        assert_eq!(order(&circle_at([0., 0.], 50., 4, 45., 90.)), [1, 2, 3, 4]);
-        assert_eq!(
-            order(&circle_at([0., 0.], 50., 5, 17., 72.)),
-            [1, 2, 3, 4, 5]
-        );
-        // Part of a circle with a mirrored pair (60° and 120°): one after
-        // the other.
-        let part = circle_at([0., 0.], 50., 4, 60., 30.);
-        let o = order(&part);
-        let (a, b) = (
-            o.iter().position(|&n| n == 1),
-            o.iter().position(|&n| n == 3),
-        );
-        assert_eq!(b.unwrap().abs_diff(a.unwrap()), 1, "{o:?}");
-    }
-    #[test]
-    fn a_bolt_circle_is_drilled_with_the_dros_numbers_beside_the_order() {
-        let (doc, mesh) = pattern_job(&plate_circle(), false, true, false);
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let Some(Step::Holes { holes, numbers, .. }) =
-            guide.steps.iter().find(|s| matches!(s, Step::Holes { .. }))
-        else {
-            panic!()
-        };
-        assert_eq!(numbers, &[1, 3, 4, 6, 5, 2]);
-        // Each hole is the DRO's hole of its number, round from 30°.
-        for (h, n) in holes.iter().zip(numbers) {
-            let t = (30. + 60. * (*n as f32 - 1.)).to_radians();
-            assert!(
-                (h[0] - 30. * t.cos()).hypot(h[1] - 30. * t.sin()) < 0.05,
-                "{n} {h:?}"
-            );
-        }
-    }
-    #[test]
-    fn a_pattern_is_used_only_when_every_hole_goes_to_the_same_depth() {
-        let at = |z: &[f32]| -> Vec<[f32; 3]> {
-            (grid_at([0., 0.], 3, 2, [10., 10.], 0.).iter().zip(z))
-                .map(|(p, z)| [p[0], p[1], *z])
-                .collect()
-        };
-        let level = at(&[-12.; 6]);
-        assert!(level_pattern(&level, true, true).is_some());
-        // One hole shallower: the DRO's hole N might be another depth (LIO-403).
-        let shallow = at(&[-12., -12., -8., -12., -12., -12.]);
-        assert_eq!(level_pattern(&shallow, true, true), None);
-        // Within the hundredth shown is the same depth.
-        let close = at(&[-12., -12.001, -12., -12., -12.002, -12.]);
-        assert!(level_pattern(&close, true, true).is_some());
-    }
     /// A 120 × 90 × 10 plate with Ø6 holes through at `at` (its middle at
-    /// 0), drilled Ø6 on a manual mill whose DRO has matrix holes (`grids`)
-    /// and arc holes (`arcs`); with `centred` a centre drilling of the same
-    /// holes before it.
-    pub fn pattern_job(
-        at: &[[f32; 2]],
-        grids: bool,
-        arcs: bool,
-        centred: bool,
-    ) -> (Document, Mesh) {
+    /// 0), drilled Ø6 on a manual mill; with `centred` a centre drilling of
+    /// the same holes before it.
+    pub(crate) fn holes_job(at: &[[f32; 2]], centred: bool) -> (Document, Mesh) {
         use crate::cam::boring::tests::{drill, drilling, job};
         let outer = [
             (-60., -45., 0.),
@@ -3726,12 +2517,7 @@ pub mod tests {
         loops.extend(circles.iter().map(|c| &c[..]));
         let mesh = crate::cam::arcs::tests::slab(&loops, 10., 0., true, true);
         let mesh = crate::mesh::normalize(mesh).unwrap();
-        let mut machine = manual::defaults();
-        for (k, on) in [("dro_matrix", grids), ("dro_arc", arcs)] {
-            machine
-                .p
-                .insert(k.into(), if on { "Yes" } else { "No" }.into());
-        }
+        let machine = manual::defaults();
         let mut d = drill("6");
         d.p.insert("machines".into(), machine.id.clone());
         let mut op = drilling(&mesh, &d, "Drilling");
@@ -3750,131 +2536,17 @@ pub mod tests {
         (doc, mesh)
     }
     /// The plate's 3 × 4 grid: Ø6 holes 20 apart in X, 15 in Y.
-    pub fn plate_grid() -> Vec<[f32; 2]> {
-        grid_at([-30., -15.], 4, 3, [20., 15.], 0.)
+    pub(crate) fn plate_grid() -> Vec<[f32; 2]> {
+        (0..3)
+            .flat_map(|r| (0..4).map(move |c| [-30. + 20. * c as f32, -15. + 15. * r as f32]))
+            .collect()
     }
     /// The plate's bolt circle: six Ø6 holes on Ø60, the first at 30°.
-    pub fn plate_circle() -> Vec<[f32; 2]> {
-        circle_at([0., 0.], 60., 6, 30., 60.)
-    }
-    #[test]
-    fn a_drilled_grid_has_a_pattern_screen_and_its_holes_in_the_dros_order() {
-        let (doc, mesh) = pattern_job(&plate_grid(), true, false, false);
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let section = guide.sections[1].steps.clone();
-        assert_eq!(
-            kinds(&guide, section.clone()),
-            ["Tool", "Pattern", "Holes", "Check"]
-        );
-        let Step::Pattern {
-            pattern:
-                Pattern::Grid {
-                    first,
-                    columns,
-                    rows,
-                    pitch,
-                    angle,
-                },
-            same: false,
-            ..
-        } = guide.steps[section.start + 1]
-        else {
-            panic!("{:?}", guide.steps[section.start + 1])
-        };
-        assert_eq!((columns, rows, pitch, angle), (4, 3, [20., 15.], 0.));
-        let Step::Holes { holes, pattern, .. } = &guide.steps[section.start + 2] else {
-            panic!()
-        };
-        assert!(pattern.is_some());
-        // Row by row from the first hole, back and forth (LIO-405).
-        assert_eq!(holes.len(), 12);
-        for (j, h) in holes.iter().enumerate() {
-            let col = if (j / 4) % 2 == 1 { 3 - j % 4 } else { j % 4 };
-            let want = [first[0] + col as f32 * 20., first[1] + (j / 4) as f32 * 15.];
-            assert!((h[0] - want[0]).hypot(h[1] - want[1]) < 0.02, "{j} {h:?}");
-        }
-        // Without the DRO's matrix holes: hole by hole, as before.
-        let (doc, mesh) = pattern_job(&plate_grid(), false, true, false);
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let section = guide.sections[1].steps.clone();
-        assert_eq!(kinds(&guide, section.clone()), ["Tool", "Holes", "Check"]);
-        assert!(matches!(
-            guide.steps[section.start + 1],
-            Step::Holes { pattern: None, .. }
-        ));
-    }
-    #[test]
-    fn a_drill_after_its_centre_drill_on_the_same_circle_says_the_pattern_is_the_same() {
-        let (doc, mesh) = pattern_job(&plate_circle(), false, true, true);
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let patterns: Vec<(&Pattern, bool)> = (guide.steps.iter())
-            .filter_map(|s| match s {
-                Step::Pattern { pattern, same, .. } => Some((pattern, *same)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(patterns.len(), 2, "{:?}", guide.steps);
-        assert_eq!((patterns[0].1, patterns[1].1), (false, true));
-        let Pattern::Arc {
-            diameter,
-            count,
-            first,
-            step,
-            full,
-            ..
-        } = patterns[1].0
-        else {
-            panic!()
-        };
-        assert_eq!(
-            (*diameter, *count, *first, *step, *full),
-            (60., 6, 30., 60., true)
-        );
-    }
-    /// The guide's job with its holes drilled before the Step, so that an
-    /// operation in work coordinates follows the DRO's matrix holes.
-    pub(crate) fn holes_then_step() -> (Document, Mesh) {
-        let (mut doc, mesh) = job("Yes");
-        doc.setups[0].operations.swap(1, 2);
-        (doc, mesh)
-    }
-    #[test]
-    fn the_operation_after_the_dros_holes_starts_by_leaving_its_hole_function() {
-        let (doc, mesh) = holes_then_step();
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
-        assert_eq!(of(2), ["Tool", "Pattern", "Holes", "Check"]);
-        // The Step, in work coordinates, starts with the DRO back in them
-        // (LIO-488), then its new tool.
-        assert_eq!(of(3)[..2], ["Leave", "Tool"]);
-        let Some(Step::Holes { holes, numbers, .. }) =
-            guide.steps.iter().find(|s| matches!(s, Step::Holes { .. }))
-        else {
-            panic!()
-        };
-        let h = holes.last().unwrap();
-        assert_eq!(
-            guide.steps[guide.sections[3].steps.start],
-            Step::Leave {
-                op: 2,
-                from: 1,
-                at: [h[0], h[1]],
-                number: *numbers.last().unwrap(),
-            }
-        );
-        // A drill after its centre drill on the same pattern goes on in the
-        // hole function, and the setup's last holes hand over: no Leave.
-        let (doc, mesh) = pattern_job(&plate_grid(), true, false, true);
-        let guide = build(&doc, &mesh, 0).unwrap();
-        assert!(
-            !guide.steps.iter().any(|s| matches!(s, Step::Leave { .. })),
-            "{:?}",
-            kinds(&guide, 0..guide.steps.len())
-        );
-        // As on the job, where the holes are last.
-        let (doc, mesh) = job("Yes");
-        let guide = build(&doc, &mesh, 0).unwrap();
-        assert!(!guide.steps.iter().any(|s| matches!(s, Step::Leave { .. })));
+    pub(crate) fn plate_circle() -> Vec<[f32; 2]> {
+        (0..6)
+            .map(|k| (30. + 60. * k as f32).to_radians())
+            .map(|a| [30. * a.cos(), 30. * a.sin()])
+            .collect()
     }
     #[test]
     fn one_section_per_operation_between_set_up_and_hand_over() {
@@ -3893,17 +2565,15 @@ pub mod tests {
         }
         assert_eq!(at, guide.steps.len());
         let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
-        assert_eq!(of(0), ["Hold", "Zero"]);
-        assert_eq!(of(1), ["Face"]);
-        // The 15 mm step is one row on each of its two levels (LIO-366); the
-        // Face's tool is still in, so only the DRO is set (LIO-368).
-        assert_eq!(of(2), ["Comp", "Pass", "Pass", "Check"]);
-        // The four holes on a 96 x 56 rectangle are a 2 x 2 grid, which the
-        // DRO's matrix holes (on by default, LIO-399) take: a Pattern first.
-        assert_eq!(of(3), ["Tool", "Pattern", "Holes", "Check"]);
+        // The zero, then a page an operation (LIO-688).
+        assert_eq!(of(0), ["Zero"]);
+        for k in 1..4 {
+            assert_eq!(of(k), ["Sheet"]);
+        }
         assert_eq!(of(4), ["HandOver"]);
+        // What each page lists: a box each, four holes.
         let counts: Vec<usize> = guide.sections.iter().map(|s| s.count).collect();
-        assert_eq!(counts, [0, 0, 2, 4, 0]);
+        assert_eq!(counts, [0, 1, 1, 4, 0]);
         // The minutes: the operations' plans and two tool changes of 3 minutes.
         let plans: f32 = guide.done.iter().map(|d| d.plan.duration / 60.).sum();
         close(guide.minutes, plans + 6.);
@@ -3978,125 +2648,54 @@ pub mod tests {
         assert!(!unchecked(0), "{:?}", held(0));
         assert!(unchecked(1), "{:?}", held(1));
     }
-    /// A Face that cuts the part's own top, on stock whose bottom is the
-    /// part's already, has the part's size along Z to be measured to; one
-    /// that stops above the top, or on stock with more under the part, or
-    /// with an allowance left, has none (LIO-487).
+    /// LIO-688: the zero page holds the stock as it starts, where the zero
+    /// is on it; each operation's page its tool, its speed and what it
+    /// cuts, in work coordinates.
     #[test]
-    fn a_face_that_makes_the_parts_top_on_a_bottom_at_size_has_the_size() {
-        let (mut doc, mesh) = job("Yes");
-        let part = simulation::part_box(&doc.setups[0], &mesh);
-        let face = |doc: &Document| {
-            (build(doc, &mesh, 0).unwrap().steps.into_iter())
-                .find_map(|s| match s {
-                    Step::Face { size, to, .. } => Some((size, to)),
-                    _ => None,
-                })
-                .unwrap()
-        };
-        let set = |doc: &mut Document, k: &str, v: &str| {
-            doc.setups[0].p.insert(k.into(), v.into());
-        };
-        // 2 over the part's top, which the Face takes off, none under it.
-        set(&mut doc, "stock_top", "2");
-        set(&mut doc, "stock_bottom", "0");
-        let (size, to) = face(&doc);
-        close(to, -2.);
-        close(size.expect("a size"), part.max[2] - part.min[2]);
-        // 3 under the part: its bottom is not at size yet.
-        set(&mut doc, "stock_bottom", "3");
-        assert_eq!(face(&doc).0, None);
-        // 4 over the top: the Face stops 2 above it.
-        set(&mut doc, "stock_bottom", "0");
-        set(&mut doc, "stock_top", "4");
-        assert_eq!(face(&doc).0, None);
-        // Any allowance left on the top, however small, is left on purpose:
-        // not the part's face yet.
-        set(&mut doc, "stock_top", "2");
-        for allowance in ["0.2", "0.01", "0.005"] {
-            (doc.setups[0].operations[0].p).insert("allowance".into(), allowance.into());
-            assert_eq!(face(&doc).0, None, "{allowance}");
-        }
-    }
-    #[test]
-    fn steps_run_hold_zero_then_each_operation_and_a_face_is_one_step() {
+    fn steps_run_the_zero_then_a_page_an_operation() {
         let (doc, mesh) = job("Yes");
         let guide = build(&doc, &mesh, 0).unwrap();
         assert_eq!(
             kinds(&guide, 0..guide.steps.len()),
-            // The holes are a 2 x 2 grid: a Pattern before them (LIO-399).
-            [
-                "Hold", "Zero", "Face", "Comp", "Pass", "Pass", "Check", "Tool", "Pattern",
-                "Holes", "Check", "HandOver"
-            ]
+            ["Zero", "Sheet", "Sheet", "Sheet", "HandOver"]
         );
-        let Step::Hold {
+        let Step::Zero {
             stock,
             holding,
             vise,
+            clamps,
         } = &guide.steps[0]
         else {
             panic!()
         };
-        assert_eq!(*vise, None);
+        assert_eq!((*vise, clamps.len()), (None, 0));
         // In work coordinates: the zero on the stock top's front-left corner.
         assert_eq!((stock.min[0], stock.min[1], stock.max[2]), (0., 0., 0.));
         close(stock.max[1], 120.);
         assert_eq!(holding.stock, *stock);
-        // The Ø10 edge finder touches the left and front faces from outside:
-        // its centre is 5 mm off them when the DRO is set.
-        assert_eq!(
-            guide.steps[1],
-            Step::Zero {
-                corner: [0.; 3],
-                approach: [-1, -1],
-                touch: [-5., -5., 0.],
-                finder: 10.,
-                // The 124 × 120 block's left and front faces, at their
-                // middles, on the top.
-                at: [[0., 60., 0.], [62., 0., 0.]],
-                round: [false, false],
-                // A corner: no axis is halved.
-                far: [None; 2],
-                // In a vise: no clamps.
-                clamps: vec![],
-                blocked: Default::default(),
-            }
-        );
-        let Step::Face {
+        let Step::Sheet {
             op,
             tool,
             rpm,
-            diameter,
-            top,
-            remove,
-            to,
-            size,
-        } = &guide.steps[2]
+            features: Features::Box { lo, hi, through },
+        } = &guide.steps[1]
         else {
-            panic!("{:?}", guide.steps[2])
+            panic!("{:?}", guide.steps[1])
         };
-        assert_eq!(
-            (*op, tool, *rpm, *diameter),
-            (0, &doc.tools[3].id, 640., 25.)
-        );
-        close(*to, -2.);
-        close(*remove, 2.);
-        // Stock under the part: no size to face to (LIO-487).
-        assert_eq!(*size, None);
-        // The first tool picks up Z on the untouched top.
-        close(top.unwrap(), 0.);
-        assert_eq!(guide.steps[11], Step::HandOver { next: Some(1) });
-        // The Step's floor is closed: not a squaring Box. The Face's tool
-        // is still in: only the DRO's diameter and sides (LIO-368).
-        assert_eq!(
-            guide.steps[3],
-            Step::Comp {
-                op: 1,
-                comp: [1, 1],
-                diameter: 25.
-            }
-        );
+        assert_eq!((*op, tool, *rpm, *through), (0, &doc.tools[3].id, Some(640.), false));
+        close(lo[2], -2.);
+        close(hi[2], 0.);
+        for k in 0..2 {
+            close(lo[k], stock.min[k]);
+            close(hi[k], stock.max[k]);
+        }
+        let holes = holes_of_op(&guide, 2);
+        assert_eq!(holes.len(), 4);
+        // On the Face's floor.
+        for h in holes {
+            close(h.mouth, -2.);
+        }
+        assert_eq!(guide.steps[4], Step::HandOver { next: Some(1) });
     }
     /// The job in the manual mill's vise, its jaws on the Y sides.
     pub fn in_the_vise(doc: &mut Document) {
@@ -4110,14 +2709,15 @@ pub mod tests {
         doc.settle_holding(0);
     }
     #[test]
-    fn the_hold_step_has_the_vise_its_grip_and_jaw_height() {
+    fn the_zero_step_has_the_vise_its_grip_and_jaw_height() {
         let (mut doc, mesh) = job("Yes");
         in_the_vise(&mut doc);
         let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Hold {
+        let Step::Zero {
             stock,
             holding,
             vise: Some(vise),
+            ..
         } = &guide.steps[0]
         else {
             panic!("{:?}", guide.steps[0])
@@ -4130,93 +2730,6 @@ pub mod tests {
         assert_eq!(Some(vise.jaw_thickness), num(&holder.p, "jaw_thickness"));
         assert!(vise.grip > 0. && vise.grip < stock.max[2] - stock.min[2]);
         assert_eq!(holding.bottom, stock.min[2]);
-    }
-    #[test]
-    fn every_new_tool_picks_up_z_on_the_top_left_before_its_operation() {
-        let (doc, mesh) = job("Yes");
-        let guide = build(&doc, &mesh, 0).unwrap();
-        // The Face's mill on the untouched top; after the 2 mm face, the
-        // Holes' drill touches a top 2 mm down. The Step keeps the Face's
-        // mill and its Z (LIO-368).
-        let tops: Vec<(usize, Option<f32>)> = (guide.steps.iter())
-            .filter_map(|s| match s {
-                Step::Tool { op, top, .. } | Step::Face { op, top, .. } => Some((*op, *top)),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(tops.len(), 2, "{tops:?}");
-        for ((op, top), want) in tops.into_iter().zip([(0, 0.), (2, -2.)]) {
-            assert_eq!(op, want.0);
-            assert!((top.unwrap() - want.1).abs() < 0.01, "{op} {top:?}");
-        }
-        // A square after the face with its tool still in picks up nothing.
-        let (mut doc, mesh) = job("Yes");
-        let mill = doc.tools[3].id.clone();
-        let b = [123., 500., -500., 500., 0., -30.];
-        let square = boxed("Square", &mill, b, &[("allowance", "0")]);
-        doc.setups[0].operations.insert(1, square);
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Square { top, .. } = &guide.steps[3] else {
-            panic!("{:?}", guide.steps[3])
-        };
-        assert_eq!(*top, None);
-    }
-    #[test]
-    fn a_tool_already_in_gets_only_what_changes() {
-        let (mut doc, mesh) = job("Yes");
-        let mill = doc.tools[3].id.clone();
-        // A deeper step after the Step: same tool, gear and sides.
-        let b = [-500., 500., -500., 15.5, 0., -14.];
-        let deeper = boxed("Deeper", &mill, b, &[("stepdown", "5")]);
-        doc.setups[0].operations.insert(2, deeper);
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let first = |g: &Guide, i: usize| g.steps[g.sections[i].steps.start].clone();
-        // After the Face: only the DRO's diameter and sides.
-        assert_eq!(
-            first(&guide, 2),
-            Step::Comp {
-                op: 1,
-                comp: [1, 1],
-                diameter: 25.
-            }
-        );
-        // Nothing changes: the section starts with its first pass.
-        assert!(
-            matches!(
-                first(&guide, 3),
-                Step::Pass {
-                    op: 2,
-                    index: 1,
-                    ..
-                }
-            ),
-            "{:?}",
-            first(&guide, 3)
-        );
-        // A change of tool: put it in, pick up Z, the DRO.
-        assert!(matches!(
-            first(&guide, 4),
-            Step::Tool {
-                op: 3,
-                top: Some(_),
-                comp: Some([0, 0]),
-                ..
-            }
-        ));
-        // Another gear alone: the gear and nothing else.
-        doc.setups[0].operations[2]
-            .p
-            .insert("rpm".into(), "400".into());
-        let guide = build(&doc, &mesh, 0).unwrap();
-        assert!(matches!(
-            first(&guide, 3),
-            Step::Tool {
-                op: 2,
-                top: None,
-                comp: None,
-                ..
-            }
-        ));
     }
     /// The shaft turned on the lathe (`proposal::tests::turned`), Ø20 over
     /// its top 20 mm and Ø30 under it; the manual mill, setup 2, then
@@ -4358,181 +2871,6 @@ pub mod tests {
             },
         )
     }
-    #[test]
-    fn with_only_2_mm_of_ø20_over_the_jaws_the_zero_touches_it_and_with_none_it_is_refused() {
-        // The CNC grips the Ø30 foot 28 mm.
-        let (doc, mesh, report, plan) = stepped_in_soft_jaws(28., 28.);
-        let (check, job) = crate::plan_check::check(&doc, &mesh, &report, &plan);
-        assert!(check.passed, "{:?}", check.problems);
-        let mut job = job.unwrap();
-        // The manual mill grips 28 mm of the 30 too.
-        job.setups[1].p.insert("round_grip".into(), "28".into());
-        let guide = build(&job, &mesh, 1).unwrap();
-        let Step::Zero { touch, at, .. } = &guide.steps[1] else {
-            panic!("{:?}", guide.steps[1])
-        };
-        // The Ø20 stands 2 mm over the jaws' top at 28: the finder comes
-        // in over them to it, at the top, and X/Y are set to −15 for it.
-        for k in 0..2 {
-            close(at[k][k], -10.);
-            close(at[k][2], touch[2]);
-            close(touch[k], -15.);
-        }
-        // Gripped to 29.6, nothing stands 0.5 mm clear of the jaws.
-        job.setups[1].p.insert("round_grip".into(), "29.6".into());
-        assert_eq!(build(&job, &mesh, 1).unwrap_err(), NOT_CLEAR);
-    }
-    #[test]
-    fn a_short_part_in_soft_jaws_is_touched_on_its_ø20_above_them_not_its_ø30_inside_them() {
-        let (doc, mesh, report, plan) = short_part_in_soft_jaws();
-        let (check, job) = crate::plan_check::check(&doc, &mesh, &report, &plan);
-        assert!(check.passed, "{:?}", check.problems);
-        // The manual mill grips 8 mm of it too.
-        let mut job = job.unwrap();
-        job.setups[1].p.insert("round_grip".into(), "8".into());
-        let guide = build(&job, &mesh, 1).unwrap();
-        let Step::Zero {
-            touch, at, round, ..
-        } = &guide.steps[1]
-        else {
-            panic!("{:?}", guide.steps[1])
-        };
-        // The Ø30 stands only 2 mm over the jaws: the finder touches the
-        // Ø20 at the top, 10 off the axis, and X/Y are set to −15 for it.
-        for k in 0..2 {
-            close(at[k][k], -10.);
-            close(at[k][1 - k], 0.);
-            close(at[k][2], touch[2]);
-            close(touch[k], -15.);
-        }
-        assert_eq!(*round, [true, true]);
-    }
-    #[test]
-    fn after_the_lathe_the_mills_zero_touches_the_shafts_foot_under_its_shoulder() {
-        let (job, mesh) = turned_then_drilled_by_hand();
-        let guide = build(&job, &mesh, 1).unwrap();
-        let Step::Zero {
-            touch, at, round, ..
-        } = &guide.steps[1]
-        else {
-            panic!("{:?}", guide.steps[1])
-        };
-        // The left and front of the Ø30, 15 off the axis, less the Ø10
-        // finder's radius: −20, not the −15 the Ø20 top would need.
-        close(touch[0], -20.);
-        close(touch[1], -20.);
-        for k in 0..2 {
-            // On the Ø30's face, on its centre line, 3 mm under the
-            // shoulder that is 20 under the top.
-            close(at[k][k], -15.);
-            close(at[k][1 - k], 0.);
-            close(touch[2] - at[k][2], 23.);
-        }
-        assert_eq!(*round, [true, true]);
-        // With the zero on the top's centre, each axis is halved across
-        // the Ø30 (LIO-451): both sides on the centre line, as low, round
-        // both; the DRO reads 30 + Ø10 on the + side and is set to half.
-        let mut job = job;
-        (job.setups[1].p).insert("origin".into(), "Stock top center".into());
-        let guide = build(&job, &mesh, 1).unwrap();
-        let Step::Zero {
-            touch,
-            at,
-            round,
-            far,
-            ..
-        } = &guide.steps[1]
-        else {
-            panic!("{:?}", guide.steps[1])
-        };
-        assert_eq!(*round, [true, true]);
-        for k in 0..2 {
-            let f = far[k].unwrap();
-            assert!(f.round);
-            close(at[k][k], -15.);
-            close(f.at[k], 15.);
-            close(f.at[1 - k], 0.);
-            close(f.at[2], at[k][2]);
-            close(f.reads, 40.);
-            close(touch[k], 20.);
-        }
-    }
-    #[test]
-    fn the_zero_takes_the_edge_finders_radius_off_each_face_it_touches() {
-        let (mut doc, mesh) = job("Yes");
-        // Only the holes, which do not depend on the zero.
-        doc.setups[0].operations.drain(..2);
-        doc.setups[0]
-            .machine
-            .p
-            .insert("edge_finder".into(), "6".into());
-        // 124 × 120 × 47 stock: the back-right corner, the centre, the
-        // middle of the front edge, the bottom. A middle is halved
-        // (LIO-451): set at the + face to half of what the DRO reads there,
-        // the width plus the finder's diameter.
-        for (origin, corner, approach, touch, reads) in [
-            (
-                "Stock top back-right",
-                [0., 0., 0.],
-                [1, 1],
-                [3., 3., 0.],
-                [None, None],
-            ),
-            (
-                "Stock top center",
-                [0., 0., 0.],
-                [-1, -1],
-                [65., 63., 0.],
-                [Some(130.), Some(126.)],
-            ),
-            (
-                "Stock top front",
-                [0., 0., 0.],
-                [-1, -1],
-                [65., -3., 0.],
-                [Some(130.), None],
-            ),
-            (
-                "Stock bottom front-left",
-                [0., 0., 47.],
-                [-1, -1],
-                [-3., -3., 47.],
-                [None, None],
-            ),
-        ] {
-            doc.setups[0].p.insert("origin".into(), origin.into());
-            let guide = build(&doc, &mesh, 0).unwrap();
-            let Step::Zero {
-                corner: c,
-                approach: a,
-                touch: t,
-                finder,
-                far,
-                ..
-            } = &guide.steps[1]
-            else {
-                panic!()
-            };
-            assert_eq!((*a, *finder), (approach, 6.), "{origin}");
-            for k in 0..3 {
-                close(c[k], corner[k]);
-                close(t[k], touch[k]);
-            }
-            for k in 0..2 {
-                match (far[k], reads[k]) {
-                    (Some(f), Some(r)) => close(f.reads, r),
-                    (None, None) => {}
-                    other => panic!("{origin} axis {k}: {other:?}"),
-                }
-            }
-        }
-        doc.setups[0]
-            .machine
-            .p
-            .insert("edge_finder".into(), "0".into());
-        let error = build(&doc, &mesh, 0).unwrap_err();
-        assert!(error.contains("edge finder"), "{error}");
-    }
     /// `job`'s manual setup held down by the starter toe clamp, made
     /// `width` wide, at `clamps` (a clamp layout) instead of its vise
     /// (LIO-458).
@@ -4553,120 +2891,52 @@ pub mod tests {
         }
         doc.workholding.push(holder);
     }
+    /// LIO-688: the zero page says where the zero is, not how to find it,
+    /// but a zero the edge finder cannot reach is still refused, as the
+    /// plan check says (LIO-451, LIO-458): no finder, nothing clear above
+    /// soft jaws, a face it must touch all under a clamp, a middle with both
+    /// faces under clamps. One face of a middle under a clamp is not.
     #[test]
-    fn a_touch_under_a_toe_clamp_moves_along_its_face_clear_of_it() {
-        // The 124 × 120 block's left and front faces, touched at their
-        // middles in a vise
-        // (`steps_run_hold_zero_then_each_operation_and_a_face_is_one_step`),
-        // here have a 20 wide clamp each over that middle.
-        let (mut doc, mesh) = job("No");
-        on_clamps(&mut doc, "-Y:0;-X:0;+Y:0", "20");
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Zero {
-            at,
-            touch,
-            finder,
-            clamps,
-            blocked,
-            far,
-            ..
-        } = &guide.steps[1]
-        else {
-            panic!("{:?}", guide.steps[1])
-        };
-        // The probe check's clamps, drawn: on −Y over X 52 to 72.
-        assert_eq!(clamps.len(), 3);
-        let (label, front) = &clamps[0];
-        assert_eq!(label, "clamp on -Y (offset 0)");
-        close(front.min[0], 52.);
-        close(front.max[0], 72.);
-        assert_eq!(*blocked, <[[Option<String>; 2]; 2]>::default());
-        assert_eq!(*far, [None; 2]);
-        // The faces and what the DRO is set to there are as in the vise.
-        assert_eq!(*touch, [-5., -5., 0.]);
-        close(at[0][0], 0.);
-        close(at[1][1], 0.);
-        // Each touch is the Ø10 finder's radius and 2 mm clear of its
-        // clamp, in the middle of the nearest stretch of the face clear of
-        // it, the first of the two as near: the front's X 0.5 to 45 (0.5
-        // in from its corner to 62 − 10 − 7), the left's Y 0.5 to 43.
-        let room = finder / 2. + CLAMP_CLEAR;
-        assert!((at[1][0] - 62.).abs() >= 10. + room, "{at:?}");
-        assert!((at[0][1] - 60.).abs() >= 10. + room, "{at:?}");
-        assert!((at[1][0] - 22.75).abs() < 0.02, "{at:?}");
-        assert!((at[0][1] - 21.75).abs() < 0.02, "{at:?}");
-        // A clamp off the touched faces moves nothing: the +Y one alone
-        // leaves both at their middles.
-        let (mut doc, mesh) = job("No");
-        on_clamps(&mut doc, "+Y:0", "20");
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Zero { at, blocked, .. } = &guide.steps[1] else {
-            panic!()
-        };
-        assert_eq!(*at, [[0., 60., 0.], [62., 0., 0.]]);
-        assert_eq!(*blocked, <[[Option<String>; 2]; 2]>::default());
-    }
-    #[test]
-    fn a_narrow_gap_between_clamps_is_found_between_the_samples() {
-        // Two clamps 50 wide on the front of the 124 long face, X 5.4 to
-        // 55.4 and 70.4 to 120.4: the Ø10 finder, 5 + 2 off each, has only
-        // X 62.4 to 63.4 clear, between two of the face's 61 samples (62.0
-        // and 64.0).
-        let (mut doc, mesh) = job("No");
-        on_clamps(&mut doc, "-Y:-31.6;-Y:33.4", "50");
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Zero { at, blocked, .. } = &guide.steps[1] else {
-            panic!()
-        };
-        assert_eq!(*blocked, <[[Option<String>; 2]; 2]>::default());
-        assert!((at[1][0] - 62.9).abs() < 0.01, "{at:?}");
-    }
-    #[test]
-    fn a_face_all_under_a_clamp_is_named_and_its_axis_set_from_the_other_face() {
-        // A strap 140 wide over the whole of the 124 long front face, and
-        // the zero at the top's centre: Y is not halved but set on the back
-        // face alone, 60 + 5 for the Ø10 finder, by the stock's size.
+    fn a_zero_the_edge_finder_cannot_reach_is_refused() {
+        let (mut doc, mesh) = job("Yes");
+        (doc.setups[0].machine.p).insert("edge_finder".into(), "0".into());
+        let error = build(&doc, &mesh, 0).unwrap_err();
+        assert!(error.contains("edge finder"), "{error}");
+        // The Ø20 over a Ø30 gripped 28 of its 30 in soft jaws: 2 mm of it
+        // stands over them; gripped 29.6, nothing stands 0.5 mm clear.
+        let (doc, mesh, report, plan) = stepped_in_soft_jaws(28., 28.);
+        let (check, job2) = crate::plan_check::check(&doc, &mesh, &report, &plan);
+        assert!(check.passed, "{:?}", check.problems);
+        let mut job2 = job2.unwrap();
+        job2.setups[1].p.insert("round_grip".into(), "28".into());
+        assert!(build(&job2, &mesh, 1).is_ok());
+        job2.setups[1].p.insert("round_grip".into(), "29.6".into());
+        assert_eq!(build(&job2, &mesh, 1).unwrap_err(), NOT_CLEAR);
+        // A strap over the whole front face.
         let centred = |clamps: &str| {
             let (mut doc, mesh) = job("No");
             on_clamps(&mut doc, clamps, "140");
             doc.setups[0].operations.drain(..2);
-            doc.setups[0]
-                .p
-                .insert("origin".into(), "Stock top center".into());
+            (doc.setups[0].p).insert("origin".into(), "Stock top center".into());
             (doc, mesh)
         };
+        // The zero at the top's centre: Y from the back face alone.
         let (doc, mesh) = centred("-Y:0");
         let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Zero {
-            at,
-            far,
-            blocked,
-            approach,
-            touch,
-            ..
-        } = &guide.steps[1]
-        else {
-            panic!()
+        let Step::Zero { clamps, .. } = &guide.steps[0] else {
+            panic!("{:?}", guide.steps[0])
         };
-        assert_eq!(
-            *blocked,
-            [[None, None], [Some("clamp on -Y (offset 0)".into()), None]]
-        );
-        assert_eq!(approach[1], 1);
-        assert!(far[0].is_some() && far[1].is_none(), "{far:?}");
-        close(at[1][1], 60.);
-        close(touch[1], 65.);
+        assert_eq!(clamps[0].0, "clamp on -Y (offset 0)");
         // The front and the back both under straps: Y cannot be found.
         let (doc, mesh) = centred("-Y:0;+Y:0");
-        let why = build(&doc, &mesh, 0).unwrap_err();
         assert_eq!(
-            why,
+            build(&doc, &mesh, 0).unwrap_err(),
             format!(
                 "{UNDER_CLAMPS} on the front face (clamp on -Y (offset 0)) or the back face (clamp on +Y (offset 0)). Move a clamp along its side so that the finder can touch one of them, or choose a work zero on faces the clamps leave clear."
             )
         );
         // A zero on the front-left corner must touch the front: refused,
-        // and the Check page says why.
+        // and the plan check says why.
         let (mut doc, mesh) = job("No");
         on_clamps(&mut doc, "-Y:0", "140");
         let why = build(&doc, &mesh, 0).unwrap_err();
@@ -4686,6 +2956,10 @@ pub mod tests {
             "{:?}",
             check.problems
         );
+        // A 20 wide clamp on the front, clear of the corner: given.
+        let (mut doc, mesh) = job("No");
+        on_clamps(&mut doc, "-Y:0", "20");
+        assert!(build(&doc, &mesh, 0).is_ok());
     }
     #[test]
     fn clamps_that_cannot_be_placed_give_no_zero() {
@@ -4706,326 +2980,6 @@ pub mod tests {
         }
     }
     #[test]
-    fn a_clear_stretch_at_the_end_of_a_face_is_found() {
-        // A strap 140 wide from X 7.8 on the 124 long front: the Ø10
-        // finder, 5 + 2 off it, has X 0 to 0.8 clear; 0.5 in from the
-        // corner, X 0.5 to 0.8.
-        let (mut doc, mesh) = job("No");
-        on_clamps(&mut doc, "-Y:15.8", "140");
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Zero { at, .. } = &guide.steps[1] else {
-            panic!()
-        };
-        assert!((at[1][0] - 0.65).abs() < 0.02, "{at:?}");
-    }
-    #[test]
-    fn a_bar_under_its_clamps_is_not_touched_beside_them_in_the_air() {
-        // An uncut Ø200 bar standing up, clamped at the middles of its
-        // front and back: they are over the lines Y is touched on, and off
-        // them the finder meets nothing.
-        let (mut doc, mesh) = job("No");
-        doc.setups[0].operations.drain(..2);
-        for (k, v) in [
-            ("stock_type", "Round bar"),
-            ("stock_diameter", "200"),
-            ("stock_length", "60"),
-            ("origin", "Stock top center"),
-        ] {
-            doc.setups[0].p.insert(k.into(), v.into());
-        }
-        on_clamps(&mut doc, "-Y:0;+Y:0", "20");
-        let why = build(&doc, &mesh, 0).unwrap_err();
-        assert!(why.starts_with(UNDER_CLAMPS), "{why}");
-        // Clamped 60 off those lines instead, Y is touched on them.
-        doc.setups[0]
-            .p
-            .insert("clamps".into(), "-Y:60;+Y:-60".into());
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let Step::Zero { at, far, .. } = &guide.steps[1] else {
-            panic!()
-        };
-        close(at[1][0], 0.);
-        close(far[1].unwrap().at[0], 0.);
-    }
-    /// What a DRO shows at the work zero after the Zero step's touches on
-    /// axis `k` (X or Y) of `zero`, for a blank whose faces are where
-    /// `faces` (work coordinates) say, which may differ from the
-    /// drawing's: the edge finder's centre stands a radius outside each
-    /// face touched, the axis is set as the step says, and the reading
-    /// at the work zero is what the DRO then shows there.
-    pub fn dro_at_zero(zero: &Step, k: usize, faces: [f32; 2]) -> f32 {
-        let Step::Zero {
-            approach,
-            touch,
-            finder,
-            far,
-            ..
-        } = zero
-        else {
-            panic!("{zero:?}")
-        };
-        let r = finder / 2.;
-        // The DRO reads `position - offset`; each set picks the offset.
-        // Halved: 0 on the − face, then the + face set to `touch`, which
-        // replaces it.
-        let offset = match far[k] {
-            Some(_) => (faces[1] + r) - touch[k],
-            None if approach[k] > 0 => (faces[1] + r) - touch[k],
-            None => (faces[0] - r) - touch[k],
-        };
-        -offset
-    }
-    #[test]
-    fn a_centre_zero_is_found_by_halving_between_both_faces() {
-        let (mut doc, mesh) = job("Yes");
-        doc.setups[0].operations.drain(..2);
-        doc.setups[0]
-            .p
-            .insert("origin".into(), "Stock top center".into());
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let zero = &guide.steps[1];
-        let Step::Zero {
-            approach,
-            touch,
-            finder,
-            at,
-            far,
-            ..
-        } = zero
-        else {
-            panic!("{zero:?}")
-        };
-        assert_eq!((*approach, *finder), ([-1, -1], 10.));
-        // The 124 × 120 block: the − faces at −62 and −60, the + faces at
-        // +62 and +60, each touched at the middle of the other axis, on
-        // the top.
-        let far = far.map(Option::unwrap);
-        for (k, half) in [(0, 62.), (1, 60.)] {
-            close(at[k][k], -half);
-            close(far[k].at[k], half);
-            close(at[k][1 - k], 0.);
-            close(far[k].at[1 - k], 0.);
-            close(at[k][2], 0.);
-            close(far[k].at[2], 0.);
-            // The DRO reads the width plus the Ø10 finder there: a check.
-            close(far[k].reads, 2. * half + 10.);
-            // Set to half the reading: the finder's radius cancels.
-            close(touch[k], far[k].reads / 2.);
-        }
-        close(touch[2], 0.);
-        // On the drawing's blank, the DRO reads 0 at the work zero.
-        for k in 0..2 {
-            let half = [62., 60.][k];
-            close(dro_at_zero(zero, k, [-half, half]), 0.);
-        }
-        // A sawn blank 1 mm wider on X, 0.6 mm narrower on Y than drawn,
-        // its middle on the drawing's: halving, with ½ taking half of what
-        // the DRO really reads, still puts 0 on its middle, where one touch
-        // on the − face set to the drawing's half (the step before
-        // LIO-451) is off by half the error.
-        for (k, faces, error) in [(0, [-62.5, 62.5], 0.5), (1, [-59.7, 59.7], -0.3)] {
-            let read = (faces[1] + 5.) - (faces[0] - 5.);
-            let mut halved = zero.clone();
-            let mut one_face = zero.clone();
-            if let Step::Zero { touch, .. } = &mut halved {
-                touch[k] = read / 2.;
-            }
-            if let Step::Zero { touch, far, .. } = &mut one_face {
-                touch[k] = -[62., 60.][k] - 5.;
-                far[k] = None;
-            }
-            close(dro_at_zero(&halved, k, faces), 0.);
-            close(dro_at_zero(&one_face, k, faces), error);
-        }
-    }
-    #[test]
-    fn a_squaring_box_is_one_square_step_cut_to_the_wall() {
-        let (width, height) = (124., 47.);
-        // The +X side, 1 mm off as cut: down to a closed floor at −30 with
-        // and without compensation, with 0.5 left on the wall and the floor,
-        // and down through the stock's bottom.
-        for (dro, readout, x_min, z_bottom, allowance, down_to) in [
-            ("Yes", 0., 123., -30., "0", -30.),
-            ("No", 12.5, 123., -30., "0", -30.),
-            ("Yes", 0., 122.5, -30., "0.5", -29.5),
-            ("Yes", 0., 123., -100., "0", -height),
-        ] {
-            let (mut doc, mesh) = job(dro);
-            let mill = doc.tools[3].id.clone();
-            let b = [x_min, 500., -500., 500., 0., z_bottom];
-            let square = boxed("Square", &mill, b, &[("allowance", allowance)]);
-            doc.setups[0].operations.insert(1, square);
-            let guide = build(&doc, &mesh, 0).unwrap();
-            let Step::Hold { stock, .. } = &guide.steps[0] else {
-                panic!()
-            };
-            close(stock.max[0], width);
-            close(stock.min[2], -height);
-            assert_eq!(kinds(&guide, guide.sections[2].steps.clone()), ["Square"]);
-            let Step::Square {
-                op,
-                comp,
-                axis,
-                side,
-                to,
-                shown,
-                remove,
-                down_to: down,
-                diameter,
-                ..
-            } = &guide.steps[3]
-            else {
-                panic!("{:?}", guide.steps[3])
-            };
-            assert_eq!((*op, *axis, *side, *diameter), (1, 0, 1, 25.));
-            // The DRO's compensation reads the edge on the wall's side: the
-            // wall is on −X of the tool, cutting the stock's +X side.
-            let want = if dro == "Yes" { [-1, 0] } else { [0, 0] };
-            assert_eq!(*comp, want);
-            close(*to, 123.);
-            close(*shown, 123. + readout);
-            close(*remove, 1.);
-            close(*down, down_to);
-            // The plan's cut nearest the wall has its centre a radius off it,
-            // on the floor.
-            let plan = &guide.done[1].plan;
-            let near = (plan.moves.iter())
-                .filter(|m| m.cutting_pass)
-                .map(|m| m.to[0] - guide.zero[0])
-                .fold(f32::INFINITY, f32::min);
-            close(near, 123. + 12.5);
-            close(plan.target - guide.zero[2], down_to);
-            // The 15.5 mm front step, wider than the radius, is not squaring:
-            // it runs its passes, the same tool still in (LIO-368), after
-            // the DRO's diameter and sides when its compensation is on.
-            let want: &[&str] = match dro {
-                "Yes" => &["Comp", "Pass", "Pass", "Check"],
-                _ => &["Pass", "Pass", "Check"],
-            };
-            assert_eq!(kinds(&guide, guide.sections[3].steps.clone()), want);
-        }
-    }
-    #[test]
-    fn targets_replay_the_plans_moves_in_order() {
-        let (doc, mesh) = job("Yes");
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let (zero, plan) = (guide.zero, &guide.done[1].plan);
-        let work = |p: [f32; 3]| -> [f32; 3] { std::array::from_fn(|k| p[k] - zero[k]) };
-        let start = work(plan.moves[0].from);
-        let mut moves = plan.moves.iter().filter(|m| m.motion != Motion::Dwell);
-        let (mut at, mut n) = (start, 0);
-        for step in &guide.steps {
-            let Step::Pass {
-                targets, index, of, ..
-            } = step
-            else {
-                continue;
-            };
-            n += 1;
-            assert_eq!((*index, *of), (n, 2));
-            // The plan's moves since the last cut, this cut last.
-            let mut legs = vec![];
-            for m in moves.by_ref() {
-                let k = moved(m).unwrap();
-                legs.push((k, work(m.to)[k]));
-                if m.cutting_pass {
-                    break;
-                }
-            }
-            let got: Vec<(usize, f32)> = targets.iter().map(|t| (t.axis, t.centre)).collect();
-            if n == 1 {
-                // The first pass also sets, before the plunge, each axis the
-                // plan leaves where it starts. Its one row (Y 2.5, LIO-366)
-                // is off the plan's start, so here every axis moves.
-                let extra: Vec<(usize, f32)> =
-                    got.iter().copied().filter(|g| !legs.contains(g)).collect();
-                assert!(extra.iter().all(|e| *e == (e.0, start[e.0])), "{extra:?}");
-                assert_eq!(got.len(), legs.len() + extra.len());
-                for k in 0..3 {
-                    assert!(got[..got.len() - 1].iter().any(|g| g.0 == k));
-                }
-            } else {
-                assert_eq!(got, legs);
-            }
-            // Applied in order from where the last pass left the tool, they
-            // reach the cut's end; their numbers run 1, 2, 3…
-            for (i, t) in targets.iter().enumerate() {
-                assert_eq!(usize::from(t.order), i + 1);
-                at[t.axis] = t.centre;
-            }
-            let cut = plan
-                .moves
-                .iter()
-                .filter(|m| m.cutting_pass)
-                .nth(n - 1)
-                .unwrap();
-            assert_eq!(at, work(cut.to));
-            // The cut is along X with Y and Z locked; Y and Z are locked
-            // where they are set for the last time.
-            let (cut, setting) = targets.split_last().unwrap();
-            assert_eq!((cut.axis, cut.lock), (0, [false, true, true]));
-            for (i, t) in setting.iter().enumerate() {
-                let again = setting[i + 1..].iter().any(|u| u.axis == t.axis);
-                let want = t.axis != 0 && !again;
-                assert_eq!(
-                    t.lock,
-                    std::array::from_fn(|k| k == t.axis && want),
-                    "{t:?}"
-                );
-            }
-        }
-        assert_eq!(n, 2);
-        assert!(moves.all(|m| !m.cutting_pass));
-        // Conventional with M3: one row on each level, its wall on +Y, so it
-        // feeds along +X with the uncut material on its left.
-        let rows: Vec<&Move> = plan.moves.iter().filter(|m| m.cutting_pass).collect();
-        assert!(rows.iter().all(|m| m.to[0] > m.from[0]));
-        assert!(simulation::uncut_sides(&rows).is_empty());
-    }
-    #[test]
-    fn x_and_y_read_the_tool_edge_on_the_comp_side_with_the_dros_compensation() {
-        let (doc, mesh) = job("Yes");
-        let guide = build(&doc, &mesh, 0).unwrap();
-        // Open on both X ends (+), closed on +Y (+).
-        assert!(matches!(guide.steps[3], Step::Comp { comp: [1, 1], .. }));
-        assert!(matches!(
-            guide.steps[7],
-            Step::Tool {
-                comp: Some([0, 0]),
-                ..
-            }
-        ));
-        let all = targets(&guide);
-        for (_, t) in &all {
-            match t.axis {
-                2 => assert!(!t.edge && t.shown == t.centre),
-                _ => {
-                    assert!(t.edge);
-                    close(t.shown, t.centre + 12.5);
-                }
-            }
-        }
-        // The last row's edge stops on the wall less the stock to leave.
-        let (_, y) = all.iter().rev().find(|(_, t)| t.axis == 1).unwrap();
-        close(y.shown, 15.);
-        close(y.centre, 2.5);
-        // Never past the wall's allowance, the floor's, nor below the floor.
-        let Step::Pass { never, cut, .. } = &guide.steps[5] else {
-            panic!()
-        };
-        close(never.y[1], 15.);
-        close(never.z, -11.5);
-        close(cut.max[1], 15.);
-        close(cut.min[2], -11.5);
-        // Without it, every readout is the centre.
-        let (doc, mesh) = job("No");
-        let guide = build(&doc, &mesh, 0).unwrap();
-        // The Face's tool is still in and there are no sides to set: the
-        // Step starts with its first pass (LIO-368).
-        assert!(matches!(guide.steps[3], Step::Pass { op: 1, .. }));
-        for (_, t) in targets(&guide) {
-            assert!(!t.edge && t.shown == t.centre, "{t:?}");
-        }
     }
     #[test]
     fn a_step_beside_a_hole_or_a_flat_face_does_not_centre_it_and_a_cone_does() {
@@ -5112,166 +3066,25 @@ pub mod tests {
     fn the_holes_are_centres_and_depths_in_work_coordinates() {
         let (doc, mesh) = job("Yes");
         let guide = build(&doc, &mesh, 0).unwrap();
-        // After the Tool and the holes' Pattern (LIO-399).
-        let Step::Holes { op, holes, .. } = &guide.steps[9] else {
-            panic!()
-        };
-        assert_eq!((*op, holes.len()), (2, 4));
+        let holes = holes_of_op(&guide, 2);
+        assert_eq!(holes.len(), 4);
         let plan = &guide.done[2].plan;
         for h in holes {
             let at: Vec<&Move> = (plan.moves.iter())
                 .filter(|m| {
                     m.cutting_pass
-                        && m.to[0] - guide.zero[0] == h[0]
-                        && m.to[1] - guide.zero[1] == h[1]
+                        && m.to[0] - guide.zero[0] == h.at[0]
+                        && m.to[1] - guide.zero[1] == h.at[1]
                 })
                 .collect();
             assert!(!at.is_empty());
             let deepest = at.iter().map(|m| m.to[2]).fold(f32::INFINITY, f32::min);
-            assert_eq!(h[2], deepest - guide.zero[2]);
+            let (Depth::Through { tip } | Depth::Blind { tip, .. }) = h.depth;
+            assert_eq!(tip, deepest - guide.zero[2]);
             assert!(
-                h[2] < -2. && (0. ..124.).contains(&h[0]) && (20. ..100.).contains(&h[1]),
+                tip < -2. && (0. ..124.).contains(&h.at[0]) && (20. ..100.).contains(&h.at[1]),
                 "{h:?}"
             );
-        }
-    }
-    /// The job's Step closed at both X ends (X 20..100): its passes start
-    /// inside the stock.
-    pub fn close_the_step(doc: &mut Document) {
-        let mill = doc.tools[3].id.clone();
-        doc.setups[0].operations[1] = boxed(
-            "Step",
-            &mill,
-            [20., 100., -500., 15.5, 0., -12.],
-            &[("stepdown", "5")],
-        );
-    }
-    /// The job's Step as a Ø10 pocket in the stock in front of the part
-    /// (X 20..100, Y 2..18, 5 deep): closed all round, so it plunges.
-    pub fn pocket_the_step(doc: &mut Document) {
-        let mut mill = Tool::new("End mill 10", "Flat end mill", "10");
-        let machine = doc.setups[0].machine.id.clone();
-        for (k, v) in [("length", "30"), ("stickout", "40"), ("machines", &machine)] {
-            mill.p.insert(k.into(), v.into());
-        }
-        let b = [20., 100., 2., 18., 0., -5.];
-        doc.setups[0].operations[1] = boxed("Pocket", &mill.id, b, &[("stepdown", "5")]);
-        doc.tools.push(mill);
-    }
-    #[test]
-    fn a_closed_pocket_plunges_once_per_level_and_feeds_across_to_its_rows() {
-        let (mut doc, mesh) = job("Yes");
-        pocket_the_step(&mut doc);
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let passes: Vec<&Vec<Target>> = (guide.steps.iter())
-            .filter_map(|s| match s {
-                Step::Pass { op: 1, targets, .. } => Some(targets),
-                _ => None,
-            })
-            .collect();
-        // Two rows (Y 7.5 and 12.5) on one level.
-        assert_eq!(passes.len(), 2);
-        for (i, targets) in passes.iter().enumerate() {
-            let (cut, setting) = targets.split_last().unwrap();
-            assert!(cut.feed && cut.axis == 0);
-            let plunges = setting.iter().filter(|t| t.axis == 2 && t.feed).count();
-            let across = setting.iter().filter(|t| t.axis == 1 && t.feed).count();
-            // The first row plunges; the second feeds across.
-            assert_eq!((plunges, across), [(1, 0), (0, 1)][i], "{i} {targets:?}");
-        }
-        // Feeds along +X with the uncut material on +Y on the left.
-        let plan = &guide.done[1].plan;
-        let rows: Vec<&Move> = plan.moves.iter().filter(|m| m.cutting_pass).collect();
-        assert!(rows.iter().all(|m| m.to[0] > m.from[0]));
-        assert!(simulation::uncut_sides(&rows).iter().all(|s| *s > 0.));
-    }
-    #[test]
-    fn a_step_closed_at_both_ends_goes_down_outside_its_open_front_and_feeds_across() {
-        let (mut doc, mesh) = job("Yes");
-        close_the_step(&mut doc);
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let passes: Vec<&Vec<Target>> = (guide.steps.iter())
-            .filter_map(|s| match s {
-                Step::Pass { op: 1, targets, .. } => Some(targets),
-                _ => None,
-            })
-            .collect();
-        // One row (Y 2.5) on each of two levels.
-        assert_eq!(passes.len(), 2);
-        for targets in &passes {
-            let (cut, setting) = targets.split_last().unwrap();
-            assert!(cut.feed && cut.axis == 0);
-            // No plunge: down in front of the stock, then the first target
-            // that cuts is a feed across into the row (LIO-367).
-            assert!(
-                !setting.iter().any(|t| t.axis == 2 && t.feed),
-                "{targets:?}"
-            );
-            let first = setting.iter().find(|t| t.feed).unwrap();
-            assert_eq!(first.axis, 1);
-            close(first.centre, 2.5);
-        }
-        // Feeds along +X with the wall on +Y on the left: conventional.
-        let plan = &guide.done[1].plan;
-        let rows: Vec<&Move> = plan.moves.iter().filter(|m| m.cutting_pass).collect();
-        assert!(rows.iter().all(|m| m.to[0] > m.from[0]));
-        assert!(simulation::uncut_sides(&rows).iter().all(|s| *s > 0.));
-    }
-    #[test]
-    fn a_change_of_sides_alone_is_a_comp_step() {
-        let (mut doc, mesh) = job("Yes");
-        let mill = doc.tools[3].id.clone();
-        // Behind the part: closed on −Y.
-        let back = boxed(
-            "Back step",
-            &mill,
-            [-500., 500., 104.5, 500., 0., -12.],
-            &[("stepdown", "5")],
-        );
-        doc.setups[0].operations.insert(2, back);
-        let guide = build(&doc, &mesh, 0).unwrap();
-        let of = |i: usize| kinds(&guide, guide.sections[i].steps.clone());
-        assert_eq!(guide.sections[3].name, "Back step");
-        assert_eq!(of(3)[0], "Comp");
-        assert_eq!(
-            guide.steps[guide.sections[3].steps.start],
-            Step::Comp {
-                op: 2,
-                comp: [1, -1],
-                diameter: 25.
-            }
-        );
-        // The back step's row reads its wall less the allowance: set on its
-        // first pass, its one row on each level (LIO-366).
-        let y = (guide.steps.iter())
-            .filter_map(|s| match s {
-                Step::Pass { op: 2, targets, .. } => Some(targets),
-                _ => None,
-            })
-            .flatten()
-            .rfind(|t| t.axis == 1)
-            .unwrap();
-        close(y.shown, 105.);
-        close(y.centre, 117.5);
-        // A different speed with the same tool is a Tool step.
-        doc.setups[0].operations[2]
-            .p
-            .insert("rpm".into(), "400".into());
-        let guide = build(&doc, &mesh, 0).unwrap();
-        assert_eq!(kinds(&guide, guide.sections[3].steps.clone())[0], "Tool");
-    }
-    #[test]
-    fn a_pass_shows_the_handwheel_turns_for_its_feed() {
-        let (doc, mesh) = job("Yes");
-        let guide = build(&doc, &mesh, 0).unwrap();
-        assert_eq!(manual::turns(&doc.setups[0].machine, 0, 120.), 24.);
-        for step in &guide.steps {
-            if let Step::Pass {
-                turns_per_minute, ..
-            } = step
-            {
-                assert_eq!(*turns_per_minute, 24.);
-            }
         }
     }
     #[test]
@@ -5280,19 +3093,19 @@ pub mod tests {
         let guide = build(&doc, &mesh, 0).unwrap();
         assert_eq!(place(&doc, &guide), 0);
         let id = doc.setups[0].id.clone();
-        // One step on for the holes' Pattern since LIO-399.
-        doc.guide.insert(id.clone(), 8);
+        // The hand-over (LIO-688: the zero, a page an operation).
+        doc.guide.insert(id.clone(), 4);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("job.axis.json");
         crate::storage::save(&path, &doc).unwrap();
         let mut doc = crate::storage::load(&path).unwrap();
-        assert_eq!(doc.guide.get(&id), Some(&8));
-        assert_eq!(place(&doc, &guide), 8);
-        // Without the Step the setup has 8 steps: the place is the last.
+        assert_eq!(doc.guide.get(&id), Some(&4));
+        assert_eq!(place(&doc, &guide), 4);
+        // Without the Step the setup has 4 steps: the place is the last.
         doc.setups[0].operations.remove(1);
         let guide = build(&doc, &mesh, 0).unwrap();
-        assert_eq!(guide.steps.len(), 8);
-        assert_eq!(place(&doc, &guide), 7);
+        assert_eq!(guide.steps.len(), 4);
+        assert_eq!(place(&doc, &guide), 3);
         // A project saved without places loads with none.
         let mut json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -5301,40 +3114,24 @@ pub mod tests {
         assert!(old.guide.is_empty());
     }
     #[test]
-    fn faces_squares_and_comp_sides_follow_the_open_sides() {
+    fn only_a_box_neither_facing_nor_squaring_is_cut_in_passes() {
         let all = [[true; 2]; 3];
         let (lo, hi, r) = ([0., 0., -10.], [124., 120., 0.], 12.5);
-        assert_eq!(kind(all, lo, hi, r), Kind::Face);
+        assert!(!in_passes(all, lo, hi, r));
         // A wall on −X with a 1 mm slab off it: squaring, floor open or closed.
         let mut wall = all;
         wall[0][0] = false;
         let slab = [123., 0., -10.];
-        assert_eq!(kind(wall, slab, hi, r), Kind::Square { axis: 0, low: true });
-        assert_eq!(comp_sides(wall), [-1, 1]);
+        assert!(!in_passes(wall, slab, hi, r));
         wall[2][0] = false;
-        assert_eq!(kind(wall, slab, hi, r), Kind::Square { axis: 0, low: true });
+        assert!(!in_passes(wall, slab, hi, r));
         // As wide as the radius still is; wider is not.
-        assert_eq!(
-            kind(wall, [111.5, 0., -10.], hi, r),
-            Kind::Square { axis: 0, low: true }
-        );
-        assert_eq!(kind(wall, [111.4, 0., -10.], hi, r), Kind::Other);
-        // The front step: 15 mm off its +Y wall, wider than the radius.
-        let mut step = all;
-        (step[1][1], step[2][0]) = (false, false);
-        let front = [124., 15., 0.];
-        assert_eq!(
-            (kind(step, lo, front, r), comp_sides(step)),
-            (Kind::Other, [1, 1])
-        );
+        assert!(!in_passes(wall, [111.5, 0., -10.], hi, r));
+        assert!(in_passes(wall, [111.4, 0., -10.], hi, r));
         // Two closed sides are never squaring, however thin.
         let mut slot = all;
         slot[1] = [false; 2];
-        let thin = ([0., 50., -10.], [124., 60., 0.]);
-        assert_eq!(
-            (kind(slot, thin.0, thin.1, r), comp_sides(slot)),
-            (Kind::Other, [1, 1])
-        );
+        assert!(in_passes(slot, [0., 50., -10.], [124., 60., 0.], r));
     }
     #[test]
     fn only_a_manual_setup_with_an_enabled_operation_has_steps() {

@@ -1587,13 +1587,17 @@ impl App {
         let names: Vec<&str> = g.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["Set up", "Face", "Hand over"]);
         assert_eq!(at, 0);
-        assert!(matches!(g.steps[0], Step::Hold { .. }), "{:?}", g.steps[0]);
-        let Some(Step::Face { to, remove, .. }) =
-            g.steps.iter().find(|s| matches!(s, Step::Face { .. }))
-        else {
-            panic!("no Face step: {:?}", g.steps)
+        assert!(matches!(g.steps[0], Step::Zero { .. }), "{:?}", g.steps[0]);
+        let Some((to, remove)) = g.steps.iter().find_map(|s| match s {
+            Step::Sheet {
+                features: crate::guide::Features::Box { lo, hi, .. },
+                ..
+            } => Some((lo[2], hi[2] - lo[2])),
+            _ => None,
+        }) else {
+            panic!("no Face page: {:?}", g.steps)
         };
-        assert!((to + 2.).abs() < 1e-3 && *remove > 0., "{to} {remove}");
+        assert!((to + 2.).abs() < 1e-3 && remove > 0., "{to} {remove}");
         format!(
             "{} steps, face to Z {to:.2}, {remove:.2} mm off, ~{:.0} min",
             g.steps.len(),
@@ -11728,9 +11732,9 @@ flood = { pin = 8 }
             .steps
             .iter()
             .position(|s| {
-                matches!(s, Step::Holes { op, .. } if ops[*op].tapping() && ops[*op].name().contains("M6"))
+                matches!(s, Step::Sheet { op, .. } if ops[*op].tapping() && ops[*op].name().contains("M6"))
             })
-            .expect("a Tap step")
+            .expect("a Tap page")
     }
     #[test]
     fn a_manual_drill_gets_a_centre_drilling_and_takes_it_when_deleted() {
@@ -11770,26 +11774,30 @@ flood = { pin = 8 }
         let _ = a.update(Message::RemoveOp);
         assert!(a.doc.setups[0].operations.is_empty());
     }
+    /// A tap's holes start at their mouths, the plate's top under a face,
+    /// and the spiral flute tap's tip goes 2.5 pitches past its bottom
+    /// (LIO-688: its page lists them, no turns).
     #[test]
-    fn a_taps_turns_are_counted_from_the_holes_mouth() {
-        use crate::guide::Step;
-        for (faced, mouth, turns) in [(false, 0., "22.4"), (true, -8., "14.4")] {
-            let mut a = manual_threaded_app(faced);
+    fn a_taps_holes_start_at_their_mouths() {
+        use crate::guide::{Depth, Features, Step};
+        for (faced, mouth) in [(false, 0.), (true, -8.)] {
+            let a = manual_threaded_app(faced);
             let at = m6_tap_step(&a);
             let (shown, _) = a.guide_at().unwrap();
-            let Step::Holes { holes, mouths, .. } = &shown.guide.steps[at] else {
-                panic!()
+            let Step::Sheet {
+                features: Features::Holes { thread, holes, .. },
+                rpm: None,
+                ..
+            } = &shown.guide.steps[at]
+            else {
+                panic!("{:?}", shown.guide.steps[at])
             };
-            // The plate's top is 8 under the stock's, its bottom 20; the
-            // spiral flute tap's tip goes 2.5 pitches past it.
-            assert!((mouths[0] - mouth).abs() < 0.05, "{faced}: {mouths:?}");
-            assert!((holes[0][2] + 22.44).abs() < 0.05, "{faced}: {holes:?}");
-            let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
-            let texts = crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.));
-            assert!(
-                texts.iter().any(|t| t == turns),
-                "{faced}: {turns} in {texts:?}"
-            );
+            assert_eq!(thread.as_deref(), Some("M6×1"));
+            for h in holes {
+                let (Depth::Through { tip } | Depth::Blind { tip, .. }) = h.depth;
+                assert!((h.mouth - mouth).abs() < 0.05, "{faced}: {h:?}");
+                assert!((tip + 22.44).abs() < 0.05, "{faced}: {h:?}");
+            }
         }
     }
     #[test]
@@ -11812,11 +11820,11 @@ flood = { pin = 8 }
         crate::steps::tests::build(&mut a);
         assert!(under(&texts(&mut a)));
         // The setup's notes say where the supports go: the warning points
-        // back to them on the Hold page (LIO-487).
+        // back to them on the Zero page (LIO-487).
         let notes = |t: &Vec<String>| {
             t.iter().any(|t| {
                 t.ends_with(
-                    "nothing under the hole; the setup notes on the Hold page say where the supports go",
+                    "nothing under the hole; the setup notes on the Zero page say where the supports go",
                 )
             })
         };
@@ -11825,117 +11833,44 @@ flood = { pin = 8 }
         crate::steps::tests::build(&mut a);
         assert!(notes(&texts(&mut a)));
     }
-    /// The guide's step of the operation named `name`, of kind `holes`
-    /// (its Holes) or the step before it.
+    /// The guide's page of the operation named `name`.
     fn op_step(a: &App, name: &str) -> usize {
         use crate::guide::Step;
         let (shown, _) = a.guide_at().expect("a guide");
         let ops = &a.doc.setups[0].operations;
         (shown.guide.steps.iter())
-            .position(|s| matches!(s, Step::Holes { op, .. } if ops[*op].name() == name))
+            .position(|s| matches!(s, Step::Sheet { op, .. } if ops[*op].name() == name))
             .unwrap_or_else(|| panic!("{name}"))
     }
     fn texts_at(a: &mut App, at: usize) -> Vec<String> {
         let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
         crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.))
     }
-    /// LIO-410: a hand tap has its own screen before it (spindle off, no
-    /// gear; its Z pick-up came with LIO-449), its depth said as a hand follows it, and no
-    /// speeds, feeds or Linking in the editor.
+    /// LIO-410, LIO-688: a hand tap's page says it is turned by hand, the
+    /// spindle off, with no gear; a tap through says through, a blind one
+    /// its depth; the editor has no speeds, feeds or Linking for it.
     #[test]
-    fn a_hand_tap_is_put_in_with_the_spindle_off_and_its_depth_followed_by_hand() {
-        use crate::guide::Step;
+    fn a_hand_tap_is_turned_by_hand_with_the_spindle_off_through_or_to_its_depth() {
         let mut a = manual_threaded_app(false);
         let at = m6_tap_step(&a);
-        let (shown, _) = a.guide_at().unwrap();
-        assert!(
-            matches!(shown.guide.steps[at - 1], Step::TapIn { .. }),
-            "{:?}",
-            shown.guide.steps[at - 1]
-        );
-        let t = texts_at(&mut a, at - 1);
-        assert!(t.iter().any(|s| s == "spindle off"), "{t:?}");
-        assert!(
-            !t.iter()
-                .any(|s| s.contains("set the gear") || s.contains("PICK UP Z")),
-            "{t:?}"
-        );
-        // Through: turn until it runs free; the blind M5: mark the tap.
         let t = texts_at(&mut a, at);
-        assert!(
-            t.iter()
-                .any(|s| s.starts_with("through: turn until it runs free")),
-            "{t:?}"
-        );
+        assert!(t.iter().any(|s| s == "by hand, spindle off"), "{t:?}");
+        assert!(!t.iter().any(|s| s.ends_with(" rpm")), "{t:?}");
+        assert!(t.iter().any(|s| s == "Thread"), "{t:?}");
+        assert!(t.iter().any(|s| s == "M6×1") && t.iter().any(|s| s == "through"), "{t:?}");
         let m5 = op_step(&a, "Thread M5×0.8");
         let t = texts_at(&mut a, m5);
-        assert!(t.iter().any(|s| s.starts_with("mark the tap ")), "{t:?}");
+        assert!(t.iter().any(|s| s == "M5×0.8"), "{t:?}");
+        assert!(!t.iter().any(|s| s == "through"), "{t:?}");
+        assert!(
+            t.iter()
+                .any(|s| s.starts_with("Depth: from the top of the hole to the full thread")),
+            "{t:?}"
+        );
         let tap = (a.doc.setups[0].operations.iter())
             .find(|o| o.name() == "Thread M6×1")
             .unwrap();
         assert!(!tap.tabs(&a.doc.setups[0].machine).contains(&"Linking"));
-    }
-    /// LIO-449: the tap picks up Z on the top when it goes in, so that
-    /// each hole starts with the tap turned back out and Z up to a safe
-    /// reading before X and Y move.
-    #[test]
-    fn a_hand_tap_picks_up_z_and_each_hole_lifts_to_a_safe_z() {
-        use crate::guide::Step;
-        let mut a = manual_threaded_app(false);
-        let at = m6_tap_step(&a);
-        let (shown, _) = a.guide_at().unwrap();
-        let Step::TapIn { top: Some(top), .. } = shown.guide.steps[at - 1] else {
-            panic!("{:?}", shown.guide.steps[at - 1]);
-        };
-        let t = texts_at(&mut a, at - 1);
-        let z = t.iter().position(|s| s == "Z").expect("a Z row");
-        assert_eq!(t[z + 1], crate::steps::tests::dro_of(top), "{t:?}");
-        // Both ways of holding the tap: its tip in the chuck; in a wrench,
-        // the centre's point, the tap lifted out by hand before each move.
-        for want in [
-            "in the chuck: touch the top with the tap's tip",
-            "in a wrench: with the centre's point",
-            "In a wrench, Z is the centre's point, not the tap's tip",
-        ] {
-            assert!(t.iter().any(|s| s.contains(want)), "{want}: {t:?}");
-        }
-        let holes = match &shown.guide.steps[at] {
-            Step::Holes { holes, .. } => holes.len(),
-            s => panic!("{s:?}"),
-        };
-        for item in 0..holes {
-            let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
-            a.guide_item = item;
-            let t = crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.));
-            let up = t.iter().position(|s| s == "up to").expect("the lift");
-            assert_eq!(t[up + 1], "Z", "{t:?}");
-            assert!(
-                t.iter()
-                    .any(|s| s.starts_with("turn the tap back out first")
-                        && s.contains(
-                            "in a wrench: lift the tap and wrench out by hand, then the centre"
-                        )),
-                "{t:?}"
-            );
-            let turns = t.iter().position(|s| s == "turns").unwrap();
-            assert!(up < turns, "{t:?}");
-        }
-        // Every hole page's lift reads the same DRO Z: the operations'
-        // one clearance over the top, a centre drill's too, its DRO on the
-        // pilot's tip (the plan's point is the pilot's top).
-        let mut lifts = std::collections::BTreeSet::new();
-        for (at, step) in shown.guide.steps.iter().enumerate() {
-            if !matches!(step, Step::Holes { .. }) {
-                continue;
-            }
-            let _ = a.update(Message::Guide(crate::GuideAction::Go(at)));
-            let t = crate::ui::probe::texts(a.view(), iced::Size::new(1280., 800.));
-            let up = t.iter().position(|s| s == "up to").expect("the lift");
-            lifts.insert(t[up + 2].clone());
-        }
-        let ops = &a.doc.setups[0].operations;
-        assert!(ops.iter().any(|o| crate::centre::centres(o).is_some()));
-        assert_eq!(lifts.len(), 1, "{lifts:?}");
     }
     /// LIO-411: the centre drill goes in once; names fit the browser.
     #[test]
@@ -11953,10 +11888,10 @@ flood = { pin = 8 }
         );
         let (shown, _) = a.guide_at().unwrap();
         let centre = |o: usize| crate::centre::centres(&ops[o]).is_some();
-        let tools = (shown.guide.steps.iter())
-            .filter(|s| matches!(s, Step::Tool { op, .. } if centre(*op)))
+        let pages = (shown.guide.steps.iter())
+            .filter(|s| matches!(s, Step::Sheet { op, .. } if centre(*op)))
             .count();
-        assert_eq!(tools, 1, "one Tool screen for the centre drill");
+        assert_eq!(pages, 1, "one page for the centre drill");
         assert!(
             // Named Thread since LIO-419.
             a.status
@@ -11996,20 +11931,11 @@ flood = { pin = 8 }
             a.op_issues()
         );
     }
-    /// LIO-413, LIO-417: a tapped hole is tried with a screw; a tap drill
-    /// coming out under the stock says so, and not with stock under it.
+    /// LIO-417: a tap drill coming out under the stock says so, and not
+    /// with stock under it.
     #[test]
-    fn a_tapped_hole_is_tried_with_a_screw_and_a_drill_under_the_stock_warned() {
-        use crate::guide::Step;
+    fn a_drill_coming_out_under_the_stock_is_warned() {
         let mut a = manual_threaded_app(false);
-        let at = m6_tap_step(&a);
-        let (shown, _) = a.guide_at().unwrap();
-        let check = (at..shown.guide.steps.len())
-            .find(|&i| matches!(shown.guide.steps[i], Step::Check { .. }))
-            .unwrap();
-        let t = texts_at(&mut a, check);
-        assert!(t.iter().any(|s| s == "M6×1 screw"), "{t:?}");
-        assert!(!t.iter().any(|s| s == "Ø"), "{t:?}");
         let drill = op_step(&a, "Tap drill Ø5");
         let under = |t: &Vec<String>| t.iter().any(|s| s.contains("under the stock"));
         assert!(under(&texts_at(&mut a, drill)));
@@ -44103,150 +44029,26 @@ soft_max = 180.0
             texts.iter().any(|t| t == "Scallop left between steps · mm"),
             "{texts:?}"
         );
-        // The Steps: a walk screen with its numbers, then the File screen.
+        // The Steps: one page listing the four corners, each with its
+        // place, its round's centre and its radius (LIO-688).
         let _ = a.update(Message::Guide(GuideAction::Open(0)));
         crate::steps::tests::build(&mut a);
         let g = a.current_guide().unwrap().as_ref().unwrap().guide.clone();
-        let walk = g
+        let page = g
             .steps
             .iter()
-            .position(|s| matches!(s, Step::Corner { .. }))
+            .position(|s| matches!(s, Step::Sheet { .. }))
             .unwrap();
-        let _ = a.update(Message::Guide(GuideAction::Go(walk)));
+        let _ = a.update(Message::Guide(GuideAction::Go(page)));
         let texts = page_texts(&a);
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.to_lowercase() == "corner 1 of 4 · back right (x+ y+) · r5"),
-            "{texts:?}"
-        );
-        assert!(texts.iter().any(|t| t == "Walk done ▶"), "{texts:?}");
-        assert!(
-            texts.iter().any(|t| t == "DRO comp off: centres"),
-            "{texts:?}"
-        );
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.contains("X only ever down, Y only ever up")),
-            "{texts:?}"
-        );
-        let Step::Corner { targets, .. } = &g.steps[walk] else {
-            unreachable!()
-        };
-        let first_feed = targets.iter().find(|t| t.feed).unwrap();
-        assert!(
-            texts
-                .iter()
-                .any(|t| t.ends_with(&crate::steps::tests::dro_of(first_feed.centre))),
-            "{texts:?}"
-        );
-        let file = g
-            .steps
-            .iter()
-            .position(|s| matches!(s, Step::Check { .. }))
-            .unwrap();
-        let _ = a.update(Message::Guide(GuideAction::Go(file)));
-        let texts = page_texts(&a);
-        assert!(
-            texts
-                .iter()
-                .any(|t| t == "file the scallops to the line · the most left between two steps"),
-            "{texts:?}"
-        );
-        assert!(texts.iter().any(|t| t == "File"), "{texts:?}");
-        // The most left, rounded up to the DRO's hundredths: a bound still.
-        let most = (g.steps.iter())
-            .filter_map(|s| match s {
-                Step::Corner {
-                    offset, scallop, ..
-                } if *offset == 0. => Some(*scallop),
-                _ => None,
-            })
-            .fold(0., f32::max);
-        assert!(most > 0.04 && most < 0.05, "{most}");
-        assert!(texts.iter().any(|t| t == "0.05"), "{texts:?}");
-    }
-    /// Every walk's Steps screen on the adapter plate's setup 3 (LIO-447):
-    /// up above the stock, X and Y said where the tool goes down, and each
-    /// feed's arrow the way the screen says its axis only ever goes. With
-    /// `$AXIS_RENDER_DIR`, each walk's screen as a PNG there.
-    #[test]
-    fn every_corner_walk_screen_says_where_to_go_down_and_points_the_one_way() {
-        use crate::{GuideAction, guide::Step};
-        let (doc, mesh) = crate::corner::tests::adapter_plate_setup_3();
-        let mut a = plate_app();
-        let file = a.doc.file.take();
-        a.doc = doc;
-        a.doc.file = file;
-        a.imported_mesh = Some(mesh);
-        let _ = a.update(Message::Guide(GuideAction::Open(0)));
-        crate::steps::tests::build(&mut a);
-        let g = a.current_guide().unwrap().as_ref().unwrap().guide.clone();
-        let dro = crate::steps::tests::dro_of;
-        let out = std::env::var("AXIS_RENDER_DIR")
-            .ok()
-            .map(std::path::PathBuf::from);
-        let mut walks = 0;
-        for (i, s) in g.steps.iter().enumerate() {
-            let Step::Corner {
-                index,
-                points,
-                targets,
-                ..
-            } = s
-            else {
-                continue;
-            };
-            walks += 1;
-            let _ = a.update(Message::Guide(GuideAction::Go(i)));
-            let texts = page_texts(&a);
-            let way = |k: usize| points[points.len() - 1][k] > points[0][k];
-            let words = format!(
-                "X only ever {}, Y only ever {}",
-                if way(0) { "up" } else { "down" },
-                if way(1) { "up" } else { "down" }
-            );
-            assert!(
-                texts.iter().any(|t| t.contains(&words)),
-                "walk {index}: {words} in {texts:?}"
-            );
-            assert!(
-                texts.iter().any(|t| t == "up, above the stock"),
-                "walk {index}: {texts:?}"
-            );
-            // Z, then X and Y, all said before the tool goes down.
-            let down = targets
-                .iter()
-                .position(|t| t.axis == 2 && t.lock[2])
-                .unwrap();
-            for k in 0..3 {
-                assert!(
-                    targets[..down].iter().any(|t| t.axis == k),
-                    "walk {index}: axis {k} not said before going down"
-                );
-            }
-            // Each feed's arrow the walk's way on its axis.
-            for t in targets.iter().filter(|t| t.feed) {
-                let arrow = [["◀", "▶"], ["▼", "▲"]][t.axis][usize::from(way(t.axis))];
-                let shown = format!("{arrow} {}", dro(t.centre));
-                assert!(texts.contains(&shown), "walk {index}: {shown} in {texts:?}");
-            }
-            if let Some(dir) = &out {
-                std::fs::create_dir_all(dir).unwrap();
-                let _ = a.view();
-                render_png(
-                    &a,
-                    iced::Size::new(1600., 1000.),
-                    &dir.join(format!("walk-{index:02}.png")),
-                );
-            }
+        for want in ["back right (X+ Y+)", "R5", "4 corners", "Section done ▶"] {
+            assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
         }
-        assert_eq!(walks, 16);
+        assert!(!texts.iter().any(|t| t == "Walk done ▶"), "{texts:?}");
     }
     /// Pictures of Round corners on the adapter plate (LIO-443): the
-    /// Corners tab with all four picked, the 3D view with the toolpath, a
-    /// walk's screen and the File screen, as PNGs in `$AXIS_RENDER_DIR`
+    /// Corners tab with all four picked, the 3D view with the toolpath and
+    /// its Steps page (LIO-688), as PNGs in `$AXIS_RENDER_DIR`
     /// (default /tmp/round-corners). With `$AXIS_PLATE` the plate's own STL
     /// instead of the outline made here.
     #[test]
@@ -44278,59 +44080,16 @@ soft_max = 180.0
         crate::steps::tests::build(&mut a);
         let steps_time = started.elapsed();
         let g = a.current_guide().unwrap().as_ref().unwrap().guide.clone();
-        let mut said = format!(
+        let said = format!(
             "{}\npick all: {pick_time:?}; steps: {steps_time:?}\n",
             a.status
         );
-        for (i, s) in g.steps.iter().enumerate() {
-            if let Step::Corner {
-                index,
-                corner,
-                offset,
-                z,
-                scallop,
-                points,
-                targets,
-                ..
-            } = s
-            {
-                said += &format!(
-                    "walk {index}: corner {corner} offset {offset} z {z} scallop {scallop:.4} readings {} targets {}\n",
-                    points.len(),
-                    targets.len()
-                );
-                if *index <= 2
-                    || *index + 1
-                        == g.steps
-                            .iter()
-                            .filter(|s| matches!(s, Step::Corner { .. }))
-                            .count()
-                {
-                    let _ = a.update(Message::Guide(GuideAction::Go(i)));
-                    for _ in 0..6 {
-                        let _ = a.update(Message::Guide(GuideAction::Reached(a.guide_item)));
-                    }
-                    let _ = a.view();
-                    render_png(&a, size, &out.join(format!("3-walk-{index}.png")));
-                    for t in targets {
-                        said += &format!(
-                            "  {} {:.2}{}\n",
-                            ["X", "Y", "Z"][t.axis],
-                            t.centre,
-                            if t.feed { " feed" } else { "" }
-                        );
-                    }
-                }
-            }
-        }
-        let file = g
-            .steps
-            .iter()
-            .position(|s| matches!(s, Step::Check { .. }))
+        let page = (g.steps.iter())
+            .position(|s| matches!(s, Step::Sheet { .. }))
             .unwrap();
-        let _ = a.update(Message::Guide(GuideAction::Go(file)));
+        let _ = a.update(Message::Guide(GuideAction::Go(page)));
         let _ = a.view();
-        render_png(&a, size, &out.join("4-file.png"));
+        render_png(&a, size, &out.join("3-corners-page.png"));
         std::fs::write(out.join("said.txt"), said).unwrap();
     }
 }
