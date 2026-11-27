@@ -19,9 +19,9 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
   app's tests use sit behind its `test-support` feature, which the app's
   dev-dependency turns on: `cargo test -p axis-core` builds the core without
   it and `cargo test` (or `-p axis-cam`) with it, so switching between the two
-  recompiles the core once (about 35 s). `cargo fmt --all` and `cargo clippy --workspace`
-  cover both. Tests build the core at `opt-level` 1 and the app at 0
-  (below).
+  recompiles the core once (about 35 s). `cargo fmt --all` and `cargo
+  clippy --workspace` cover both. Tests build the core at `opt-level` 1 and
+  the app at 0 (below).
 
 - **Never set `CARGO_INCREMENTAL=0`**: not on a command line, in the
   environment or in a Cargo config. Each crate is large (the app about
