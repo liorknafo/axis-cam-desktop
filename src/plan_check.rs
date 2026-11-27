@@ -1573,7 +1573,7 @@ fn run(
             .filter_map(|setup| {
                 let si = setup.setup;
                 match get(&job_doc.setups[si].machine.p, "controller") {
-                    "UC100" => crate::run::plan_problems(job_doc, mesh, si, &results[si]).err(),
+                    "UC100" => crate::post::plan_problems(job_doc, mesh, si, &results[si]).err(),
                     _ => setup.result.clone().err(),
                 }
                 .map(|e| (si, e))
@@ -1762,13 +1762,13 @@ fn run(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         model::{Operation, Tool},
         proposal::tests::{block, good, op},
     };
-    fn stages(report: &CheckReport) -> Vec<String> {
+    pub(crate) fn stages(report: &CheckReport) -> Vec<String> {
         report
             .problems
             .iter()
@@ -1784,99 +1784,6 @@ mod tests {
         assert!(!check.passed && job.is_some());
         let (check, job) = super::check(&doc, &mesh, &report, &slow);
         assert!(!check.passed && job.is_none());
-    }
-    #[test]
-    fn a_side_up_setup_after_a_contour_is_located_without_the_cut_stock_top() {
-        use crate::proposal::tests::side_up;
-        let (doc, mesh, report) = block();
-        let (check, built) = check(&doc, &mesh, &report, &side_up(&report, "-Y"));
-        assert!(check.passed, "{:?}", stages(&check));
-        let (part, top) = check.zeros[1].unwrap();
-        assert_eq!(top, None, "{part:?}");
-        let line = crate::ui::work_zero_line(&built.unwrap().setups[1], check.zeros[1]);
-        assert!(
-            line.ends_with(
-                "Z0 40 mm below the part's top. The stock top was cut by an earlier setup; touch off on a part face."
-            ),
-            "{line}"
-        );
-        assert!(!line.contains("Stock top") && !line.contains("below the stock top"));
-    }
-    #[test]
-    fn a_good_two_setup_plan_passes_every_stage() {
-        let (doc, mesh, report) = block();
-        let (check, built) = check(&doc, &mesh, &report, &good(&report));
-        assert!(check.passed, "{:?}", stages(&check));
-        assert_eq!(check.operations.len(), 6);
-        assert_eq!(
-            (check.operations[5].setup, check.operations[5].operation),
-            (2, 2)
-        );
-        assert!(check.operations.iter().all(|o| o.minutes > 0.));
-        let sum: f32 = check.operations.iter().map(|o| o.minutes).sum();
-        assert!((check.total_minutes - sum).abs() < 0.11);
-        assert_eq!(built.as_ref().unwrap().setups.len(), 2);
-        // Setup 2's Model origin is located for the preview: the part's box
-        // and the stock top in its work coordinates.
-        assert_eq!(check.zeros.len(), 2);
-        assert!(check.zeros[0].is_none());
-        let (part, top) = check.zeros[1].unwrap();
-        let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k]).abs() < 0.01);
-        assert!(
-            near(part.min, [-60., -40., -40.]) && near(part.max, [60., 40., 0.]),
-            "{part:?}"
-        );
-        assert!(top.is_some_and(|top| (top - 3.).abs() < 0.01), "{top:?}");
-        assert!(
-            crate::ui::work_zero_line(&built.as_ref().unwrap().setups[1], check.zeros[1])
-                .ends_with("Z0 3 mm below the stock top")
-        );
-        let coverage = check.coverage.unwrap();
-        assert!(
-            coverage.exposed_percent > 60. && coverage.exposed_percent < 100.,
-            "{coverage:?}"
-        );
-        assert_eq!(coverage.leftover_cm3.above, 0.);
-        assert_eq!(coverage.leftover_cm3.below, 0.);
-        // The pocket floors and both faces are machined; they are not listed.
-        let machined: Vec<usize> = good(&report)
-            .setups
-            .iter()
-            .flat_map(|s| &s.operations)
-            .flat_map(|o| o.surfaces.clone())
-            .collect();
-        for plane in &coverage.covered_planes {
-            assert!(
-                plane.surfaces.iter().all(|id| !machined.contains(id)),
-                "{plane:?}"
-            );
-        }
-        // Side features need other setups: something there is still covered.
-        assert!(
-            coverage
-                .covered_planes
-                .iter()
-                .any(|p| p.orientation == "+X" || p.orientation == "-Y")
-        );
-        // The stock before each setup: setup 1's block, then the block less
-        // the 4 mm setup 1's Face took off its top, which is setup 2's
-        // bottom. The Contour stopped at the part's bottom, so the sides stay.
-        let stocks: Vec<String> = check
-            .stocks
-            .iter()
-            .map(|s| serde_json::to_string(s).unwrap())
-            .collect();
-        assert_eq!(
-            stocks,
-            [
-                r#"{"setup":1,"size":[124.0,84.0,47.0],"box_from_part_corner":[-2.0,-2.0,-3.0,122.0,82.0,44.0],"removed":{"top":0.0,"bottom":0.0,"-X":0.0,"+X":0.0,"-Y":0.0,"+Y":0.0},"by":[]}"#,
-                r#"{"setup":2,"size":[124.0,84.0,43.0],"box_from_part_corner":[-2.0,-2.0,0.0,122.0,82.0,43.0],"removed":{"top":0.0,"bottom":4.0,"-X":0.0,"+X":0.0,"-Y":0.0,"+Y":0.0},"by":["setup 1, operation 1 (Facing \"Face by planner\")"]}"#,
-            ]
-        );
-        assert_eq!(
-            check.stocks[1].line(),
-            "Stock before setup 2: 124 × 84 × 43 mm; bottom cut 4 mm by setup 1"
-        );
     }
     #[test]
     fn the_stock_summary_names_each_side_cut_away_and_the_operations_that_did() {
@@ -2353,114 +2260,6 @@ mod tests {
             plan.target
         );
         assert_eq!(plan.shape, crate::simulation::CutterShape::Drill);
-    }
-    #[test]
-    fn the_command_line_check_matches_the_library() {
-        let (mut doc, _, report) = block();
-        let dir = tempfile::tempdir().unwrap();
-        let project = dir.path().join("job.axis.json");
-        crate::storage::save(&project, &doc).unwrap();
-        let write = |name: &str, text: &str| {
-            let path = dir.path().join(name);
-            std::fs::write(&path, text).unwrap();
-            path.to_string_lossy().into_owned()
-        };
-        let project = project.to_string_lossy().into_owned();
-        let good_file = write("good.json", &serde_json::to_string(&good(&report)).unwrap());
-        let (json, summary, passed) =
-            crate::check_plan(&[project.clone(), good_file.clone()]).unwrap();
-        assert!(passed && summary.starts_with("The plan passes every check: 6 operations"));
-        // With a third path the passing job is saved as a project.
-        let saved = dir.path().join("saved.axis.json");
-        let with_job = [
-            project.clone(),
-            good_file.clone(),
-            saved.display().to_string(),
-        ];
-        assert!(crate::check_plan(&with_job).unwrap().2);
-        let job = crate::storage::load(&saved).unwrap();
-        assert_eq!(
-            job.setups.iter().map(|s| s.operations.len()).sum::<usize>(),
-            6
-        );
-        let printed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(printed["passed"], true);
-        assert_eq!(crate::exit_code(&Ok(passed)), 0);
-        let mut bad = good(&report);
-        bad.setups[0].operations[0].tool = 9;
-        let bad_file = write("bad.json", &serde_json::to_string(&bad).unwrap());
-        let (json, summary, passed) = crate::check_plan(&[project.clone(), bad_file]).unwrap();
-        assert!(!passed && summary.contains("1 problem"));
-        assert!(json.contains("T9 is not in the tool library"));
-        assert_eq!(crate::exit_code(&Ok(passed)), 1);
-        // The check could not run: usage, unreadable or invalid files.
-        let not_json = write("notes.txt", "Here is the plan: {}");
-        let missing = dir
-            .path()
-            .join("missing.json")
-            .to_string_lossy()
-            .into_owned();
-        for args in [
-            vec![project.clone()],
-            vec![
-                project.clone(),
-                good_file.clone(),
-                "job.json".into(),
-                "extra".into(),
-            ],
-            vec![project.clone(), not_json],
-            vec![missing.clone(), good_file.clone()],
-        ] {
-            let result = crate::check_plan(&args);
-            assert_eq!(crate::exit_code(&result.map(|r| r.2)), 2, "{args:?}");
-        }
-        assert!(
-            crate::check_plan(std::slice::from_ref(&project))
-                .unwrap_err()
-                .starts_with("Usage")
-        );
-        let printed = crate::part_report(std::slice::from_ref(&project)).unwrap();
-        let printed: serde_json::Value = serde_json::from_str(&printed).unwrap();
-        assert_eq!(printed["orientations"][0]["up"], "+Z");
-        assert!(
-            crate::part_report(&[project.clone(), "extra".into()])
-                .unwrap_err()
-                .starts_with("Usage")
-        );
-        assert!(crate::part_report(&[missing]).is_err());
-        let schema: serde_json::Value =
-            serde_json::from_str(&crate::proposal_schema(&[]).unwrap()).unwrap();
-        assert_eq!(schema["additionalProperties"], false);
-        assert!(
-            crate::proposal_schema(&[project.clone(), "extra".into()])
-                .unwrap_err()
-                .starts_with("Usage")
-        );
-        // With a project, the schema and the instructions its report asks
-        // for: here without a manual mill, the plain ones.
-        assert!(crate::proposal_schema(&["missing.axis.json".into()]).is_err());
-        let own: serde_json::Value =
-            serde_json::from_str(&crate::proposal_schema(std::slice::from_ref(&project)).unwrap())
-                .unwrap();
-        assert_eq!(own, schema);
-        let told = crate::planner_instructions(std::slice::from_ref(&project)).unwrap();
-        assert_eq!(
-            told,
-            crate::planner::instructions_for(false, false, false, false)
-        );
-        assert!(
-            crate::planner_instructions(&[])
-                .unwrap_err()
-                .starts_with("Usage")
-        );
-        doc.material.clear();
-        doc.material_id.clear();
-        crate::storage::save(std::path::Path::new(&project), &doc).unwrap();
-        assert!(
-            crate::check_plan(&[project, good_file])
-                .unwrap_err()
-                .starts_with("Material")
-        );
     }
     #[test]
     fn unknown_parts_of_a_plan_never_pass_silently() {
@@ -2989,7 +2788,7 @@ mod tests {
         }
     }
     /// The surfaces of an orientation's top plane, or of its first floor.
-    fn plane(report: &PartReport, up: &str, kind: &str) -> Vec<usize> {
+    pub(crate) fn plane(report: &PartReport, up: &str, kind: &str) -> Vec<usize> {
         report
             .orientations
             .iter()

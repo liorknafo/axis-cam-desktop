@@ -1266,7 +1266,7 @@ pub struct SetupPost {
     /// setup is refused here: it takes no G-code file.
     pub result: Result<Vec<Program>, Vec<String>>,
     /// For a UC100 setup only: whether it passes the checks of a run on the
-    /// machine (`run::plan_problems`), or what they refuse.
+    /// machine (`plan_problems`), or what they refuse.
     pub run: Option<Result<(), Vec<String>>>,
     /// The operation each of `problems()` is about, in step with it: its
     /// index in the setup's operations and its id, None for a problem of
@@ -1900,7 +1900,7 @@ pub fn pins_issue(setup: &Setup) -> Option<String> {
     if !sits_on_pins(setup) {
         return None;
     }
-    match crate::control::pins_settings(&setup.machine.p) {
+    match crate::machine_profile::pins_settings(&setup.machine.p) {
         Ok(None) => Some(format!(
             "This setup sits on the pins, but its machine {} has no fixture pins: add them under Fixture pins in the Machine library and use Assign to current setup, or turn off Sits on the pins.",
             setup.machine.name()
@@ -1965,7 +1965,7 @@ pub const SLOT_PLAY: f32 = 1.;
 pub const PIN_CLEARANCE: f32 = 0.05;
 /// The pins of `pins` standing with pin 1 at `pin1` in this setup's plan,
 /// pin 1 first (mm): the plate is square to X and Y.
-pub fn plate_places(pins: &crate::control::Pins, pin1: [f32; 2]) -> Vec<[f32; 2]> {
+pub fn plate_places(pins: &crate::machine_profile::Pins, pin1: [f32; 2]) -> Vec<[f32; 2]> {
     (0..pins.at.len())
         .map(|i| {
             let d = pins.offset(i);
@@ -2109,7 +2109,9 @@ pub fn leftover_places(doc: &Document, mesh: &Mesh, si: usize) -> Option<Vec<[f3
     if !(sits_on_pins(s) && pins_in_leftover(s)) {
         return None;
     }
-    let pins = crate::control::pins_settings(&s.machine.p).ok().flatten()?;
+    let pins = crate::machine_profile::pins_settings(&s.machine.p)
+        .ok()
+        .flatten()?;
     let at = crate::volume::Frame::new(s, mesh).map(leftover_pin(s)?);
     Some(plate_places(&pins, [at[0], at[1]]))
 }
@@ -2144,7 +2146,7 @@ pub fn pin_drilling_setup(doc: &Document, mesh: &Mesh, si: usize) -> Option<usiz
 pub fn pin_drilling_tool<'a>(
     tools: &'a [Tool],
     machine: &Machine,
-    pins: &crate::control::Pins,
+    pins: &crate::machine_profile::Pins,
 ) -> Option<&'a Tool> {
     let d = pins.diameter as f32;
     let width = d + PIN_CLEARANCE;
@@ -2173,7 +2175,9 @@ pub fn sync_pin_drilling(doc: &mut Document, mesh: &Mesh) {
             let places = leftover_places(doc, mesh, si)?;
             let stock = doc.setup_stock(si, Some(mesh))?;
             let s = &doc.setups[si];
-            let pins = crate::control::pins_settings(&s.machine.p).ok().flatten()?;
+            let pins = crate::machine_profile::pins_settings(&s.machine.p)
+                .ok()
+                .flatten()?;
             let w = match leftover_issue(s, mesh, stock, &pins, &places) {
                 Some(issue) => [String::new(), String::new(), issue],
                 None => {
@@ -2205,7 +2209,7 @@ pub fn sync_pin_drilling(doc: &mut Document, mesh: &Mesh) {
 }
 /// The radius a pin hole of the leftover takes round its pin's centre
 /// (mm): its pin's, its clearance and, for a slot, half its play.
-pub fn leftover_hole_radius(pins: &crate::control::Pins) -> f32 {
+pub fn leftover_hole_radius(pins: &crate::machine_profile::Pins) -> f32 {
     pins.diameter as f32 / 2. + PIN_CLEARANCE + SLOT_PLAY / 2.
 }
 /// Why the pins of `pins` cannot stand at `places` (plan mm) in holes of
@@ -2217,7 +2221,7 @@ pub fn leftover_issue(
     setup: &Setup,
     mesh: &Mesh,
     stock: Bounds,
-    pins: &crate::control::Pins,
+    pins: &crate::machine_profile::Pins,
     places: &[[f32; 2]],
 ) -> Option<String> {
     let r = leftover_hole_radius(pins);
@@ -2291,7 +2295,7 @@ pub fn placed_on_pins(
     if let Some(issue) = pins_issue(setup) {
         return Err(issue);
     }
-    let Ok(Some(pins)) = crate::control::pins_settings(&setup.machine.p) else {
+    let Ok(Some(pins)) = crate::machine_profile::pins_settings(&setup.machine.p) else {
         return Err("This setup does not sit on the fixture pins.".into());
     };
     if pins_in_leftover(setup) {
@@ -3443,7 +3447,7 @@ pub(crate) fn a_axis_note(doc: &Document, si: usize) -> Option<String> {
             .to_string(),
         Some(u) => {
             let how = match doc.centre_mark(m) {
-                crate::control::MEASURED => "measured with Rotary A on the Control page".to_string(),
+                crate::machine_profile::MEASURED => "measured with Rotary A on the Control page".to_string(),
                 "" => "assumed, not measured: probe it with Rotary A on the Control page before running this program".to_string(),
                 why => format!(
                     "measured, but it went {why}: probe it again with Rotary A on the Control page before running this program"
@@ -3451,7 +3455,7 @@ pub(crate) fn a_axis_note(doc: &Document, si: usize) -> Option<String> {
             };
             // Its Z is the probe's tip's (LIO-207): a tool's is its own.
             let tip = match u.reference {
-                _ if doc.centre_mark(m) != crate::control::MEASURED => String::new(),
+                _ if doc.centre_mark(m) != crate::machine_profile::MEASURED => String::new(),
                 Some(r) => format!(
                     " Z is the probe's tip's: set each tool's Z0 that much over the Z reference the probe touched at machine X{} Y{} Z{}, touching the tool off there.",
                     exact_mm(r[0]),
@@ -3644,6 +3648,76 @@ pub(crate) fn checked_to_start(
     cut: &[usize],
 ) -> Result<Vec<Checked>, Vec<String>> {
     checked_held(doc, mesh, si, sims, settings, true, cut).map_err(texts)
+}
+/// What the UC100 profile's `out`puts refuse in a tool run's `ops`: a
+/// spindle speed above its maximum, a counterclockwise spindle without a
+/// direction output, and coolant it has no output for.
+pub fn output_problems(out: &uc100::config::Outputs, ops: &[OpState]) -> Vec<String> {
+    let mut e = vec![];
+    for o in ops {
+        if out.spindle_pwm.is_some() && o.rpm as f64 > out.spindle_max_rpm {
+            e.push(format!(
+                "{}: S{} is above the UC100 profile's {:.0} rpm.",
+                o.name,
+                o.rpm.round(),
+                out.spindle_max_rpm
+            ));
+        }
+        if !o.clockwise && out.spindle_dir.is_none() && out.spindle_ccw.is_none() {
+            e.push(format!("{}: the spindle turns counterclockwise, but the UC100 profile has no spindle direction output.", o.name));
+        }
+        for (on, pin, what) in [
+            (o.coolant.1, out.flood, "flood"),
+            (o.coolant.0, out.mist, "mist"),
+        ] {
+            if on && pin.is_none() {
+                e.push(format!("{}: uses {what} coolant, but the UC100 profile has no {what} output. Set its coolant to Off, or add the output to the profile.", o.name));
+            }
+        }
+    }
+    e
+}
+
+/// How the planner checks setup `si` of a UC100 machine, from the job's
+/// simulations `sims`: as a run checks it before Cycle Start, without the
+/// checks that need the connected machine (its work zero and position).
+pub(crate) fn plan_problems(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sims: &[(usize, Result<crate::simulation::Simulation, String>)],
+) -> Result<(), Vec<String>> {
+    plan_held(doc, mesh, si, sims).map_err(|e| e.into_iter().map(|h| h.message).collect())
+}
+/// `plan_problems`, each problem with the operation it is about.
+pub(crate) fn plan_held(
+    doc: &Document,
+    mesh: &Mesh,
+    si: usize,
+    sims: &[(usize, Result<crate::simulation::Simulation, String>)],
+) -> Result<(), Vec<Held>> {
+    if crate::manual::is_hand(&doc.setups[si].machine) {
+        return Ok(());
+    }
+    let programs = checked_held(doc, mesh, si, sims, PostSettings::for_uc100, false, &[])?;
+    let config = crate::machine_profile::profile(&doc.setups[si].machine).map_err(|e| {
+        vec![Held {
+            operation: None,
+            message: e,
+        }]
+    })?;
+    let e: Vec<Held> = (programs.iter())
+        .flat_map(|p| p.ops.iter().zip(&p.indexes))
+        .flat_map(|(op, oi)| {
+            output_problems(&config.outputs, std::slice::from_ref(op))
+                .into_iter()
+                .map(|message| Held {
+                    operation: Some(*oi),
+                    message,
+                })
+        })
+        .collect();
+    if e.is_empty() { Ok(()) } else { Err(e) }
 }
 /// `checked` and `checked_to_start`, each problem with the operation it is
 /// about (an index in the setup's operations), when it is one's.
@@ -4331,7 +4405,7 @@ pub(crate) fn post_simulated(
                     .collect::<Result<Vec<_>, _>>()
             });
             let run = (get(&doc.setups[si].machine.p, "controller") == "UC100")
-                .then(|| crate::run::plan_held(doc, mesh, si, sims));
+                .then(|| plan_held(doc, mesh, si, sims));
             // What `problems()` says, each with its operation.
             let held = match (&run, &result) {
                 (Some(Err(held)), _) | (None, Err(held)) => held.as_slice(),
@@ -4888,7 +4962,7 @@ pub(crate) mod fixture {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::simulation::Motion;
     fn golden_plan() -> Plan {
@@ -4902,7 +4976,7 @@ mod tests {
             ],
         )
     }
-    fn program(machine: Machine) -> (String, Vec<Block>, PostSettings) {
+    pub(crate) fn program(machine: Machine) -> (String, Vec<Block>, PostSettings) {
         let settings = PostSettings::from_machine(&machine).unwrap();
         let mut setup = Setup::new(machine, "G54");
         setup.p.insert("name".into(), "Top side".into());
@@ -7247,57 +7321,6 @@ M2
         assert!(result.unwrap_err().contains("blending"));
     }
     #[test]
-    fn headless_export_matches_the_ui_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let (doc, _) = fixture::job();
-        let project = dir.path().join("job.axis.json");
-        crate::storage::save(&project, &doc).unwrap();
-        let out = dir.path().join("out");
-        let message = crate::export_gcode(
-            Some(&project.to_string_lossy().into_owned()),
-            Some(&out.to_string_lossy().into_owned()),
-        )
-        .unwrap();
-        assert!(message.starts_with("Wrote 1 LinuxCNC program"));
-        assert!(!message.contains("LinuxCNC tool table"), "{message}");
-        assert!(!message.contains("material"), "{message}");
-        assert!(out.join("Fixture block - 1 Top (G54).ngc").exists());
-    }
-    #[test]
-    fn headless_export_announces_tools_numbered_on_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut doc, _) = fixture::job();
-        for t in &mut doc.tools {
-            t.p.remove("number");
-        }
-        doc.material = "Brass C360".into();
-        let project = dir.path().join("job.axis.json");
-        crate::storage::save(&project, &doc).unwrap();
-        let out = dir.path().join("out");
-        let message = crate::export_gcode(
-            Some(&project.to_string_lossy().into_owned()),
-            Some(&out.to_string_lossy().into_owned()),
-        )
-        .unwrap();
-        assert!(message.starts_with("Wrote 1 LinuxCNC program"), "{message}");
-        // The notes of the load follow the outcome, in the order of the load.
-        let notes = format!(
-            "{} The project material \"Brass C360\" was linked to the library.",
-            crate::storage::NUMBERED_TOOLS
-        );
-        assert!(message.ends_with(&format!("\n{notes}")), "{message}");
-        // A refused export carries the note too.
-        doc.setups[0].p.insert("offset".into(), "G99".into());
-        crate::storage::save(&project, &doc).unwrap();
-        let error = crate::export_gcode(
-            Some(&project.to_string_lossy().into_owned()),
-            Some(&out.to_string_lossy().into_owned()),
-        )
-        .unwrap_err();
-        assert!(error.starts_with("Nothing was written."), "{error}");
-        assert!(error.ends_with(&format!("\n{notes}")), "{error}");
-    }
-    #[test]
     fn posting_simulations_already_run_matches_post_job() {
         let (doc, mesh) = fixture::job();
         let direct = post_job(&doc, &mesh);
@@ -7423,7 +7446,7 @@ M2
     /// 23 and Y -15 to 15 of the stock's centre), with the starter library,
     /// its clamp tightened to hold the block alone (10 kN): the tests that
     /// use one clamp are about where it sits, not how hard it holds.
-    fn pocket_job() -> (Document, Mesh) {
+    pub(crate) fn pocket_job() -> (Document, Mesh) {
         let (mut doc, mesh) = fixture::job();
         doc.adopt_holders();
         for h in doc.workholding.iter_mut().filter(|h| h.kind() == "Clamp") {
@@ -7433,7 +7456,7 @@ M2
         (doc, mesh)
     }
     /// Setup 1 held by the starter vise or clamp, with `pairs` on the setup.
-    fn hold(doc: &mut Document, kind: &str, pairs: &[(&str, &str)]) {
+    pub(crate) fn hold(doc: &mut Document, kind: &str, pairs: &[(&str, &str)]) {
         let id = doc
             .workholding
             .iter()
@@ -7641,7 +7664,7 @@ M2
         let (doc, mesh) = fixture::leftover_flip("rx", Some("Drill"));
         let s = &doc.setups[1];
         let stock = doc.setup_stock(1, Some(&mesh)).unwrap();
-        let pins = crate::control::pins_settings(&s.machine.p)
+        let pins = crate::machine_profile::pins_settings(&s.machine.p)
             .unwrap()
             .unwrap();
         let part = crate::simulation::part_box(s, &mesh);
@@ -7769,7 +7792,9 @@ M2
         // The tool a new Drill of them takes: the drill that fits the pins,
         // else the flat end mill nearest 0.7 of their width that mills them.
         let machine = &doc.setups[0].machine;
-        let pins = crate::control::pins_settings(&machine.p).unwrap().unwrap();
+        let pins = crate::machine_profile::pins_settings(&machine.p)
+            .unwrap()
+            .unwrap();
         let mut tools = doc.tools.clone();
         assert_eq!(
             pin_drilling_tool(&tools, machine, &pins).unwrap().name(),
@@ -8156,59 +8181,6 @@ M2
         // Choosing None for that setup exports it again.
         doc.setups[1].p.insert("holding".into(), "None".into());
         assert!(post_job(&doc, &mesh).ready());
-    }
-    #[test]
-    fn headless_export_refuses_a_clamp_hit_with_the_export_message() {
-        use crate::holding;
-        let dir = tempfile::tempdir().unwrap();
-        let (mut doc, mesh) = pocket_job();
-        // Reaching 40 mm onto the stock the clamp is in the pocket's way.
-        hold(&mut doc, "Clamp", &[("clamps", "-X:0")]);
-        let id = get(&doc.setups[0].p, "holder").to_string();
-        doc.workholding
-            .iter_mut()
-            .find(|h| h.id == id)
-            .unwrap()
-            .p
-            .insert("bite".into(), "40".into());
-        let mut plans = vec![];
-        crate::simulation::sequence(&doc, &mesh, None, |_, _, r| plans.push(r.unwrap().plan));
-        let boxes = doc.holding_boxes(&doc.setups[0], plans[0].stock).unwrap();
-        let hit = &holding::hits(&plans[0], &boxes, 2.)[0];
-        let datum = datum(&doc.setups[0], plans[0].stock, &mesh).unwrap();
-        let expected = holding::message("Pocket", hit, 2., datum);
-        let project = dir.path().join("job.axis.json");
-        crate::storage::save(&project, &doc).unwrap();
-        let out = dir.path().join("out");
-        let error = crate::export_gcode(
-            Some(&project.to_string_lossy().into_owned()),
-            Some(&out.to_string_lossy().into_owned()),
-        )
-        .unwrap_err();
-        // The first reason, naming its setup once.
-        assert!(
-            error.starts_with("Nothing was written. Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 1 would cut away the stock under its bite, which reaches 38 mm over the part."),
-            "{error}"
-        );
-        assert!(
-            !error.contains("Top: Top:") && !expected.is_empty(),
-            "{error}"
-        );
-        assert!(!out.exists(), "nothing was written");
-        // With the toe clamp's own bite it is clear of the pocket: it exports.
-        doc.workholding
-            .iter_mut()
-            .find(|h| h.id == id)
-            .unwrap()
-            .p
-            .insert("bite".into(), "12".into());
-        crate::storage::save(&project, &doc).unwrap();
-        let message = crate::export_gcode(
-            Some(&project.to_string_lossy().into_owned()),
-            Some(&out.to_string_lossy().into_owned()),
-        )
-        .unwrap();
-        assert!(message.starts_with("Wrote 1 LinuxCNC program"), "{message}");
     }
     /// The `sequence` results of every setup of `doc`.
     fn results(doc: &Document, mesh: &Mesh) -> Vec<Vec<(usize, Result<Simulation, String>)>> {
@@ -9110,7 +9082,7 @@ M2
             checked(&doc, &mesh, 0, &cut[0], PostSettings::for_uc100).map(|p| p.len()),
             Ok(0)
         );
-        assert!(crate::run::plan_problems(&doc, &mesh, 0, &cut[0]).is_ok());
+        assert!(crate::post::plan_problems(&doc, &mesh, 0, &cut[0]).is_ok());
     }
     #[test]
     fn a_job_of_manual_setups_alone_has_nothing_to_export() {

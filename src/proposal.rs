@@ -52,6 +52,9 @@ fn work_zeros() -> Vec<&'static str> {
 /// The stock left beyond the part at the free end of a chuck proposal's
 /// stock when it names none, mm.
 pub const FREE_END: f32 = 2.;
+/// Setup 1's parameter that keeps the planner note the last Apply added,
+/// saved with the project, so a later Apply finds that exact text again.
+pub(crate) const PLANNER_NOTE_KEY: &str = "planner_note";
 const MAX_SETUPS: usize = 6;
 /// The setups a plan may have on every machine together.
 const MAX_ALL_SETUPS: usize = 10;
@@ -1796,7 +1799,7 @@ fn described(op: &Operation, tools: &[Tool], on: &crate::model::Machine) -> Opti
     let coolant = get(&op.p, "coolant");
     let mut p = ProposedOp {
         strategy: strategy.into(),
-        name: crate::planner::name(get(&op.p, "name")),
+        name: crate::names::name(get(&op.p, "name")),
         tool,
         surfaces,
         rpm: value("rpm").unwrap_or(0.),
@@ -1999,7 +2002,7 @@ fn described(op: &Operation, tools: &[Tool], on: &crate::model::Machine) -> Opti
 /// Whether two names are one: `proposed` is the name as the planner cleans
 /// it, `current` the operation's or setup's own.
 fn same_name(proposed: &str, current: &str) -> bool {
-    proposed == current || proposed == crate::planner::name(current)
+    proposed == current || proposed == crate::names::name(current)
 }
 /// Whether `p` asks for nothing other than `d`, the operation it keeps as
 /// [`described`] writes it: its reason does not count, nor a name the
@@ -2196,7 +2199,7 @@ fn setup_fields(doc: &Document, si: usize) -> (String, String, String, Option<us
         "Model origin"
     };
     let (notes, holder) = if si == base {
-        let note = get(&setup.p, crate::planner::PLANNER_NOTE_KEY);
+        let note = get(&setup.p, PLANNER_NOTE_KEY);
         (note, analysis::own_entry(doc, setup1))
     } else {
         let same = ["holding", "holder"]
@@ -2215,7 +2218,7 @@ fn setup_fields(doc: &Document, si: usize) -> (String, String, String, Option<us
         (get(&setup.p, "notes"), holder)
     };
     (
-        crate::planner::name(setup.name()),
+        crate::names::name(setup.name()),
         origin.into(),
         clip(notes, 500),
         holder,
@@ -2285,7 +2288,7 @@ pub fn describe(doc: &Document, report: &PartReport) -> Result<Current, String> 
                     from: number,
                     position: oi + 1,
                     strategy: op.strategy.name(),
-                    name: crate::planner::name(get(&op.p, "name")),
+                    name: crate::names::name(get(&op.p, "name")),
                 }),
             }
         }
@@ -3515,7 +3518,7 @@ pub(crate) mod tests {
             from: None,
         }
     }
-    fn ids(report: &PartReport, up: &str, depth: f32) -> Vec<usize> {
+    pub(crate) fn ids(report: &PartReport, up: &str, depth: f32) -> Vec<usize> {
         report
             .orientations
             .iter()
@@ -3628,7 +3631,7 @@ pub(crate) mod tests {
         proposal.setups[1].operations = vec![op("Face", 1, ids(report, up, 0.))];
         proposal
     }
-    fn messages(result: Result<Document, Vec<Problem>>) -> Vec<String> {
+    pub(crate) fn messages(result: Result<Document, Vec<Problem>>) -> Vec<String> {
         result
             .unwrap_err()
             .into_iter()
@@ -5052,10 +5055,9 @@ pub(crate) mod tests {
     #[test]
     fn describe_gives_setup_1_its_planner_note_as_the_workholding() {
         let (mut doc, _, report) = planned();
-        doc.setups[0].p.insert(
-            crate::planner::PLANNER_NOTE_KEY.into(),
-            "Vise on the long sides.".into(),
-        );
+        doc.setups[0]
+            .p
+            .insert(PLANNER_NOTE_KEY.into(), "Vise on the long sides.".into());
         let plan = describe(&doc, &report).unwrap().current_plan;
         assert_eq!(plan.setups[0].workholding, "Vise on the long sides.");
     }
@@ -5808,381 +5810,8 @@ pub(crate) mod tests {
             assert!(parse(&value.to_string()).is_err());
         }
     }
-    /// The rotary scenario's project, report and the plan that ends it,
-    /// with `edit` applied to the plan.
-    fn rotary(edit: impl FnOnce(&mut Proposal)) -> (Document, Mesh, PartReport, Proposal) {
-        let (doc, mesh, report) = crate::fake_openai::rotary::report();
-        let mut plan = crate::fake_openai::rotary::good();
-        edit(&mut plan);
-        (doc, mesh, report, plan)
-    }
-    /// A change of a plan on a rotary machine asks for `from` as well as
-    /// the chuck and the angles, and the schema stays strict.
-    #[test]
-    fn the_schema_of_a_change_on_a_rotary_machine_has_from_and_the_chuck() {
-        let both = schema_with(true, true);
-        let setup = &both["properties"]["setups"]["items"];
-        let op = &setup["properties"]["operations"]["items"];
-        for (object, key) in [
-            (setup, "from"),
-            (setup, "a_angles"),
-            (op, "from"),
-            (&both, "chuck"),
-        ] {
-            assert!(object["properties"].get(key).is_some(), "{key}");
-            let required = object["required"].as_array().unwrap();
-            assert!(required.contains(&json!(key)), "{key}");
-            assert_eq!(
-                required.len(),
-                object["properties"].as_object().unwrap().len()
-            );
-            assert_eq!(object["additionalProperties"], false);
-        }
-        let (_, _, report, _) = rotary(|_| {});
-        assert_eq!(schema_with(true, false), schema_for(true));
-        assert_eq!(schema_with(false, true), schema_on(&report));
-        assert_eq!(schema_with(false, false), schema());
-    }
-    /// The planner cannot change a plan that holds the stock in the chuck
-    /// on A or indexes A (it makes those afresh): it says so before
-    /// anything is sent.
-    #[test]
-    fn a_plan_on_the_chuck_or_indexing_a_is_not_described_for_a_change() {
-        let (doc, mesh, report, plan) = rotary(|_| {});
-        let job = build(&doc, &mesh, &report, &plan).unwrap();
-        assert!(crate::chuck::holds(&job.setups[0]));
-        let e = describe(&job, &report).unwrap_err();
-        assert!(
-            e.starts_with(
-                "Setup 1 holds the stock in the chuck on A, so the planner cannot change this plan."
-            ),
-            "{e}"
-        );
-        let mut loose = job.clone();
-        loose.setups[0].p.insert("holding".into(), "None".into());
-        assert!(crate::indexed::is_indexed(&loose.setups[1]));
-        let e = describe(&loose, &report).unwrap_err();
-        assert!(e.starts_with("Setup 2 indexes A"), "{e}");
-    }
-    #[test]
-    fn the_rotary_schema_asks_for_the_chuck_and_the_angles_and_stays_strict() {
-        fn walk(value: &Value, objects: &mut usize) {
-            if value["type"] == "object" {
-                *objects += 1;
-                let keys: Vec<&String> = value["properties"].as_object().unwrap().keys().collect();
-                assert_eq!(value["required"].as_array().unwrap().len(), keys.len());
-                assert_eq!(value["additionalProperties"], false);
-            }
-            match value {
-                Value::Object(map) => map.values().for_each(|v| walk(v, objects)),
-                Value::Array(items) => items.iter().for_each(|v| walk(v, objects)),
-                _ => {}
-            }
-        }
-        let (_, _, report, plan) = rotary(|_| {});
-        let schema = schema_on(&report);
-        let mut objects = 0;
-        walk(&schema, &mut objects);
-        // The proposal, its chuck, a setup, an operation, its tabs and
-        // chamfer, and an unmachined entry.
-        assert_eq!(objects, 7);
-        let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
-        let props = |v: &Value| keys(&v["properties"]);
-        let value = serde_json::to_value(&plan).unwrap();
-        assert_eq!(keys(&value), props(&schema));
-        assert_eq!(
-            keys(&value["chuck"]),
-            props(&schema["properties"]["chuck"]["anyOf"][0])
-        );
-        let setup = &schema["properties"]["setups"]["items"];
-        assert_eq!(keys(&value["setups"][1]), props(setup));
-        // The angles are numbers or null; the chuck an object or null.
-        assert_eq!(
-            setup["properties"]["a_angles"],
-            json!({"type": ["array", "null"], "items": {"type": "number"}})
-        );
-        assert_eq!(
-            schema["properties"]["chuck"]["anyOf"][1],
-            json!({"type": "null"})
-        );
-        // What the model answers reads back, null or not.
-        assert_eq!(parse(&value.to_string()).unwrap(), plan);
-        let mut nulls = value;
-        nulls["chuck"] = Value::Null;
-        nulls["setups"][1]["a_angles"] = Value::Null;
-        let parsed = parse(&nulls.to_string()).unwrap();
-        assert!(parsed.chuck.is_none() && parsed.setups[1].a_angles.is_none());
-    }
-    #[test]
-    fn a_machine_without_a_rotary_axis_refuses_a_chuck_and_angles() {
-        let (doc, mesh, report) = block();
-        assert!(report.rotary.is_none());
-        let mut plan = good(&report);
-        plan.chuck = rotary(|_| {}).3.chuck;
-        plan.setups[1].a_angles = Some(vec![90.]);
-        let said = messages(build(&doc, &mesh, &report, &plan));
-        assert!(
-            said.iter()
-                .any(|m| m.contains("`chuck` must be null: this machine has no rotary A axis"))
-                && said.iter().any(|m| m.contains("`a_angles` must be null")),
-            "{said:?}"
-        );
-    }
-    #[test]
-    fn a_chuck_seats_setup_1s_stock_and_an_indexed_setup_is_made_as_the_setups_page_makes_it() {
-        let (doc, mesh, report, plan) = rotary(|_| {});
-        let built = build(&doc, &mesh, &report, &plan).unwrap();
-        let (first, second) = (&built.setups[0], &built.setups[1]);
-        // Setup 1: a 24 mm box of the proposal's length, in a 4-jaw chuck with
-        // the chuck's defaults and the A axis as its work zero.
-        assert_eq!(
-            [
-                get(&first.p, "stock_type"),
-                get(&first.p, "stock_x"),
-                get(&first.p, "stock_y")
-            ],
-            ["Fixed size box", "130", "24"]
-        );
-        assert_eq!(
-            [
-                get(&first.p, "holding"),
-                get(&first.p, "chuck_jaws"),
-                get(&first.p, "chuck_stickout")
-            ],
-            ["Chuck", "4-jaw", "90"]
-        );
-        assert_eq!(get(&first.p, "chuck_tailstock"), "Off the table");
-        assert_eq!(get(&first.p, "chuck_jaw_angle"), "0");
-        assert_eq!(get(&first.p, "holding_gap"), "2");
-        assert_eq!(get(&first.p, "origin"), crate::indexed::ORIGINS[0]);
-        assert_eq!(first.id, doc.setups[0].id);
-        // The part sits in the stick-out, 2 mm short of the free end, on the axis.
-        let stock = built.setup_stock(0, Some(&mesh)).unwrap();
-        let placed = crate::stock::Placement::new(&mesh, Some(first)).bounds;
-        let scale = mesh.display_scale();
-        assert!((placed.max[0] / scale - (stock.max[0] - crate::proposal::FREE_END)).abs() < 0.01);
-        let mid = |b: crate::mesh::Bounds, k: usize| (b.min[k] + b.max[k]) / 2.;
-        assert!((mid(placed, 1) / scale - mid(stock, 1)).abs() < 0.01);
-        assert!((mid(placed, 2) / scale - mid(stock, 2)).abs() < 0.01);
-        // Setup 2 is the Reposition choice with its angles, and the rest is setup 1's.
-        assert_eq!(get(&second.p, "reposition"), crate::indexed::ACTION);
-        assert_eq!(get(&second.p, crate::indexed::ANGLES), "0, 90, 180, 270");
-        assert!(crate::indexed::is_indexed(second));
-        assert_eq!(built.index_base(1), Some(0));
-        for key in [
-            "offset",
-            "holding",
-            "chuck_jaws",
-            "origin",
-            "stock_type",
-            "tx",
-            "tz",
-        ] {
-            assert_eq!(get(&second.p, key), get(&first.p, key), "{key}");
-        }
-        assert_eq!(second.machine.id, first.machine.id);
-        assert_eq!(get(&second.p, "notes"), "The bar in the chuck.");
-        assert_eq!(second.turn.map(|t| (t.base, t.a)), Some((0, 0.)));
-        assert!(built.validate_structure().is_ok());
-    }
-    #[test]
-    fn a_round_bar_is_seated_on_its_axis_and_a_part_that_does_not_fit_is_refused() {
-        let round = |diameter, stickout| {
-            move |plan: &mut Proposal| {
-                let chuck = plan.chuck.as_mut().unwrap();
-                chuck.stock = "Round bar".into();
-                (chuck.diameter, chuck.width, chuck.height) = (Some(diameter), None, None);
-                chuck.jaws = "3-jaw".into();
-                chuck.stickout = stickout;
-            }
-        };
-        let (doc, mesh, report, plan) = rotary(round(30., 60.));
-        let built = build(&doc, &mesh, &report, &plan).unwrap();
-        let first = &built.setups[0];
-        assert_eq!(
-            [
-                get(&first.p, "stock_type"),
-                get(&first.p, "stock_diameter"),
-                get(&first.p, "stock_length")
-            ],
-            ["Round bar", "30", "130"]
-        );
-        // The 20 × 20 mm part is 28.28 mm across its corners.
-        let (doc, mesh, report, plan) = rotary(round(28., 60.));
-        let said = messages(build(&doc, &mesh, &report, &plan));
-        assert_eq!(said.len(), 1, "{said:?}");
-        assert!(
-            said[0].contains("needs a bar of at least Ø28.29 mm, not Ø28 mm"),
-            "{said:?}"
-        );
-        // 30 mm of part and 2 mm of stock beyond it do not fit a 31 mm stick-out.
-        let (doc, mesh, report, plan) = rotary(round(30., 31.));
-        let said = messages(build(&doc, &mesh, &report, &plan));
-        assert!(
-            said[0].contains("needs a stick-out of at least 32.00 mm, not 31 mm"),
-            "{said:?}"
-        );
-    }
-    #[test]
-    fn a_stock_the_chuck_cannot_hold_is_refused_with_the_chucks_own_message() {
-        // A 3-jaw chuck cannot hold a box.
-        let (doc, mesh, report, plan) = rotary(|p| p.chuck.as_mut().unwrap().jaws = "3-jaw".into());
-        let said = build(&doc, &mesh, &report, &plan).unwrap_err();
-        assert_eq!((said[0].setup, said[0].stage), (1, "workholding"));
-        assert!(
-            said[0]
-                .message
-                .contains("A 3-jaw chuck centres round stock"),
-            "{said:?}"
-        );
-        // Wider across its corners than the rotary unit takes.
-        let (doc, mesh, report, plan) = rotary(|p| {
-            let chuck = p.chuck.as_mut().unwrap();
-            (chuck.width, chuck.height) = (Some(60.), Some(60.));
-        });
-        let said = build(&doc, &mesh, &report, &plan).unwrap_err();
-        assert!(
-            said.iter()
-                .any(|p| p.message.contains("the jaws grip from Ø5 to Ø80 mm")),
-            "{said:?}"
-        );
-        // Nothing but the two choices of the schema is a jaw or a tailstock choice.
-        let (doc, mesh, report, plan) = rotary(|p| p.chuck.as_mut().unwrap().jaws = "5-jaw".into());
-        assert!(
-            messages(build(&doc, &mesh, &report, &plan))[0]
-                .contains("\"5-jaw\" is not a chuck jaws choice")
-        );
-    }
-    #[test]
-    fn the_orientation_of_an_indexed_setup_is_the_one_its_first_angle_brings_up() {
-        // With +Z up in setup 1, positive A brings +Y up at 90, -Z at 180, -Y at 270.
-        for (angle, up) in [(0., "+Z"), (90., "+Y"), (180., "-Z"), (270., "-Y")] {
-            let (doc, mesh, report, plan) = rotary(|p| {
-                p.setups[1].a_angles = Some(vec![angle]);
-                p.setups[1].orientation = up.into();
-                p.setups[1].operations = vec![op("Contour", 1, vec![])];
-            });
-            assert!(build(&doc, &mesh, &report, &plan).is_ok(), "A {angle} {up}");
-        }
-        let (doc, mesh, report, plan) = rotary(|p| {
-            p.setups[1].a_angles = Some(vec![90., 180.]);
-            p.setups[1].orientation = "+Z".into();
-        });
-        let said = messages(build(&doc, &mesh, &report, &plan));
-        assert_eq!(said.len(), 1, "{said:?}");
-        assert!(
-            said[0].contains("At A 90° the part shows +Y up, not +Z"),
-            "{said:?}"
-        );
-        // An angle that turns no face up has none to name.
-        let (doc, mesh, report, plan) = rotary(|p| p.setups[1].a_angles = Some(vec![45.]));
-        let said = messages(build(&doc, &mesh, &report, &plan));
-        assert!(
-            said[0].contains("At A 45° no face of the part is up"),
-            "{said:?}"
-        );
-    }
-    #[test]
-    fn an_indexed_setup_is_refused_for_what_the_setups_page_refuses() {
-        // An angle outside the machine's A range (-360° to 360°), a repeat, none.
-        for (angles, words) in [
-            (
-                vec![400.],
-                "A 400° is outside the machine's A range, -360° to 360°.",
-            ),
-            (vec![90., 90.], "A 90° is listed twice."),
-            (vec![], "List the A angles to index to"),
-        ] {
-            let (doc, mesh, report, plan) = rotary(|p| p.setups[1].a_angles = Some(angles));
-            let said = messages(build(&doc, &mesh, &report, &plan));
-            assert!(said.iter().any(|m| m.contains(words)), "{words}: {said:?}");
-        }
-        // Several angles run each operation at every one of them, so no surfaces ...
-        let (doc, mesh, report, plan) = rotary(|p| {
-            let top = report_top(&crate::fake_openai::rotary::report().2);
-            p.setups[1].operations = vec![op("Contour", 1, top)];
-        });
-        let said = messages(build(&doc, &mesh, &report, &plan));
-        assert_eq!(said.len(), 1, "{said:?}");
-        assert!(
-            said[0]
-                .starts_with("2/Some(1): This setup runs every operation at each of its A angles")
-                && said[0].contains("Contour outside, Parallel or Waterline"),
-            "{said:?}"
-        );
-        // ... but a Face of the sides each angle brings up (LIO-214): one top
-        // plane alone leaves the angles after it nothing to face, a surface
-        // that is on top at none of them is refused.
-        let (doc, mesh, report, plan) = rotary(|p| {
-            let top = report_top(&crate::fake_openai::rotary::report().2);
-            p.setups[1].operations = vec![op("Face", 1, top)];
-        });
-        let said = messages(build(&doc, &mesh, &report, &plan));
-        assert_eq!(said.len(), 1, "{said:?}");
-        assert!(
-            said[0].starts_with("2/Some(1): None of the surfaces is the top plane of +Y"),
-            "{said:?}"
-        );
-        let (doc, mesh, report, plan) = rotary(|p| {
-            let mut ids = p.setups[1].operations[0].surfaces.clone();
-            ids.push(usize::MAX);
-            p.setups[1].operations[0].surfaces = ids;
-        });
-        let said = messages(build(&doc, &mesh, &report, &plan));
-        assert!(
-            said.len() == 1
-                && said[0].contains(&format!("Surface {} is not the top plane", usize::MAX)),
-            "{said:?}"
-        );
-        // The four sides build as one Face, its tool centre out to the edges.
-        let (doc, mesh, report, plan) = rotary(|_| {});
-        let built = build(&doc, &mesh, &report, &plan).unwrap();
-        let face = &built.setups[1].operations[0];
-        assert_eq!(face.strategy, Strategy::Face);
-        assert_eq!(face.surfaces.as_ref().unwrap().ids.len(), 4);
-        assert_eq!(
-            (get(&face.p, "boundary"), get(&face.p, "containment")),
-            ("Selected geometry", "Tool center on boundary")
-        );
-        // One angle may use them: its orientation is told.
-        let (doc, mesh, report, plan) = rotary(|p| {
-            let top = report_top(&crate::fake_openai::rotary::report().2);
-            p.setups[1].a_angles = Some(vec![0.]);
-            p.setups[1].operations = vec![op("Face", 1, top)];
-        });
-        assert!(build(&doc, &mesh, &report, &plan).is_ok());
-        // The holder is the chuck's.
-        let (mut doc, mesh, report, plan) = rotary(|p| p.setups[1].holder = Some(1));
-        doc.adopt_holders();
-        let said = messages(build(&doc, &mesh, &report, &plan));
-        assert!(
-            said.iter()
-                .any(|m| m.contains("holder must be null: an indexed setup is held by the chuck")),
-            "{said:?}"
-        );
-        // The stock must be in the chuck: without `chuck` setup 1 keeps the user's.
-        let (doc, mesh, report, plan) = rotary(|p| p.chuck = None);
-        let said = messages(build(&doc, &mesh, &report, &plan));
-        assert!(
-            said.iter()
-                .any(|m| m.contains("a_angles index the stock in the chuck")),
-            "{said:?}"
-        );
-        // ... and an indexed setup cannot come first.
-        let (doc, mesh, report, plan) = rotary(|p| {
-            p.setups.remove(0);
-            p.setups[0].a_angles = Some(vec![90.]);
-            p.setups[0].orientation = "+Y".into();
-        });
-        let said = messages(build(&doc, &mesh, &report, &plan));
-        assert!(
-            said.iter()
-                .any(|m| m.contains("The first setup cannot index A")),
-            "{said:?}"
-        );
-    }
     /// The top plane's surface IDs of the first orientation.
-    fn report_top(report: &PartReport) -> Vec<usize> {
+    pub(crate) fn report_top(report: &PartReport) -> Vec<usize> {
         report.orientations[0]
             .planes
             .iter()
@@ -6190,18 +5819,6 @@ pub(crate) mod tests {
             .unwrap()
             .surfaces
             .clone()
-    }
-    #[test]
-    fn a_user_chuck_in_setup_1_takes_indexed_setups_without_a_chuck_proposal() {
-        let (doc, mesh, report, plan) = rotary(|p| p.chuck = None);
-        // Build the chuck into the project as the user would, then plan on it.
-        let seated = build(&doc, &mesh, &report, &crate::fake_openai::rotary::good()).unwrap();
-        let report = analysis::report(&seated, &mesh).unwrap();
-        assert_eq!(report.workholding.as_ref().unwrap().kind, "Chuck");
-        let built = build(&seated, &mesh, &report, &plan).unwrap();
-        assert_eq!(get(&built.setups[0].p, "holding"), "Chuck");
-        assert_eq!(built.index_base(1), Some(0));
-        assert_eq!(get(&built.setups[0].p, "stock_x"), "130");
     }
 
     /// `block` with the default manual mill in the library, machine 2 of the
@@ -6806,7 +6423,11 @@ pub(crate) mod tests {
     }
     /// A Turn of `kind` with T`tool` at 710 rpm (the lathe's gear nearest),
     /// its fields set by `fields`.
-    fn turn(kind: &str, tool: u32, fields: impl FnOnce(&mut ProposedTurn)) -> ProposedOp {
+    pub(crate) fn turn(
+        kind: &str,
+        tool: u32,
+        fields: impl FnOnce(&mut ProposedTurn),
+    ) -> ProposedOp {
         let mut t = ProposedTurn {
             kind: kind.into(),
             ..ProposedTurn::default()

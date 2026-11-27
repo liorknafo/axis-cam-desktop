@@ -244,7 +244,7 @@ fn limits(machine: &Machine) -> (f32, f32) {
         1.
     };
     let max_rpm = num(&machine.p, "rpm").unwrap_or(f32::INFINITY).min(
-        crate::control::spindle_cap(machine)
+        crate::machine_profile::spindle_cap(machine)
             .ok()
             .flatten()
             .unwrap_or(f32::INFINITY),

@@ -29,12 +29,14 @@ mod illustration;
 mod indexed;
 mod lathe;
 mod look;
+mod machine_profile;
 mod machine_view;
 mod manual;
 mod material;
 mod mcp;
 mod mesh;
 mod model;
+mod names;
 mod ngc;
 mod oauth;
 mod openai;
@@ -48,6 +50,7 @@ mod planner_tools;
 mod pocket;
 mod post;
 mod post_check;
+mod profile_draft;
 mod progress;
 mod proposal;
 mod rest;
@@ -78,6 +81,7 @@ mod ui;
 mod uncut;
 mod viewport;
 mod volume;
+pub(crate) use cam::arcs::{FoundHoles, find_holes};
 use iced::{Element, Size, Subscription, Task, Theme};
 use model::*;
 use std::{
@@ -1779,53 +1783,6 @@ impl std::fmt::Debug for PartHoles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "PartHoles({})", self.0.holes.len())
     }
-}
-/// Every hole of the part a wall click picks (`pocket::part_holes`), and
-/// each read as a drill reads it (`cam::drill_holes_of`): None where it is
-/// not round.
-#[derive(Default)]
-pub struct FoundHoles {
-    pub holes: Vec<pocket::Hole>,
-    pub round: Vec<Option<cam::Hole>>,
-    /// The round ends of the holes that are not round (a slot's, a
-    /// counterbore's), each with the hole a Drill drills for it
-    /// (`cam::arcs::arc_hole`): a Drill shows and picks each (LIO-434).
-    pub arcs: Vec<(cam::arcs::Arc, cam::Hole)>,
-}
-/// Whether a click on a wall of the part picks its whole hole in `op`: a
-/// Pocket, an Adaptive clearing, a Contour, a Drill of the part's holes
-/// (not of the pins'), and an Internal groove's bore (a boss's wall it
-/// picks as a face).
-pub(crate) fn picks_holes(op: &Operation) -> bool {
-    matches!(
-        op.strategy,
-        Strategy::Pocket | Strategy::Adaptive | Strategy::Contour | Strategy::Groove
-    ) || (op.strategy == Strategy::Drill && !op.drills_pin_holes())
-}
-/// Whether a click on the part picks the whole smooth face it lands on in
-/// `op` (`mesh::Mesh::region_of`), a curved one included: Parallel and
-/// Waterline finishing.
-pub(crate) fn picks_faces(op: &Operation) -> bool {
-    matches!(op.strategy, Strategy::Parallel | Strategy::Waterline)
-}
-/// The part's holes as `setup` places it, for picking by their outline.
-pub(crate) fn find_holes(setup: &model::Setup, mesh: &mesh::Mesh) -> FoundHoles {
-    let holes = pocket::part_holes(setup, mesh);
-    let round = cam::drill_holes_of(setup, mesh, &holes);
-    let walls: std::collections::HashSet<usize> = (holes.iter().zip(&round))
-        .filter(|(_, r)| r.is_none())
-        .flat_map(|(h, _)| h.walls.iter().copied())
-        .collect();
-    let g = cam::Geometry::new(setup, mesh);
-    // Each end of a blind counterbore over a slot's end, round the same
-    // centre, is a hole of its own to drill: wider, and only down to its
-    // floor (LIO-440).
-    let arcs: Vec<(cam::arcs::Arc, cam::Hole)> = (cam::arcs::arcs_among(setup, mesh, &walls)
-        .into_iter())
-    .filter(|a| cam::arcs::on_stock(setup, mesh, a))
-    .filter_map(|a| Some((a.clone(), cam::arcs::arc_hole(&g, &a)?)))
-    .collect();
-    FoundHoles { holes, round, arcs }
 }
 /// What a generation off the window's thread makes (`App::generate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12800,5 +12757,339 @@ fn keep_pending_cuts(
         // follow's, not the bound it holds meanwhile (LIO-582 review).
         let before = (run.before_follow.clone()).unwrap_or_else(|| run.cut_in_run.clone());
         pending.push((run.setup_id.clone(), r.index, r.from, before));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    mod plan_check_tests {
+        use crate::proposal::tests::block;
+        use crate::proposal::tests::good;
+
+        #[test]
+        fn the_command_line_check_matches_the_library() {
+            let (mut doc, _, report) = block();
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("job.axis.json");
+            crate::storage::save(&project, &doc).unwrap();
+            let write = |name: &str, text: &str| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, text).unwrap();
+                path.to_string_lossy().into_owned()
+            };
+            let project = project.to_string_lossy().into_owned();
+            let good_file = write("good.json", &serde_json::to_string(&good(&report)).unwrap());
+            let (json, summary, passed) =
+                crate::check_plan(&[project.clone(), good_file.clone()]).unwrap();
+            assert!(passed && summary.starts_with("The plan passes every check: 6 operations"));
+            // With a third path the passing job is saved as a project.
+            let saved = dir.path().join("saved.axis.json");
+            let with_job = [
+                project.clone(),
+                good_file.clone(),
+                saved.display().to_string(),
+            ];
+            assert!(crate::check_plan(&with_job).unwrap().2);
+            let job = crate::storage::load(&saved).unwrap();
+            assert_eq!(
+                job.setups.iter().map(|s| s.operations.len()).sum::<usize>(),
+                6
+            );
+            let printed: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(printed["passed"], true);
+            assert_eq!(crate::exit_code(&Ok(passed)), 0);
+            let mut bad = good(&report);
+            bad.setups[0].operations[0].tool = 9;
+            let bad_file = write("bad.json", &serde_json::to_string(&bad).unwrap());
+            let (json, summary, passed) = crate::check_plan(&[project.clone(), bad_file]).unwrap();
+            assert!(!passed && summary.contains("1 problem"));
+            assert!(json.contains("T9 is not in the tool library"));
+            assert_eq!(crate::exit_code(&Ok(passed)), 1);
+            // The check could not run: usage, unreadable or invalid files.
+            let not_json = write("notes.txt", "Here is the plan: {}");
+            let missing = dir
+                .path()
+                .join("missing.json")
+                .to_string_lossy()
+                .into_owned();
+            for args in [
+                vec![project.clone()],
+                vec![
+                    project.clone(),
+                    good_file.clone(),
+                    "job.json".into(),
+                    "extra".into(),
+                ],
+                vec![project.clone(), not_json],
+                vec![missing.clone(), good_file.clone()],
+            ] {
+                let result = crate::check_plan(&args);
+                assert_eq!(crate::exit_code(&result.map(|r| r.2)), 2, "{args:?}");
+            }
+            assert!(
+                crate::check_plan(std::slice::from_ref(&project))
+                    .unwrap_err()
+                    .starts_with("Usage")
+            );
+            let printed = crate::part_report(std::slice::from_ref(&project)).unwrap();
+            let printed: serde_json::Value = serde_json::from_str(&printed).unwrap();
+            assert_eq!(printed["orientations"][0]["up"], "+Z");
+            assert!(
+                crate::part_report(&[project.clone(), "extra".into()])
+                    .unwrap_err()
+                    .starts_with("Usage")
+            );
+            assert!(crate::part_report(&[missing]).is_err());
+            let schema: serde_json::Value =
+                serde_json::from_str(&crate::proposal_schema(&[]).unwrap()).unwrap();
+            assert_eq!(schema["additionalProperties"], false);
+            assert!(
+                crate::proposal_schema(&[project.clone(), "extra".into()])
+                    .unwrap_err()
+                    .starts_with("Usage")
+            );
+            // With a project, the schema and the instructions its report asks
+            // for: here without a manual mill, the plain ones.
+            assert!(crate::proposal_schema(&["missing.axis.json".into()]).is_err());
+            let own: serde_json::Value = serde_json::from_str(
+                &crate::proposal_schema(std::slice::from_ref(&project)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(own, schema);
+            let told = crate::planner_instructions(std::slice::from_ref(&project)).unwrap();
+            assert_eq!(
+                told,
+                crate::planner::instructions_for(false, false, false, false)
+            );
+            assert!(
+                crate::planner_instructions(&[])
+                    .unwrap_err()
+                    .starts_with("Usage")
+            );
+            doc.material.clear();
+            doc.material_id.clear();
+            crate::storage::save(std::path::Path::new(&project), &doc).unwrap();
+            assert!(
+                crate::check_plan(&[project, good_file])
+                    .unwrap_err()
+                    .starts_with("Material")
+            );
+        }
+    }
+    mod post_tests {
+        use super::*;
+        use crate::post::tests::*;
+        use crate::post::*;
+
+        #[test]
+        fn headless_export_matches_the_ui_path() {
+            let dir = tempfile::tempdir().unwrap();
+            let (doc, _) = fixture::job();
+            let project = dir.path().join("job.axis.json");
+            crate::storage::save(&project, &doc).unwrap();
+            let out = dir.path().join("out");
+            let message = crate::export_gcode(
+                Some(&project.to_string_lossy().into_owned()),
+                Some(&out.to_string_lossy().into_owned()),
+            )
+            .unwrap();
+            assert!(message.starts_with("Wrote 1 LinuxCNC program"));
+            assert!(!message.contains("LinuxCNC tool table"), "{message}");
+            assert!(!message.contains("material"), "{message}");
+            assert!(out.join("Fixture block - 1 Top (G54).ngc").exists());
+        }
+        #[test]
+        fn headless_export_announces_tools_numbered_on_load() {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut doc, _) = fixture::job();
+            for t in &mut doc.tools {
+                t.p.remove("number");
+            }
+            doc.material = "Brass C360".into();
+            let project = dir.path().join("job.axis.json");
+            crate::storage::save(&project, &doc).unwrap();
+            let out = dir.path().join("out");
+            let message = crate::export_gcode(
+                Some(&project.to_string_lossy().into_owned()),
+                Some(&out.to_string_lossy().into_owned()),
+            )
+            .unwrap();
+            assert!(message.starts_with("Wrote 1 LinuxCNC program"), "{message}");
+            // The notes of the load follow the outcome, in the order of the load.
+            let notes = format!(
+                "{} The project material \"Brass C360\" was linked to the library.",
+                crate::storage::NUMBERED_TOOLS
+            );
+            assert!(message.ends_with(&format!("\n{notes}")), "{message}");
+            // A refused export carries the note too.
+            doc.setups[0].p.insert("offset".into(), "G99".into());
+            crate::storage::save(&project, &doc).unwrap();
+            let error = crate::export_gcode(
+                Some(&project.to_string_lossy().into_owned()),
+                Some(&out.to_string_lossy().into_owned()),
+            )
+            .unwrap_err();
+            assert!(error.starts_with("Nothing was written."), "{error}");
+            assert!(error.ends_with(&format!("\n{notes}")), "{error}");
+        }
+        #[test]
+        fn headless_export_refuses_a_clamp_hit_with_the_export_message() {
+            use crate::holding;
+            let dir = tempfile::tempdir().unwrap();
+            let (mut doc, mesh) = pocket_job();
+            // Reaching 40 mm onto the stock the clamp is in the pocket's way.
+            hold(&mut doc, "Clamp", &[("clamps", "-X:0")]);
+            let id = get(&doc.setups[0].p, "holder").to_string();
+            doc.workholding
+                .iter_mut()
+                .find(|h| h.id == id)
+                .unwrap()
+                .p
+                .insert("bite".into(), "40".into());
+            let mut plans = vec![];
+            crate::simulation::sequence(&doc, &mesh, None, |_, _, r| plans.push(r.unwrap().plan));
+            let boxes = doc.holding_boxes(&doc.setups[0], plans[0].stock).unwrap();
+            let hit = &holding::hits(&plans[0], &boxes, 2.)[0];
+            let datum = datum(&doc.setups[0], plans[0].stock, &mesh).unwrap();
+            let expected = holding::message("Pocket", hit, 2., datum);
+            let project = dir.path().join("job.axis.json");
+            crate::storage::save(&project, &doc).unwrap();
+            let out = dir.path().join("out");
+            let error = crate::export_gcode(
+                Some(&project.to_string_lossy().into_owned()),
+                Some(&out.to_string_lossy().into_owned()),
+            )
+            .unwrap_err();
+            // The first reason, naming its setup once.
+            assert!(
+                error.starts_with("Nothing was written. Top: Setup 1 cannot be held by the clamp on -X (offset 0): setup 1, operation 1 would cut away the stock under its bite, which reaches 38 mm over the part."),
+                "{error}"
+            );
+            assert!(
+                !error.contains("Top: Top:") && !expected.is_empty(),
+                "{error}"
+            );
+            assert!(!out.exists(), "nothing was written");
+            // With the toe clamp's own bite it is clear of the pocket: it exports.
+            doc.workholding
+                .iter_mut()
+                .find(|h| h.id == id)
+                .unwrap()
+                .p
+                .insert("bite".into(), "12".into());
+            crate::storage::save(&project, &doc).unwrap();
+            let message = crate::export_gcode(
+                Some(&project.to_string_lossy().into_owned()),
+                Some(&out.to_string_lossy().into_owned()),
+            )
+            .unwrap();
+            assert!(message.starts_with("Wrote 1 LinuxCNC program"), "{message}");
+        }
+    }
+    mod uncut_tests {
+        use crate::post::fixture;
+
+        #[test]
+        fn faces_left_under_stock_are_found_until_a_later_setup_cuts_them() {
+            // Setup 1 faces the top: the top is cut, the bottom and the 2 mm of
+            // stock on the sides are not.
+            let (doc, mesh) = fixture::flipped_after(1);
+            let mut top_only = doc.clone();
+            top_only.setups.truncate(1);
+            let left = crate::leftover_stock(&top_only, &mesh, 0);
+            let uncut = left.uncut.unwrap().unwrap();
+            let setup1 = &doc.setups[0];
+            let (top, bottom, side) = (
+                outer(&mesh, setup1, 2, 1.),
+                outer(&mesh, setup1, 2, -1.),
+                outer(&mesh, setup1, 0, -1.),
+            );
+            assert!(!top.is_empty() && !bottom.is_empty() && !side.is_empty());
+            assert!(top.iter().all(|i| !uncut.faces[*i]), "the faced top is cut");
+            assert!(
+                bottom.iter().all(|i| uncut.faces[*i]),
+                "the bottom is under stock"
+            );
+            assert!(
+                side.iter().all(|i| uncut.faces[*i]),
+                "the -X side is under stock"
+            );
+            // The sides and the bottom, which the through holes join; the top's
+            // pocket, reached from the top.
+            let shell = &uncut.regions[0];
+            assert_eq!(
+                shell.from,
+                ["−X", "+X", "−Y", "+Y", "the bottom"],
+                "{shell:?}"
+            );
+            let pocket = uncut.regions[1].line();
+            assert!(
+                pocket.starts_with("5868 mm² reached from the top: X 16–88, Y 20–60, Z 28–40"),
+                "{pocket}"
+            );
+            assert!(uncut.share > 0.3 && uncut.share < 1., "{}", uncut.share);
+            // Setup 2, flipped, faces the bottom too.
+            let both = crate::leftover_stock(&doc, &mesh, 0)
+                .uncut
+                .unwrap()
+                .unwrap();
+            assert!(bottom.iter().all(|i| !both.faces[*i]), "the bottom is cut");
+            assert!(
+                side.iter().all(|i| both.faces[*i]),
+                "the sides are still under stock"
+            );
+            assert!(both.share < uncut.share);
+            // The through holes are no longer joined to the bottom: each is
+            // reached from either end.
+            let through = both
+                .regions
+                .iter()
+                .filter(|r| r.from == ["the bottom", "the top"]);
+            assert_eq!(through.count(), 4, "{:?}", both.regions);
+        }
+        #[test]
+        fn completeness_is_not_checked_without_a_cut_or_after_a_failure() {
+            let (mut doc, mesh) = fixture::job();
+            doc.setups[0].operations.clear();
+            let left = crate::leftover_stock(&doc, &mesh, 0);
+            assert_eq!(
+                left.uncut.unwrap().unwrap_err(),
+                "No operation has cut the stock yet."
+            );
+            let (mut doc, mesh) = fixture::job();
+            doc.setups[0].operations.truncate(1);
+            doc.setups[0].operations[0].tool = "gone".into();
+            let left = crate::leftover_stock(&doc, &mesh, 0);
+            let why = left.uncut.unwrap().unwrap_err();
+            // One short line: the operation's own check says what is wrong
+            // (LIO-425, was "Top / … could not be generated.").
+            assert!(why.starts_with("Completeness waits on Top / "), "{why}");
+        }
+        /// The faces of `mesh` that lie on a side of its box in setup 1: the
+        /// side across `axis` (2 for Z) at its high end for a positive `sign`.
+        fn outer(
+            mesh: &crate::mesh::Mesh,
+            setup1: &crate::model::Setup,
+            axis: usize,
+            sign: f32,
+        ) -> Vec<usize> {
+            let placement = crate::stock::Placement::new(mesh, Some(setup1));
+            let edge = if sign > 0. {
+                placement.bounds.max[axis]
+            } else {
+                placement.bounds.min[axis]
+            };
+            mesh.faces
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| {
+                    f.points
+                        .iter()
+                        .all(|p| (placement.transform(*p)[axis] - edge).abs() < 0.01)
+                })
+                .map(|(i, _)| i)
+                .collect()
+        }
     }
 }

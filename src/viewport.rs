@@ -4692,7 +4692,7 @@ fn grid_faces(g: &crate::simulation::StockGrid, face: &mut impl FnMut(&[[f32; 3]
     );
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     #[test]
     fn a_chamfer_mill_and_a_drill_are_drawn_with_their_cone() {
@@ -7241,6 +7241,527 @@ mod tests {
                 "{:?}",
                 changed.iter().take(4).collect::<Vec<_>>()
             );
+        }
+    }
+    mod gpu_mesh_tests {
+        use crate::gpu_mesh::tests::*;
+        use crate::stock_surface::Detail;
+        use crate::stock_surface::Snapshot;
+        use crate::stock_surface::SurfaceMesh;
+
+        fn write_png(path: &std::path::Path, volume: &crate::volume::Volume, mesh: &SurfaceMesh) {
+            let triangles: Vec<_> =
+                crate::viewport::stock_triangles(volume, mesh, volume.frame, None).collect();
+            let Some(iced::widget::image::Handle::Rgba {
+                width,
+                height,
+                pixels,
+                ..
+            }) = crate::viewport::stock_picture(&triangles, (800, 600))
+            else {
+                return;
+            };
+            let file = std::fs::File::create(path).unwrap();
+            let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&pixels)
+                .unwrap();
+        }
+        /// Times fidget against the GPU at each detail, on the example block's
+        /// whole job and on two zig-zag pockets, and draws both meshes to
+        /// `target/gpu_mesh/`. `cargo test --release gpu_mesh_timing -- --ignored --nocapture`
+        #[test]
+        #[ignore]
+        fn gpu_mesh_timing() {
+            let Some(gpu) = gpu() else { return };
+            eprintln!("GPU: {}", gpu.adapter);
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/gpu_mesh");
+            std::fs::create_dir_all(&dir).unwrap();
+            let (doc, mesh, report) = crate::proposal::tests::block();
+            let job = crate::proposal::build(
+                &doc,
+                &mesh,
+                &report,
+                &crate::proposal::tests::good(&report),
+            )
+            .unwrap();
+            let si = job.setups.len() - 1;
+            let oi = (job.setups[si].operations.iter())
+                .rposition(|o| o.enabled)
+                .unwrap();
+            let mut sim = crate::simulation::prepare(&job, &mesh, si, oi).unwrap();
+            sim.seek(1.);
+            let cases = [
+                ("block", sim.volume.unwrap()),
+                ("pocket-1280", pocket(80, 8)),
+                ("pocket-10000", pocket(250, 20)),
+            ];
+            eprintln!(
+                "{:<13} {:>6} {:<8} | {:>8} {:>8} | {:>8} {:>6} {:>6} {:>6} {:>8} {:>13} {:>9} | {:>5} {:>6} {:>6} | {:>6} {:>6}",
+                "case",
+                "cuts",
+                "detail",
+                "fidget",
+                "tris",
+                "gpu",
+                "bin",
+                "run",
+                "read",
+                "tris",
+                "bricks",
+                "lists",
+                "open",
+                "worst",
+                "median",
+                "draw",
+                "draw"
+            );
+            for (name, volume) in &cases {
+                for detail in Detail::ALL {
+                    let snapshot = Snapshot::of(volume, detail);
+                    let cpu = snapshot.build_cpu().unwrap();
+                    // The first run warms the GPU's caches; time the second.
+                    gpu.mesh(&snapshot).unwrap();
+                    let (surface, t) = gpu.mesh_timed(&snapshot).unwrap();
+                    let (worst, _, median) = off_surface(&snapshot, &surface);
+                    // What the 3D view pays a frame for each, at a window's size.
+                    let draw = |surface: &SurfaceMesh| {
+                        let triangles: Vec<_> =
+                            crate::viewport::stock_triangles(volume, surface, volume.frame, None)
+                                .collect();
+                        let started = std::time::Instant::now();
+                        crate::viewport::stock_picture(&triangles, (1600, 1000));
+                        started.elapsed().as_secs_f64() * 1e3
+                    };
+                    eprintln!(
+                        "{:<13} {:>6} {:<8} | {:>6}ms {:>8} | {:>6.0}ms {:>4.0}ms {:>4.0}ms {:>4.0}ms {:>8} {:>6}/{:<6} {:>9} | {:>5} {:>6.3} {:>6.4} | {:>4.0}ms {:>4.0}ms",
+                        name,
+                        volume.cuts.len(),
+                        detail.to_string(),
+                        cpu.milliseconds,
+                        cpu.triangles.len(),
+                        t.total,
+                        t.bin,
+                        t.gpu,
+                        t.read,
+                        surface.triangles.len(),
+                        t.meshed,
+                        t.bricks,
+                        t.entries,
+                        open_sides(&surface),
+                        worst,
+                        median,
+                        draw(&cpu),
+                        draw(&surface),
+                    );
+                    if detail == Detail::Standard {
+                        write_png(&dir.join(format!("{name}-fidget.png")), volume, &cpu);
+                        write_png(&dir.join(format!("{name}-gpu.png")), volume, &surface);
+                    }
+                }
+            }
+        }
+    }
+    pub(crate) mod guide_tests {
+        use crate::guide::tests::*;
+        use crate::guide::*;
+        use crate::manual;
+        use crate::mesh::Bounds;
+        use crate::mesh::Mesh;
+        use crate::model::Document;
+        use crate::model::Tool;
+        use crate::model::get;
+        use crate::simulation;
+
+        /// The reported three-setup sequence, without depending on a user file.
+        pub(crate) fn squared_job() -> (Document, Mesh) {
+            let bounds = Bounds {
+                min: [0.; 3],
+                max: [134., 88., 20.],
+            };
+            let tris = crate::viewport::box_triangles(bounds, [0.7; 3])
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect();
+            let mesh = crate::mesh::normalize(tris).unwrap();
+            let mut doc = Document::default();
+            let machine = manual::defaults();
+            let mut tool = Tool::new("Square mill", "Flat end mill", "10");
+            for (k, v) in [
+                ("length", "25"),
+                ("stickout", "35"),
+                ("holder", "32"),
+                ("flutes", "3"),
+                ("machines", &machine.id),
+            ] {
+                tool.p.insert(k.into(), v.into());
+            }
+            let mut holder = crate::holding::starters()
+                .into_iter()
+                .find(|h| h.kind() == "Vise")
+                .unwrap();
+            holder.p.insert("machines".into(), machine.id.clone());
+            holder.p.insert("jaw_width".into(), "100".into());
+            doc.workholding = vec![holder.clone()];
+            doc.machines = vec![machine.clone()];
+            for (si, rx) in ["90", "-90", "0"].into_iter().enumerate() {
+                let mut setup = crate::model::Setup::new(machine.clone(), "G54");
+                for (k, v) in [
+                    ("rx", rx),
+                    ("origin", "Stock top center"),
+                    ("holding", "Vise"),
+                    ("holder", &holder.id),
+                    ("vise_axis", "Y"),
+                    ("vise_grip", if si == 2 { "8" } else { "30" }),
+                    ("stock_left", "3"),
+                    ("stock_right", "3"),
+                    ("stock_front", "0"),
+                    ("stock_back", "0"),
+                    ("stock_top", "3"),
+                    ("stock_bottom", "3"),
+                ] {
+                    setup.p.insert(k.into(), v.into());
+                }
+                if si > 0 {
+                    setup
+                        .p
+                        .insert("stock_source".into(), doc.setups[si - 1].id.clone());
+                }
+                let block = if si < 2 {
+                    [-70., 70., -10., 10., 0., -3.]
+                } else {
+                    [67., 90., -44., 44., 0., -20.]
+                };
+                setup.operations = vec![boxed(
+                    "Square edge",
+                    &tool.id,
+                    block,
+                    &[
+                        ("allowance", "0"),
+                        ("stepover", "40"),
+                        ("stepdown", "0.5"),
+                        ("rpm", "1600"),
+                        ("feed", "120"),
+                    ],
+                )];
+                doc.setups.push(setup);
+            }
+            doc.tools = vec![tool];
+            doc.active = doc.setups[2].id.clone();
+            (doc, mesh)
+        }
+        #[test]
+        fn squared_edges_regrip_on_finished_sides() {
+            let (doc, mesh) = squared_job();
+            squared_acceptance(&doc, &mesh);
+        }
+        #[test]
+        fn partially_squared_edge_still_rejects_a_stepped_jaw_contact() {
+            let (mut doc, mesh) = squared_job();
+            for (k, v) in [("y_min", "-5"), ("y_max", "5")] {
+                doc.setups[0].operations[0].p.insert(k.into(), v.into());
+            }
+            let w = simulate(&doc, &mesh, 2, "empty").unwrap();
+            let s = &doc.setups[2];
+            let f = crate::volume::Frame::new(s, &mesh);
+            let bands = crate::holding::Bands::new(&w.before, f, simulation::part_box(s, &mesh));
+            let held = crate::holding::held_by(&doc, s, w.done[0].1.stock, Some(&bands));
+            let issues = crate::holding::holdable(
+                2,
+                &crate::holding::layout(s).unwrap(),
+                doc.holder(get(&s.p, "holder")).unwrap(),
+                held,
+                Some(&crate::rest::Removed::new(&w.before, f)),
+                None,
+                &|_, _| String::new(),
+            );
+            assert!(
+                issues
+                    .iter()
+                    .any(|s| s.contains("removed the material the jaws grip")),
+                "{issues:?}"
+            );
+        }
+        #[test]
+        fn a_thin_disc_under_its_clamps_is_not_touched_beside_them_in_the_air() {
+            // A Ø20 disc 0.3 thick, its rim faced, clamped 2 wide over the
+            // lines its front and back are touched on with a Ø1 finder: off
+            // them is air, so Y cannot be found.
+            let (mut doc, _) = job("No");
+            doc.setups.truncate(1);
+            doc.active = doc.setups[0].id.clone();
+            let bounds = Bounds {
+                min: [0.; 3],
+                max: [10., 8., 0.2],
+            };
+            let tris = (crate::viewport::box_triangles(bounds, [0.7; 3]).into_iter())
+                .map(|(t, _)| t)
+                .collect();
+            let mesh = crate::mesh::normalize(tris).unwrap();
+            let mut mill = Tool::new("Rim mill", "Flat end mill", "1");
+            for (k, v) in [
+                ("length", "25"),
+                ("stickout", "35"),
+                ("flutes", "3"),
+                ("machines", &doc.setups[0].machine.id),
+            ] {
+                mill.p.insert(k.into(), v.into());
+            }
+            let face = boxed(
+                "Face rim",
+                &mill.id,
+                [9., 10.1, -2., 2., 0., -0.1],
+                &[
+                    ("allowance", "0"),
+                    ("stepover", "40"),
+                    ("stepdown", "0.1"),
+                    ("rpm", "1000"),
+                    ("feed", "100"),
+                ],
+            );
+            doc.tools.push(mill);
+            doc.setups[0].operations = vec![face];
+            for (k, v) in [
+                ("stock_type", "Round bar"),
+                ("stock_diameter", "20"),
+                ("stock_length", "0.3"),
+                ("origin", "Stock top center"),
+            ] {
+                doc.setups[0].p.insert(k.into(), v.into());
+            }
+            (doc.setups[0].machine.p).insert("edge_finder".into(), "1".into());
+            on_clamps(&mut doc, "-Y:0;+Y:0", "2");
+            let holder = doc.workholding.last_mut().unwrap();
+            for (k, v) in [("length", "6"), ("height", "2.5"), ("bite", "1.2")] {
+                holder.p.insert(k.into(), v.into());
+            }
+            let why = build(&doc, &mesh, 0).unwrap_err();
+            assert!(why.starts_with(UNDER_CLAMPS), "{why}");
+            // Clamped on X 6 off the lines, Y is touched on them, on the disc.
+            doc.setups[0].p.insert("clamps".into(), "-Y:6;+Y:-6".into());
+            let guide = build(&doc, &mesh, 0).unwrap();
+            let Step::Zero { at, far, .. } = &guide.steps[1] else {
+                panic!()
+            };
+            for p in [at[1], far[1].unwrap().at] {
+                assert!(p[0].hypot(p[1]) <= 10.01, "{p:?}");
+            }
+        }
+        #[test]
+        fn a_narrow_flat_wall_an_earlier_cut_left_is_touched_beside_a_clamp() {
+            // The earlier setup cuts the +X side back 13 except Y 10 to 50: a
+            // flat wall at X 67 narrower than half the face, which the touch
+            // reads as a round. A 10 wide clamp over its middle: it is touched
+            // beside the clamp, where it is as flat.
+            let (mut doc, mesh) = after_a_cut([67., 80., -50., 10., 0., -100.]);
+            doc.setups.swap(0, 1);
+            on_clamps(&mut doc, "+X:27", "10");
+            doc.setups.swap(0, 1);
+            let walked = simulate(&doc, &mesh, 1, "").unwrap();
+            let frame = crate::volume::Frame::new(&doc.setups[1], &mesh);
+            let stock = walked.done[0].1.stock;
+            let clamps = doc.holding_boxes(&doc.setups[1], stock).unwrap();
+            let t = contact(
+                &walked.before,
+                frame,
+                stock,
+                0,
+                true,
+                f32::NEG_INFINITY,
+                &clamps,
+                5.,
+            )
+            .unwrap();
+            assert!(t.under.is_empty(), "{t:?}");
+            let off = keep_off(&clamps, 0, 1., t.at[0], t.at[2], 5.);
+            assert!(
+                off.iter()
+                    .all(|&(_, a0, a1)| !(a0 < t.at[1] && t.at[1] < a1)),
+                "{t:?} {off:?}"
+            );
+            let rest = crate::rest::RestStock::new(&walked.before, frame);
+            let removed = rest.removed_in(stock);
+            let p = [t.at[0] - 0.2, t.at[1], t.at[2] - 0.2];
+            assert!(rest.in_stock(p) && !removed.at(p), "{t:?}");
+        }
+        /// `squared_job`'s manual setup twice (LIO-451): the first cuts the
+        /// Box `cut` (x_min, x_max, y_min, y_max, z_top, z_bottom, work) into
+        /// a fresh block, the second, with the zero at the top's centre, only
+        /// faces 0.5 off its other end, so that its Zero touches what the
+        /// first left.
+        pub(crate) fn after_a_cut(cut: [f32; 6]) -> (Document, Mesh) {
+            let (mut doc, mesh) = squared_job();
+            let mut first = doc.setups[2].clone();
+            first.id = "earlier".into();
+            for (k, v) in [
+                ("stock_source", "fresh"),
+                ("stock_top", "0"),
+                ("stock_bottom", "0"),
+                ("vise_grip", "6"),
+                ("name", "Earlier cut"),
+                ("origin", "Stock top center"),
+            ] {
+                first.p.insert(k.into(), v.into());
+            }
+            let fields = [
+                ("allowance", "0"),
+                ("stepover", "40"),
+                ("stepdown", "2"),
+                ("rpm", "1000"),
+                ("feed", "100"),
+            ];
+            first.operations = vec![boxed("Earlier cut", &doc.tools[0].id, cut, &fields)];
+            let mut later = first.duplicate("G54");
+            later.p.insert("name".into(), "Zero after it".into());
+            // Outside the part's 134, on the side away from the cut.
+            let side = if cut[0] > 0. {
+                [-80., -67.]
+            } else {
+                [67., 80.]
+            };
+            later.operations = vec![boxed(
+                "Face",
+                &doc.tools[0].id,
+                [side[0], side[1], -50., 50., 0., -0.5],
+                &fields,
+            )];
+            doc.active = later.id.clone();
+            doc.setups = vec![first, later];
+            (doc, mesh)
+        }
+        #[test]
+        fn a_halved_axis_is_never_touched_in_a_notch_an_earlier_setup_cut() {
+            // A notch 20 wide and 12 deep in the middle of the +X face's top;
+            // then also a slot 1.2 wide beside it, narrower than the pitch the
+            // face is sampled at, where the material's middle falls.
+            for slot in [false, true] {
+                let (mut doc, mesh) = after_a_cut([67., 80., -10., 10., 0., -12.]);
+                if slot {
+                    let mut tool = doc.tools[0].clone();
+                    tool.id = "slot-mill".into();
+                    tool.p.insert("diameter".into(), "1.2".into());
+                    doc.setups[0].operations.push(boxed(
+                        "Slot",
+                        &tool.id,
+                        [67., 80., 26.088522, 27.288522, 0., -12.],
+                        &[
+                            ("allowance", "0"),
+                            ("stepover", "40"),
+                            ("stepdown", "1"),
+                            ("rpm", "1000"),
+                            ("feed", "40"),
+                        ],
+                    ));
+                    doc.tools.push(tool);
+                }
+                let walked = simulate(&doc, &mesh, 1, "").unwrap();
+                let guide = build(&doc, &mesh, 1).unwrap();
+                let Step::Zero { far, touch, .. } = &guide.steps[1] else {
+                    panic!("{:?}", guide.steps[1])
+                };
+                let f = far[0].unwrap();
+                // On the +X face, at the top, beside the notch, where there is
+                // material just inside it.
+                close(f.at[0], 70.);
+                close(f.at[2], 0.);
+                assert!(f.at[1].abs() > 10., "{f:?}");
+                let frame = crate::volume::Frame::new(&doc.setups[1], &mesh);
+                let rest = crate::rest::RestStock::new(&walked.before, frame);
+                let removed = rest.removed_in(walked.done[0].1.stock);
+                let mut p: [f32; 3] = std::array::from_fn(|k| f.at[k] + guide.zero[k]);
+                (p[0], p[2]) = (p[0] - 0.2, p[2] - 0.2);
+                assert!(
+                    rest.in_stock(p) && !removed.at(p),
+                    "slot {slot}: {f:?} {p:?}"
+                );
+                if slot {
+                    assert!(!(26.08..=27.29).contains(&f.at[1]), "{f:?}");
+                }
+                // Both faces whole: half the reading.
+                close(f.reads, 150.);
+                close(touch[0], 75.);
+            }
+        }
+        #[test]
+        fn halved_touches_not_either_side_of_the_zero_alike_say_how_far_from_half() {
+            // The +X face cut back 3 mm for 16 mm down, into the jaws: the
+            // finder touches it at 67, the −X face at −70; the DRO reads 147
+            // and is set to 72, half less 1.5. Mirrored on −X, half plus 1.5.
+            for (cut, near, far_x, set) in [
+                ([67., 80., -50., 50., 0., -16.], -70., 67., 72.),
+                ([-80., -67., -50., 50., 0., -16.], -67., 70., 75.),
+            ] {
+                let (doc, mesh) = after_a_cut(cut);
+                let guide = build(&doc, &mesh, 1).unwrap();
+                let zero = &guide.steps[1];
+                let Step::Zero { at, far, touch, .. } = zero else {
+                    panic!("{zero:?}")
+                };
+                let f = far[0].unwrap();
+                close(at[0][0], near);
+                close(f.at[0], far_x);
+                close(f.reads, 147.);
+                close(touch[0], set);
+                // The DRO reads 0 at the zero with the faces where touched.
+                close(dro_at_zero(zero, 0, [near, far_x]), 0.);
+            }
+        }
+        #[test]
+        fn a_face_an_earlier_cut_skimmed_less_than_the_samples_depth_is_touched_where_it_is() {
+            // Each of the four faces skimmed 0.1 mm for 16 mm down by the
+            // earlier setup: the finder touches it 0.1 in, the DRO reads 0.1
+            // less, and the + face is set to half less or plus 0.05, so that
+            // 0 stays on the plan's zero, where the later steps count from.
+            // 3 mm of stock on every side of the part, so that a skim misses it.
+            let margined = |(mut doc, mesh): (Document, Mesh)| {
+                for setup in &mut doc.setups {
+                    for side in ["stock_front", "stock_back"] {
+                        setup.p.insert(side.into(), "3".into());
+                    }
+                }
+                (doc, mesh)
+            };
+            let (doc, mesh) = margined(after_a_cut([67., 80., -10., 10., 0., -12.]));
+            let guide = build(&doc, &mesh, 1).unwrap();
+            let Step::Hold { stock, .. } = &guide.steps[0] else {
+                panic!()
+            };
+            let (half_x, half_y) = (stock.max[0], stock.max[1]);
+            for (k, plus) in [(0, true), (0, false), (1, true), (1, false)] {
+                let half = [half_x, half_y][k];
+                let mut cut = [-80., 80., -60., 60., 0., -16.];
+                let (lo, hi) = (2 * k, 2 * k + 1);
+                if plus {
+                    cut[lo] = half - 0.1;
+                } else {
+                    cut[hi] = -half + 0.1;
+                }
+                let (doc, mesh) = margined(after_a_cut(cut));
+                let guide = build(&doc, &mesh, 1).unwrap();
+                let zero = &guide.steps[1];
+                let Step::Zero { at, far, touch, .. } = zero else {
+                    panic!("{zero:?}")
+                };
+                let f = far[k].unwrap();
+                let faces = if plus {
+                    [-half, half - 0.1]
+                } else {
+                    [-half + 0.1, half]
+                };
+                let said = format!("axis {k} plus {plus}: {zero:?}");
+                assert!((at[k][k] - faces[0]).abs() < 0.006, "{said}");
+                assert!((f.at[k] - faces[1]).abs() < 0.006, "{said}");
+                assert!((f.reads - (2. * half - 0.1 + 10.)).abs() < 0.011, "{said}");
+                let off = touch[k] - f.reads / 2.;
+                let want = if plus { -0.05 } else { 0.05 };
+                assert!((off - want).abs() < 0.006, "{said}");
+                // The DRO reads 0 at the zero with the faces where they are.
+                assert!(dro_at_zero(zero, k, faces).abs() < 0.006, "{said}");
+            }
         }
     }
 }

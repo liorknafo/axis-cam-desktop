@@ -276,7 +276,7 @@ pub fn settle_sloping_picks(doc: &mut crate::model::Document, mesh: &Mesh) -> Ve
         let angles = crate::stock::Placement::new(mesh, Some(setup)).rotation();
         let mut operations = std::mem::take(&mut setup.operations);
         for operation in &mut operations {
-            if !crate::picks_holes(operation) || !operation.needs_surfaces() {
+            if !crate::model::picks_holes(operation) || !operation.needs_surfaces() {
                 continue;
             }
             let Some(selection) = operation.surfaces.as_ref().filter(|s| s.matches(mesh)) else {
@@ -385,7 +385,7 @@ pub fn issues(operation: &Operation, setup: &Setup, mesh: Option<&Mesh>) -> Vec<
     // The part as the setup turns it, by A too for an indexed setup posed
     // at an angle (`indexed`).
     let angles = crate::stock::Placement::new(mesh, Some(setup)).rotation();
-    let picks_holes = crate::picks_holes(operation);
+    let picks_holes = crate::model::picks_holes(operation);
     let steps = if matches!(
         operation.strategy,
         crate::model::Strategy::Pocket | crate::model::Strategy::Adaptive

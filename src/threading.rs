@@ -235,7 +235,7 @@ pub fn add(doc: &Document, si: usize, mesh: &Mesh) -> Result<Added, String> {
             // flood output, and a run refuses one it lacks.
             op.p.insert(
                 "coolant".into(),
-                crate::control::default_coolant(machine).into(),
+                crate::machine_profile::default_coolant(machine).into(),
             );
         };
         // The tap drill: a drill of its size, else (on the CNC) an end mill
@@ -763,7 +763,7 @@ mod tests {
         let path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/threaded-plate.3mf");
         let mesh = crate::mesh::load(&path).unwrap();
-        let machine = crate::control::owners_machine(&dir).unwrap();
+        let machine = crate::machine_profile::owners_machine(&dir).unwrap();
         let mut tools = vec![];
         // The owner's 3-tooth thread mills: cutting Ø, the one pitch their
         // teeth are spaced at (a guess, M3 to M8, until read off the
@@ -835,7 +835,7 @@ mod tests {
         job.setups[0].operations = added.ops.clone();
         let mut sims = vec![];
         crate::simulation::sequence(&job, &mesh, None, |_, oi, r| sims.push((oi, r)));
-        if let Err(problems) = crate::run::plan_problems(&job, &mesh, 0, &sims) {
+        if let Err(problems) = crate::post::plan_problems(&job, &mesh, 0, &sims) {
             panic!("{problems:?}");
         }
         doc.setups[0].operations = added.ops;
@@ -861,7 +861,7 @@ mod tests {
     fn on_the_owners_cnc_the_ops_added_pass_the_runs_checks() {
         // Its UC100 profile has no flood output: the ops take its coolant.
         let dir = tempfile::tempdir().unwrap();
-        let machine = crate::control::owners_machine(dir.path()).unwrap();
+        let machine = crate::machine_profile::owners_machine(dir.path()).unwrap();
         let tools = vec![
             tool(
                 "Ø5 drill",
@@ -899,7 +899,7 @@ mod tests {
         }
         let mut sims = vec![];
         crate::simulation::sequence(&doc, &mesh, None, |_, oi, r| sims.push((oi, r)));
-        assert_eq!(crate::run::plan_problems(&doc, &mesh, 0, &sims), Ok(()));
+        assert_eq!(crate::post::plan_problems(&doc, &mesh, 0, &sims), Ok(()));
     }
     #[test]
     fn the_owners_tools_are_given_once_and_are_valid() {

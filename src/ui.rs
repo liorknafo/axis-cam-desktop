@@ -18208,4 +18208,269 @@ mod tests {
             .insert("controller".into(), "UC100".into());
         assert!(super::run_setups(&clash, &big.id).is_empty());
     }
+    mod model_tests {
+        use crate::model::manual_setups::*;
+        use crate::model::*;
+
+        #[test]
+        fn a_turn_needs_the_tool_type_of_its_kind() {
+            let tools = lathe_tools();
+            let m = crate::lathe::defaults();
+            for kind in crate::lathe::TURN_KINDS {
+                let needed = crate::lathe::tool_for(kind).unwrap();
+                for tool in &tools {
+                    let mut op = Operation::new(Strategy::Turn, tool.id.clone());
+                    op.set_turn_kind(kind);
+                    // The tool-dependent numbers fit the default of each kind.
+                    let issues = op.issues(&m, &tools, &[]);
+                    let message =
+                        format!("Choose a {} for the {kind} turn.", needed.to_lowercase());
+                    assert_eq!(
+                        issues.contains(&message),
+                        !crate::lathe::takes(kind, get(&tool.p, "type")),
+                        "{kind} with {}: {issues:?}",
+                        tool.name()
+                    );
+                }
+            }
+            assert_eq!(
+                crate::ui::issue_tab("Choose a boring bar for the Bore turn."),
+                Some("Tool")
+            );
+            // A mill tool is no tool for a Turn, and a Turn without a tool says so.
+            let mill = Tool::new("End mill", "Flat end mill", "6");
+            let op = Operation::new(Strategy::Turn, mill.id.clone());
+            let issues = op.issues(&m, &[mill], &[]);
+            assert!(
+                issues.contains(&"Choose a turning tool for the Outside turn.".to_string()),
+                "{issues:?}"
+            );
+            let op = Operation::new(Strategy::Turn, "gone".into());
+            assert!(
+                op.issues(&m, &[], &[])
+                    .contains(&"Choose a tool from the library.".to_string())
+            );
+        }
+        #[test]
+        fn a_drill_on_a_lathe_goes_in_on_the_centre_to_a_depth() {
+            let (m, tools, op) = lathe_drill();
+            assert!(op.on_centre(&m) && !op.on_centre(&Machine::new(3)));
+            assert!(op.geometry.is_empty());
+            assert_eq!(get(&op.p, "depth"), "20");
+            // Snapped to a gear of the lathe.
+            assert!(num(&op.p, "rpm").is_some_and(|rpm| crate::manual::on_gear(&m, rpm)));
+            assert_eq!(op.issues(&m, &tools, &[]), Vec::<String>::new());
+            assert_eq!(op.tabs(&m), vec!["Tool", "Drill", "Cycle"]);
+            // No selection is asked of it, and none is taken.
+            let mut selected = op.clone();
+            selected.geometry = vec![5];
+            assert_eq!(
+                selected.issues(&m, &tools, &[]),
+                vec![crate::lathe::DRILL_ON_CENTRE.to_string()]
+            );
+            let mut picked = op.clone();
+            picked.surfaces = Some(crate::surface::Selection {
+                mesh_fingerprint: "x".into(),
+                ids: vec![3],
+            });
+            assert_eq!(
+                picked.issues(&m, &tools, &[]),
+                vec![crate::lathe::DRILL_ON_CENTRE.to_string()]
+            );
+            assert_eq!(
+                crate::ui::issue_tab(crate::lathe::DRILL_ON_CENTRE),
+                Some("Drill")
+            );
+            // The depth is a positive number that the drill's flutes cover.
+            for depth in ["0", "-5", "", "deep"] {
+                let mut bad = op.clone();
+                bad.p.insert("depth".into(), depth.into());
+                assert_eq!(
+                    bad.issues(&m, &tools, &[]),
+                    vec!["depth must be greater than zero.".to_string()],
+                    "{depth:?}"
+                );
+            }
+            let mut deep = op.clone();
+            deep.p.insert("depth".into(), "26".into());
+            assert_eq!(
+                deep.issues(&m, &tools, &[]),
+                vec!["depth is deeper than Drill 8's flutes, 25 mm.".to_string()]
+            );
+            deep.p.insert("depth".into(), "25".into());
+            assert!(deep.issues(&m, &tools, &[]).is_empty());
+            // The drill must list the lathe: a CNC drill is not on it.
+            let mut elsewhere = tools.clone();
+            elsewhere[0].p.remove("machines");
+            assert_eq!(
+                op.issues(&m, &elsewhere, &[]),
+                vec!["Drill 8 is not on Manual Lathe.".to_string()]
+            );
+        }
+    }
+    mod plan_check_tests {
+        use crate::plan_check::tests::*;
+        use crate::plan_check::*;
+        use crate::proposal::tests::block;
+        use crate::proposal::tests::good;
+
+        #[test]
+        fn a_side_up_setup_after_a_contour_is_located_without_the_cut_stock_top() {
+            use crate::proposal::tests::side_up;
+            let (doc, mesh, report) = block();
+            let (check, built) = check(&doc, &mesh, &report, &side_up(&report, "-Y"));
+            assert!(check.passed, "{:?}", stages(&check));
+            let (part, top) = check.zeros[1].unwrap();
+            assert_eq!(top, None, "{part:?}");
+            let line = crate::ui::work_zero_line(&built.unwrap().setups[1], check.zeros[1]);
+            assert!(
+                line.ends_with(
+                    "Z0 40 mm below the part's top. The stock top was cut by an earlier setup; touch off on a part face."
+                ),
+                "{line}"
+            );
+            assert!(!line.contains("Stock top") && !line.contains("below the stock top"));
+        }
+        #[test]
+        fn a_good_two_setup_plan_passes_every_stage() {
+            let (doc, mesh, report) = block();
+            let (check, built) = check(&doc, &mesh, &report, &good(&report));
+            assert!(check.passed, "{:?}", stages(&check));
+            assert_eq!(check.operations.len(), 6);
+            assert_eq!(
+                (check.operations[5].setup, check.operations[5].operation),
+                (2, 2)
+            );
+            assert!(check.operations.iter().all(|o| o.minutes > 0.));
+            let sum: f32 = check.operations.iter().map(|o| o.minutes).sum();
+            assert!((check.total_minutes - sum).abs() < 0.11);
+            assert_eq!(built.as_ref().unwrap().setups.len(), 2);
+            // Setup 2's Model origin is located for the preview: the part's box
+            // and the stock top in its work coordinates.
+            assert_eq!(check.zeros.len(), 2);
+            assert!(check.zeros[0].is_none());
+            let (part, top) = check.zeros[1].unwrap();
+            let near = |a: [f32; 3], b: [f32; 3]| (0..3).all(|k| (a[k] - b[k]).abs() < 0.01);
+            assert!(
+                near(part.min, [-60., -40., -40.]) && near(part.max, [60., 40., 0.]),
+                "{part:?}"
+            );
+            assert!(top.is_some_and(|top| (top - 3.).abs() < 0.01), "{top:?}");
+            assert!(
+                crate::ui::work_zero_line(&built.as_ref().unwrap().setups[1], check.zeros[1])
+                    .ends_with("Z0 3 mm below the stock top")
+            );
+            let coverage = check.coverage.unwrap();
+            assert!(
+                coverage.exposed_percent > 60. && coverage.exposed_percent < 100.,
+                "{coverage:?}"
+            );
+            assert_eq!(coverage.leftover_cm3.above, 0.);
+            assert_eq!(coverage.leftover_cm3.below, 0.);
+            // The pocket floors and both faces are machined; they are not listed.
+            let machined: Vec<usize> = good(&report)
+                .setups
+                .iter()
+                .flat_map(|s| &s.operations)
+                .flat_map(|o| o.surfaces.clone())
+                .collect();
+            for plane in &coverage.covered_planes {
+                assert!(
+                    plane.surfaces.iter().all(|id| !machined.contains(id)),
+                    "{plane:?}"
+                );
+            }
+            // Side features need other setups: something there is still covered.
+            assert!(
+                coverage
+                    .covered_planes
+                    .iter()
+                    .any(|p| p.orientation == "+X" || p.orientation == "-Y")
+            );
+            // The stock before each setup: setup 1's block, then the block less
+            // the 4 mm setup 1's Face took off its top, which is setup 2's
+            // bottom. The Contour stopped at the part's bottom, so the sides stay.
+            let stocks: Vec<String> = check
+                .stocks
+                .iter()
+                .map(|s| serde_json::to_string(s).unwrap())
+                .collect();
+            assert_eq!(
+                stocks,
+                [
+                    r#"{"setup":1,"size":[124.0,84.0,47.0],"box_from_part_corner":[-2.0,-2.0,-3.0,122.0,82.0,44.0],"removed":{"top":0.0,"bottom":0.0,"-X":0.0,"+X":0.0,"-Y":0.0,"+Y":0.0},"by":[]}"#,
+                    r#"{"setup":2,"size":[124.0,84.0,43.0],"box_from_part_corner":[-2.0,-2.0,0.0,122.0,82.0,43.0],"removed":{"top":0.0,"bottom":4.0,"-X":0.0,"+X":0.0,"-Y":0.0,"+Y":0.0},"by":["setup 1, operation 1 (Facing \"Face by planner\")"]}"#,
+                ]
+            );
+            assert_eq!(
+                check.stocks[1].line(),
+                "Stock before setup 2: 124 × 84 × 43 mm; bottom cut 4 mm by setup 1"
+            );
+        }
+    }
+
+    mod slot_tests {
+        use crate::cam;
+        use crate::model::{Strategy, get, num};
+        use crate::slot::tests::adapter;
+
+        #[test]
+        #[ignore = "requires private adapter copy; headless App dispatch only"]
+        fn toolbar_add_pick_and_edit_use_the_first_class_slot() {
+            let (mut doc, mesh, dir) = adapter();
+            doc.active = doc.setups[2].id.clone();
+            doc.setups[2].operations.truncate(7);
+            let tiles = crate::ui::ribbon_tiles(Some(&doc.setups[2].machine));
+            assert!(
+                tiles
+                    .iter()
+                    .flat_map(|(_, t)| t)
+                    .any(|t| { matches!(t, crate::ui::Tile::Op(Strategy::Slot)) })
+            );
+            let mut app = crate::App::from_workspace(dir.join("pick-state.axis.json"), None);
+            app.doc = doc;
+            app.imported_mesh = Some(mesh);
+            let _ = app.update(crate::Message::AddOp(Strategy::Slot));
+            assert_eq!(app.operation().unwrap().strategy, Strategy::Slot);
+            assert_eq!(app.tab, "Slot");
+            assert!(app.picking);
+            let mesh = app.imported_mesh.as_ref().unwrap();
+            let setup = app.doc.setup();
+            let stock = app.known_stock(2).0.unwrap();
+            let zero = crate::post::datum(setup, stock, mesh).unwrap();
+            let arc = cam::arcs::arcs_among(setup, mesh, &cam::arcs::upright(setup, mesh))
+                .into_iter()
+                .find(|a| {
+                    (a.r - 6.5).abs() < 0.0001
+                        && (a.centre[0] - zero[0] + 55.35).abs() < 0.0001
+                        && (a.centre[1] - zero[1] + 15.4).abs() < 0.0001
+                })
+                .unwrap();
+            let _ = app.update(crate::Message::Surface(arc.walls[0]));
+            assert!(app.status.starts_with("Picked Slot"), "{}", app.status);
+            let op = app.operation().unwrap();
+            for (k, want) in [
+                ("slot_x", -52.85),
+                ("slot_y", -15.4),
+                ("slot_length", 18.),
+                ("slot_width", 13.),
+                ("z_top", -1.5),
+                ("z_bottom", -10.),
+            ] {
+                assert!((num(&op.p, k).unwrap() - want).abs() < 0.001, "{k}");
+            }
+            let _ = app.update(crate::Message::Edit(
+                crate::Target::Operation,
+                "slot_x",
+                "52.85".into(),
+            ));
+            assert_eq!(get(&app.operation().unwrap().p, "slot_x"), "52.85");
+            let texts = crate::ui::probe::texts(app.view(), iced::Size::new(1440., 1000.));
+            assert!(
+                texts.iter().any(|s| s.contains("Overall length")),
+                "{texts:?}"
+            );
+            std::fs::write(dir.join("toolbar-picking.txt"), texts.join("\n")).unwrap();
+        }
+    }
 }

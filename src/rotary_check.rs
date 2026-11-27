@@ -179,7 +179,7 @@ fn limits(m: &Machine) -> Result<[Limits; 4], String> {
         out[3].push(("the machine's A range".into(), lo, hi));
     }
     if get(&m.p, "controller") == "UC100" {
-        let config = crate::control::profile(m)?;
+        let config = crate::machine_profile::profile(m)?;
         for (k, axis) in ["X", "Y", "Z", "A"].iter().enumerate() {
             let soft = config.axes.get(k).and_then(|x| x.soft_min.zip(x.soft_max));
             match soft {
@@ -303,7 +303,7 @@ fn placed(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Vec<(Option<us
     let on_machine =
         |p: [f32; 3]| -> [f32; 3] { std::array::from_fn(|k| p[k] - at.zero[k] + machine_zero[k]) };
     let centre_z = unit.map_or(0., |u| u.centre_z);
-    let probe_length = (crate::control::probe_settings(&machine.p).ok())
+    let probe_length = (crate::machine_profile::probe_settings(&machine.p).ok())
         .and_then(|p| p.length)
         .map(|l| l as f32);
     // The holder is kept the setup's gap over the bar, as off the jaws.
@@ -331,7 +331,7 @@ fn placed(doc: &Document, mesh: &Mesh, si: usize, sims: &Sims) -> Vec<(Option<us
         };
         if let (Some(swing), Some(unit)) = (swing, unit) {
             let room = -swing.machine_z;
-            let least = crate::control::RETRACT_ROOM as f32;
+            let least = crate::machine_profile::RETRACT_ROOM as f32;
             if room < least {
                 out.push((Some(oi), format!(
                     "{name}, {op}: A turns all within {} mm of its centreline under the tool ({} that far at any angle), which at machine Z {} reaches machine Z {}: {} mm under the top of the machine's {} mm Z travel (Z 0), less than the {} mm a retract over it needs. There is no room to lift the tool over it between angles. Measure the A centreline (Rotary A on the Control page), or use smaller stock.",
@@ -1582,7 +1582,7 @@ impl Walk<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::indexed::tests::{bar_job, contour, cutter, prism};
     use crate::simulation::{Move, prepare};
@@ -1590,7 +1590,7 @@ mod tests {
     /// `indexed`'s bar job: the part in a Ø40 × 120 aluminium bar 80 mm out
     /// of a 3-jaw chuck, on an A centreline at machine Z `centre_z`, setup 2
     /// a contour indexed to `angles`; and setup 2's simulation.
-    fn job(centre_z: &str, angles: &str) -> (Document, Mesh, Simulation) {
+    pub(crate) fn job(centre_z: &str, angles: &str) -> (Document, Mesh, Simulation) {
         let mesh = prism(30.);
         let mut doc = bar_job(&mesh, 0., "80", centre_z, angles, contour(&cutter("12")));
         crate::proposal::tests::aluminium(&mut doc);
@@ -1598,7 +1598,10 @@ mod tests {
         (doc, mesh, sim)
     }
     /// `sim` with its moves replaced: (from, to, motion, A), in the setup's frame.
-    fn with(sim: &Simulation, moves: &[([f32; 3], [f32; 3], Motion, f32)]) -> Simulation {
+    pub(crate) fn with(
+        sim: &Simulation,
+        moves: &[([f32; 3], [f32; 3], Motion, f32)],
+    ) -> Simulation {
         let mut sim = sim.clone();
         sim.plan.moves = moves
             .iter()
@@ -1817,7 +1820,7 @@ mod tests {
         let (mut doc, mesh, sim) = job("-150", "90");
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("jy5800-rotary.toml");
-        std::fs::write(&path, crate::control::rotary_profile()).unwrap();
+        std::fs::write(&path, crate::machine_profile::rotary_profile()).unwrap();
         let m = &mut doc.setups[0].machine;
         m.p.insert("controller".into(), "UC100".into());
         m.p.insert("uc100_profile".into(), path.display().to_string());
@@ -2073,7 +2076,7 @@ mod tests {
         // is at Z 0, the top of the CNC4030's 55 mm Z travel: no room to
         // lift the tool over it.
         let dir = tempfile::tempdir().unwrap();
-        let machine = crate::control::rotary_machine(dir.path()).unwrap();
+        let machine = crate::machine_profile::rotary_machine(dir.path()).unwrap();
         let unit = machine.rotary_unit().unwrap();
         assert_eq!(
             (unit.centre_z, unit.fit_diameter, unit.grip_max),
@@ -2229,79 +2232,10 @@ mod tests {
         assert!(problems(&doc, &mesh, 0, &[(0, Ok(sim))]).is_empty());
     }
 
-    /// The 4-angle job the demo used to be: the part 20 mm out of the
-    /// chuck's jaws in a Ø40 bar `len` mm long, 20 mm of it in the jaws, a
-    /// contour at A 90, 180, 270 and 0° whose passes across the bar's ends go
-    /// `bottom` mm over the part's bottom, 10 mm under the A axis; and what
-    /// the rotary checks say of setup 2. Ready to post: the tool numbered and
-    /// the part's file given.
-    fn four_angles_on(len: f32, bottom: &str) -> (Document, Mesh, Vec<String>) {
-        let mesh = prism(30.);
-        let mut op = contour(&cutter("12"));
-        op.p.insert("bottom".into(), bottom.into());
-        let stickout = (len - 20.).to_string();
-        let mut doc = bar_job(&mesh, 20., &stickout, "-150", "90, 180, 270, 0", op);
-        doc.setups[0]
-            .p
-            .insert("stock_length".into(), len.to_string());
-        doc.tools[0].p.insert("number".into(), "1".into());
-        doc.file = Some(crate::model::ModelFile {
-            name: "bar.stl".into(),
-            path: "bar.stl".into(),
-            format: "STL".into(),
-            bytes: 0,
-            thickness: None,
-        });
-        doc.sync_stock_sources();
-        doc.sync_turns(Some(&mesh));
-        let sims = crate::run::simulated_for_tests(&doc, &mesh, 1);
-        let said = problems(&doc, &mesh, 1, &sims)
-            .into_iter()
-            .map(|(_, m)| m)
-            .collect();
-        (doc, mesh, said)
-    }
-    /// `four_angles_on` the 120 mm bar.
-    fn four_angles(bottom: &str) -> (Document, Mesh, Vec<String>) {
-        four_angles_on(120., bottom)
-    }
     /// What the rotary checks say of the contour to the A axis, which parts
     /// the bar at A 270° (LIO-208): the part, with what the angle before left
     /// round it.
-    const PARTED: &str = "Flats at A 270°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-52 to X-40, and nothing else joins the 40 × 30 × 20 mm piece of it (17520 mm³) from X-40 to X-10 to the bar the chuck holds, so it comes loose, to be thrown or to break the tool. Leave a web of the stock that holds it (the stock is checked in 1 mm cells: a thinner web counts as cut through, and a loose piece over 2 mm long or 2 mm³ is not taken for a chip); a part-off is not an operation yet.";
-
-    #[test]
-    fn a_contour_to_the_axis_that_cuts_the_part_off_the_bar_is_refused_where_it_does() {
-        // Each angle's passes across the bar's ends go to the A axis: after
-        // A 270° nothing joins the part to the bar on the axis, between the
-        // Ø12 cutter's edges at X-52.06 and X-40.06 (to the 1 mm cells).
-        // Said once, at the angle that parts it.
-        let (_, _, said) = four_angles("10");
-        assert_eq!(said, vec![PARTED.to_string()]);
-        // On a 250 mm bar the part and the 63 mm of bar beyond it, out to
-        // its free end.
-        let (_, _, said) = four_angles_on(250., "10");
-        assert_eq!(said.len(), 1, "{said:?}");
-        assert!(
-            said[0].starts_with("Flats at A 270°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-75 to X-63, and nothing else joins the 68 × 40 × 40 mm piece of it (79878 mm³) from X-68 to X0"),
-            "{said:?}"
-        );
-    }
-
-    #[test]
-    fn a_contour_to_the_parts_bottom_leaves_a_fin_at_the_bars_end_that_is_refused() {
-        // To the part's bottom, 10 mm under the axis, as the demo job once
-        // did: already at A 90° the round corner of the passes at the bar's
-        // free end leaves a fin 3 × 3 mm across, 20 mm tall, on less than a
-        // millimetre of the bar. Under three voxels thick, the first check
-        // took it for a chip (LIO-211).
-        let (_, _, said) = four_angles("0");
-        assert_eq!(said.len(), 1, "{said:?}");
-        assert!(
-            said[0].starts_with("Flats at A 90°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-10 to X-3, and nothing else joins the 20 × 3 × 3 mm piece of it (60 mm³) from X-3 to X0 to the bar the chuck holds"),
-            "{said:?}"
-        );
-    }
+    pub(crate) const PARTED: &str = "Flats at A 270°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-52 to X-40, and nothing else joins the 40 × 30 × 20 mm piece of it (17520 mm³) from X-40 to X-10 to the bar the chuck holds, so it comes loose, to be thrown or to break the tool. Leave a web of the stock that holds it (the stock is checked in 1 mm cells: a thinner web counts as cut through, and a loose piece over 2 mm long or 2 mm³ is not taken for a chip); a part-off is not an operation yet.";
 
     /// What the part-off check says of setup 2 of a Ø40 bar `len` mm long,
     /// 20 mm of it in the jaws, at A 90, 180, 270 and 0°, its contour's moves
@@ -2452,37 +2386,6 @@ mod tests {
     }
 
     #[test]
-    fn a_web_too_thin_to_hold_is_refused_with_its_size_and_a_sound_one_passes() {
-        // 0.8 mm over the axis at all four angles leaves the part on a
-        // 1.6 mm square neck: it was seen, and passed. It is refused, on the
-        // 120 and the 250 mm bar, as soon as the cuts leave it under 3 mm
-        // across, with the square web the cut's force needs.
-        for len in [120., 250.] {
-            let (_, _, said) = four_angles_on(len, "10.8");
-            assert_eq!(said.len(), 1, "{len}: {said:?}");
-            let s = &said[0];
-            assert!(
-                s.starts_with("Flats at A 270°, Contour: the web the cuts leave at X"),
-                "{s}"
-            );
-            assert!(s.contains("2 mm across at its thinnest: a web under 3 mm across does not hold what is beyond it, and to hold the cut's 168 N"), "{s}");
-            assert!(s.contains("a square one about 13."), "{s}");
-        }
-        // 2 mm over it, a 4 mm square web: thick enough to be one, too thin
-        // to hold the cut on the part out of it: refused with the stresses.
-        let (_, _, said) = four_angles("12");
-        assert_eq!(
-            said,
-            vec!["Flats at A 270°, Contour: the web the cuts leave at X-48.5, between the bar the chuck holds and the 48.5 mm of it out to X0, is 92 mm² and 4.49 mm across at its thinnest: the cut's 168 N 48.5 mm out bends it at 215 N/mm² and its 4085 N·mm about A twist it at 42 N/mm², 227 N/mm² together, against the 70 N/mm² the stock (no material is chosen: taken as copper, the least of the metals) yields at (×0.3, under the ×2 wanted). It needs to be about 13.35 mm square. Leave a thicker web or take a lighter cut (the stock is checked in 1 mm cells); a part-off is not an operation yet.".to_string()]
-        );
-        // 7 mm over it, a 14 mm web (`on_the_bar`), holds on both bars.
-        for len in [120., 250.] {
-            let (_, _, said) = four_angles_on(len, "17");
-            assert!(said.is_empty(), "{len}: {said:?}");
-        }
-    }
-
-    #[test]
     fn held_is_inside_the_jaws_grip_not_anything_behind_their_front() {
         // A core of the bar inside the jaws, cut free of the shell they grip
         // round it (an annulus round it and a slab across its end), is not
@@ -2575,85 +2478,5 @@ mod tests {
             let pieces = grid.loose(&v, &whole, &grid.held(&v));
             assert_eq!(!pieces.is_empty(), loose, "{len} cells");
         }
-    }
-
-    #[test]
-    fn the_export_the_plan_check_and_the_run_refuse_a_cut_that_parts_the_bar() {
-        for (bottom, parts) in [("10", true), ("17", false)] {
-            let (mut doc, mesh, _) = four_angles(bottom);
-            let posted = crate::post::post_job(&doc, &mesh);
-            match parts {
-                true => {
-                    let refused = posted.setups[1].result.as_ref().unwrap_err();
-                    assert!(refused.contains(&PARTED.to_string()), "{refused:?}");
-                }
-                false => assert!(
-                    posted.setups[1].result.is_ok(),
-                    "{:?}",
-                    posted.setups[1].result
-                ),
-            }
-            crate::proposal::tests::aluminium(&mut doc);
-            doc.active = doc.setups[0].id.clone();
-            let report = crate::analysis::report(&doc, &mesh).unwrap();
-            let check = crate::plan_check::check_built(&doc, &mesh, &report);
-            let said = check.problems.iter().filter(|p| p.message == PARTED);
-            assert_eq!(said.count(), usize::from(parts), "{:?}", check.problems);
-            // A run's admission on a UC100 too, once: the machine with the
-            // CNC4030's UC100 profile.
-            let dir = tempfile::tempdir().unwrap();
-            let uc100 = crate::control::rotary_machine(dir.path()).unwrap();
-            for k in ["controller", "uc100_profile"] {
-                let v = get(&uc100.p, k).to_string();
-                doc.setups[0].machine.p.insert(k.into(), v);
-            }
-            doc.sync_indexed();
-            let ready = crate::run::ready(&doc, &mesh, 1, 0);
-            let said = ready.problems.iter().filter(|m| m.as_str() == PARTED);
-            assert_eq!(said.count(), usize::from(parts), "{:?}", ready.problems);
-        }
-    }
-
-    #[test]
-    fn a_cut_through_in_the_first_setup_in_the_chuck_is_refused_too() {
-        use crate::indexed::tests::on_the_bar;
-        // Setup 1, at A0 with no A, contours the part down to the bar's
-        // bottom: its passes across the bar's ends cut it through.
-        let mesh = prism(30.);
-        let mut doc = bar_job(&mesh, 20., "100", "-150", "90", on_the_bar(&cutter("12")));
-        let mut through = contour(&doc.tools[0]);
-        through.p.insert("bottom".into(), "-10".into());
-        doc.setups[0].operations = vec![through];
-        doc.sync_stock_sources();
-        doc.sync_turns(Some(&mesh));
-        let sims = crate::run::simulated_for_tests(&doc, &mesh, 0);
-        let said: Vec<String> = problems(&doc, &mesh, 0, &sims)
-            .into_iter()
-            .map(|(_, m)| m)
-            .collect();
-        let name = doc.setups[0].name();
-        assert_eq!(said.len(), 1, "{said:?}");
-        assert!(
-            said[0].starts_with(&format!("{name} at A 0°, Contour: the cuts leave nothing of the Ø40 mm bar on the A axis from X-52 to X-40, and nothing else joins the 40 × 30 × 20 mm piece of it (23040 mm³) from X-40 to X-10")),
-            "{said:?}"
-        );
-        doc.tools[0].p.insert("number".into(), "1".into());
-        doc.file = Some(crate::model::ModelFile {
-            name: "bar.stl".into(),
-            path: "bar.stl".into(),
-            format: "STL".into(),
-            bytes: 0,
-            thickness: None,
-        });
-        let posted = crate::post::post_job(&doc, &mesh);
-        let refused = posted.setups[0].result.as_ref().unwrap_err();
-        assert!(refused.contains(&said[0]), "{refused:?}");
-        // The same cut in a 3-axis setup, the stock in a vise: not this
-        // check's, unchanged.
-        doc.setups.truncate(1);
-        doc.setups[0].p.insert("holding".into(), "Vise".into());
-        let sims = crate::run::simulated_for_tests(&doc, &mesh, 0);
-        assert!(sims.iter().all(|(_, r)| r.is_ok()));
-        assert!(problems(&doc, &mesh, 0, &sims).is_empty());
     }
 }

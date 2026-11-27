@@ -266,7 +266,7 @@ pub struct Stack {
 }
 impl Stack {
     /// The tool tip's height over the table at setup Z `z`.
-    fn height(&self, z: f32) -> Option<f32> {
+    pub(crate) fn height(&self, z: f32) -> Option<f32> {
         self.z0.map(|z0| self.base + z - z0)
     }
     /// The stack of setup `si` of `doc`, or None when it cannot be told:
@@ -499,13 +499,13 @@ pub fn problems(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::model::Setup;
     use crate::post::fixture;
 
     /// A CNC machine with the placeholders, and Z travel of 55 mm.
-    fn machine(nose: &str, height: &str, width: &str) -> Machine {
+    pub(crate) fn machine(nose: &str, height: &str, width: &str) -> Machine {
         let mut m = Machine::new(3);
         for (k, v) in [
             ("x", "390"),
@@ -519,12 +519,9 @@ mod tests {
         }
         m
     }
-    fn simulated(doc: &Document, mesh: &Mesh) -> Vec<(usize, Result<Simulation, String>)> {
-        crate::run::simulated_for_tests(doc, mesh, 0)
-    }
     /// `fixture::job` held in the starter vise on a machine of the given
     /// clearances, only its drilling enabled.
-    fn drilled(m: Machine, base: Option<&str>) -> (Document, Mesh) {
+    pub(crate) fn drilled(m: Machine, base: Option<&str>) -> (Document, Mesh) {
         let (mut doc, mesh) = fixture::job();
         doc.adopt_holders();
         for op in &mut doc.setups[0].operations {
@@ -547,302 +544,6 @@ mod tests {
         p.insert("vise_grip".into(), "8".into());
         doc.setups[0].machine = m;
         (doc, mesh)
-    }
-
-    #[test]
-    fn a_machine_without_the_figures_is_not_checked_and_a_bad_one_is_said() {
-        let (doc, mesh) = drilled(machine("", "", ""), Some("25"));
-        assert!(problems(&doc, &mesh, 0, &simulated(&doc, &mesh)).is_empty());
-        assert!(!Machine::new(3).p.contains_key("nose_to_table"));
-        assert!(issues(&machine("150", "120", "390")).is_empty());
-        assert!(issues(&machine("", "", "")).is_empty());
-        assert_eq!(
-            issues(&machine("0", "120", "390")),
-            ["Spindle nose to table at Z top must be greater than zero."]
-        );
-        assert_eq!(
-            issues(&machine("150", "abc", "390")),
-            ["Gantry clearance height must be greater than zero."]
-        );
-        assert_eq!(
-            issues(&machine("150", "120", "300")),
-            [
-                "Gantry clearance width cannot be narrower than the 390 mm X travel the spindle crosses it over."
-            ]
-        );
-        let mut m = machine("150", "120", "390");
-        m.p.insert("nose_to_table_source".into(), "guess".into());
-        assert_eq!(
-            issues(&m),
-            ["Spindle nose to table at Z top: choose ASSUMED or Measured."]
-        );
-    }
-
-    #[test]
-    fn the_stack_up_is_the_vise_the_stock_and_the_tool_up_to_the_nose() {
-        // The fixture's stock is 98 mm along Y; the vise holds it by 8 mm.
-        let (doc, mesh) = drilled(machine("1000", "1000", "1000"), Some("25"));
-        let stack = Stack::of(&doc, &mesh, 0).unwrap();
-        let height = doc.setup_stock(0, Some(&mesh)).unwrap().dimensions()[2];
-        assert_eq!(stack.base, 25.);
-        assert!(!stack.base_assumed);
-        assert_eq!(stack.stock_top, 25. + height);
-        assert_eq!(stack.top, stack.stock_top);
-        // A frame Z is the stock's underside at the base, rising with it.
-        let stock = doc.setup_stock(0, Some(&mesh)).unwrap();
-        assert_eq!(stack.height(stock.min[2]), Some(25.));
-        assert_eq!(stack.height(stock.max[2]), Some(25. + height));
-        // Roomy: the job passes, and a library vise that gives no height
-        // is taken as the typical one, saying so.
-        assert!(problems(&doc, &mesh, 0, &simulated(&doc, &mesh)).is_empty());
-        let (doc, mesh) = drilled(machine("1000", "1000", "1000"), None);
-        let stack = Stack::of(&doc, &mesh, 0).unwrap();
-        assert_eq!((stack.base, stack.base_assumed), (VISE_BASE, true));
-        assert!(stack.what.contains("taken"), "{}", stack.what);
-        // Clamps and nothing stand on the table.
-        let mut none = doc.clone();
-        none.setups[0].p.insert("holding".into(), "None".into());
-        let stack = Stack::of(&none, &mesh, 0).unwrap();
-        assert_eq!((stack.base, stack.base_assumed), (0., false));
-        assert!(
-            stack.what.starts_with("on the table, the stock's "),
-            "{}",
-            stack.what
-        );
-    }
-
-    #[test]
-    fn a_part_taller_than_the_gantry_is_refused_naming_the_numbers() {
-        let (doc, mesh) = drilled(machine("1000", "50", "1000"), Some("25"));
-        let stack = Stack::of(&doc, &mesh, 0).unwrap();
-        let found = problems(&doc, &mesh, 0, &simulated(&doc, &mesh));
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].0, None);
-        let top = super::mm(stack.top);
-        assert!(
-            found[0].1.contains(&format!(
-                "the part doesn't fit under the gantry: needs {top} mm, has 50 mm."
-            )),
-            "{}",
-            found[0].1
-        );
-        // The same part under a gantry with the room passes, and one marked
-        // ASSUMED says so in the refusal.
-        let tall = stack.top + 1.;
-        let (roomy, _) = drilled(machine("1000", &tall.to_string(), "1000"), Some("25"));
-        assert!(problems(&roomy, &mesh, 0, &simulated(&roomy, &mesh)).is_empty());
-        let (mut doc, mesh) = drilled(machine("1000", "50", "1000"), Some("25"));
-        doc.setups[0]
-            .machine
-            .p
-            .insert("gantry_height_source".into(), ASSUMED.into());
-        let found = problems(&doc, &mesh, 0, &simulated(&doc, &mesh));
-        assert!(
-            found[0].1.contains("has 50 mm (ASSUMED, not measured"),
-            "{}",
-            found[0].1
-        );
-    }
-
-    #[test]
-    fn a_part_wider_than_the_gantry_is_refused() {
-        let (doc, mesh) = drilled(machine("1000", "1000", "10"), Some("25"));
-        let found = problems(&doc, &mesh, 0, &simulated(&doc, &mesh));
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert!(
-            found[0].1.contains("doesn't fit under the gantry: needs ")
-                && found[0].1.contains(" mm across X, has 10 mm"),
-            "{}",
-            found[0].1
-        );
-    }
-
-    /// LIO-457: the gantry's width spans the axis across the table: Y on a
-    /// machine whose X runs front to back.
-    #[test]
-    fn the_gantry_width_is_across_the_table_whichever_axis_that_is() {
-        use crate::orient::{KEY, Orient};
-        // X 500 long, Y 200 across, the gantry 250 wide.
-        let mut m = machine("150", "120", "250");
-        m.p.insert("x".into(), "500".into());
-        m.p.insert("y".into(), "200".into());
-        for (o, issue) in [
-            ("Right", Some("the 500 mm X travel")),
-            ("Left", Some("the 500 mm X travel")),
-            ("Away from you", None),
-            ("Toward you", None),
-        ] {
-            m.p.insert(KEY.into(), o.into());
-            let found = issues(&m);
-            match issue {
-                Some(words) => assert!(found.iter().any(|e| e.contains(words)), "{o}: {found:?}"),
-                None => assert!(found.is_empty(), "{o}: {found:?}"),
-            }
-        }
-        m.p.insert("x".into(), "200".into());
-        m.p.insert("y".into(), "500".into());
-        m.p.insert(KEY.into(), "Away from you".into());
-        assert!(
-            issues(&m).iter().any(|e| e.contains("the 500 mm Y travel")),
-            "{:?}",
-            issues(&m)
-        );
-        // A part that fits across one way and not the other: its reach
-        // across X and across Y, and a gantry between the two.
-        // The vise's jaws along X: wider across X than across Y.
-        let (mut doc, mesh) = drilled(machine("1000", "1000", "1000"), Some("25"));
-        doc.setups[0].p.insert("vise_axis".into(), "X".into());
-        let reach = |o: Orient| {
-            let mut d = doc.clone();
-            d.setups[0].machine.p.insert(KEY.into(), o.label().into());
-            let [lo, hi] = Stack::of(&d, &mesh, 0).unwrap().across.unwrap();
-            hi - lo
-        };
-        let (wx, wy) = (reach(Orient::Right), reach(Orient::Away));
-        assert!((wx - wy).abs() > 2., "{wx} {wy}");
-        assert_eq!(reach(Orient::Left), wx);
-        assert_eq!(reach(Orient::Toward), wy);
-        let limit = format!("{}", (wx + wy) / 2.);
-        for o in [Orient::Right, Orient::Left, Orient::Away, Orient::Toward] {
-            let (mut d, mesh) = drilled(machine("1000", "1000", &limit), Some("25"));
-            d.setups[0].p.insert("vise_axis".into(), "X".into());
-            d.setups[0].machine.p.insert(KEY.into(), o.label().into());
-            let found = problems(&d, &mesh, 0, &simulated(&d, &mesh));
-            let wide = if o.across() == 0 { wx > wy } else { wy > wx };
-            let axis = ["X", "Y"][o.across()];
-            assert_eq!(
-                found
-                    .iter()
-                    .any(|(_, e)| e.contains(&format!(" mm across {axis}, has "))),
-                wide,
-                "{o:?}: {found:?}"
-            );
-            assert_eq!(found.len(), usize::from(wide), "{o:?}: {found:?}");
-        }
-    }
-
-    #[test]
-    fn a_tool_that_reaches_the_nose_is_refused_with_its_stick_out_and_holder() {
-        let (mut doc, mesh) = drilled(machine("1000", "1000", "1000"), Some("25"));
-        let sims = simulated(&doc, &mesh);
-        let op = &doc.setups[0].operations[sims[0].0];
-        let (stickout, id) = (
-            sims[0].1.as_ref().unwrap().plan.tool_length,
-            op.tool.clone(),
-        );
-        let tool = doc.tools.iter_mut().find(|t| t.id == id).unwrap();
-        tool.p.insert("holder_length".into(), "20".into());
-        let stack = Stack::of(&doc, &mesh, 0).unwrap();
-        let sim = sims[0].1.as_ref().unwrap();
-        let high = sim
-            .plan
-            .moves
-            .iter()
-            .flat_map(|m| [m.from[2], m.to[2]])
-            .filter_map(|z| stack.height(z))
-            .fold(stack.stock_top, f32::max);
-        let needs = high + stickout + 20.;
-        // A hair of room passes; a hair short is refused with the sum.
-        doc.setups[0]
-            .machine
-            .p
-            .insert("nose_to_table".into(), (needs + 0.1).to_string());
-        assert!(problems(&doc, &mesh, 0, &sims).is_empty());
-        doc.setups[0]
-            .machine
-            .p
-            .insert("nose_to_table".into(), (needs - 0.1).to_string());
-        let found = problems(&doc, &mesh, 0, &sims);
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert_eq!(found[0].0, Some(sims[0].0));
-        let said = &found[0].1;
-        assert!(
-            said.contains(&format!(
-                "the tool doesn't fit under the spindle: needs {} mm, has {} mm from the table",
-                super::mm(needs),
-                super::mm(needs - 0.1)
-            )),
-            "{said}"
-        );
-        assert!(
-            said.contains(&format!(
-                "{} mm stick-out and 20 mm holder",
-                super::mm(stickout)
-            )),
-            "{said}"
-        );
-        assert!(!said.contains("is taken"), "{said}");
-        // A tool that gives no holder length is taken as the short default.
-        doc.tools
-            .iter_mut()
-            .find(|t| t.id == id)
-            .unwrap()
-            .p
-            .remove("holder_length");
-        let found = problems(&doc, &mesh, 0, &sims);
-        assert!(
-            found.is_empty() || found[0].1.contains("The holder's 10 mm length is taken"),
-            "{found:?}"
-        );
-    }
-
-    #[test]
-    fn a_tool_too_short_to_reach_down_is_refused_only_for_a_measured_nose_height() {
-        let (mut doc, mesh) = drilled(machine("150", "1000", "1000"), Some("25"));
-        // A long Z travel, so that the span of the job is inside it.
-        doc.setups[0].machine.p.insert("z".into(), "100".into());
-        let sims = simulated(&doc, &mesh);
-        // The drilling goes down through the stock to near the vise.
-        let stack = Stack::of(&doc, &mesh, 0).unwrap();
-        let sim = sims[0].1.as_ref().unwrap();
-        let tool = sim.plan.tool_length + HOLDER_LENGTH;
-        let low = sim
-            .plan
-            .moves
-            .iter()
-            .flat_map(|m| [m.from[2], m.to[2]])
-            .filter_map(|z| stack.height(z))
-            .fold(f32::INFINITY, f32::min);
-        let id = doc.setups[0].operations[sims[0].0].tool.clone();
-        doc.tools
-            .iter_mut()
-            .find(|t| t.id == id)
-            .unwrap()
-            .p
-            .remove("holder_length");
-        // The tip's lowest reach is `low` + 1 mm too high.
-        let nose = low + 1. + tool + 100.;
-        doc.setups[0]
-            .machine
-            .p
-            .insert("nose_to_table".into(), nose.to_string());
-        let found = problems(&doc, &mesh, 0, &sims);
-        assert!(found.is_empty(), "{found:?}");
-        doc.setups[0]
-            .machine
-            .p
-            .insert("nose_to_table_source".into(), ASSUMED.into());
-        assert!(problems(&doc, &mesh, 0, &sims).is_empty());
-        doc.setups[0]
-            .machine
-            .p
-            .insert("nose_to_table_source".into(), MEASURED.into());
-        let found = problems(&doc, &mesh, 0, &sims);
-        assert_eq!(found.len(), 1, "{found:?}");
-        assert!(
-            found[0]
-                .1
-                .contains("the tool can't reach down: the cut goes to"),
-            "{}",
-            found[0].1
-        );
-        assert!(found[0].1.contains("100 mm Z travel"), "{}", found[0].1);
-        // Lower by 2 mm: it reaches.
-        doc.setups[0]
-            .machine
-            .p
-            .insert("nose_to_table".into(), (nose - 2.).to_string());
-        assert!(problems(&doc, &mesh, 0, &sims).is_empty());
     }
 
     #[test]
@@ -905,8 +606,8 @@ mod tests {
     fn the_library_machines_carry_the_assumed_placeholders_and_are_valid() {
         let dir = tempfile::tempdir().unwrap();
         for m in [
-            crate::control::owners_machine(dir.path()).unwrap(),
-            crate::control::rotary_machine(dir.path()).unwrap(),
+            crate::machine_profile::owners_machine(dir.path()).unwrap(),
+            crate::machine_profile::rotary_machine(dir.path()).unwrap(),
         ] {
             assert!(m.issues().is_empty(), "{:?}", m.issues());
             for (key, _, value) in CLEARANCES {
@@ -927,7 +628,7 @@ mod tests {
     #[test]
     fn a_workspace_saved_before_the_clearances_adopts_them_once_on_load() {
         let dir = tempfile::tempdir().unwrap();
-        let mut old = crate::control::owners_machine(dir.path()).unwrap();
+        let mut old = crate::machine_profile::owners_machine(dir.path()).unwrap();
         for (key, _, _) in CLEARANCES {
             old.p.remove(key);
         }
@@ -996,25 +697,5 @@ mod tests {
             "{}",
             found[0].1
         );
-    }
-
-    #[test]
-    fn export_run_and_the_plan_check_see_the_refusal() {
-        let (doc, mesh) = drilled(machine("1000", "50", "1000"), Some("25"));
-        let said = |messages: &[String]| {
-            messages
-                .iter()
-                .filter(|m| m.contains("doesn't fit under the gantry"))
-                .count()
-        };
-        let posted = crate::post::post_job(&doc, &mesh);
-        assert_eq!(said(posted.setups[0].result.as_ref().unwrap_err()), 1);
-        assert_eq!(said(&crate::run::ready(&doc, &mesh, 0, 0).problems), 1);
-        // The same job on a gantry with the room is ready.
-        let (doc, mesh) = drilled(machine("1000", "1000", "1000"), Some("25"));
-        assert_eq!(said(&crate::run::ready(&doc, &mesh, 0, 0).problems), 0);
-        let posted = crate::post::post_job(&doc, &mesh);
-        let errors = posted.setups[0].result.clone().err().unwrap_or_default();
-        assert_eq!(said(&errors), 0);
     }
 }

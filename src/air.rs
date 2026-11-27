@@ -795,7 +795,7 @@ fn relink(
     blend: f32,
 ) -> (Plan, Option<Trimmed>) {
     // The plan's clearance: where its rapids cross from its first cut on,
-    // which a run splits its steps at (`run::step_clearance`). A chuck-held
+    // which a run splits its steps at (`step_clearance`). A chuck-held
     // plan comes in from higher, over what the jaws swing
     // (`indexed::enter_held`); a link up there would be the only rise a
     // run splits at, and the plan's own retracts to its clearance between
@@ -803,7 +803,7 @@ fn relink(
     if !plan.moves.iter().any(|m| m.motion == Motion::Rapid) {
         return (plan, None);
     }
-    let clearance = crate::run::step_clearance(&plan);
+    let clearance = step_clearance(&plan);
     if !clearance.is_finite() {
         return (plan, None);
     }
@@ -1179,6 +1179,23 @@ fn relink(
     plan.keep_air = keep_air;
     plan.duration = clock;
     (plan, Some(trimmed))
+}
+
+/// The clearance a plan's steps start at (`plan_steps`): the highest Z it
+/// moves at from its first feed move on. Its way in may come from higher, as
+/// a chuck-held plan does from over what its jaws swing
+/// (`indexed::enter_held`), but it never rises there again, so steps by that
+/// height would be one: a bore at a time is the clearance it retracts to
+/// (LIO-555). The highest Z of all for a plan without a feed move. Air
+/// trimming's links between levels rise to it too (`air::relink`, LIO-565).
+pub(crate) fn step_clearance(plan: &Plan) -> f32 {
+    let moves = &plan.moves;
+    let first = (moves.iter())
+        .position(|m| m.motion == Motion::Feed)
+        .unwrap_or(0);
+    (moves[first..].iter())
+        .map(|m| m.from[2].max(m.to[2]))
+        .fold(f32::NEG_INFINITY, f32::max)
 }
 
 #[cfg(test)]

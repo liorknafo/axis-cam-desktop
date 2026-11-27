@@ -140,7 +140,7 @@ fn rotary_report(doc: &Document, setup1: &Setup) -> Option<RotaryReport> {
         a_max: r2(num(m, "rotary_max")?),
         grip_min: r2(unit.grip_min),
         grip_max: r2(unit.grip_max),
-        centreline: if doc.centre_mark(&setup1.machine) == crate::control::MEASURED {
+        centreline: if doc.centre_mark(&setup1.machine) == crate::machine_profile::MEASURED {
             "measured"
         } else {
             "assumed"
@@ -1723,7 +1723,7 @@ pub(crate) fn machine_report(machine: &crate::model::Machine) -> Result<MachineR
         1.
     };
     let mut max_rpm = num(&machine.p, "rpm").unwrap_or(0.);
-    if let Some(cap) = crate::control::spindle_cap(machine)? {
+    if let Some(cap) = crate::machine_profile::spindle_cap(machine)? {
         max_rpm = max_rpm.min(cap);
     }
     Ok(MachineReport {
@@ -1731,7 +1731,7 @@ pub(crate) fn machine_report(machine: &crate::model::Machine) -> Result<MachineR
         max_feed: r2(num(&machine.p, "feed").unwrap_or(0.) * inch),
         travel: ["x", "y", "z"].map(|k| r2(num(&machine.p, k).unwrap_or(0.) * inch)),
         clearance: clearance_report(machine, inch),
-        coolants: crate::control::coolants(machine)?,
+        coolants: crate::machine_profile::coolants(machine)?,
     })
 }
 /// The machine's clearances for the report, None when it gives none.

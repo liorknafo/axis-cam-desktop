@@ -585,225 +585,7 @@ fn feedback(check: &CheckReport) -> String {
         )
     }
 }
-/// Unicode 16's combining marks (general category M: accents, vowel signs,
-/// viramas, tone marks, enclosing marks) as sorted half-open ranges: first,
-/// last + 1, first, last + 1, …
-const MARKS: [u32; 642] = [
-    0x0300, 0x0370, 0x0483, 0x048A, 0x0591, 0x05BE, 0x05BF, 0x05C0, 0x05C1, 0x05C3, 0x05C4, 0x05C6,
-    0x05C7, 0x05C8, 0x0610, 0x061B, 0x064B, 0x0660, 0x0670, 0x0671, 0x06D6, 0x06DD, 0x06DF, 0x06E5,
-    0x06E7, 0x06E9, 0x06EA, 0x06EE, 0x0711, 0x0712, 0x0730, 0x074B, 0x07A6, 0x07B1, 0x07EB, 0x07F4,
-    0x07FD, 0x07FE, 0x0816, 0x081A, 0x081B, 0x0824, 0x0825, 0x0828, 0x0829, 0x082E, 0x0859, 0x085C,
-    0x0897, 0x08A0, 0x08CA, 0x08E2, 0x08E3, 0x0904, 0x093A, 0x093D, 0x093E, 0x0950, 0x0951, 0x0958,
-    0x0962, 0x0964, 0x0981, 0x0984, 0x09BC, 0x09BD, 0x09BE, 0x09C5, 0x09C7, 0x09C9, 0x09CB, 0x09CE,
-    0x09D7, 0x09D8, 0x09E2, 0x09E4, 0x09FE, 0x09FF, 0x0A01, 0x0A04, 0x0A3C, 0x0A3D, 0x0A3E, 0x0A43,
-    0x0A47, 0x0A49, 0x0A4B, 0x0A4E, 0x0A51, 0x0A52, 0x0A70, 0x0A72, 0x0A75, 0x0A76, 0x0A81, 0x0A84,
-    0x0ABC, 0x0ABD, 0x0ABE, 0x0AC6, 0x0AC7, 0x0ACA, 0x0ACB, 0x0ACE, 0x0AE2, 0x0AE4, 0x0AFA, 0x0B00,
-    0x0B01, 0x0B04, 0x0B3C, 0x0B3D, 0x0B3E, 0x0B45, 0x0B47, 0x0B49, 0x0B4B, 0x0B4E, 0x0B55, 0x0B58,
-    0x0B62, 0x0B64, 0x0B82, 0x0B83, 0x0BBE, 0x0BC3, 0x0BC6, 0x0BC9, 0x0BCA, 0x0BCE, 0x0BD7, 0x0BD8,
-    0x0C00, 0x0C05, 0x0C3C, 0x0C3D, 0x0C3E, 0x0C45, 0x0C46, 0x0C49, 0x0C4A, 0x0C4E, 0x0C55, 0x0C57,
-    0x0C62, 0x0C64, 0x0C81, 0x0C84, 0x0CBC, 0x0CBD, 0x0CBE, 0x0CC5, 0x0CC6, 0x0CC9, 0x0CCA, 0x0CCE,
-    0x0CD5, 0x0CD7, 0x0CE2, 0x0CE4, 0x0CF3, 0x0CF4, 0x0D00, 0x0D04, 0x0D3B, 0x0D3D, 0x0D3E, 0x0D45,
-    0x0D46, 0x0D49, 0x0D4A, 0x0D4E, 0x0D57, 0x0D58, 0x0D62, 0x0D64, 0x0D81, 0x0D84, 0x0DCA, 0x0DCB,
-    0x0DCF, 0x0DD5, 0x0DD6, 0x0DD7, 0x0DD8, 0x0DE0, 0x0DF2, 0x0DF4, 0x0E31, 0x0E32, 0x0E34, 0x0E3B,
-    0x0E47, 0x0E4F, 0x0EB1, 0x0EB2, 0x0EB4, 0x0EBD, 0x0EC8, 0x0ECF, 0x0F18, 0x0F1A, 0x0F35, 0x0F36,
-    0x0F37, 0x0F38, 0x0F39, 0x0F3A, 0x0F3E, 0x0F40, 0x0F71, 0x0F85, 0x0F86, 0x0F88, 0x0F8D, 0x0F98,
-    0x0F99, 0x0FBD, 0x0FC6, 0x0FC7, 0x102B, 0x103F, 0x1056, 0x105A, 0x105E, 0x1061, 0x1062, 0x1065,
-    0x1067, 0x106E, 0x1071, 0x1075, 0x1082, 0x108E, 0x108F, 0x1090, 0x109A, 0x109E, 0x135D, 0x1360,
-    0x1712, 0x1716, 0x1732, 0x1735, 0x1752, 0x1754, 0x1772, 0x1774, 0x17B4, 0x17D4, 0x17DD, 0x17DE,
-    0x180B, 0x180E, 0x180F, 0x1810, 0x1885, 0x1887, 0x18A9, 0x18AA, 0x1920, 0x192C, 0x1930, 0x193C,
-    0x1A17, 0x1A1C, 0x1A55, 0x1A5F, 0x1A60, 0x1A7D, 0x1A7F, 0x1A80, 0x1AB0, 0x1ACF, 0x1B00, 0x1B05,
-    0x1B34, 0x1B45, 0x1B6B, 0x1B74, 0x1B80, 0x1B83, 0x1BA1, 0x1BAE, 0x1BE6, 0x1BF4, 0x1C24, 0x1C38,
-    0x1CD0, 0x1CD3, 0x1CD4, 0x1CE9, 0x1CED, 0x1CEE, 0x1CF4, 0x1CF5, 0x1CF7, 0x1CFA, 0x1DC0, 0x1E00,
-    0x20D0, 0x20F1, 0x2CEF, 0x2CF2, 0x2D7F, 0x2D80, 0x2DE0, 0x2E00, 0x302A, 0x3030, 0x3099, 0x309B,
-    0xA66F, 0xA673, 0xA674, 0xA67E, 0xA69E, 0xA6A0, 0xA6F0, 0xA6F2, 0xA802, 0xA803, 0xA806, 0xA807,
-    0xA80B, 0xA80C, 0xA823, 0xA828, 0xA82C, 0xA82D, 0xA880, 0xA882, 0xA8B4, 0xA8C6, 0xA8E0, 0xA8F2,
-    0xA8FF, 0xA900, 0xA926, 0xA92E, 0xA947, 0xA954, 0xA980, 0xA984, 0xA9B3, 0xA9C1, 0xA9E5, 0xA9E6,
-    0xAA29, 0xAA37, 0xAA43, 0xAA44, 0xAA4C, 0xAA4E, 0xAA7B, 0xAA7E, 0xAAB0, 0xAAB1, 0xAAB2, 0xAAB5,
-    0xAAB7, 0xAAB9, 0xAABE, 0xAAC0, 0xAAC1, 0xAAC2, 0xAAEB, 0xAAF0, 0xAAF5, 0xAAF7, 0xABE3, 0xABEB,
-    0xABEC, 0xABEE, 0xFB1E, 0xFB1F, 0xFE00, 0xFE10, 0xFE20, 0xFE30, 0x101FD, 0x101FE, 0x102E0,
-    0x102E1, 0x10376, 0x1037B, 0x10A01, 0x10A04, 0x10A05, 0x10A07, 0x10A0C, 0x10A10, 0x10A38,
-    0x10A3B, 0x10A3F, 0x10A40, 0x10AE5, 0x10AE7, 0x10D24, 0x10D28, 0x10D69, 0x10D6E, 0x10EAB,
-    0x10EAD, 0x10EFC, 0x10F00, 0x10F46, 0x10F51, 0x10F82, 0x10F86, 0x11000, 0x11003, 0x11038,
-    0x11047, 0x11070, 0x11071, 0x11073, 0x11075, 0x1107F, 0x11083, 0x110B0, 0x110BB, 0x110C2,
-    0x110C3, 0x11100, 0x11103, 0x11127, 0x11135, 0x11145, 0x11147, 0x11173, 0x11174, 0x11180,
-    0x11183, 0x111B3, 0x111C1, 0x111C9, 0x111CD, 0x111CE, 0x111D0, 0x1122C, 0x11238, 0x1123E,
-    0x1123F, 0x11241, 0x11242, 0x112DF, 0x112EB, 0x11300, 0x11304, 0x1133B, 0x1133D, 0x1133E,
-    0x11345, 0x11347, 0x11349, 0x1134B, 0x1134E, 0x11357, 0x11358, 0x11362, 0x11364, 0x11366,
-    0x1136D, 0x11370, 0x11375, 0x113B8, 0x113C1, 0x113C2, 0x113C3, 0x113C5, 0x113C6, 0x113C7,
-    0x113CB, 0x113CC, 0x113D1, 0x113D2, 0x113D3, 0x113E1, 0x113E3, 0x11435, 0x11447, 0x1145E,
-    0x1145F, 0x114B0, 0x114C4, 0x115AF, 0x115B6, 0x115B8, 0x115C1, 0x115DC, 0x115DE, 0x11630,
-    0x11641, 0x116AB, 0x116B8, 0x1171D, 0x1172C, 0x1182C, 0x1183B, 0x11930, 0x11936, 0x11937,
-    0x11939, 0x1193B, 0x1193F, 0x11940, 0x11941, 0x11942, 0x11944, 0x119D1, 0x119D8, 0x119DA,
-    0x119E1, 0x119E4, 0x119E5, 0x11A01, 0x11A0B, 0x11A33, 0x11A3A, 0x11A3B, 0x11A3F, 0x11A47,
-    0x11A48, 0x11A51, 0x11A5C, 0x11A8A, 0x11A9A, 0x11C2F, 0x11C37, 0x11C38, 0x11C40, 0x11C92,
-    0x11CA8, 0x11CA9, 0x11CB7, 0x11D31, 0x11D37, 0x11D3A, 0x11D3B, 0x11D3C, 0x11D3E, 0x11D3F,
-    0x11D46, 0x11D47, 0x11D48, 0x11D8A, 0x11D8F, 0x11D90, 0x11D92, 0x11D93, 0x11D98, 0x11EF3,
-    0x11EF7, 0x11F00, 0x11F02, 0x11F03, 0x11F04, 0x11F34, 0x11F3B, 0x11F3E, 0x11F43, 0x11F5A,
-    0x11F5B, 0x13440, 0x13441, 0x13447, 0x13456, 0x1611E, 0x16130, 0x16AF0, 0x16AF5, 0x16B30,
-    0x16B37, 0x16F4F, 0x16F50, 0x16F51, 0x16F88, 0x16F8F, 0x16F93, 0x16FE4, 0x16FE5, 0x16FF0,
-    0x16FF2, 0x1BC9D, 0x1BC9F, 0x1CF00, 0x1CF2E, 0x1CF30, 0x1CF47, 0x1D165, 0x1D16A, 0x1D16D,
-    0x1D173, 0x1D17B, 0x1D183, 0x1D185, 0x1D18C, 0x1D1AA, 0x1D1AE, 0x1D242, 0x1D245, 0x1DA00,
-    0x1DA37, 0x1DA3B, 0x1DA6D, 0x1DA75, 0x1DA76, 0x1DA84, 0x1DA85, 0x1DA9B, 0x1DAA0, 0x1DAA1,
-    0x1DAB0, 0x1E000, 0x1E007, 0x1E008, 0x1E019, 0x1E01B, 0x1E022, 0x1E023, 0x1E025, 0x1E026,
-    0x1E02B, 0x1E08F, 0x1E090, 0x1E130, 0x1E137, 0x1E2AE, 0x1E2AF, 0x1E2EC, 0x1E2F0, 0x1E4EC,
-    0x1E4F0, 0x1E5EE, 0x1E5F0, 0x1E8D0, 0x1E8D7, 0x1E944, 0x1E94B, 0xE0100, 0xE01F0,
-];
-/// A combining mark, drawn on the character before it.
-fn combining(c: char) -> bool {
-    // An odd count of bounds at or below `c` puts it inside a range.
-    MARKS.partition_point(|&bound| bound <= u32::from(c)) % 2 == 1
-}
-/// A letter of any script that a name keeps. Letters drawn as quotation
-/// marks, primes or apostrophes are not kept: the modifier letters (ʺ ˮ ʹ ʻ
-/// ʼ), the Greek numeral sign, ՙ, ߴ ߵ, ꞈ, Ꞌ ꞌ, the Canadian syllabics finals
-/// ᐟ ᐠ ᐥ, ŉ and the Duployan affixes.
-fn name_letter(c: char) -> bool {
-    c.is_alphabetic()
-        && !combining(c)
-        && !matches!(
-            c,
-            '\u{149}'
-                | '\u{2b0}'..='\u{2ff}'
-                | '\u{374}'
-                | '\u{559}'
-                | '\u{7f4}'
-                | '\u{7f5}'
-                | '\u{141f}'
-                | '\u{1420}'
-                | '\u{1425}'
-                | '\u{a788}'
-                | '\u{a78b}'
-                | '\u{a78c}'
-                | '\u{1bc80}'..='\u{1bc93}'
-        )
-}
-/// A format character that joins or breaks words without being drawn: the
-/// soft hyphen, the zero-width space, non-joiner and joiner, the direction
-/// marks, the word joiner, the invisible operators and the byte order mark.
-fn invisible(c: char) -> bool {
-    matches!(c, '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{2060}'..='\u{2064}' | '\u{feff}')
-}
-/// A character as a name reads it: fullwidth forms of ASCII (！ to ～)
-/// become ASCII, except the fullwidth quotation marks ＂ and ＇, which stay
-/// fullwidth and go; dashes and minus signs (U+2010–2015, U+2212, U+FE58,
-/// U+FE63 and, through its ASCII form, U+FF0D) become -; the wave dash 〜
-/// (and, through its ASCII form, ～) becomes ~; the Arabic decimal and
-/// thousands separators and percent sign (U+066B, U+066C, U+066A) become
-/// . , and %; the fraction and division slashes (U+2044, U+2215) become /;
-/// ∅ (U+2205) becomes ⌀; and × becomes x.
-fn name_form(c: char) -> char {
-    let c = match c {
-        '\u{ff02}' | '\u{ff07}' => c,
-        '\u{ff01}'..='\u{ff5e}' => char::from_u32(u32::from(c) - 0xfee0).unwrap_or(c),
-        _ => c,
-    };
-    match c {
-        '\u{2010}'..='\u{2015}' | '\u{2212}' | '\u{fe58}' | '\u{fe63}' => '-',
-        '\u{301c}' => '~',
-        '\u{66b}' => '.',
-        '\u{66c}' => ',',
-        '\u{66a}' => '%',
-        '\u{2044}' | '\u{2215}' => '/',
-        '\u{2205}' => '\u{2300}',
-        '\u{d7}' => 'x',
-        _ => c,
-    }
-}
-/// A setup or operation name the model chose, as one cleaned line of at most
-/// 60 characters. Each character is first read as `name_form` gives it, so
-/// "1–4", "1～4", "۳٫۵", "Z−0.5", "10×10" and "（左）" keep their meaning. The
-/// name keeps letters and digits of any script, the combining marks on a
-/// kept letter and - _ . , / ( ) # + : & % ~ < > = ± ° ⌀ ≤ ≥. A * between
-/// two digits, white space aside, becomes x ("10 * 10" is "10 x 10"); any
-/// other * is removed, so "**Roughing**" is "Roughing". An apostrophe
-/// (' or ’) stays between a letter or digit and a letter, so "Bob's" and
-/// "Op 2's" do too; combining marks are skipped back to the letter they are
-/// on, so a decomposed "José's" keeps it as well. `invisible` format
-/// characters go without a trace, so a Persian word written with a
-/// zero-width non-joiner, or "Bohrung" with a soft hyphen, stays one word,
-/// and a middle dot · inside Catalan l·l goes the same way ("paral·lel" is
-/// "parallel"); elsewhere it separates words ("드릴·탭" is "드릴 탭"). Every other character becomes a space, and runs of spaces
-/// become one, so words and numbers never run together, and no quotation or
-/// check mark, or listed look-alike, can close the app's quotes around the
-/// name or pass for the app's check lines or the " · " between their fields.
-pub(crate) fn name(text: &str) -> String {
-    let mut kept = String::new();
-    let mut chars = text
-        .chars()
-        .filter(|&c| !invisible(c))
-        .map(name_form)
-        .peekable();
-    // The last character that is not a combining mark, and whether it is a
-    // kept letter, whose marks stay.
-    let (mut base, mut on_letter) = (None::<char>, false);
-    // The last character that is not white space.
-    let mut before = None::<char>;
-    while let Some(c) = chars.next() {
-        let previous = before;
-        if !c.is_whitespace() {
-            before = Some(c);
-        }
-        // A * between two digits, white space aside, is a times sign; any
-        // other * is removed like other symbols.
-        let c = match c {
-            '*' if previous.is_some_and(char::is_numeric)
-                && chars
-                    .clone()
-                    .find(|next| !next.is_whitespace())
-                    .is_some_and(char::is_numeric) =>
-            {
-                'x'
-            }
-            _ => c,
-        };
-        if combining(c) {
-            kept.push(if on_letter { c } else { ' ' });
-            continue;
-        }
-        // A middle dot inside Catalan l·l goes without a space; anywhere
-        // else it separates words, as in Korean "드릴·탭" (drill and tap).
-        if c == '\u{b7}'
-            && matches!(base, Some('l' | 'L'))
-            && matches!(chars.peek(), Some('l' | 'L'))
-        {
-            continue;
-        }
-        let apostrophe = matches!(c, '\'' | '\u{2019}')
-            && base.is_some_and(|b| name_letter(b) || b.is_numeric())
-            && chars.peek().is_some_and(|&next| name_letter(next));
-        on_letter = name_letter(c);
-        let keep = on_letter
-            || c.is_numeric()
-            || apostrophe
-            || matches!(
-                c,
-                '-' | '_'
-                    | '.'
-                    | ','
-                    | '/'
-                    | '('
-                    | ')'
-                    | '#'
-                    | '+'
-                    | ':'
-                    | '&'
-                    | '%'
-                    | '~'
-                    | '<'
-                    | '>'
-                    | '='
-                    | '\u{b1}'
-                    | '\u{b0}'
-                    | '\u{2300}'
-                    | '\u{2264}'
-                    | '\u{2265}'
-            );
-        kept.push(if keep { c } else { ' ' });
-        base = Some(c);
-    }
-    // One line: runs of spaces become one, and none is left at either end.
-    proposal::clip(&kept, 60)
-}
+pub(crate) use crate::names::name;
 /// The model's free text, cleaned and bounded once, before anything keeps or
 /// shows it, and before the check builds the job from it. Returns how many
 /// warnings and unmachined entries were left out.
@@ -833,9 +615,7 @@ pub(crate) fn tidy(mut p: Proposal) -> (Proposal, usize, usize) {
 }
 /// What joins the planner's workholding note to setup 1's own notes.
 const PLANNER_NOTE: &str = " · Planner: ";
-/// Setup 1's parameter that keeps the planner note the last Apply added,
-/// saved with the project, so a later Apply finds that exact text again.
-pub(crate) const PLANNER_NOTE_KEY: &str = "planner_note";
+pub(crate) use crate::proposal::PLANNER_NOTE_KEY;
 /// Setup 1's notes after Apply, and the planner note to keep in its
 /// `planner_note` parameter (empty when there is none). The planner's
 /// workholding note joins the notes on one line, "… · Planner: …", or
@@ -1648,6 +1428,7 @@ pub(crate) fn view_after(
 pub(crate) mod tests {
     use super::*;
     use crate::model::{Setup, get};
+    use crate::names::{MARKS, combining};
     use crate::openai::ToolCall;
     use crate::proposal::tests::{block, good};
     use std::sync::Mutex;
@@ -5884,5 +5665,410 @@ pub(crate) mod tests {
             outcome.report.rotary.as_ref().unwrap().centreline,
             "assumed"
         );
+    }
+    mod proposal_tests {
+        use super::*;
+        use crate::analysis;
+        use crate::analysis::PartReport;
+        use crate::mesh::Mesh;
+        use crate::model::Document;
+        use crate::model::Strategy;
+        use crate::model::get;
+        use crate::proposal::tests::*;
+        use crate::proposal::*;
+        use serde_json::Value;
+        use serde_json::json;
+
+        /// The rotary scenario's project, report and the plan that ends it,
+        /// with `edit` applied to the plan.
+        fn rotary(edit: impl FnOnce(&mut Proposal)) -> (Document, Mesh, PartReport, Proposal) {
+            let (doc, mesh, report) = crate::fake_openai::rotary::report();
+            let mut plan = crate::fake_openai::rotary::good();
+            edit(&mut plan);
+            (doc, mesh, report, plan)
+        }
+        /// A change of a plan on a rotary machine asks for `from` as well as
+        /// the chuck and the angles, and the schema stays strict.
+        #[test]
+        fn the_schema_of_a_change_on_a_rotary_machine_has_from_and_the_chuck() {
+            let both = schema_with(true, true);
+            let setup = &both["properties"]["setups"]["items"];
+            let op = &setup["properties"]["operations"]["items"];
+            for (object, key) in [
+                (setup, "from"),
+                (setup, "a_angles"),
+                (op, "from"),
+                (&both, "chuck"),
+            ] {
+                assert!(object["properties"].get(key).is_some(), "{key}");
+                let required = object["required"].as_array().unwrap();
+                assert!(required.contains(&json!(key)), "{key}");
+                assert_eq!(
+                    required.len(),
+                    object["properties"].as_object().unwrap().len()
+                );
+                assert_eq!(object["additionalProperties"], false);
+            }
+            let (_, _, report, _) = rotary(|_| {});
+            assert_eq!(schema_with(true, false), schema_for(true));
+            assert_eq!(schema_with(false, true), schema_on(&report));
+            assert_eq!(schema_with(false, false), schema());
+        }
+        /// The planner cannot change a plan that holds the stock in the chuck
+        /// on A or indexes A (it makes those afresh): it says so before
+        /// anything is sent.
+        #[test]
+        fn a_plan_on_the_chuck_or_indexing_a_is_not_described_for_a_change() {
+            let (doc, mesh, report, plan) = rotary(|_| {});
+            let job = build(&doc, &mesh, &report, &plan).unwrap();
+            assert!(crate::chuck::holds(&job.setups[0]));
+            let e = describe(&job, &report).unwrap_err();
+            assert!(
+                e.starts_with(
+                    "Setup 1 holds the stock in the chuck on A, so the planner cannot change this plan."
+                ),
+                "{e}"
+            );
+            let mut loose = job.clone();
+            loose.setups[0].p.insert("holding".into(), "None".into());
+            assert!(crate::indexed::is_indexed(&loose.setups[1]));
+            let e = describe(&loose, &report).unwrap_err();
+            assert!(e.starts_with("Setup 2 indexes A"), "{e}");
+        }
+        #[test]
+        fn the_rotary_schema_asks_for_the_chuck_and_the_angles_and_stays_strict() {
+            fn walk(value: &Value, objects: &mut usize) {
+                if value["type"] == "object" {
+                    *objects += 1;
+                    let keys: Vec<&String> =
+                        value["properties"].as_object().unwrap().keys().collect();
+                    assert_eq!(value["required"].as_array().unwrap().len(), keys.len());
+                    assert_eq!(value["additionalProperties"], false);
+                }
+                match value {
+                    Value::Object(map) => map.values().for_each(|v| walk(v, objects)),
+                    Value::Array(items) => items.iter().for_each(|v| walk(v, objects)),
+                    _ => {}
+                }
+            }
+            let (_, _, report, plan) = rotary(|_| {});
+            let schema = schema_on(&report);
+            let mut objects = 0;
+            walk(&schema, &mut objects);
+            // The proposal, its chuck, a setup, an operation, its tabs and
+            // chamfer, and an unmachined entry.
+            assert_eq!(objects, 7);
+            let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+            let props = |v: &Value| keys(&v["properties"]);
+            let value = serde_json::to_value(&plan).unwrap();
+            assert_eq!(keys(&value), props(&schema));
+            assert_eq!(
+                keys(&value["chuck"]),
+                props(&schema["properties"]["chuck"]["anyOf"][0])
+            );
+            let setup = &schema["properties"]["setups"]["items"];
+            assert_eq!(keys(&value["setups"][1]), props(setup));
+            // The angles are numbers or null; the chuck an object or null.
+            assert_eq!(
+                setup["properties"]["a_angles"],
+                json!({"type": ["array", "null"], "items": {"type": "number"}})
+            );
+            assert_eq!(
+                schema["properties"]["chuck"]["anyOf"][1],
+                json!({"type": "null"})
+            );
+            // What the model answers reads back, null or not.
+            assert_eq!(parse(&value.to_string()).unwrap(), plan);
+            let mut nulls = value;
+            nulls["chuck"] = Value::Null;
+            nulls["setups"][1]["a_angles"] = Value::Null;
+            let parsed = parse(&nulls.to_string()).unwrap();
+            assert!(parsed.chuck.is_none() && parsed.setups[1].a_angles.is_none());
+        }
+        #[test]
+        fn a_machine_without_a_rotary_axis_refuses_a_chuck_and_angles() {
+            let (doc, mesh, report) = block();
+            assert!(report.rotary.is_none());
+            let mut plan = good(&report);
+            plan.chuck = rotary(|_| {}).3.chuck;
+            plan.setups[1].a_angles = Some(vec![90.]);
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert!(
+                said.iter()
+                    .any(|m| m.contains("`chuck` must be null: this machine has no rotary A axis"))
+                    && said.iter().any(|m| m.contains("`a_angles` must be null")),
+                "{said:?}"
+            );
+        }
+        #[test]
+        fn a_chuck_seats_setup_1s_stock_and_an_indexed_setup_is_made_as_the_setups_page_makes_it() {
+            let (doc, mesh, report, plan) = rotary(|_| {});
+            let built = build(&doc, &mesh, &report, &plan).unwrap();
+            let (first, second) = (&built.setups[0], &built.setups[1]);
+            // Setup 1: a 24 mm box of the proposal's length, in a 4-jaw chuck with
+            // the chuck's defaults and the A axis as its work zero.
+            assert_eq!(
+                [
+                    get(&first.p, "stock_type"),
+                    get(&first.p, "stock_x"),
+                    get(&first.p, "stock_y")
+                ],
+                ["Fixed size box", "130", "24"]
+            );
+            assert_eq!(
+                [
+                    get(&first.p, "holding"),
+                    get(&first.p, "chuck_jaws"),
+                    get(&first.p, "chuck_stickout")
+                ],
+                ["Chuck", "4-jaw", "90"]
+            );
+            assert_eq!(get(&first.p, "chuck_tailstock"), "Off the table");
+            assert_eq!(get(&first.p, "chuck_jaw_angle"), "0");
+            assert_eq!(get(&first.p, "holding_gap"), "2");
+            assert_eq!(get(&first.p, "origin"), crate::indexed::ORIGINS[0]);
+            assert_eq!(first.id, doc.setups[0].id);
+            // The part sits in the stick-out, 2 mm short of the free end, on the axis.
+            let stock = built.setup_stock(0, Some(&mesh)).unwrap();
+            let placed = crate::stock::Placement::new(&mesh, Some(first)).bounds;
+            let scale = mesh.display_scale();
+            assert!(
+                (placed.max[0] / scale - (stock.max[0] - crate::proposal::FREE_END)).abs() < 0.01
+            );
+            let mid = |b: crate::mesh::Bounds, k: usize| (b.min[k] + b.max[k]) / 2.;
+            assert!((mid(placed, 1) / scale - mid(stock, 1)).abs() < 0.01);
+            assert!((mid(placed, 2) / scale - mid(stock, 2)).abs() < 0.01);
+            // Setup 2 is the Reposition choice with its angles, and the rest is setup 1's.
+            assert_eq!(get(&second.p, "reposition"), crate::indexed::ACTION);
+            assert_eq!(get(&second.p, crate::indexed::ANGLES), "0, 90, 180, 270");
+            assert!(crate::indexed::is_indexed(second));
+            assert_eq!(built.index_base(1), Some(0));
+            for key in [
+                "offset",
+                "holding",
+                "chuck_jaws",
+                "origin",
+                "stock_type",
+                "tx",
+                "tz",
+            ] {
+                assert_eq!(get(&second.p, key), get(&first.p, key), "{key}");
+            }
+            assert_eq!(second.machine.id, first.machine.id);
+            assert_eq!(get(&second.p, "notes"), "The bar in the chuck.");
+            assert_eq!(second.turn.map(|t| (t.base, t.a)), Some((0, 0.)));
+            assert!(built.validate_structure().is_ok());
+        }
+        #[test]
+        fn a_round_bar_is_seated_on_its_axis_and_a_part_that_does_not_fit_is_refused() {
+            let round = |diameter, stickout| {
+                move |plan: &mut Proposal| {
+                    let chuck = plan.chuck.as_mut().unwrap();
+                    chuck.stock = "Round bar".into();
+                    (chuck.diameter, chuck.width, chuck.height) = (Some(diameter), None, None);
+                    chuck.jaws = "3-jaw".into();
+                    chuck.stickout = stickout;
+                }
+            };
+            let (doc, mesh, report, plan) = rotary(round(30., 60.));
+            let built = build(&doc, &mesh, &report, &plan).unwrap();
+            let first = &built.setups[0];
+            assert_eq!(
+                [
+                    get(&first.p, "stock_type"),
+                    get(&first.p, "stock_diameter"),
+                    get(&first.p, "stock_length")
+                ],
+                ["Round bar", "30", "130"]
+            );
+            // The 20 × 20 mm part is 28.28 mm across its corners.
+            let (doc, mesh, report, plan) = rotary(round(28., 60.));
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(
+                said[0].contains("needs a bar of at least Ø28.29 mm, not Ø28 mm"),
+                "{said:?}"
+            );
+            // 30 mm of part and 2 mm of stock beyond it do not fit a 31 mm stick-out.
+            let (doc, mesh, report, plan) = rotary(round(30., 31.));
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert!(
+                said[0].contains("needs a stick-out of at least 32.00 mm, not 31 mm"),
+                "{said:?}"
+            );
+        }
+        #[test]
+        fn a_stock_the_chuck_cannot_hold_is_refused_with_the_chucks_own_message() {
+            // A 3-jaw chuck cannot hold a box.
+            let (doc, mesh, report, plan) =
+                rotary(|p| p.chuck.as_mut().unwrap().jaws = "3-jaw".into());
+            let said = build(&doc, &mesh, &report, &plan).unwrap_err();
+            assert_eq!((said[0].setup, said[0].stage), (1, "workholding"));
+            assert!(
+                said[0]
+                    .message
+                    .contains("A 3-jaw chuck centres round stock"),
+                "{said:?}"
+            );
+            // Wider across its corners than the rotary unit takes.
+            let (doc, mesh, report, plan) = rotary(|p| {
+                let chuck = p.chuck.as_mut().unwrap();
+                (chuck.width, chuck.height) = (Some(60.), Some(60.));
+            });
+            let said = build(&doc, &mesh, &report, &plan).unwrap_err();
+            assert!(
+                said.iter()
+                    .any(|p| p.message.contains("the jaws grip from Ø5 to Ø80 mm")),
+                "{said:?}"
+            );
+            // Nothing but the two choices of the schema is a jaw or a tailstock choice.
+            let (doc, mesh, report, plan) =
+                rotary(|p| p.chuck.as_mut().unwrap().jaws = "5-jaw".into());
+            assert!(
+                messages(build(&doc, &mesh, &report, &plan))[0]
+                    .contains("\"5-jaw\" is not a chuck jaws choice")
+            );
+        }
+        #[test]
+        fn the_orientation_of_an_indexed_setup_is_the_one_its_first_angle_brings_up() {
+            // With +Z up in setup 1, positive A brings +Y up at 90, -Z at 180, -Y at 270.
+            for (angle, up) in [(0., "+Z"), (90., "+Y"), (180., "-Z"), (270., "-Y")] {
+                let (doc, mesh, report, plan) = rotary(|p| {
+                    p.setups[1].a_angles = Some(vec![angle]);
+                    p.setups[1].orientation = up.into();
+                    p.setups[1].operations = vec![op("Contour", 1, vec![])];
+                });
+                assert!(build(&doc, &mesh, &report, &plan).is_ok(), "A {angle} {up}");
+            }
+            let (doc, mesh, report, plan) = rotary(|p| {
+                p.setups[1].a_angles = Some(vec![90., 180.]);
+                p.setups[1].orientation = "+Z".into();
+            });
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(
+                said[0].contains("At A 90° the part shows +Y up, not +Z"),
+                "{said:?}"
+            );
+            // An angle that turns no face up has none to name.
+            let (doc, mesh, report, plan) = rotary(|p| p.setups[1].a_angles = Some(vec![45.]));
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert!(
+                said[0].contains("At A 45° no face of the part is up"),
+                "{said:?}"
+            );
+        }
+        #[test]
+        fn an_indexed_setup_is_refused_for_what_the_setups_page_refuses() {
+            // An angle outside the machine's A range (-360° to 360°), a repeat, none.
+            for (angles, words) in [
+                (
+                    vec![400.],
+                    "A 400° is outside the machine's A range, -360° to 360°.",
+                ),
+                (vec![90., 90.], "A 90° is listed twice."),
+                (vec![], "List the A angles to index to"),
+            ] {
+                let (doc, mesh, report, plan) = rotary(|p| p.setups[1].a_angles = Some(angles));
+                let said = messages(build(&doc, &mesh, &report, &plan));
+                assert!(said.iter().any(|m| m.contains(words)), "{words}: {said:?}");
+            }
+            // Several angles run each operation at every one of them, so no surfaces ...
+            let (doc, mesh, report, plan) = rotary(|p| {
+                let top = report_top(&crate::fake_openai::rotary::report().2);
+                p.setups[1].operations = vec![op("Contour", 1, top)];
+            });
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(
+                said[0].starts_with(
+                    "2/Some(1): This setup runs every operation at each of its A angles"
+                ) && said[0].contains("Contour outside, Parallel or Waterline"),
+                "{said:?}"
+            );
+            // ... but a Face of the sides each angle brings up (LIO-214): one top
+            // plane alone leaves the angles after it nothing to face, a surface
+            // that is on top at none of them is refused.
+            let (doc, mesh, report, plan) = rotary(|p| {
+                let top = report_top(&crate::fake_openai::rotary::report().2);
+                p.setups[1].operations = vec![op("Face", 1, top)];
+            });
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert_eq!(said.len(), 1, "{said:?}");
+            assert!(
+                said[0].starts_with("2/Some(1): None of the surfaces is the top plane of +Y"),
+                "{said:?}"
+            );
+            let (doc, mesh, report, plan) = rotary(|p| {
+                let mut ids = p.setups[1].operations[0].surfaces.clone();
+                ids.push(usize::MAX);
+                p.setups[1].operations[0].surfaces = ids;
+            });
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert!(
+                said.len() == 1
+                    && said[0].contains(&format!("Surface {} is not the top plane", usize::MAX)),
+                "{said:?}"
+            );
+            // The four sides build as one Face, its tool centre out to the edges.
+            let (doc, mesh, report, plan) = rotary(|_| {});
+            let built = build(&doc, &mesh, &report, &plan).unwrap();
+            let face = &built.setups[1].operations[0];
+            assert_eq!(face.strategy, Strategy::Face);
+            assert_eq!(face.surfaces.as_ref().unwrap().ids.len(), 4);
+            assert_eq!(
+                (get(&face.p, "boundary"), get(&face.p, "containment")),
+                ("Selected geometry", "Tool center on boundary")
+            );
+            // One angle may use them: its orientation is told.
+            let (doc, mesh, report, plan) = rotary(|p| {
+                let top = report_top(&crate::fake_openai::rotary::report().2);
+                p.setups[1].a_angles = Some(vec![0.]);
+                p.setups[1].operations = vec![op("Face", 1, top)];
+            });
+            assert!(build(&doc, &mesh, &report, &plan).is_ok());
+            // The holder is the chuck's.
+            let (mut doc, mesh, report, plan) = rotary(|p| p.setups[1].holder = Some(1));
+            doc.adopt_holders();
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert!(
+                said.iter()
+                    .any(|m| m
+                        .contains("holder must be null: an indexed setup is held by the chuck")),
+                "{said:?}"
+            );
+            // The stock must be in the chuck: without `chuck` setup 1 keeps the user's.
+            let (doc, mesh, report, plan) = rotary(|p| p.chuck = None);
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert!(
+                said.iter()
+                    .any(|m| m.contains("a_angles index the stock in the chuck")),
+                "{said:?}"
+            );
+            // ... and an indexed setup cannot come first.
+            let (doc, mesh, report, plan) = rotary(|p| {
+                p.setups.remove(0);
+                p.setups[0].a_angles = Some(vec![90.]);
+                p.setups[0].orientation = "+Y".into();
+            });
+            let said = messages(build(&doc, &mesh, &report, &plan));
+            assert!(
+                said.iter()
+                    .any(|m| m.contains("The first setup cannot index A")),
+                "{said:?}"
+            );
+        }
+        #[test]
+        fn a_user_chuck_in_setup_1_takes_indexed_setups_without_a_chuck_proposal() {
+            let (doc, mesh, report, plan) = rotary(|p| p.chuck = None);
+            // Build the chuck into the project as the user would, then plan on it.
+            let seated = build(&doc, &mesh, &report, &crate::fake_openai::rotary::good()).unwrap();
+            let report = analysis::report(&seated, &mesh).unwrap();
+            assert_eq!(report.workholding.as_ref().unwrap().kind, "Chuck");
+            let built = build(&seated, &mesh, &report, &plan).unwrap();
+            assert_eq!(get(&built.setups[0].p, "holding"), "Chuck");
+            assert_eq!(built.index_base(1), Some(0));
+            assert_eq!(get(&built.setups[0].p, "stock_x"), "130");
+        }
     }
 }

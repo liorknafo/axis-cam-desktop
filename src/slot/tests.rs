@@ -721,65 +721,6 @@ fn drilled_entry_needs_its_full_diameter_past_the_floor() {
     }
 }
 
-#[test]
-#[ignore = "requires private adapter copy; headless App dispatch only"]
-fn toolbar_add_pick_and_edit_use_the_first_class_slot() {
-    let (mut doc, mesh, dir) = adapter();
-    doc.active = doc.setups[2].id.clone();
-    doc.setups[2].operations.truncate(7);
-    let tiles = crate::ui::ribbon_tiles(Some(&doc.setups[2].machine));
-    assert!(
-        tiles
-            .iter()
-            .flat_map(|(_, t)| t)
-            .any(|t| { matches!(t, crate::ui::Tile::Op(Strategy::Slot)) })
-    );
-    let mut app = crate::App::from_workspace(dir.join("pick-state.axis.json"), None);
-    app.doc = doc;
-    app.imported_mesh = Some(mesh);
-    let _ = app.update(crate::Message::AddOp(Strategy::Slot));
-    assert_eq!(app.operation().unwrap().strategy, Strategy::Slot);
-    assert_eq!(app.tab, "Slot");
-    assert!(app.picking);
-    let mesh = app.imported_mesh.as_ref().unwrap();
-    let setup = app.doc.setup();
-    let stock = app.known_stock(2).0.unwrap();
-    let zero = crate::post::datum(setup, stock, mesh).unwrap();
-    let arc = cam::arcs::arcs_among(setup, mesh, &cam::arcs::upright(setup, mesh))
-        .into_iter()
-        .find(|a| {
-            (a.r - 6.5).abs() < 0.0001
-                && (a.centre[0] - zero[0] + 55.35).abs() < 0.0001
-                && (a.centre[1] - zero[1] + 15.4).abs() < 0.0001
-        })
-        .unwrap();
-    let _ = app.update(crate::Message::Surface(arc.walls[0]));
-    assert!(app.status.starts_with("Picked Slot"), "{}", app.status);
-    let op = app.operation().unwrap();
-    for (k, want) in [
-        ("slot_x", -52.85),
-        ("slot_y", -15.4),
-        ("slot_length", 18.),
-        ("slot_width", 13.),
-        ("z_top", -1.5),
-        ("z_bottom", -10.),
-    ] {
-        assert!((num(&op.p, k).unwrap() - want).abs() < 0.001, "{k}");
-    }
-    let _ = app.update(crate::Message::Edit(
-        crate::Target::Operation,
-        "slot_x",
-        "52.85".into(),
-    ));
-    assert_eq!(get(&app.operation().unwrap().p, "slot_x"), "52.85");
-    let texts = crate::ui::probe::texts(app.view(), iced::Size::new(1440., 1000.));
-    assert!(
-        texts.iter().any(|s| s.contains("Overall length")),
-        "{texts:?}"
-    );
-    std::fs::write(dir.join("toolbar-picking.txt"), texts.join("\n")).unwrap();
-}
-
 /// A `w` × `l` plate `t` thick (X −w/2..w/2, Y −l/2..l/2, Z 0..t) with a
 /// round-ended counterbore `width` wide and `length` long along X (Y when
 /// `along_y`), `depth` deep from its top, round X0 Y0 (LIO-455).
@@ -844,7 +785,7 @@ pub(crate) fn job(mesh: &Mesh, diameter: &str, fields: &[(&str, &str)]) -> Docum
 }
 /// The adapter's counterbore (LIO-455): 21.5 long along X, 16.5 wide, 8.9
 /// deep, in a 60 × 50 × 20 plate.
-fn adapter_counterbore(along_y: bool) -> (Document, Mesh) {
+pub(crate) fn adapter_counterbore(along_y: bool) -> (Document, Mesh) {
     let mesh =
         crate::mesh::normalize(counterbore((60., 50., 20.), 21.5, 16.5, 8.9, along_y)).unwrap();
     let doc = job(
@@ -1050,77 +991,6 @@ fn a_wide_slot_steps_out_no_more_than_0_9_of_the_cutter_and_a_ccw_spindle_walks_
         let left = crate::uncut::uncut(&stock, &doc.setups, &mesh);
         assert!(!left.any(), "{spindle}: {:?}", left.regions);
     }
-}
-#[test]
-fn a_narrower_cutters_steps_give_each_pass_its_dro_numbers_and_the_check_the_round() {
-    let (doc, mesh) = adapter_counterbore(false);
-    let shown = crate::steps::shown(&doc, &mesh, 0).unwrap();
-    let g = &shown.guide;
-    let slots: Vec<&crate::guide::Step> = (g.steps.iter())
-        .filter(|s| matches!(s, crate::guide::Step::Slot { .. }))
-        .collect();
-    assert_eq!(slots.len(), 37);
-    // Where the tool is, from step to step.
-    let mut at = [f32::NAN; 2];
-    for s in &slots {
-        let crate::guide::Step::Slot {
-            targets,
-            pass,
-            points,
-            ..
-        } = s
-        else {
-            unreachable!()
-        };
-        assert!(!targets.is_empty());
-        if *pass != Kind::Sweep {
-            // Each of its readings is a number on the page, in order.
-            let feeds: Vec<[f32; 2]> = {
-                let mut out = vec![];
-                for t in targets.iter().filter(|t| t.axis < 2) {
-                    at[t.axis] = t.centre;
-                    if t.feed {
-                        out.push(at);
-                    }
-                }
-                out
-            };
-            for p in points {
-                assert!(
-                    feeds
-                        .iter()
-                        .any(|q| (q[0] - p[0]).abs() < 1e-4 && (q[1] - p[1]).abs() < 1e-4),
-                    "{pass:?}: {p:?}"
-                );
-            }
-            // The walk is closed: it ends where it starts, at the end's tip.
-            assert_eq!(points.first(), points.last());
-            // Out to the walk's tip on the DRO's hundredths: 2.5 + 2.05 for
-            // the outline, + 2.25 for the finish.
-            let tip = if *pass == Kind::Finish { 4.75 } else { 4.55 };
-            assert!(
-                (points[0][0] - tip).abs() < 1e-4,
-                "{pass:?} {:?}",
-                points[0]
-            );
-        } else {
-            for t in targets.iter().filter(|t| t.axis < 2) {
-                at[t.axis] = t.centre;
-            }
-        }
-    }
-    let top = shown.boxes[0].max[2] + g.zero[2];
-    let m = crate::steps::measures(&doc, g, &g.done[0], top);
-    let find = |axis: &str, v: f32| {
-        m.iter()
-            .find(|x| x.axis == axis && (x.value - v).abs() < 0.001)
-            .unwrap_or_else(|| panic!("{axis} {v} in {m:?}"))
-    };
-    find("X", 21.5);
-    find("Y", 16.5);
-    find("Z", 8.9);
-    let r = find("R", 8.25);
-    assert!(r.words[1].contains("0.05"), "{:?}", r.words);
 }
 
 /// The redesigned adapter plate (LIO-455) from a private copy of its STEP
@@ -1517,110 +1387,6 @@ fn a_counterbore_far_from_the_setups_origin_is_planned_as_near_it() {
                 e.contains("sweep") || e.contains("walk reaches past"),
                 "tx {tx} ty {ty} {key} {value} Ø{tool}: {e}"
             );
-        }
-    }
-}
-
-/// The user's own adapter project, a private copy in `AXIS_ADAPTER_COPY`
-/// (adapter-plate.axis.json and the STEP), never the original: every
-/// operation of every setup plans and simulates, the Slots among them
-/// (LIO-455: setup 4's two upper counterbores, far from its origin, were
-/// refused), and every setup's Steps build. Each Slot plans and simulates
-/// in seconds, and each is picked again by its round end in seconds
-/// (LIO-481: setup 4's one counterbore took ten minutes, a pick as long).
-/// Run it on a release build.
-#[test]
-#[ignore = "requires a private copy of the user's adapter project (AXIS_ADAPTER_COPY)"]
-fn the_users_adapter_project_plans_every_slot() {
-    let dir = std::path::PathBuf::from(
-        std::env::var_os("AXIS_ADAPTER_COPY").expect("set AXIS_ADAPTER_COPY to the private copy"),
-    );
-    let mut doc = crate::storage::load(&dir.join("adapter-plate.axis.json")).unwrap();
-    doc.file.as_mut().unwrap().path = dir.join("adapter-plate.step");
-    let mesh = crate::mesh::load_file(doc.file.as_ref().unwrap()).unwrap();
-    let mut failures = vec![];
-    let mut slots = vec![];
-    let mut since = std::time::Instant::now();
-    simulation::sequence_with(
-        &doc,
-        &mesh,
-        None,
-        |si, oi, r| {
-            let op = &doc.setups[si].operations[oi];
-            match r {
-                Ok(_) if op.strategy == Strategy::Slot => {
-                    slots.push((op.name(), since.elapsed().as_secs_f32()));
-                }
-                Ok(_) => {}
-                Err(e) => failures.push(format!("{}/{} {}: {e}", si + 1, oi, op.name())),
-            }
-            since = std::time::Instant::now();
-        },
-        |_, _, _| {},
-    );
-    assert!(failures.is_empty(), "{failures:#?}");
-    assert_eq!(slots.len(), 8);
-    eprintln!("{slots:#?}");
-    assert!(slots.iter().all(|(_, s)| *s < 10.), "{slots:#?}");
-    // Each Slot of setup 4 picked again by its far round end: the fields it
-    // reads back are the operation's, each pick in seconds (the whole
-    // part's arcs, along its threads' relieved roots, took minutes).
-    let si = 3;
-    let first = doc.setups[si]
-        .operations
-        .iter()
-        .find(|o| o.strategy == Strategy::Slot)
-        .unwrap();
-    let here = pick_setup(&doc, &mesh, si, &first.id).unwrap();
-    let stock = crate::stock::resolve(&doc.setups[si], Some(&mesh))
-        .unwrap()
-        .stock;
-    let zero = crate::post::datum(&here, stock, &mesh).unwrap();
-    let g = Geometry::new(&here, &mesh);
-    let mut picks = vec![];
-    for o in doc.setups[si]
-        .operations
-        .iter()
-        .filter(|o| o.strategy == Strategy::Slot)
-    {
-        let slot = Slot::read(o, zero).unwrap();
-        let axis = slot.axis();
-        let half = slot.width / 2.;
-        let tip = (g.triangles.iter())
-            .find(|t| {
-                t.p.iter().all(|p| {
-                    let d = [p[0] - slot.b[0], p[1] - slot.b[1]];
-                    (d[0].hypot(d[1]) - half).abs() < 0.05
-                        && d[axis] > 0.9 * half
-                        && p[2] > slot.bottom - 0.01
-                        && p[2] < slot.top + 0.01
-                })
-            })
-            .and_then(|t| t.feature)
-            .unwrap_or_else(|| panic!("{}: no wall at its far end", o.name()));
-        let pick = Selection {
-            mesh_fingerprint: mesh.fingerprint.clone(),
-            ids: vec![tip],
-        };
-        let took = std::time::Instant::now();
-        let fields =
-            from_face(&here, &mesh, &pick, stock).unwrap_or_else(|e| panic!("{}: {e}", o.name()));
-        let took = took.elapsed().as_secs_f32();
-        for k in ["slot_x", "slot_y", "slot_length", "slot_width"] {
-            let (got, want) = (num(&fields, k).unwrap(), num(&o.p, k).unwrap());
-            assert!(
-                (got - want).abs() < 0.01,
-                "{}: {k} {got} for {want}",
-                o.name()
-            );
-        }
-        picks.push((o.name(), took));
-    }
-    eprintln!("{picks:#?}");
-    assert!(picks.iter().all(|(_, s)| *s < 10.), "{picks:#?}");
-    for si in 0..doc.setups.len() {
-        if let Err(e) = crate::steps::shown(&doc, &mesh, si) {
-            panic!("setup {}: {e}", si + 1);
         }
     }
 }
