@@ -12442,6 +12442,118 @@ flood = { pin = 8 }
         assert!(run_of(&a).start_moved().is_some());
     }
 
+    /// Tool run 1 (the Drill) done and Next on tool run 2: an edit that
+    /// makes a tool run more keeps the Drill done and the start at the
+    /// Face, where an edit used to send it back to the Drill. The Face
+    /// removed, the start moves to the Pocket and says so (LIO-681).
+    #[test]
+    fn an_edit_that_makes_more_tool_runs_keeps_the_start_and_what_was_done() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        // Tool runs [Drill], [Face, Pocket, Contour].
+        let mut a = run_app_of(dir.path(), FAST, &[3, 0, 1, 2]);
+        zeroed(&mut a);
+        a.page = Page::Control;
+        check_run(&mut a, 0);
+        answer_skips(&mut a, 0);
+        {
+            let run = a.control.as_mut().unwrap().run.as_mut().unwrap();
+            run.done = vec![true, false];
+            (run.next, run.from) = (1, 0);
+        }
+        let start = |a: &App| (run_of(a).next, run_of(a).from);
+        let edited = |a: &mut App| {
+            a.last_edit -= crate::EDIT_PAUSE * 2;
+            let _ = a.update(Message::Tick);
+            assert!(run_of(a).programs.is_none());
+            answer_skips(a, 0);
+        };
+        // The Drill duplicated and the copy moved last: a third tool run.
+        a.selected = Some(0);
+        let _ = a.update(Message::DuplicateOp);
+        for _ in 0..3 {
+            let _ = a.update(Message::MoveOp(1));
+        }
+        edited(&mut a);
+        let names = |a: &App| -> Vec<Vec<String>> {
+            (run_of(a).checked().unwrap().iter())
+                .map(|p| p.ops.iter().map(|o| o.name.clone()).collect())
+                .collect()
+        };
+        let drill = names(&a)[0][0].clone();
+        assert_eq!(names(&a).len(), 3, "{:?}", names(&a));
+        assert_eq!(names(&a)[1], ["Face", "Pocket", "Contour · outside"]);
+        assert_eq!(run_of(&a).done, [true, false, false]);
+        assert_eq!(start(&a), (1, 0));
+        assert!(run_of(&a).start_moved().is_none() && run_of(&a).progress_note.is_none());
+        // The Face removed: the start is at the Pocket, and that is said.
+        a.selected = Some(1);
+        assert_eq!(a.doc.setups[0].operations[1].name(), "Face");
+        let _ = a.update(Message::RemoveOp);
+        edited(&mut a);
+        assert_eq!(names(&a)[1], ["Pocket", "Contour · outside"]);
+        assert_eq!(
+            (run_of(&a).done.clone(), start(&a)),
+            (vec![true, false, false], (1, 0))
+        );
+        assert_eq!(
+            run_of(&a).start_moved().as_deref(),
+            Some(
+                "The start was at Face, which the setup no longer runs, so Cycle Start now starts at Pocket, the first operation of tool run 2. Pick the start again in the Operations list if the operations before it are cut."
+            )
+        );
+        // Removing the copy of the Drill keeps the start and the note.
+        a.selected = Some(3);
+        assert_eq!(
+            a.doc.setups[0].operations[3].name(),
+            format!("{drill} · copy")
+        );
+        let _ = a.update(Message::RemoveOp);
+        edited(&mut a);
+        assert_eq!(
+            (run_of(&a).done.clone(), start(&a)),
+            (vec![true, false], (1, 0))
+        );
+        assert!(run_of(&a).start_moved().is_some());
+        // A start picked: nothing more is said.
+        let _ = a.update(Message::Run(R::From(1, 1)));
+        assert!(run_of(&a).start_moved().is_none());
+    }
+
+    /// Next on tool run 2 (the Drill), run to its end: every tool run has
+    /// run, tool run 1 taken as cut. Check again and an edit that changes
+    /// nothing cut leave it so, where they used to send Cycle Start back to
+    /// tool run 1 (LIO-681 stage 2 review).
+    #[test]
+    fn a_run_finished_after_next_stays_finished_over_check_again_and_an_edit() {
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = two_pass_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        answer_skips(&mut a, 0);
+        let _ = a.update(Message::Run(R::Next(1)));
+        let _ = a.update(Message::Run(R::KeepZero));
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_some(), "{:?}", problems(&a));
+        run_until(&mut a, 90., "tool run 2", |r| r.running.is_none());
+        let finished = |a: &App| {
+            let r = run_of(a);
+            assert_eq!((r.done.clone(), r.next), (vec![false, true], 2));
+            assert!(r.start_moved().is_none() && r.progress_note.is_none());
+        };
+        finished(&a);
+        let _ = a.update(Message::Run(R::Check));
+        answer_skips(&mut a, 0);
+        finished(&a);
+        let _ = a.update(Message::Title("Edited".into()));
+        a.last_edit -= crate::EDIT_PAUSE * 2;
+        let _ = a.update(Message::Tick);
+        answer_skips(&mut a, 0);
+        finished(&a);
+        let _ = a.update(Message::Disconnect);
+    }
+
     /// A start picked partway into a tool run (the Pocket, after the Face)
     /// stays on its operation through Check again, Set coolant to Off and
     /// the check after an edit, while its tool run has the same operations:

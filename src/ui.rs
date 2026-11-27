@@ -13390,6 +13390,9 @@ pub(crate) fn program<'a>(app: &'a App, c: &'a crate::control::Connection) -> El
     if let Some(n) = run.start_moved() {
         checks = checks.push(note(n));
     }
+    if let Some(n) = &run.progress_note {
+        checks = checks.push(note(n.clone()));
+    }
     if let Some(n) = &run.journal_note {
         checks = checks.push(note(n.clone()));
     }

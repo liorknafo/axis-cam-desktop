@@ -1128,10 +1128,26 @@ pub struct Run {
     /// Its operations by id (`Left::ops`; empty when it gave none).
     last_passed_ops: Vec<String>,
     /// A check moved a start partway into a tool run back to its first
-    /// operation, its operations having changed: the operation that was
-    /// picked (`op_key`, name), until a start is picked or Cycle Start
-    /// sends a tool run (`start_moved`).
-    start_moved: Option<(String, String)>,
+    /// operation, its operations having changed, or one whose operation the
+    /// setup no longer runs to another (LIO-681): the operation that was
+    /// picked (`op_key`, name) and why, until a start is picked or Cycle
+    /// Start sends a tool run (`start_moved`).
+    start_moved: Option<(String, String, Moved)>,
+    /// A check found operations cut in a tool run done in one not shown
+    /// done that Cycle Start cuts, or new or changed ones before the start
+    /// that it does not (`progress_note`, LIO-681): what the Run panel says
+    /// of them, until the next check, a start is picked or Cycle Start
+    /// sends a tool run.
+    pub progress_note: Option<String>,
+    /// The operations cut in a tool run done that an edit left in none
+    /// done (`Carried::cut`), until new stock: an edit undone shows them
+    /// done again (LIO-681).
+    cut_away: Vec<(String, crate::post::OpState)>,
+    /// The operations a check found before the start and not cut
+    /// (`Carried::skipped`), by `op_key`: said by `progress_note` over the
+    /// checks after, until a start is picked, Cycle Start sends a tool run,
+    /// a skip or new stock (LIO-681).
+    skipped_ops: Vec<String>,
 }
 
 /// What a tool run sent to the Pi was sent from (`Run::follow_record`),
@@ -1253,6 +1269,245 @@ pub fn layout_with_skips(
             row
         })
         .collect()
+}
+
+/// Why a check moved the start off the operation it was at
+/// (`Run::start_moved`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Moved {
+    /// Its tool run's operations changed: back to that tool run's first
+    /// (LIO-636).
+    Changed,
+    /// The setup no longer runs it: to the first operation after it still
+    /// sent (LIO-681).
+    Gone,
+}
+
+/// What was done and where Cycle Start starts, carried from the tool runs
+/// of the last check that passed to those of the next (`carry_progress`,
+/// LIO-681).
+#[derive(Debug, PartialEq)]
+pub(crate) struct Carried {
+    /// Each new tool run: done when each of its operations was cut in a
+    /// tool run done, as it is now.
+    pub done: Vec<bool>,
+    /// The operations cut in a tool run done that are in one not shown done
+    /// now, at or after the start: each with its new tool run (from 0) and
+    /// name.
+    pub lost: Vec<(usize, String)>,
+    /// The operations before the start, in tool runs not done, that were
+    /// neither cut nor before the start then (new, or changed since), or
+    /// were found so before: their `op_key` and name. Cycle Start does not
+    /// cut them (LIO-741).
+    pub skipped: Vec<(String, String)>,
+    pub next: usize,
+    pub from: usize,
+    /// The start moved off its operation: why, and that operation (its
+    /// `op_key` in the last check, name).
+    pub moved: Option<(Moved, String, String)>,
+    /// The operations cut that are in no tool run done now (`op_key`, and
+    /// what it cuts with, `cuts_with`): kept for the next check, so that an
+    /// edit undone shows them done again (`Run::cut_away`).
+    pub cut: Vec<(String, crate::post::OpState)>,
+}
+
+/// What operation `o` cuts with, for whether it is the one cut before:
+/// its strategy, tool, cutter and spindle. Its name, its tool's name and
+/// the coolant change nothing cut (LIO-636).
+fn cuts_with(o: &crate::post::OpState) -> crate::post::OpState {
+    crate::post::OpState {
+        name: String::new(),
+        tool_name: String::new(),
+        coolant: (false, false),
+        ..o.clone()
+    }
+}
+
+/// `Carried` from tool runs `old` to `new`, `done` and the start at
+/// operation `from` of tool run `next` being of `old`, `cut` the
+/// operations cut besides those of its tool runs done, and `skipped` those
+/// found before the start and not cut (`Carried::skipped`). An operation
+/// is known by its id (`Left::ops` of each check, `op_key`), by its index
+/// in the setup when either check gave none, and is the same one while it
+/// cuts with the same (`cuts_with`).
+///
+/// The start follows its operation to whichever tool run has it now. It
+/// stays on it while that tool run has the same operations as the start's
+/// had, else goes to its first, as LIO-636 does. One whose operation the
+/// setup no longer runs, or is in a tool run done now that was not then,
+/// goes to the first operation of the tool run of the first operation
+/// after it still sent and not done. One with nothing after it left to
+/// send (past the last tool run, every tool run having run) goes to the
+/// first operation new or changed since and not cut, or stays past the
+/// last tool run. A run not begun (the start at the setup's start, nothing cut)
+/// starts at the first tool run, whatever its operations.
+pub(crate) fn carry_progress(
+    (old, old_ids): (&[Checked], &[String]),
+    (new, new_ids): (&[Checked], &[String]),
+    (done, cut, skipped): (&[bool], &[(String, crate::post::OpState)], &[String]),
+    (next, from): (usize, usize),
+) -> Carried {
+    struct Op {
+        key: String,
+        state: crate::post::OpState,
+        name: String,
+        run: usize,
+        k: usize,
+    }
+    let by_id = !old_ids.is_empty() && !new_ids.is_empty();
+    let flat = |runs: &[Checked], ids: &[String]| -> Vec<Op> {
+        let ids = if by_id { ids } else { &[][..] };
+        (runs.iter().enumerate())
+            .flat_map(|(run, p)| {
+                (p.indexes.iter().zip(&p.ops).enumerate()).map(move |(k, (&oi, o))| Op {
+                    key: op_key(ids, oi),
+                    state: cuts_with(o),
+                    name: o.name.clone(),
+                    run,
+                    k,
+                })
+            })
+            .collect()
+    };
+    let (was, now) = (flat(old, old_ids), flat(new, new_ids));
+    // Cut: in a tool run done, or before (`cut`).
+    let mut cut: Vec<(String, crate::post::OpState)> = cut.to_vec();
+    for w in was.iter().filter(|w| done.get(w.run) == Some(&true)) {
+        if !cut.iter().any(|c| c.0 == w.key && c.1 == w.state) {
+            cut.push((w.key.clone(), w.state.clone()));
+        }
+    }
+    let was_cut = |o: &Op| cut.iter().any(|c| c.0 == o.key);
+    let cut_now = |o: &Op| cut.iter().any(|c| c.0 == o.key && c.1 == o.state);
+    let new_done: Vec<bool> = (0..new.len())
+        .map(|i| {
+            let ops: Vec<&Op> = now.iter().filter(|o| o.run == i).collect();
+            !ops.is_empty() && ops.iter().all(|o| cut_now(o))
+        })
+        .collect();
+    let first_open = || (new_done.iter().position(|d| !d)).unwrap_or(new.len());
+    let at = |key: &str| now.iter().find(|o| o.key == key);
+    let run_of = |ops: &[Op], run: usize| -> Vec<(String, crate::post::OpState)> {
+        (ops.iter().filter(|o| o.run == run))
+            .map(|o| (o.key.clone(), o.state.clone()))
+            .collect()
+    };
+    let start = was.iter().position(|o| (o.run, o.k) == (next, from));
+    // A start on a tool run done then is that tool run cut again.
+    let again = |s: &Op| done.get(s.run) == Some(&true);
+    let begun = (next, from) != (0, 0) || !cut.is_empty();
+    // Before the start then, or cut: what Cycle Start does not need to cut
+    // again. A start past the last tool run had every operation before it.
+    let behind = |o: &Op| {
+        let before = start.map_or(&was[..], |s| &was[..s]);
+        before.iter().any(|w| w.key == o.key && w.state == o.state) || cut_now(o)
+    };
+    // With nothing after the start left to send: the first operation new or
+    // changed since and not cut, else past the last tool run, where every
+    // tool run has run (LIO-681 review).
+    let past = || {
+        (now.iter())
+            .find(|o| !new_done[o.run] && !behind(o))
+            .map_or((new.len(), 0), |o| (o.run, o.k))
+    };
+    let ((next, from), moved) = match start.map(|s| (s, &was[s])) {
+        _ if !begun => ((first_open(), 0), None),
+        None => (past(), None),
+        Some((_, s)) if let Some(n) = at(&s.key).filter(|n| !new_done[n.run] || again(s)) => {
+            match run_of(&was, s.run) == run_of(&now, n.run) {
+                true => ((n.run, n.k), None),
+                false => ((n.run, 0), Some(Moved::Changed)),
+            }
+        }
+        Some((i, s)) => {
+            let after = (was[i + 1..].iter())
+                .filter_map(|w| at(&w.key))
+                .find(|n| !new_done[n.run]);
+            // Done now (an edit undone): nothing to say.
+            let gone = at(&s.key).is_none().then_some(Moved::Gone);
+            (after.map_or_else(past, |n| (n.run, 0)), gone)
+        }
+    };
+    let moved = moved
+        .zip(start)
+        .map(|(m, s)| (m, was[s].key.clone(), was[s].name.clone()));
+    // Cut in a tool run done, now in one not done that Cycle Start cuts:
+    // before the start, it is taken as cut.
+    let lost = (now.iter())
+        .filter(|o| !new_done[o.run] && (o.run, o.k) >= (next, from) && was_cut(o))
+        .map(|o| (o.run, o.name.clone()))
+        .collect();
+    // Before the start, in a tool run not done: neither cut nor before
+    // the start then, it is new or changed, and not cut (LIO-741). One
+    // found so before still is, while it stays before the start.
+    let skipped = (now.iter())
+        .filter(|o| !new_done[o.run] && (o.run, o.k) < (next, from))
+        .filter(|o| !behind(o) || skipped.contains(&o.key))
+        .map(|o| (o.key.clone(), o.name.clone()))
+        .collect();
+    // Those in a tool run done now are known by it.
+    let done_now = |c: &(String, crate::post::OpState)| {
+        (now.iter()).any(|o| new_done[o.run] && o.key == c.0 && o.state == c.1)
+    };
+    cut.retain(|c| !done_now(c));
+    Carried {
+        done: new_done,
+        lost,
+        skipped,
+        next,
+        from,
+        moved,
+        cut,
+    }
+}
+
+/// What the Run panel says after a check of operations cut in a tool run
+/// done that are in one not shown done (`Carried::lost`), and of new or
+/// changed ones before the start (`Carried::skipped`) (LIO-681).
+fn progress_note(c: &Carried) -> Option<String> {
+    let skipped: Vec<String> = c.skipped.iter().map(|s| s.1.clone()).collect();
+    let notes: Vec<String> = [lost_note(&c.lost), skipped_note(&skipped)]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!notes.is_empty()).then(|| notes.join(" "))
+}
+
+/// What the Run panel says of new or changed operations before the start
+/// (`Carried::skipped`).
+fn skipped_note(skipped: &[String]) -> Option<String> {
+    let first = skipped.first()?;
+    Some(match skipped.len() {
+        1 => format!(
+            "{first} comes before the start but is new or has changed since, so Cycle Start will not cut it. Pick the start at {first} in the Operations list if it is to be cut."
+        ),
+        _ => format!(
+            "{} come before the start but are new or have changed since, so Cycle Start will not cut them. Pick the start at {first} in the Operations list if they are to be cut.",
+            crate::post::listed(skipped)
+        ),
+    })
+}
+
+/// What the Run panel says of operations cut in a tool run done that are
+/// in one not shown done after a check (`Carried::lost`).
+fn lost_note(lost: &[(usize, String)]) -> Option<String> {
+    let mut runs: Vec<String> = lost.iter().map(|o| format!("{}", o.0 + 1)).collect();
+    runs.dedup();
+    let names: Vec<&str> = lost.iter().map(|o| o.1.as_str()).collect();
+    let (one, ops) = (runs.len() == 1, names.len() == 1);
+    (!lost.is_empty()).then(|| {
+        format!(
+            "{} {} {} not shown done, though {} in {} {} cut: {} operations have changed since. Pick the start in the Operations list if {} not to be cut again.",
+            if one { "Tool run" } else { "Tool runs" },
+            crate::post::listed(&runs),
+            if one { "is" } else { "are" },
+            crate::post::listed(&names),
+            if one { "it" } else { "them" },
+            if ops { "was" } else { "were" },
+            if one { "its" } else { "their" },
+            if ops { "it is" } else { "they are" },
+        )
+    })
 }
 
 /// FNV-1a over operation `oi` of setup `si` and its tool as the project
@@ -1834,6 +2089,9 @@ impl Run {
             last_passed: None,
             last_passed_ops: vec![],
             start_moved: None,
+            progress_note: None,
+            cut_away: vec![],
+            skipped_ops: vec![],
         }
     }
 
@@ -2461,7 +2719,8 @@ impl Run {
                 })
                 .unwrap_or((new.len(), 0));
             // The start is the skip's now.
-            self.start_moved = None;
+            (self.start_moved, self.progress_note) = (None, None);
+            self.skipped_ops.clear();
         } else if let Ok(new) = programs.as_ref() {
             // The start stays on its operation only when its tool run still
             // has the same operations; the work zero is set for it again.
@@ -2472,40 +2731,50 @@ impl Run {
             // and an edit elsewhere that numbers them otherwise (Duplicate,
             // Remove, Move up of an operation before them) too: they are
             // known by id, where both checks gave them (LIO-636 review).
+            // The start follows its operation, and what was done its
+            // operations, to whichever tool run has them now: an edit that
+            // makes more or fewer tool runs, or moves one, keeps them where
+            // they can be found, and says so where they cannot (LIO-681).
             let ids_now = left.as_ref().map_or(&[][..], |l| &l.ops[..]);
-            let by_id = !ids_now.is_empty() && !self.last_passed_ops.is_empty();
-            let ops = |p: Option<&Checked>, ids: &[String]| {
-                p.map(|p| {
-                    let ops = (p.ops.iter()).map(|o| crate::post::OpState {
-                        coolant: (false, false),
-                        ..o.clone()
-                    });
-                    let ids = match by_id {
-                        true => ids,
-                        false => &[][..],
-                    };
-                    let keys = (p.indexes.iter()).map(|&oi| op_key(ids, oi));
-                    (keys.collect::<Vec<_>>(), ops.collect::<Vec<_>>())
-                })
-            };
             let last = (self.last_passed.as_deref()).and_then(|a| a.as_deref().ok());
-            let was = last.and_then(|c| c.get(self.next));
-            let before = ops(was, &self.last_passed_ops);
-            if self.done.len() != new.len() {
-                self.done = vec![false; new.len()];
-                self.next = 0;
-            }
-            let now = new.get(self.next);
-            let after = ops(now, ids_now);
-            if before.is_none() || before != after {
-                // A start partway that moves says so (LIO-636). One moved
-                // before stays moved from the operation picked then.
-                if let Some(was) = was.filter(|_| self.from > 0) {
-                    self.start_moved = (was.indexes.get(self.from))
-                        .zip(was.ops.get(self.from))
-                        .map(|(&oi, o)| (op_key(&self.last_passed_ops, oi), o.name.clone()));
+            match last {
+                Some(last) => {
+                    let c = carry_progress(
+                        (last, &self.last_passed_ops),
+                        (new, ids_now),
+                        (&self.done, &self.cut_away, &self.skipped_ops),
+                        (self.next, self.from),
+                    );
+                    // A start partway that moves says so (LIO-636), and one at
+                    // a later tool run's first operation or whose operation is
+                    // gone too, unless it was at the setup's start with
+                    // nothing done (LIO-681). One moved before stays moved
+                    // from the operation picked then.
+                    let begun =
+                        self.next > 0 || self.done.contains(&true) || !self.cut_away.is_empty();
+                    self.progress_note = progress_note(&c);
+                    self.skipped_ops = c.skipped.iter().map(|s| s.0.clone()).collect();
+                    match c.moved {
+                        Some((Moved::Changed, key, name)) if self.from > 0 => {
+                            self.start_moved = Some((key, name, Moved::Changed));
+                        }
+                        Some((why, key, name))
+                            if (begun || self.from > 0) && self.start_moved.is_none() =>
+                        {
+                            self.start_moved = Some((key, name, why));
+                        }
+                        _ => {}
+                    }
+                    (self.done, self.next, self.from) = (c.done, c.next, c.from);
+                    self.cut_away = c.cut;
                 }
-                self.from = 0;
+                None => {
+                    if self.done.len() != new.len() {
+                        self.done = vec![false; new.len()];
+                        self.next = 0;
+                    }
+                    self.from = 0;
+                }
             }
         }
         if self.skips.is_empty() {
@@ -3671,7 +3940,8 @@ impl Run {
         self.zero.get_or_insert(zero);
         self.last = Some((tool, s.work_offset[2]));
         self.touched_for = None;
-        (self.outcome, self.start_moved) = (None, None);
+        (self.outcome, self.start_moved, self.progress_note) = (None, None, None);
+        self.skipped_ops.clear();
         Some(Command::Job {
             name,
             actions: Arc::new(actions),
@@ -4739,6 +5009,7 @@ impl Run {
         // to its end on the old, the operator's pick before it kept, is
         // sent again after it (LIO-634 review).
         self.done.iter_mut().for_each(|d| *d = false);
+        (self.cut_away, self.progress_note, self.skipped_ops) = (vec![], None, vec![]);
         if back {
             // A pick at a step is that step again; one not gone back to is
             // the operator's start no more (LIO-634 review).
@@ -5084,7 +5355,9 @@ impl Run {
         let done: Vec<usize> = done.into_iter().filter(|&o| o < oi).collect();
         self.start_step = start;
         (self.keep, self.picked, self.carving) = (Some((done, Some(oi))), None, None);
-        (self.zeroed, self.tool_kept, self.start_moved) = (false, false, None);
+        (self.zeroed, self.tool_kept) = (false, false);
+        (self.start_moved, self.progress_note) = (None, None);
+        self.skipped_ops.clear();
         // A Z set before is asked for again, as the tool's Z kept is
         // (LIO-618).
         self.forget_touch();
@@ -5092,19 +5365,22 @@ impl Run {
     }
 
     /// What the Run panel says of a start a check moved back to its tool
-    /// run's first operation (`checked_as`, LIO-636): where it was picked,
-    /// and where Cycle Start starts now. Nothing while the start is at the
-    /// operation picked, its tool run's first now.
+    /// run's first operation (`checked_as`, LIO-636), or off an operation
+    /// the setup no longer runs (LIO-681): where it was, and where Cycle
+    /// Start starts now. Nothing while the start is at the operation
+    /// picked, its tool run's first now.
     pub fn start_moved(&self) -> Option<String> {
-        let (key, picked) = self.start_moved.as_ref()?;
+        let (key, picked, why) = self.start_moved.as_ref()?;
         let p = self.checked()?.get(self.next).filter(|_| self.from == 0)?;
         let first = (p.indexes.first()).map(|&oi| op_key(&self.last_passed_ops, oi));
-        (first.as_ref() != Some(key)).then(|| {
-            format!(
-                "The start was at {picked}, but the operations of its tool run have changed since, so Cycle Start now starts at {}, the first operation of tool run {}. Pick the start again in the Operations list if the operations before it are cut.",
-                p.ops[0].name,
-                self.next + 1
-            )
+        let (name, n) = (&p.ops[0].name, self.next + 1);
+        (first.as_ref() != Some(key)).then(|| match why {
+            Moved::Changed => format!(
+                "The start was at {picked}, but the operations of its tool run have changed since, so Cycle Start now starts at {name}, the first operation of tool run {n}. Pick the start again in the Operations list if the operations before it are cut."
+            ),
+            Moved::Gone => format!(
+                "The start was at {picked}, which the setup no longer runs, so Cycle Start now starts at {name}, the first operation of tool run {n}. Pick the start again in the Operations list if the operations before it are cut."
+            ),
         })
     }
 
@@ -5373,7 +5649,8 @@ impl Run {
                 (self.keep, self.recheck) = (Some((done, start)), true);
             }
             (self.next, self.from) = (i, k);
-            (self.zeroed, self.start_moved) = (false, None);
+            (self.zeroed, self.start_moved, self.progress_note) = (false, None, None);
+            self.skipped_ops.clear();
             // A Z set before is forgotten: Cycle Start waits for this
             // start's, at a tool change or a start at a step (LIO-618).
             self.forget_touch();
@@ -10021,6 +10298,9 @@ pub(crate) mod tests {
             last_passed: None,
             last_passed_ops: vec![],
             start_moved: None,
+            progress_note: None,
+            cut_away: vec![],
+            skipped_ops: vec![],
         };
         let (_, op, block) = run.progress(Some(3)).unwrap();
         assert_eq!((op, block), (0, 2));
@@ -15588,6 +15868,486 @@ pub(crate) mod tests {
             assert!(
                 pauses[1].contains("set the head out") || pauses[1].contains("Set the head out")
             );
+        }
+    }
+
+    /// Tool runs of a setup whose operations have the ids `ids`: each run
+    /// its operations, by index in the setup, each with its tool number.
+    /// An operation is named its id in capitals.
+    fn tool_runs(ids: &[&str], runs: &[&[(usize, u32)]]) -> (Vec<Checked>, Vec<String>) {
+        let plan = fixture::plan([0., 0., 15.], &[(Motion::Feed, [1., 0., 5.], 600.)]);
+        let base = checked(vec![fixture::facing_op()], &[&plan]);
+        let runs = (runs.iter())
+            .map(|ops| Checked {
+                indexes: ops.iter().map(|o| o.0).collect(),
+                ops: (ops.iter())
+                    .map(|&(oi, tool)| OpState {
+                        name: ids[oi].to_uppercase(),
+                        tool,
+                        tool_id: format!("t{tool}"),
+                        ..fixture::facing_op()
+                    })
+                    .collect(),
+                ..base.clone()
+            })
+            .collect();
+        (runs, ids.iter().map(|s| s.to_string()).collect())
+    }
+
+    #[test]
+    fn a_start_at_a_later_tool_run_and_what_was_done_follow_their_operations() {
+        // LIO-681: tool run 1 done, Next on tool run 2; an operation E of
+        // another tool added after D makes a tool run 3. The start stays on
+        // C and tool run 1 is done.
+        let (old, old_ids) = tool_runs(
+            &["a", "b", "c", "d"],
+            &[&[(0, 1), (1, 1)], &[(2, 2), (3, 2)]],
+        );
+        let (added, ids) = tool_runs(
+            &["a", "b", "c", "d", "e"],
+            &[&[(0, 1), (1, 1)], &[(2, 2), (3, 2)], &[(4, 5)]],
+        );
+        let c = carry_progress(
+            (&old, &old_ids),
+            (&added, &ids),
+            (&[true, false], &[], &[]),
+            (1, 0),
+        );
+        assert_eq!((c.done, c.next, c.from), (vec![true, false, false], 1, 0));
+        assert_eq!((c.moved, c.lost), (None, vec![]));
+        // A start partway, at D, over an edit that gives A a tool of its
+        // own: tool run 1 splits in two. The start stays on D, now in tool
+        // run 3; B, cut, is still done in a tool run of its own. A, not cut
+        // with its new tool, is before the start: that is said (LIO-741).
+        let (split, ids) = tool_runs(
+            &["a", "b", "c", "d"],
+            &[&[(0, 3)], &[(1, 1)], &[(2, 2), (3, 2)]],
+        );
+        let c = carry_progress(
+            (&old, &old_ids),
+            (&split, &ids),
+            (&[true, false], &[], &[]),
+            (1, 1),
+        );
+        assert_eq!(
+            (c.done.clone(), c.next, c.from),
+            (vec![false, true, false], 2, 1)
+        );
+        assert_eq!((c.moved.clone(), c.lost.clone()), (None, vec![]));
+        assert_eq!(c.skipped, [("a".to_string(), "A".to_string())]);
+        assert_eq!(
+            progress_note(&c).as_deref(),
+            Some(
+                "A comes before the start but is new or has changed since, so Cycle Start will not cut it. Pick the start at A in the Operations list if it is to be cut."
+            )
+        );
+        // Checked again with nothing changed, or the coolant only: kept.
+        let mut dry = old.clone();
+        dry[1].ops[1].coolant = (false, false);
+        dry[0].ops[0].coolant = (true, true);
+        for same in [&old, &dry] {
+            let c = carry_progress(
+                (&old, &old_ids),
+                (same, &old_ids),
+                (&[true, false], &[], &[]),
+                (1, 1),
+            );
+            assert_eq!((c.done.clone(), c.next, c.from), (vec![true, false], 1, 1));
+            assert_eq!((c.moved.clone(), progress_note(&c)), (None, None));
+        }
+    }
+
+    #[test]
+    fn a_start_partway_follows_its_tool_run_when_tool_runs_swap_places() {
+        // LIO-636 stage 2: the lone Drill moved after Face, Pocket and
+        // Contour, the start at the Pocket. The start stays on the Pocket,
+        // now in tool run 1, the Face before it taken as cut as before.
+        let ids = ["drill", "face", "pocket", "contour"];
+        let (old, old_ids) = tool_runs(&ids, &[&[(0, 4)], &[(1, 1), (2, 1), (3, 1)]]);
+        let moved = ["face", "pocket", "contour", "drill"];
+        let (new, new_ids) = tool_runs(&moved, &[&[(0, 1), (1, 1), (2, 1)], &[(3, 4)]]);
+        let c = carry_progress(
+            (&old, &old_ids),
+            (&new, &new_ids),
+            (&[false, false], &[], &[]),
+            (1, 1),
+        );
+        assert_eq!((c.done, c.next, c.from), (vec![false, false], 0, 1));
+        assert_eq!((c.moved, c.lost), (None, vec![]));
+        // Its tool run's operations changed as well (the Contour off): to
+        // the Face, the first, for the reason LIO-636 says.
+        let (new, new_ids) = tool_runs(&moved, &[&[(0, 1), (1, 1)], &[(3, 4)]]);
+        let c = carry_progress(
+            (&old, &old_ids),
+            (&new, &new_ids),
+            (&[false, false], &[], &[]),
+            (1, 1),
+        );
+        assert_eq!((c.next, c.from), (0, 0));
+        assert_eq!(
+            c.moved,
+            Some((Moved::Changed, "pocket".into(), "POCKET".into()))
+        );
+    }
+
+    #[test]
+    fn a_start_whose_operation_is_gone_moves_to_the_next_still_sent() {
+        // Start at C, the only operation of tool run 2; C removed: D, of
+        // tool run 3 before, is the start, at tool run 2.
+        let (old, old_ids) = tool_runs(&["a", "c", "d"], &[&[(0, 1)], &[(1, 2)], &[(2, 3)]]);
+        let (new, ids) = tool_runs(&["a", "d"], &[&[(0, 1)], &[(1, 3)]]);
+        let c = carry_progress(
+            (&old, &old_ids),
+            (&new, &ids),
+            (&[true, false, false], &[], &[]),
+            (1, 0),
+        );
+        assert_eq!((c.done, c.next, c.from), (vec![true, false], 1, 0));
+        assert_eq!(c.moved, Some((Moved::Gone, "c".into(), "C".into())));
+        // Every operation after it done, A before it taken as cut: nothing
+        // is left to cut, so past the last tool run (LIO-681 review).
+        let c = carry_progress(
+            (&old, &old_ids),
+            (&new, &ids),
+            (&[false, false, true], &[], &[]),
+            (1, 0),
+        );
+        assert_eq!((c.done, c.next, c.from), (vec![false, true], 2, 0));
+        assert_eq!(c.moved.unwrap().0, Moved::Gone);
+        // Partway: C between B and D of one tool. The start goes to that
+        // tool run's first, B.
+        let (old, old_ids) = tool_runs(
+            &["a", "b", "c", "d"],
+            &[&[(0, 1)], &[(1, 2), (2, 2), (3, 2)]],
+        );
+        let (new, ids) = tool_runs(&["a", "b", "d"], &[&[(0, 1)], &[(1, 2), (2, 2)]]);
+        let c = carry_progress(
+            (&old, &old_ids),
+            (&new, &ids),
+            (&[true, false], &[], &[]),
+            (1, 1),
+        );
+        assert_eq!((c.done, c.next, c.from), (vec![true, false], 1, 0));
+        assert_eq!(c.moved.unwrap().0, Moved::Gone);
+        // A check without ids knows operations by their index in the setup.
+        let (new, _) = tool_runs(
+            &["a", "x", "c", "d"],
+            &[&[(0, 1)], &[(1, 4)], &[(2, 2), (3, 2)]],
+        );
+        let c = carry_progress((&old, &[]), (&new, &[]), (&[true, false], &[], &[]), (1, 1));
+        assert_eq!((c.done, c.next, c.from), (vec![true, false, false], 2, 0));
+        assert_eq!(c.moved.unwrap().0, Moved::Changed);
+    }
+
+    #[test]
+    fn an_operation_cut_in_a_tool_run_done_that_joins_another_is_said_to_be_cut_again() {
+        // Tool run 1 (A, B) done; B given C and D's tool joins their tool
+        // run, which Cycle Start cuts from B: that is said.
+        let (old, old_ids) = tool_runs(
+            &["a", "b", "c", "d"],
+            &[&[(0, 1), (1, 1)], &[(2, 2), (3, 2)]],
+        );
+        let (new, ids) = tool_runs(
+            &["a", "b", "c", "d"],
+            &[&[(0, 1)], &[(1, 2), (2, 2), (3, 2)]],
+        );
+        let c = carry_progress(
+            (&old, &old_ids),
+            (&new, &ids),
+            (&[true, false], &[], &[]),
+            (1, 0),
+        );
+        assert_eq!((c.done.clone(), c.next, c.from), (vec![true, false], 1, 0));
+        assert_eq!(c.lost, [(1, "B".to_string())]);
+        assert_eq!(
+            lost_note(&c.lost).as_deref(),
+            Some(
+                "Tool run 2 is not shown done, though B in it was cut: its operations have changed since. Pick the start in the Operations list if it is not to be cut again."
+            )
+        );
+        // Two tool runs, two operations.
+        let lost = [(1, "B".to_string()), (2, "E".to_string())];
+        assert_eq!(
+            lost_note(&lost).as_deref(),
+            Some(
+                "Tool runs 2 and 3 are not shown done, though B and E in them were cut: their operations have changed since. Pick the start in the Operations list if they are not to be cut again."
+            )
+        );
+        assert_eq!(lost_note(&[]), None);
+        // The edit undone: B is done again with A, and the start, at B
+        // then, goes on to C.
+        let c = carry_progress(
+            (&new, &ids),
+            (&old, &old_ids),
+            (&c.done, &c.cut, &[]),
+            (1, 0),
+        );
+        assert_eq!((c.done, c.next, c.from), (vec![true, false], 1, 0));
+        assert_eq!((c.moved, c.lost, c.cut), (None, vec![], vec![]));
+    }
+
+    #[test]
+    fn an_operation_cut_and_removed_is_done_again_once_it_is_back() {
+        // Tool run 1 (A, B) done, the start at C; B removed, then put back.
+        let (old, old_ids) = tool_runs(&["a", "b", "c"], &[&[(0, 1), (1, 1)], &[(2, 2)]]);
+        let (new, ids) = tool_runs(&["a", "c"], &[&[(0, 1)], &[(1, 2)]]);
+        let c = carry_progress(
+            (&old, &old_ids),
+            (&new, &ids),
+            (&[true, false], &[], &[]),
+            (1, 0),
+        );
+        assert_eq!((c.done.clone(), c.next, c.from), (vec![true, false], 1, 0));
+        assert_eq!(c.cut.len(), 1);
+        let c = carry_progress(
+            (&new, &ids),
+            (&old, &old_ids),
+            (&c.done, &c.cut, &[]),
+            (1, 0),
+        );
+        assert_eq!(
+            (c.done, c.next, c.from, c.cut),
+            (vec![true, false], 1, 0, vec![])
+        );
+        // Put back with another tool, in a tool run of its own: not cut
+        // with it, so that tool run is not done. The start stays at C, and
+        // B before it is said not to be cut (LIO-741).
+        let (other, ids2) = tool_runs(&["a", "b", "c"], &[&[(0, 1)], &[(1, 3)], &[(2, 2)]]);
+        let c1 = carry_progress(
+            (&old, &old_ids),
+            (&new, &ids),
+            (&[true, false], &[], &[]),
+            (1, 0),
+        );
+        let c = carry_progress(
+            (&new, &ids),
+            (&other, &ids2),
+            (&c1.done, &c1.cut, &[]),
+            (1, 0),
+        );
+        assert_eq!((c.done, c.next, c.from), (vec![true, false, false], 2, 0));
+        assert!(c.lost.is_empty());
+        assert_eq!(c.skipped, [("b".to_string(), "B".to_string())]);
+        let two = ["X".to_string(), "B".to_string()];
+        assert_eq!(
+            skipped_note(&two).as_deref(),
+            Some(
+                "X and B come before the start but are new or have changed since, so Cycle Start will not cut them. Pick the start at X in the Operations list if they are to be cut."
+            )
+        );
+    }
+
+    #[test]
+    fn a_later_tool_runs_start_moved_by_an_edit_is_said_and_new_stock_drops_the_cut_note() {
+        // Through `checked_as` (LIO-681 review): tool runs [A], [B], [C, D],
+        // A done, Next on C. An edit gives B C's tool: [A], [B, C, D]. The
+        // start goes to B, which is cut now, and says so.
+        let (doc, _) = crate::post::fixture::job();
+        let mut run = Run::new(&doc, 0, 0);
+        let check = |run: &mut Run, (p, ids): (Vec<Checked>, Vec<String>)| {
+            let left = Left {
+                ops: ids,
+                ..Default::default()
+            };
+            run.checked_as(Arc::new(Ok(p)), Some(Arc::new(left)), None);
+        };
+        let abcd = ["a", "b", "c", "d"];
+        check(
+            &mut run,
+            tool_runs(&abcd, &[&[(0, 1)], &[(1, 2)], &[(2, 3), (3, 3)]]),
+        );
+        run.done = vec![true, false, false];
+        (run.next, run.from) = (2, 0);
+        check(
+            &mut run,
+            tool_runs(&abcd, &[&[(0, 1)], &[(1, 3), (2, 3), (3, 3)]]),
+        );
+        assert_eq!(
+            (run.done.clone(), run.next, run.from),
+            (vec![true, false], 1, 0)
+        );
+        assert_eq!(
+            run.start_moved().as_deref(),
+            Some(
+                "The start was at C, but the operations of its tool run have changed since, so Cycle Start now starts at B, the first operation of tool run 2. Pick the start again in the Operations list if the operations before it are cut."
+            )
+        );
+        // At the setup's start with nothing done, nothing is said.
+        let mut fresh = Run::new(&doc, 0, 0);
+        check(
+            &mut fresh,
+            tool_runs(&abcd, &[&[(0, 1), (1, 1)], &[(2, 3), (3, 3)]]),
+        );
+        check(
+            &mut fresh,
+            tool_runs(&abcd, &[&[(0, 3), (1, 3), (2, 3), (3, 3)]]),
+        );
+        assert_eq!((fresh.next, fresh.from), (0, 0));
+        assert!(fresh.start_moved().is_none());
+        // Tool run 1 (A, B) done, B given C's tool: B is said to be cut
+        // again, until New stock, on which nothing is cut.
+        let mut cut = Run::new(&doc, 0, 0);
+        check(
+            &mut cut,
+            tool_runs(&abcd, &[&[(0, 1), (1, 1)], &[(2, 3), (3, 3)]]),
+        );
+        cut.done = vec![true, false];
+        (cut.next, cut.from) = (1, 0);
+        check(
+            &mut cut,
+            tool_runs(&abcd, &[&[(0, 1)], &[(1, 3), (2, 3), (3, 3)]]),
+        );
+        assert!(
+            cut.progress_note
+                .as_deref()
+                .is_some_and(|n| n.contains("though B in it was cut"))
+        );
+        let _ = cut.new_stock();
+        assert_eq!(
+            (cut.progress_note.clone(), cut.done.clone()),
+            (None, vec![false, false])
+        );
+    }
+
+    #[test]
+    fn a_new_operation_before_the_start_is_cut_on_a_fresh_run_and_said_once_begun() {
+        // LIO-681 review: nothing cut, the start at the setup's start; X,
+        // of another tool, added first. Cycle Start starts at X.
+        let (doc, _) = crate::post::fixture::job();
+        let check = |run: &mut Run, (p, ids): (Vec<Checked>, Vec<String>)| {
+            let left = Left {
+                ops: ids,
+                ..Default::default()
+            };
+            run.checked_as(Arc::new(Ok(p)), Some(Arc::new(left)), None);
+        };
+        for before in [
+            tool_runs(&["a", "b"], &[&[(0, 1), (1, 1)]]),
+            tool_runs(&["a", "b"], &[&[(0, 1)], &[(1, 2)]]),
+        ] {
+            let after = match before.0.len() {
+                1 => tool_runs(&["x", "a", "b"], &[&[(0, 2)], &[(1, 1), (2, 1)]]),
+                _ => tool_runs(&["x", "a", "b"], &[&[(0, 3)], &[(1, 1)], &[(2, 2)]]),
+            };
+            let mut run = Run::new(&doc, 0, 0);
+            check(&mut run, before);
+            check(&mut run, after);
+            assert_eq!((run.next, run.from), (0, 0));
+            assert!(run.start_moved().is_none() && run.progress_note.is_none());
+        }
+        // A done, Next on B; X of another tool put between them. Cycle Start
+        // starts at B and does not cut X: that is said.
+        let mut run = Run::new(&doc, 0, 0);
+        check(&mut run, tool_runs(&["a", "b"], &[&[(0, 1)], &[(1, 2)]]));
+        run.done = vec![true, false];
+        (run.next, run.from) = (1, 0);
+        check(
+            &mut run,
+            tool_runs(&["a", "x", "b"], &[&[(0, 1)], &[(1, 3)], &[(2, 2)]]),
+        );
+        assert_eq!(
+            (run.done.clone(), run.next, run.from),
+            (vec![true, false, false], 2, 0)
+        );
+        let x = "X comes before the start but is new or has changed since, so Cycle Start will not cut it. Pick the start at X in the Operations list if it is to be cut.";
+        assert_eq!(run.progress_note.as_deref(), Some(x));
+        // Still said over the checks after (Check again, another edit),
+        // until a start is picked (LIO-681 review).
+        let axb = tool_runs(&["a", "x", "b"], &[&[(0, 1)], &[(1, 3)], &[(2, 2)]]);
+        check(&mut run, axb.clone());
+        check(&mut run, axb.clone());
+        assert_eq!((run.next, run.progress_note.as_deref()), (2, Some(x)));
+        run.start_at(1, 0);
+        check(&mut run, axb);
+        assert_eq!((run.next, run.progress_note.as_deref()), (1, None));
+    }
+
+    #[test]
+    fn a_start_past_the_last_tool_run_stays_there_unless_something_new_is_to_cut() {
+        // LIO-681 stage 2 review: Next on tool run 2, then tool runs 2 and 3
+        // cut, so every tool run has run (tool run 1 taken as cut). Check
+        // again, a rename, or the last tool run not done (a stop after its
+        // last step) keep the start past the last tool run, nothing said.
+        let (doc, _) = crate::post::fixture::job();
+        let check = |run: &mut Run, (p, ids): (Vec<Checked>, Vec<String>)| {
+            let left = Left {
+                ops: ids,
+                ..Default::default()
+            };
+            run.checked_as(Arc::new(Ok(p)), Some(Arc::new(left)), None);
+        };
+        let abc = ["a", "b", "c"];
+        let runs: &[&[(usize, u32)]] = &[&[(0, 1)], &[(1, 2)], &[(2, 3)]];
+        let mut renamed = tool_runs(&abc, runs);
+        renamed.0[2].ops[0].name = "C finishing".into();
+        for (done, again) in [
+            (vec![false, true, true], tool_runs(&abc, runs)),
+            (vec![false, true, true], renamed),
+            (vec![true, true, true], tool_runs(&abc, runs)),
+            (vec![true, true, false], tool_runs(&abc, runs)),
+        ] {
+            let mut run = Run::new(&doc, 0, 0);
+            check(&mut run, tool_runs(&abc, runs));
+            run.done = done.clone();
+            (run.next, run.from) = (3, 0);
+            check(&mut run, again);
+            assert_eq!((run.done.clone(), run.next, run.from), (done, 3, 0));
+            assert!(run.start_moved().is_none() && run.progress_note.is_none());
+        }
+        // E of another tool added last: the start goes to it.
+        let mut run = Run::new(&doc, 0, 0);
+        check(&mut run, tool_runs(&abc, runs));
+        run.done = vec![false, true, true];
+        (run.next, run.from) = (3, 0);
+        let abce = ["a", "b", "c", "e"];
+        check(
+            &mut run,
+            tool_runs(&abce, &[&[(0, 1)], &[(1, 2)], &[(2, 3)], &[(3, 5)]]),
+        );
+        assert_eq!(
+            (run.done.clone(), run.next, run.from),
+            (vec![false, true, true, false], 3, 0)
+        );
+        assert!(run.progress_note.is_none());
+        // Mid-run, Next on tool run 2, it done, the start at C; C removed:
+        // nothing is left to cut, so every tool run has run.
+        let mut run = Run::new(&doc, 0, 0);
+        check(&mut run, tool_runs(&abc, runs));
+        run.done = vec![false, true, false];
+        (run.next, run.from) = (2, 0);
+        check(&mut run, tool_runs(&["a", "b"], &[&[(0, 1)], &[(1, 2)]]));
+        assert_eq!(
+            (run.done.clone(), run.next, run.from),
+            (vec![false, true], 2, 0)
+        );
+    }
+
+    #[test]
+    fn a_rename_keeps_what_was_done_and_the_start() {
+        // LIO-681 review: [A, B] done, Next on C; A renamed, and its tool.
+        // It cuts as it did: tool run 1 stays done, the start at C, and
+        // nothing is said. All done, the same: the start stays past them.
+        let (doc, _) = crate::post::fixture::job();
+        let check = |run: &mut Run, (p, ids): (Vec<Checked>, Vec<String>)| {
+            let left = Left {
+                ops: ids,
+                ..Default::default()
+            };
+            run.checked_as(Arc::new(Ok(p)), Some(Arc::new(left)), None);
+        };
+        let abc = ["a", "b", "c"];
+        let runs: &[&[(usize, u32)]] = &[&[(0, 1), (1, 1)], &[(2, 2)]];
+        for (done, next) in [(vec![true, false], 1), (vec![true, true], 2)] {
+            let mut run = Run::new(&doc, 0, 0);
+            check(&mut run, tool_runs(&abc, runs));
+            run.done = done.clone();
+            (run.next, run.from) = (next, 0);
+            let mut renamed = tool_runs(&abc, runs);
+            renamed.0[0].ops[0].name = "A roughing".into();
+            renamed.0[0].ops[0].tool_name = "6 mm end mill".into();
+            check(&mut run, renamed);
+            assert_eq!((run.done.clone(), run.next, run.from), (done, next, 0));
+            assert!(run.progress_note.is_none() && run.start_moved().is_none());
         }
     }
 }
