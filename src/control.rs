@@ -4245,7 +4245,10 @@ impl Connection {
                 run.picked = run.picked.filter(|p| Some(p.0) == oi);
             }
             R::ClearSteps => run.picked = None,
-            R::KeepToolZ if run.at_step().is_some() => run.tool_kept = true,
+            // Not at a tool change: the tool in the spindle is another one (LIO-652).
+            R::KeepToolZ if run.at_step().is_some() && run.tool_change().is_none() => {
+                run.tool_kept = true
+            }
             R::StopAfterStep
                 if run.running.is_some() && matches!(state, Some(State::Run | State::Hold)) =>
             {

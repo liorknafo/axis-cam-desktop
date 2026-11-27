@@ -1372,8 +1372,10 @@ bar, at once when that machine is connected, or when you press
      cut with (**Keep it**, or set it again on the stock: the check knows the
      stock before and after the operation, so a probe spot or surface the
      operation leaves as it was is offered), and the tool's Z (**Same tool,
-     keep Z**, or Set Z from reference). Cycle Start then rapids over the
-     step's entry and **waits there**, spindle on; **Resume** feeds in.
+     keep Z**, or Set Z from reference; at a tool change, when the tool in
+     the spindle is another one, only Set Z from reference). Cycle Start
+     then rapids over the step's entry and **waits there**, spindle on;
+     **Resume** feeds in.
    Each skip of steps and each start at one checks the setup again, keeping
    what was done and where Cycle Start starts.
 
