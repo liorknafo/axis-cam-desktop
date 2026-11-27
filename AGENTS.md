@@ -40,9 +40,11 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
   run too). If your brief or a memory tells you to set it, leave it unset and
   say so in your answer, so the brief gets corrected.
 - The first build in a new checkout compiles both crates whole, with the
-  dependencies already built: about a minute for `cargo test --no-run`
-  (53–69 s measured, peaking at about 5 GB) and 24 s for `cargo build`. The
-  builds after it are incremental. To start over
+  dependencies already built. On the Mac: about a minute for `cargo test
+  --no-run` (53–69 s measured, peaking at about 5 GB) and 24 s for `cargo
+  build`. On the Linux laptop (24 cores, 14 GB): 92 s, its compilers peaking
+  at 6.8 GB together (5.2 GB the largest) and the machine at 9.5 GB, and 36 s
+  for `cargo build`. The builds after it are incremental. To start over
   without the incremental data, `cargo clean -p axis-cam -p axis-core`
   recompiles only the two crates, not the dependencies.
 - Dependencies are built without debug info (`[profile.dev.package."*"]` in
@@ -51,10 +53,11 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
   To step into another dependency in a debugger, turn it on for that crate
   on your own machine, not in a commit.
 - Tests build the core at `opt-level = 1` (`[profile.test.package.axis-core]`,
-  LIO-729) and the app at 0: most of the tests' time is the core's
-  toolpath, simulation and posting code, so the test groups run about twice
-  as fast as unoptimised, and a one-line change in the app still rebuilds
-  the test binary in about 5 s (11 s in the core, which recompiles it at
-  `opt-level` 1). `cargo build` and `cargo run` build both crates at
-  `opt-level` 0 (a one-line rebuild 2–4 s). Don't override it for a run:
-  each setting keeps its own copy of a crate in `target/`.
+  LIO-729) and the app at 0: most of the tests' time is the core's toolpath,
+  simulation and posting code, so the test groups run about twice as fast as
+  unoptimised, and a one-line change in the app still rebuilds the test binary
+  in about 5 s on the Mac and 11 s on the Linux laptop (a change in the core,
+  which recompiles it at `opt-level` 1: 11 s and 19 s). `cargo build` and
+  `cargo run` build both crates at `opt-level` 0 (a one-line rebuild 2–4 s on
+  the Mac, 5–9 s on the Linux laptop). Don't override it for a run: each
+  setting keeps its own copy of a crate in `target/`.
