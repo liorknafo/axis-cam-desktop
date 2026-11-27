@@ -2904,6 +2904,22 @@ flood = { pin = 8 }
             (crate::ui::probe::clicks(a.view(), window).into_iter())
                 .find(|m| matches!(m, Message::Run(R::KeepZero)))
         };
+        assert!(
+            keep(&a).is_some(),
+            "Keep this work zero offered after the Stop"
+        );
+        // In G55, not the setup's G54, it is off and says why (LIO-643).
+        let _ = a.update(Message::Machine(crate::control::Action::Wcs(1)));
+        tick_until(&mut a, 2.0, "G55", |s| s.active_wcs == 1);
+        assert!(keep(&a).is_none(), "Keep this work zero on in G55");
+        let texts = crate::ui::probe::texts(a.view(), window);
+        assert!(
+            texts.iter().any(|t| t
+                == "This setup uses G54, but the active work system is G55: select G54 first."),
+            "{texts:?}"
+        );
+        let _ = a.update(Message::Machine(crate::control::Action::Wcs(0)));
+        tick_until(&mut a, 2.0, "G54", |s| s.active_wcs == 0);
         let _ = a.update(keep(&a).expect("Keep this work zero offered after the Stop"));
         assert!(
             run_of(&a).zeroed && waits(&a).is_none(),
@@ -7408,6 +7424,184 @@ flood = { pin = 8 }
         assert!(run_of(&a).running.is_none());
         assert_eq!(conn(&a).snapshot.state, Some(State::Idle));
         assert!((conn(&a).snapshot.work_offset[2] - offset).abs() < 1e-9);
+    }
+
+    /// LIO-643: at a tool change with G55 active for a G54 setup, the run's
+    /// own buttons that touch the tool off, set the work zero or record the
+    /// reference are off and say to select G54 first; pressed anyway, they
+    /// set nothing. The Position card's Zero on Z stays on and sets G55's Z,
+    /// but touches nothing off: once G54 is selected again, still the old
+    /// tool's, Cycle Start asks for the touch-off.
+    #[test]
+    fn a_z_set_in_another_work_system_than_the_setups_touches_nothing_off() {
+        use crate::control::Action as C;
+        use crate::run::Action as R;
+        use crate::ui::ControlTab;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        assert!(run_of(&a).tool_change().is_some());
+        let _ = a.update(Message::Run(R::RecordReference));
+        let reference = run_of(&a).reference.unwrap();
+        let g54 = conn(&a).snapshot.work_offset;
+        // The new tool, 2 mm longer, its tip on the reference; G55 active.
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 2.));
+        let _ = a.update(Message::Machine(C::Wcs(1)));
+        tick_until(&mut a, 2.0, "G55", |s| s.active_wcs == 1);
+        let g55 = conn(&a).snapshot.work_offset;
+        assert!((g55[2] - g54[2]).abs() > 1., "{g54:?} {g55:?}");
+        let why = "This setup uses G54, but the active work system is G55: select G54 first.";
+        assert_eq!(run_of(&a).wcs_problem(conn(&a)).as_deref(), Some(why));
+        // Off, and said, on the Tool change and Work zero tabs.
+        let window = iced::Size::new(1440., 2400.);
+        for tab in [ControlTab::ToolChange, ControlTab::WorkZero] {
+            let _ = a.update(Message::ControlPhaseTab(tab, false));
+            let clicks = crate::ui::probe::clicks(a.view(), window);
+            let own = (clicks.iter()).find(|m| {
+                matches!(
+                    m,
+                    Message::Run(
+                        R::RecordReference
+                            | R::ZFromReference
+                            | R::ProbeReference
+                            | R::ProbeFromReference
+                            | R::KeepZero
+                    ) | Message::Machine(C::TouchOff)
+                )
+            });
+            assert!(own.is_none(), "{tab:?}: {own:?} is on");
+            assert!(
+                (clicks.iter()).any(|m| matches!(m, Message::Machine(C::WorkZero(Some(2))))),
+                "{tab:?}: the Position card's Zero on Z is off"
+            );
+            let texts = crate::ui::probe::texts(a.view(), window);
+            assert!(texts.iter().any(|t| t.contains(why)), "{tab:?}: {texts:?}");
+            // The reference is named by the work system it was recorded in.
+            if tab == ControlTab::ToolChange {
+                assert!(
+                    (texts.iter()).any(|t| t.starts_with("Reference: Z") && t.ends_with("(G54)")),
+                    "{texts:?}"
+                );
+            }
+        }
+        // Pressed anyway (by MCP, say): nothing recorded, nothing set.
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 5.));
+        for press in [
+            Message::Run(R::RecordReference),
+            Message::Run(R::ZFromReference),
+            Message::Run(R::KeepZero),
+            Message::Machine(C::TouchOff),
+        ] {
+            let _ = a.update(press);
+        }
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = a.update(Message::Tick);
+        }
+        assert_eq!(run_of(&a).reference, Some(reference));
+        assert_eq!(conn(&a).snapshot.work_offset, g55);
+        assert!(!run_of(&a).touched() && !conn(&a).z_set_waits(run_of(&a)));
+        // Zero on Z sets G55's Z, and touches nothing off.
+        let _ = a.update(Message::Machine(C::WorkZero(Some(2))));
+        tick_until(&mut a, 2.0, "G55's Z", |s| s.work_pos[2].abs() < 1e-6);
+        z_settled(&mut a);
+        assert!(!run_of(&a).touched() && conn(&a).z_said(run_of(&a)).is_none());
+        // G54 again: its Z is still the old tool's, and Cycle Start asks for
+        // the touch-off; nothing runs.
+        let _ = a.update(Message::Machine(C::Wcs(0)));
+        tick_until(&mut a, 2.0, "G54", |s| s.active_wcs == 0);
+        assert_eq!(conn(&a).snapshot.work_offset, g54);
+        assert!(run_of(&a).wcs_problem(conn(&a)).is_none());
+        assert!(
+            problems(&a)
+                .iter()
+                .any(|p| p.contains("touch off its Z first")),
+            "{:?}",
+            problems(&a)
+        );
+        cycle_start(&mut a);
+        assert!(run_of(&a).running.is_none());
+        // Set Z from reference there touches it off.
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 2.));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        run_until(&mut a, 2.0, "the touch-off", |r| r.touched());
+        assert!((conn(&a).snapshot.work_offset[2] - (g54[2] - 2.)).abs() < 1e-6);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
+    }
+
+    /// LIO-643: before the setup's first check answers, its work system is
+    /// not known, so Record reference and Set Z from reference may be
+    /// pressed in G55. Once the check finds the setup in G54, neither holds:
+    /// the reference is forgotten and the tool not touched off; a Zero on Z
+    /// in G54 then touches it off.
+    #[test]
+    fn a_touch_off_before_the_first_check_in_another_work_system_does_not_count() {
+        use crate::control::Action as C;
+        use crate::run::Action as R;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        let _ = a.update(Message::Machine(C::Wcs(1)));
+        tick_until(&mut a, 2.0, "G55", |s| s.active_wcs == 1);
+        let _ = a.update(Message::Run(R::Setup(0)));
+        assert!(run_of(&a).programs.is_none());
+        assert!(run_of(&a).wcs_problem(conn(&a)).is_none());
+        let _ = a.update(Message::Run(R::RecordReference));
+        assert!(run_of(&a).reference.is_some());
+        let _ = a.update(Message::Run(R::ZFromReference));
+        touch_shown(&mut a);
+        let epoch = run_of(&a).epoch;
+        let programs = crate::run::programs(&a.doc, a.part_mesh().unwrap(), 0);
+        let _ = a.update(Message::RunChecked(epoch, std::sync::Arc::new(programs)));
+        assert_eq!(run_of(&a).wcs(), Some(0));
+        assert!(!run_of(&a).touched() && run_of(&a).reference.is_none());
+        let _ = a.update(Message::Machine(C::Wcs(0)));
+        tick_until(&mut a, 2.0, "G54", |s| s.active_wcs == 0);
+        assert!(!run_of(&a).touched());
+        // Touched off in G54, it counts.
+        let _ = a.update(Message::Machine(C::WorkZero(Some(2))));
+        run_until(&mut a, 2.0, "the touch-off", |r| r.touched());
+    }
+
+    /// LIO-643: a Set Z from reference sent in G54, the setup's, with G55
+    /// selected before the controller shows it, cannot be checked while
+    /// G55 is active (the controller shows that system's offsets alone): it
+    /// waits, touching nothing off, until G54 is active again.
+    #[test]
+    fn a_z_set_waits_for_its_work_system_to_be_active_again() {
+        use crate::control::Action as C;
+        use crate::run::Action as R;
+        use uc100::controller::State;
+        let dir = tempfile::tempdir().unwrap();
+        let mut a = run_app(dir.path());
+        zeroed(&mut a);
+        check_run(&mut a, 0);
+        let _ = a.update(Message::Run(R::CycleStart));
+        run_until(&mut a, 30.0, "tool run 1", |r| r.done[0]);
+        tick_until(&mut a, 2.0, "Idle", |s| s.state == Some(State::Idle));
+        let _ = a.update(Message::Run(R::RecordReference));
+        let reference = run_of(&a).reference.unwrap();
+        let before = conn(&a).snapshot.work_offset[2];
+        mdi(&mut a, &format!("G0 Z{:.3}", reference - 2.));
+        let _ = a.update(Message::Run(R::ZFromReference));
+        let _ = a.update(Message::Machine(C::Wcs(1)));
+        tick_until(&mut a, 2.0, "G55", |s| s.active_wcs == 1);
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            let _ = a.update(Message::Tick);
+        }
+        assert!(!run_of(&a).touched() && conn(&a).z_set_waits(run_of(&a)));
+        assert!(conn(&a).z_said(run_of(&a)).is_none());
+        let _ = a.update(Message::Machine(C::Wcs(0)));
+        tick_until(&mut a, 2.0, "G54", |s| s.active_wcs == 0);
+        run_until(&mut a, 2.0, "the touch-off", |r| r.touched());
+        assert!((conn(&a).snapshot.work_offset[2] - (before - 2.)).abs() < 1e-6);
+        assert!(problems(&a).is_empty(), "{:?}", problems(&a));
     }
 
     /// Ticks until no Z set for the run's tool waits for the machine to
@@ -12942,6 +13136,10 @@ flood = { pin = 8 }
         assert_eq!(run_of(&a).setup, 1);
         assert!(!run_of(&a).earlier_cuts.is_empty());
         assert!(!run_of(&a).stock_unconfirmed && run_of(&a).away.is_none());
+        // Setup 2, duplicated, is in G55: its touch-off only there (LIO-643).
+        assert_eq!(a.doc.setups[1].offset(), Some("G55"));
+        let _ = a.update(Message::Machine(M::Wcs(1)));
+        tick_until(&mut a, 2.0, "G55", |s| s.active_wcs == 1);
         let touches_off = |a: &mut App, z: Option<f64>, when: &str| {
             let r = run_of(a);
             assert!(!r.earlier_unfollowed(), "{when}");
@@ -14050,6 +14248,23 @@ flood = { pin = 8 }
             !texts.iter().any(|t| t == "Probe the stock again"),
             "{texts:?}"
         );
+        // In G55, not the setup's G54, Keep it and Set Z from reference are
+        // off, and step 2 says why (LIO-643).
+        let own = |a: &App| {
+            (crate::ui::probe::clicks(a.view(), iced::Size::new(1440., 1100.)).into_iter())
+                .filter(|m| matches!(m, Message::Run(R::KeepZero | R::ZFromReference)))
+                .count()
+        };
+        assert!(own(&a) > 0, "Keep it offered in G54");
+        let _ = a.update(Message::Machine(crate::control::Action::Wcs(1)));
+        tick_until(&mut a, 2.0, "G55", |s| s.active_wcs == 1);
+        let texts = start_tab(&mut a);
+        assert!(
+            texts.iter().any(|t| t
+                == "This setup uses G54, but the active work system is G55: select G54 first."),
+            "{texts:?}"
+        );
+        assert_eq!(own(&a), 0, "Keep it or Set Z from reference on in G55");
         let _ = a.update(Message::Disconnect);
     }
 
@@ -20920,6 +21135,38 @@ flood = { pin = 8 }
         });
         assert!(run_of(&a).touched());
         let _ = a.view();
+        // Probe Z in G55, not the setup's G54: it sets G55's Z and says it
+        // does not count; G54's touch-off is as it was (LIO-643 review).
+        // The probe's lift may still start after Idle: pressed until shown.
+        let select = |a: &mut App, i: usize| {
+            let mut deadline = Deadline::new(5.);
+            while conn(a).snapshot.active_wcs != i {
+                assert!(
+                    deadline.within(&conn(a).snapshot),
+                    "G{} not selected",
+                    54 + i
+                );
+                let _ = a.update(Message::Machine(crate::control::Action::Wcs(i)));
+                for _ in 0..10 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    let _ = a.update(Message::Tick);
+                }
+            }
+        };
+        select(&mut a, 1);
+        mdi(&mut a, "G53 G0 Z-30");
+        let _ = a.update(Message::Machine(crate::control::Action::ProbeZ));
+        let (ok, message) = probed(&mut a);
+        assert!(
+            !ok && message.starts_with("Contact at machine Z")
+                && message.ends_with(
+                    "That is G55's work Z, not G54's, the setup's: the tool does not count as touched off."
+                ),
+            "{message}"
+        );
+        select(&mut a, 0);
+        assert!(run_of(&a).touched());
+        assert!((conn(&a).snapshot.work_offset[2] - -20.).abs() < 0.06);
     }
 
     /// LIO-627: Probe Z from reference whose work Z is lost on its way

@@ -11167,20 +11167,28 @@ fn reference_rows<'a>(
     let running = run.running.is_some();
     let msg = |on: bool, a: R| on.then_some(Message::Run(a));
     let manual = c.manual() && !running;
-    let set_ok = run.reference.is_some() && run.reference_a_problem(c).is_none();
+    // Only in the setup's work system (LIO-643).
+    let in_wcs = run.in_wcs(c);
+    let recorded = run.reference_wcs().unwrap_or(s.active_wcs);
+    let set_ok = run.reference.is_some() && run.reference_a_problem(c).is_none() && in_wcs;
     let mut col = column![
         row![
-            small("Record reference", msg(manual, R::RecordReference), false),
+            small(
+                "Record reference",
+                msg(manual && in_wcs, R::RecordReference),
+                false
+            ),
             small(
                 "Set Z from reference",
                 msg(manual && set_ok, R::ZFromReference),
                 false
             ),
+            // In the work system it was recorded in (LIO-643 review).
             muted(match (run.reference, run.reference_a, fit.narrow) {
                 (Some(z), Some(a), false) =>
-                    format!("Reference: Z {z:.3} (G{}) at A {a:.3}°", 54 + s.active_wcs),
+                    format!("Reference: Z {z:.3} (G{}) at A {a:.3}°", 54 + recorded),
                 (Some(z), Some(a), true) => format!("Z {z:.3} at A {a:.1}°"),
-                (Some(z), None, _) => format!("Reference: Z {z:.3} (G{})", 54 + s.active_wcs),
+                (Some(z), None, _) => format!("Reference: Z {z:.3} (G{})", 54 + recorded),
                 (None, _, false) => "Reference surface: not recorded".into(),
                 (None, _, true) => "Not recorded".into(),
             })
@@ -11201,7 +11209,7 @@ fn reference_rows<'a>(
         let probe = c.probe_blocked().is_none() && !running;
         col = col.push(
             row![
-                small("Probe reference", msg(probe, R::ProbeReference), false),
+                small("Probe reference", msg(probe && in_wcs, R::ProbeReference), false),
                 small(
                     "Probe Z from reference",
                     msg(probe && set_ok, R::ProbeFromReference),
@@ -11224,7 +11232,8 @@ fn reference_rows<'a>(
             col = col.push(note);
         }
     }
-    if let Some(why) = run.reference_a_problem(c).filter(|_| !running) {
+    let why = run.wcs_problem(c).or_else(|| run.reference_a_problem(c));
+    if let Some(why) = why.filter(|_| !running) {
         col = col.push(hint("Reference", why, fit.chars(90)));
     }
     col
@@ -11517,6 +11526,9 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
     col = col.push(step_box(1, placed, !placed, one));
     // 2. The work zero the steps before were cut with.
     let manual = run.running.is_none() && c.manual();
+    // Kept, and the tool's Z set from the reference, only in the setup's
+    // work system: said so (LIO-643).
+    let wcs = run.wcs_problem(c);
     let offset = &p.offset;
     let recorded = (run.resumed.as_ref())
         .filter(|j| j.op == oi)
@@ -11541,6 +11553,9 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
             .color(AMBER),
         );
     }
+    if let Some(why) = wcs.as_ref().filter(|_| manual) {
+        two = two.push(text(why.clone()).size(12).color(AMBER));
+    }
     if let Some(j) = recorded {
         two = two.push(
             text(format!(
@@ -11560,7 +11575,7 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
         row![
             small(
                 "Keep it",
-                (manual && !run.zeroed).then_some(Message::Run(R::KeepZero)),
+                (manual && !run.zeroed && wcs.is_none()).then_some(Message::Run(R::KeepZero)),
                 run.zeroed
             ),
             // Where the stock's surface is not known, the Work zero tab
@@ -11595,8 +11610,11 @@ fn start_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element<'a,
             ),
             small(
                 "Set Z from reference",
-                (manual && run.reference.is_some() && run.reference_a_problem(c).is_none())
-                    .then_some(Message::Run(R::ZFromReference)),
+                (manual
+                    && run.reference.is_some()
+                    && run.reference_a_problem(c).is_none()
+                    && wcs.is_none())
+                .then_some(Message::Run(R::ZFromReference)),
                 touched
             ),
         ]
@@ -11941,21 +11959,25 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
             ));
         }
         let blocked = c.partway_blocked();
+        // The setup's touch-off and work zero, only in its work system
+        // (LIO-643).
+        let wcs = run.wcs_problem(c);
+        let own = manual && wcs.is_none();
         buttons = buttons.push(match c.touch_off() {
             _ if blocked.is_some() => small("Zero Z on the stock top", None, false),
             Some((_, work)) if pins || run.on_cut_stock() => small(
                 format!("Set Z{}", crate::post::exact_mm(work[2] as f32)),
-                manual.then_some(Message::Machine(Action::TouchOff)),
+                own.then_some(Message::Machine(Action::TouchOff)),
                 false,
             ),
             Some((_, work)) => small(
                 touch_label(work),
-                manual.then_some(Message::Machine(Action::TouchOff)),
+                own.then_some(Message::Machine(Action::TouchOff)),
                 false,
             ),
             None => small(
                 "Zero all",
-                manual.then_some(Message::Machine(Action::WorkZero(None))),
+                own.then_some(Message::Machine(Action::WorkZero(None))),
                 false,
             ),
         });
@@ -11964,11 +11986,12 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
         if run.asks_zero() {
             buttons = buttons.push(small(
                 "Keep this work zero",
-                (checked.is_ok() && !run.zeroed && !running).then_some(Message::Run(R::KeepZero)),
+                (checked.is_ok() && !run.zeroed && !running && wcs.is_none())
+                    .then_some(Message::Run(R::KeepZero)),
                 run.zeroed,
             ));
         }
-        if let Err(why) = checked {
+        if let Some(why) = (checked.as_ref().err().cloned()).or(wcs.filter(|_| !running)) {
             buttons = buttons.push(hint("Work zero", why, fit.chars(50)));
         }
         let mut list = column![bold("Work zero on the stock", 13)].spacing(4);
@@ -12035,16 +12058,21 @@ fn work_zero_tab<'a>(app: &'a App, c: &'a crate::control::Connection) -> Element
             let why = c.partway_blocked().unwrap_or_else(|| {
                 "Steps of the operation Cycle Start starts at are taken as cut since a tool run of this run started.".into()
             });
+            // Only in the setup's work system, said so (LIO-643).
+            let wcs = run.wcs_problem(c).filter(|_| !running);
             col = col
                 .push(text(format!(
                     "{why} Set Z by hand on a surface whose height you know (Set above), then press Keep this work zero, or press it if the work zero is still the one they were cut with."
                 )).size(12))
                 .push(small(
                     "Keep this work zero",
-                    (c.run_program().is_ok() && !run.zeroed && !running)
+                    (c.run_program().is_ok() && !run.zeroed && !running && wcs.is_none())
                         .then_some(Message::Run(R::KeepZero)),
                     run.zeroed,
                 ));
+            if let Some(why) = wcs {
+                col = col.push(text(why).size(12).color(AMBER));
+            }
         }
     }
     if run.checked().is_some_and(|p| p.len() > 1) {

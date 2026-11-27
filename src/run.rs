@@ -319,6 +319,12 @@ pub struct TouchedFor {
     /// holds no more.
     #[serde(default)]
     for_start: bool,
+    /// The machine's active work system it was made in (`Snapshot::
+    /// active_wcs`): it holds only for a setup in that one (`touched`),
+    /// one pressed before the setup's first check answered too (LIO-643).
+    /// None from a file before LIO-643.
+    #[serde(default)]
+    wcs: Option<usize>,
 }
 
 /// The driver's outcome of a job it refused before anything moved: "<name>:
@@ -992,6 +998,12 @@ pub struct Run {
     touched_for: Option<TouchedFor>,
     /// A check of the setup has answered since it was picked.
     answered: bool,
+    /// The setup's work system the last check that answered found
+    /// (`Run::wcs`), kept while it is checked again (LIO-643).
+    known_wcs: Option<usize>,
+    /// The machine's active work system the reference was recorded in: a
+    /// check that finds the setup in another forgets it (LIO-643).
+    reference_wcs: Option<usize>,
     /// While the setup is checked again: the tool of the tool run the check
     /// before found next (`check_again`), what a touch-off is for meanwhile.
     rechecked_tool: Option<String>,
@@ -1777,6 +1789,8 @@ impl Run {
             length: None,
             touched_for: None,
             answered: false,
+            known_wcs: None,
+            reference_wcs: None,
             rechecked_tool: None,
             starts: 0,
             outcome: None,
@@ -2205,8 +2219,24 @@ impl Run {
     /// tool only (LIO-619), and for the start picked then (LIO-618).
     pub fn touched(&self) -> bool {
         let next = self.tool_of(self.next);
-        (self.touched_for.as_ref())
-            .is_some_and(|t| t.for_start && !t.held && next.is_some() && t.tool == next)
+        // Made in another work system than the setup's, it set that one's
+        // Z (LIO-643).
+        let wcs = self.wcs();
+        (self.touched_for.as_ref()).is_some_and(|t| {
+            t.for_start
+                && !t.held
+                && next.is_some()
+                && t.tool == next
+                && t.wcs.is_none_or(|w| wcs.is_none_or(|s| s == w))
+        })
+    }
+
+    /// The touch-off just counted (`z_touched_for`) was made in the
+    /// machine's active work system `wcs` (LIO-643).
+    pub fn touched_in(&mut self, wcs: usize) {
+        if let Some(t) = &mut self.touched_for {
+            t.wcs = Some(wcs);
+        }
     }
 
     /// The tool a touch-off made before the setup's first check answered
@@ -2276,6 +2306,7 @@ impl Run {
             z: None,
             held: false,
             for_start: true,
+            wcs: None,
         });
     }
 
@@ -2514,6 +2545,16 @@ impl Run {
             t.tool = start;
         }
         (self.answered, self.rechecked_tool) = (true, None);
+        // The setup's work system, kept while it is checked again; a
+        // reference recorded in another is not the setup's (LIO-643).
+        if let Some(w) = self.checked_wcs() {
+            self.known_wcs = Some(w);
+        }
+        if let (Some(w), Some(r)) = (self.wcs(), self.reference_wcs)
+            && w != r
+        {
+            (self.reference, self.reference_a, self.reference_wcs) = (None, None, None);
+        }
     }
 
     /// Where a run of this setup stopped (`journal`), once it is checked:
@@ -2714,6 +2755,7 @@ impl Run {
     pub fn record_reference(&mut self, c: &Connection, z: f64) {
         let s = &c.snapshot;
         self.reference = Some(z);
+        self.reference_wcs = Some(s.active_wcs);
         self.reference_a = (c.axis(3) && s.referenced[3]).then_some(s.work_pos[3]);
     }
 
@@ -2729,6 +2771,45 @@ impl Run {
                 "Turn A to {ra:.3}° first, where the reference surface was recorded: a surface that turns with A is touched off at the same angle."
             )
         })
+    }
+
+    /// The setup's work system, as the machine numbers them
+    /// (`Snapshot::active_wcs`: G54 is 0), once the setup is checked; None
+    /// before, or for one the machine does not have.
+    /// While it is checked again, the one the check before found; None
+    /// before the first check answers.
+    pub fn wcs(&self) -> Option<usize> {
+        self.checked_wcs().or(self.known_wcs)
+    }
+
+    /// The setup's work system its checked programs give.
+    fn checked_wcs(&self) -> Option<usize> {
+        let p = self.checked()?.first()?;
+        OFFSETS
+            .iter()
+            .position(|o| *o == p.offset)
+            .filter(|&i| i < 6)
+    }
+
+    /// The machine's active work system the reference was recorded in.
+    pub fn reference_wcs(&self) -> Option<usize> {
+        self.reference_wcs
+    }
+
+    /// The machine's active work system is the setup's, or the setup's is
+    /// not known yet (its first check): only then does a reference
+    /// recorded hold for the setup (LIO-643).
+    pub fn in_wcs(&self, c: &Connection) -> bool {
+        self.wcs().is_none_or(|w| w == c.snapshot.active_wcs)
+    }
+
+    /// Why the run's own buttons that touch its tool off, set its work zero
+    /// or record its reference cannot be pressed now: the machine's active
+    /// work system is not the setup's, so they would set another's Z, and
+    /// the setup's would stay the old tool's (LIO-643). None when it is the
+    /// setup's, or the setup's is not known yet.
+    pub fn wcs_problem(&self, c: &Connection) -> Option<String> {
+        crate::control::wcs_mismatch(OFFSETS[self.wcs()?], c.snapshot.active_wcs)
     }
 
     /// The next tool run, when its tool is not the one the last tool run
@@ -9974,6 +10055,8 @@ pub(crate) mod tests {
             length: None,
             touched_for: None,
             answered: false,
+            known_wcs: None,
+            reference_wcs: None,
             rechecked_tool: None,
             starts: 0,
             outcome: None,
