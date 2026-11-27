@@ -1055,6 +1055,36 @@ pub fn arc_hole(g: &Geometry, a: &Arc) -> Option<Hole> {
     hole.arc = Some(a.clone());
     Some(hole)
 }
+/// Every hole of the part a wall click picks (`pocket::part_holes`), and
+/// each read as a drill reads it (`cam::drill_holes_of`): None where it is
+/// not round.
+#[derive(Default)]
+pub struct FoundHoles {
+    pub holes: Vec<crate::pocket::Hole>,
+    pub round: Vec<Option<Hole>>,
+    /// The round ends of the holes that are not round (a slot's, a
+    /// counterbore's), each with the hole a Drill drills for it
+    /// (`arc_hole`): a Drill shows and picks each (LIO-434).
+    pub arcs: Vec<(Arc, Hole)>,
+}
+/// The part's holes as `setup` places it, for picking by their outline.
+pub(crate) fn find_holes(setup: &Setup, mesh: &Mesh) -> FoundHoles {
+    let holes = crate::pocket::part_holes(setup, mesh);
+    let round = super::drill_holes_of(setup, mesh, &holes);
+    let walls: HashSet<usize> = (holes.iter().zip(&round))
+        .filter(|(_, r)| r.is_none())
+        .flat_map(|(h, _)| h.walls.iter().copied())
+        .collect();
+    let g = Geometry::new(setup, mesh);
+    // Each end of a blind counterbore over a slot's end, round the same
+    // centre, is a hole of its own to drill: wider, and only down to its
+    // floor (LIO-440).
+    let arcs: Vec<(Arc, Hole)> = (arcs_among(setup, mesh, &walls).into_iter())
+        .filter(|a| on_stock(setup, mesh, a))
+        .filter_map(|a| Some((a.clone(), arc_hole(&g, &a)?)))
+        .collect();
+    FoundHoles { holes, round, arcs }
+}
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2397,7 +2427,7 @@ pub(crate) mod tests {
     fn a_drill_lists_each_round_end_of_a_slot_to_pick() {
         let mesh = mesh::normalize(slot(10.)).unwrap();
         let (setup, _, _) = fixture(Strategy::Drill);
-        let found = crate::find_holes(&setup, &mesh);
+        let found = super::find_holes(&setup, &mesh);
         let mut ends: Vec<[f32; 2]> = found.arcs.iter().map(|(_, h)| h.center).collect();
         ends.sort_by(|a, b| a[0].total_cmp(&b[0]));
         assert_eq!(ends.len(), 2, "{ends:?}");
@@ -2434,7 +2464,7 @@ pub(crate) mod tests {
         let mesh = mesh::normalize(counterbored_slot()).unwrap();
         let (setup, mut op, _) = fixture(Strategy::Drill);
         let floor = Geometry::new(&setup, &mesh).bounds.min[2] + 10.;
-        let found = crate::find_holes(&setup, &mesh);
+        let found = super::find_holes(&setup, &mesh);
         let mut ends: Vec<&Hole> = found.arcs.iter().map(|(_, h)| h).collect();
         ends.sort_by(|a, b| {
             a.diameter
@@ -2482,7 +2512,7 @@ pub(crate) mod tests {
         let mesh = crate::mesh::load_with(std::path::Path::new(&file), None).unwrap();
         let (setup, _, _) = fixture(Strategy::Drill);
         let started = std::time::Instant::now();
-        let found = crate::find_holes(&setup, &mesh);
+        let found = super::find_holes(&setup, &mesh);
         let took = started.elapsed().as_secs_f32();
         eprintln!("the plate's holes found in {took:.2} s");
         // The times are checked last: what is found, even on a busy machine.

@@ -18408,4 +18408,69 @@ mod tests {
             );
         }
     }
+
+    mod slot_tests {
+        use crate::cam;
+        use crate::model::{Strategy, get, num};
+        use crate::slot::tests::adapter;
+
+        #[test]
+        #[ignore = "requires private adapter copy; headless App dispatch only"]
+        fn toolbar_add_pick_and_edit_use_the_first_class_slot() {
+            let (mut doc, mesh, dir) = adapter();
+            doc.active = doc.setups[2].id.clone();
+            doc.setups[2].operations.truncate(7);
+            let tiles = crate::ui::ribbon_tiles(Some(&doc.setups[2].machine));
+            assert!(
+                tiles
+                    .iter()
+                    .flat_map(|(_, t)| t)
+                    .any(|t| { matches!(t, crate::ui::Tile::Op(Strategy::Slot)) })
+            );
+            let mut app = crate::App::from_workspace(dir.join("pick-state.axis.json"), None);
+            app.doc = doc;
+            app.imported_mesh = Some(mesh);
+            let _ = app.update(crate::Message::AddOp(Strategy::Slot));
+            assert_eq!(app.operation().unwrap().strategy, Strategy::Slot);
+            assert_eq!(app.tab, "Slot");
+            assert!(app.picking);
+            let mesh = app.imported_mesh.as_ref().unwrap();
+            let setup = app.doc.setup();
+            let stock = app.known_stock(2).0.unwrap();
+            let zero = crate::post::datum(setup, stock, mesh).unwrap();
+            let arc = cam::arcs::arcs_among(setup, mesh, &cam::arcs::upright(setup, mesh))
+                .into_iter()
+                .find(|a| {
+                    (a.r - 6.5).abs() < 0.0001
+                        && (a.centre[0] - zero[0] + 55.35).abs() < 0.0001
+                        && (a.centre[1] - zero[1] + 15.4).abs() < 0.0001
+                })
+                .unwrap();
+            let _ = app.update(crate::Message::Surface(arc.walls[0]));
+            assert!(app.status.starts_with("Picked Slot"), "{}", app.status);
+            let op = app.operation().unwrap();
+            for (k, want) in [
+                ("slot_x", -52.85),
+                ("slot_y", -15.4),
+                ("slot_length", 18.),
+                ("slot_width", 13.),
+                ("z_top", -1.5),
+                ("z_bottom", -10.),
+            ] {
+                assert!((num(&op.p, k).unwrap() - want).abs() < 0.001, "{k}");
+            }
+            let _ = app.update(crate::Message::Edit(
+                crate::Target::Operation,
+                "slot_x",
+                "52.85".into(),
+            ));
+            assert_eq!(get(&app.operation().unwrap().p, "slot_x"), "52.85");
+            let texts = crate::ui::probe::texts(app.view(), iced::Size::new(1440., 1000.));
+            assert!(
+                texts.iter().any(|s| s.contains("Overall length")),
+                "{texts:?}"
+            );
+            std::fs::write(dir.join("toolbar-picking.txt"), texts.join("\n")).unwrap();
+        }
+    }
 }

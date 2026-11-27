@@ -81,6 +81,7 @@ mod ui;
 mod uncut;
 mod viewport;
 mod volume;
+pub(crate) use cam::arcs::{FoundHoles, find_holes};
 use iced::{Element, Size, Subscription, Task, Theme};
 use model::*;
 use std::{
@@ -1782,37 +1783,6 @@ impl std::fmt::Debug for PartHoles {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "PartHoles({})", self.0.holes.len())
     }
-}
-/// Every hole of the part a wall click picks (`pocket::part_holes`), and
-/// each read as a drill reads it (`cam::drill_holes_of`): None where it is
-/// not round.
-#[derive(Default)]
-pub struct FoundHoles {
-    pub holes: Vec<pocket::Hole>,
-    pub round: Vec<Option<cam::Hole>>,
-    /// The round ends of the holes that are not round (a slot's, a
-    /// counterbore's), each with the hole a Drill drills for it
-    /// (`cam::arcs::arc_hole`): a Drill shows and picks each (LIO-434).
-    pub arcs: Vec<(cam::arcs::Arc, cam::Hole)>,
-}
-/// The part's holes as `setup` places it, for picking by their outline.
-pub(crate) fn find_holes(setup: &model::Setup, mesh: &mesh::Mesh) -> FoundHoles {
-    let holes = pocket::part_holes(setup, mesh);
-    let round = cam::drill_holes_of(setup, mesh, &holes);
-    let walls: std::collections::HashSet<usize> = (holes.iter().zip(&round))
-        .filter(|(_, r)| r.is_none())
-        .flat_map(|(h, _)| h.walls.iter().copied())
-        .collect();
-    let g = cam::Geometry::new(setup, mesh);
-    // Each end of a blind counterbore over a slot's end, round the same
-    // centre, is a hole of its own to drill: wider, and only down to its
-    // floor (LIO-440).
-    let arcs: Vec<(cam::arcs::Arc, cam::Hole)> = (cam::arcs::arcs_among(setup, mesh, &walls)
-        .into_iter())
-    .filter(|a| cam::arcs::on_stock(setup, mesh, a))
-    .filter_map(|a| Some((a.clone(), cam::arcs::arc_hole(&g, &a)?)))
-    .collect();
-    FoundHoles { holes, round, arcs }
 }
 /// What a generation off the window's thread makes (`App::generate`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
