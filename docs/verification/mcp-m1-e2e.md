@@ -12,8 +12,9 @@ MCP_E2E_PICTURE=docs/verification/mcp-m1-e2e.png \
   cargo test --test mcp_e2e an_agent_plans -- --nocapture   # and the picture
 ```
 
-Under `cargo test`, which builds `axis-cam` at `opt-level` 1 (LIO-729), the
-four tests take about 4 minutes; at `opt-level` 0 they took about 8 (the STEP
+Under `cargo test`, which builds the core (`axis-core`) at `opt-level` 1 and
+the app at 0 (LIO-729), the four tests take about 4 minutes; with all of it
+at `opt-level` 0 they took about 8 (the STEP
 test, the longest, up to 12 when the machine is busy): every
 command waits until the app's background work has settled, and after each
 edit the app checks the left stock, the holding and the run again on the

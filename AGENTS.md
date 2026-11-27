@@ -17,7 +17,9 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
   axis-cam -- post::` runs only the app's tests: the core's are in
   `cargo test -p axis-core -- post::`. The core's test-only helpers the
   app's tests use sit behind its `test-support` feature, which the app's
-  dev-dependency turns on. `cargo fmt --all` and `cargo clippy --workspace`
+  dev-dependency turns on: `cargo test -p axis-core` builds the core without
+  it and `cargo test` (or `-p axis-cam`) with it, so switching between the two
+  recompiles the core once (about 35 s). `cargo fmt --all` and `cargo clippy --workspace`
   cover both. Tests build the core at `opt-level` 1 and the app at 0
   (below).
 
@@ -34,12 +36,13 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
 - Review briefs, notes and memories written before LIO-729 may still say to
   run `CARGO_INCREMENTAL=0 cargo test ...`. That advice is out of date: it
   saved disk when the disk was nearly full (the incremental data takes about
-  3.9 GB per checkout after `cargo test` and `cargo build`). If your
-  brief or a memory tells you to set it, leave it unset and say so in your
-  answer, so the brief gets corrected.
+  4 GB per checkout after `cargo test`, and about 5 GB once `cargo build` has
+  run too). If your brief or a memory tells you to set it, leave it unset and
+  say so in your answer, so the brief gets corrected.
 - The first build in a new checkout compiles both crates whole, with the
-  dependencies already built: about 53 s for `cargo test --no-run` and 24 s
-  for `cargo build`. The builds after it are incremental. To start over
+  dependencies already built: about a minute for `cargo test --no-run`
+  (53–69 s measured, peaking at about 5 GB) and 24 s for `cargo build`. The
+  builds after it are incremental. To start over
   without the incremental data, `cargo clean -p axis-cam -p axis-core`
   recompiles only the two crates, not the dependencies.
 - Dependencies are built without debug info (`[profile.dev.package."*"]` in
