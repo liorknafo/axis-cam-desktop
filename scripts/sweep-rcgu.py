@@ -121,13 +121,15 @@ def profile_dirs(target):
             dns[:] = sorted(d for d in dns if d not in ("incremental", "doc", "tmp") and not d.endswith(".dSYM"))
 
 
-def take_locks(prof):
-    """Cargo's locks on this profile folder, all of them or none."""
+def take_locks(prof, create):
+    """Cargo's locks on this profile folder, all of them or none. With `create`,
+    a missing lock file is made (empty, as Cargo makes it), so a build that
+    starts meanwhile waits for it too; a dry run makes none."""
     fds = []
     for name in LOCKS:
         path = os.path.join(prof, name)
         try:
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(path, (os.O_RDWR | os.O_CREAT if create else os.O_RDONLY) | os.O_NOFOLLOW, 0o644)
         except FileNotFoundError:
             continue
         except OSError:
@@ -245,7 +247,7 @@ def main():
             print(f"busy (a build tool runs in the checkout), left alone: {target}")
             continue
         for prof in profs[target]:
-            fds = take_locks(prof)
+            fds = take_locks(prof, create=delete)
             if fds is None:
                 print(f"busy (Cargo holds its lock), left alone: {prof}")
                 continue
