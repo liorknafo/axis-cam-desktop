@@ -2979,7 +2979,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Manual(2)),
         ),
         (_, "turn_x" | "turn_y" | "turn_z") => (
-            "How far the axis moves in one handwheel turn, in mm. The steps use it to say how many turns a feed is.",
+            "How far the axis moves in one handwheel turn, in mm. Kept for your machine's record; the Steps pages give positions, not turns.",
             "",
             Some(Manual(3)),
         ),

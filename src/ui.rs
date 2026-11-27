@@ -6378,13 +6378,14 @@ fn zero_note(app: &App) -> Element<'_, Message> {
     );
     let refs = crate::post::references(origin);
     // A hand machine has no probe and no Control page (LIO-386): the Steps
-    // page's Zero screen picks the zero up with the edge finder.
+    // page's Zero page says where the zero is, picked up with the edge
+    // finder.
     let hand = crate::manual::is_hand(&setup.machine);
     let o = crate::orient::Orient::of(&setup.machine);
     let mut lines = vec![
         match (crate::post::touch_off_spots(o, origin, stock), refs) {
             (_, Some(_)) if hand => format!(
-                "On the stock this setup starts from ({from}): the Steps page's Zero screen has you touch a side for X and one for Y with the edge finder (both sides of an axis whose zero is at the middle, halving the reading) and the top for Z, and set the DRO so that it reads 0 at this work zero."
+                "On the stock this setup starts from ({from}): the Steps page's Zero page says where X0, Y0 and Z0 are on the stock; pick them up with the edge finder and set the DRO so that it reads 0 there."
             ),
             (Some(spots), _) => format!(
                 "On the stock this setup starts from ({from}): touch off {spots}.{}{}",
