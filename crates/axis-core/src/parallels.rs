@@ -7,7 +7,7 @@
 //!
 //! The parallels are boxes under the stock the setup starts from
 //! (`boxes`, `holding::Shape::Support`), drawn in the 3D view and on the
-//! manual Steps' Hold page and checked as a jaw is (`holding::hits`), but
+//! manual Steps' Zero page and checked as a jaw is (`holding::hits`), but
 //! for their top: the part's own material lies between a parallel and a
 //! tool that does not break through, so only a tool below the underside
 //! over a parallel (or within the gap beside one) hits it. The floor the
@@ -229,7 +229,7 @@ pub fn boxes_of(parallels: &Parallels, stock: Bounds) -> Vec<HoldBox> {
         .collect()
 }
 
-/// `setup`'s parallels in a sentence, for the Hold page and the setup's
+/// `setup`'s parallels in a sentence, for the Zero page and the setup's
 /// description, as the machinist is told it: "Stand it on two 15 mm
 /// parallels, 10 mm wide, running front to back at X-18 and X+18 from the
 /// stock's centre." None without parallels or when they do not read.

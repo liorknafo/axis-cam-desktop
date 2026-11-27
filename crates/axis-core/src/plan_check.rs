@@ -1689,9 +1689,16 @@ fn run(
                 }
                 Ok(guide) => {
                     for step in &guide.steps {
-                        if let crate::guide::Step::Holes { op, uncentred, .. } = step
-                            && uncentred.iter().any(|u| *u)
-                        {
+                        let crate::guide::Step::Sheet {
+                            op,
+                            features: crate::guide::Features::Holes { holes, .. },
+                            ..
+                        } = step
+                        else {
+                            continue;
+                        };
+                        let uncentred: Vec<bool> = holes.iter().map(|h| h.uncentred).collect();
+                        if uncentred.iter().any(|u| *u) {
                             export.push(Problem {
                                 setup: si + 1,
                                 operation: Some(op + 1),

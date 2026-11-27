@@ -622,13 +622,20 @@ fn real_adapter_eight_slots_and_prior_box_failure() {
             .count(),
         8
     );
+    // A page a Slot (LIO-688).
     assert_eq!(
         guide
             .steps
             .iter()
-            .filter(|v| matches!(v, crate::guide::Step::Slot { .. }))
+            .filter(|v| matches!(
+                v,
+                crate::guide::Step::Sheet {
+                    features: crate::guide::Features::Slot { .. },
+                    ..
+                }
+            ))
             .count(),
-        154
+        8
     );
     report.push(format!(
         "Guide: {} steps; {} operations; zero {:?}",

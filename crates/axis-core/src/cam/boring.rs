@@ -1,6 +1,6 @@
 //! Reaming and Boring (`model::REAMING`, `model::BORING`): a hole an earlier
 //! operation drilled or roughed, finished to size on a CNC or the manual
-//! mill (whose guide shows each pass, `guide::Step::Bore`). A reamer is fed
+//! mill (whose page gives the finished size, `guide::Features::Holes`). A reamer is fed
 //! in and fed back out. A boring head is set to a size and fed down each
 //! hole, then leaves it with the spindle stopped or fed out, as the head
 //! says: a pass at each size up to the hole's, the program pausing before
