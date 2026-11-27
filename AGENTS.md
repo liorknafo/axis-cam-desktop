@@ -69,10 +69,12 @@ app does, and how to test it, is in the README ("Tests and renderer checks").
   no binary points at: nothing is rebuilt afterwards, and backtraces keep
   their file and line. It leaves alone any build folder that is building,
   testing or waiting for the heavy-tests lock. On the Mac a launchd job runs
-  it every hour over every checkout of this repository
-  (`~/Library/LaunchAgents/local.sweep-rcgu.plist`, log in
-  `~/Library/Logs/sweep-rcgu.log`), so you don't need to run it yourself.
-  With no arguments other than folders it only reports; `--delete` deletes.
+  it every hour over the worktrees in `~/.t3/worktrees/axis-cam-desktop/`
+  (`scripts/install-sweep-rcgu.sh`; log in `~/Library/Logs/sweep-rcgu.log`),
+  so you don't need to run it yourself. macOS doesn't let the job read
+  `~/Documents`, so the main checkout's `target/` is swept only by hand:
+  `scripts/sweep-rcgu.py --delete --worktrees .` from any checkout.
+  Without `--delete` it only reports what it would delete.
   Don't switch to `split-debuginfo = "packed"` to avoid this: `dsymutil` adds
   about 17 s to every link of the test binary. `scripts/test-sweep-rcgu.py`
   checks the script on a small crate.

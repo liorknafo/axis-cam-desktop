@@ -1,10 +1,12 @@
 #!/usr/bin/env -S python3 -I
 """Delete the loose rustc object files (*.rcgu.o) that no binary uses (LIO-676).
 
-Usage: scripts/sweep-rcgu.py [--delete] [--worktrees REPO]... [TARGET_DIR]...
+Usage: scripts/sweep-rcgu.py [--delete] [--worktrees REPO]... [--in DIR]... [TARGET_DIR]...
 
 Without --delete it only reports what it would delete. --worktrees REPO adds
-the target/ of every checkout (main and worktrees) of the git repository REPO.
+the target/ of every checkout (main and worktrees) of the git repository REPO;
+--in DIR the target/ of every folder directly in DIR (the T3 worktrees of a
+repository, say). A REPO that can't be read is reported and skipped.
 
 Why they pile up: on macOS the dev profile builds with split-debuginfo =
 "unpacked". rustc leaves each crate's object files in deps/ (and
@@ -37,10 +39,13 @@ release, <triple>/<profile>) is left alone when Cargo's build-folder locks
 can't all be taken at once; with --delete they are held while its files are
 deleted, so a build that starts meanwhile waits for them.
 
-The Mac runs it hourly over every axis-cam-desktop checkout from a launchd job:
+The Mac runs it hourly from a launchd job (scripts/install-sweep-rcgu.sh):
 ~/Library/LaunchAgents/local.sweep-rcgu.plist runs ~/.local/bin/sweep-rcgu (a
-copy of this file) with --delete --worktrees <main checkout>, logging to
-~/Library/Logs/sweep-rcgu.log.
+copy of this file) with --delete --worktrees <main checkout> --in
+~/.t3/worktrees/axis-cam-desktop, logging to ~/Library/Logs/sweep-rcgu.log.
+macOS doesn't let a launchd job read ~/Documents, where the main checkout is,
+so there it reaches only the T3 worktrees; the main checkout's target/ is swept
+when it is run by hand.
 """
 
 import fcntl
@@ -59,9 +64,19 @@ UNIT_SUBDIRS = ("deps", "build", "examples")
 
 
 def git_checkouts(repo):
-    out = subprocess.run(["git", "-C", repo, "worktree", "list", "--porcelain"],
-                         check=True, capture_output=True, text=True).stdout
-    return [line[len("worktree "):] for line in out.splitlines() if line.startswith("worktree ")]
+    run = subprocess.run(["git", "-C", repo, "worktree", "list", "--porcelain"], capture_output=True, text=True)
+    if run.returncode != 0:
+        print(f"can't list the checkouts of {repo}, skipped: {run.stderr.strip()}")
+        return []
+    return [line[len("worktree "):] for line in run.stdout.splitlines() if line.startswith("worktree ")]
+
+
+def folders_in(parent):
+    try:
+        return [e.path for e in os.scandir(parent) if e.is_dir(follow_symlinks=False)]
+    except OSError as e:
+        print(f"can't list {parent}, skipped: {e}")
+        return []
 
 
 def in_use():
@@ -170,6 +185,8 @@ def object_files(prof):
 
 def main():
     args = sys.argv[1:]
+    if not args:
+        sys.exit(__doc__)
     delete = False
     targets = []
     while args:
@@ -178,6 +195,8 @@ def main():
             delete = True
         elif a == "--worktrees" and args:
             targets += [os.path.join(c, "target") for c in git_checkouts(os.path.expanduser(args.pop(0)))]
+        elif a == "--in" and args:
+            targets += [os.path.join(c, "target") for c in folders_in(os.path.expanduser(args.pop(0)))]
         elif a.startswith("-"):
             sys.exit(__doc__)
         else:
@@ -185,7 +204,8 @@ def main():
     targets = list(dict.fromkeys(os.path.realpath(os.path.expanduser(t)) for t in targets))
     targets = [t for t in targets if os.path.isdir(t)]
     if not targets:
-        sys.exit(__doc__)
+        print("no target folder found")
+        return
     verb = "deleted" if delete else "would delete"
 
     # References from every binary of every given checkout: clone-cargo-cache's
