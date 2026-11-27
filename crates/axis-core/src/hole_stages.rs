@@ -507,8 +507,10 @@ mod tests {
         // The guide's page gives the finished size of the one hole, no
         // passes (LIO-688).
         let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
-        let crate::guide::Features::Holes { diameter, holes, .. } =
-            crate::guide::tests::features(&guide, 1)
+        let bored = doc.setups[0].operations.len() - 1;
+        let crate::guide::Features::Holes {
+            diameter, holes, ..
+        } = crate::guide::tests::features(&guide, bored)
         else {
             panic!("{:?}", guide.steps)
         };

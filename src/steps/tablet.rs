@@ -374,11 +374,7 @@ fn fill(
             .iter()
             .rposition(|x| x.section == k)
             .map_or(first, |i| i + 1);
-        let (head, size, _) = tall(
-            head(&page(s.steps.start, 0), k).into(),
-            CARD + 200.,
-            true,
-        );
+        let (head, size, _) = tall(head(&page(s.steps.start, 0), k).into(), CARD + 200., true);
         out.sections.push(SectionSteps {
             name: section_name(doc, g, s),
             mark: op_number(g, k).map_or("•".to_string(), |n| n.to_string()),

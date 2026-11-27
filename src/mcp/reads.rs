@@ -1147,12 +1147,7 @@ fn program_text(doc: &Document, job: &crate::post::JobPost, si: usize) -> Value 
 
 /// The steps of `guide` read at `step` (None: the first), with its
 /// sections and where the machinist's own place is.
-fn steps_of(
-    doc: &Document,
-    guide: &guide::Guide,
-    step: Option<usize>,
-    how: &str,
-) -> Answer {
+fn steps_of(doc: &Document, guide: &guide::Guide, step: Option<usize>, how: &str) -> Answer {
     let n = guide.steps.len();
     let at = step.unwrap_or(0);
     if at >= n {
@@ -1307,17 +1302,17 @@ pub(crate) fn step_detail(doc: &Document, si: usize, step: &guide::Step) -> Valu
                 listed,
             )
         }
-            S::HandOver { next } => (
-                "HandOver",
-                None,
-                match next {
-                    Some(n) => format!("The stock goes on to setup {}.", n + 1),
-                    None => "The setup is done.".into(),
-                },
-                vec![],
-            ),
-            S::Lathe(l) => (l.title(), lathe_op(l), format!("{}.", l.title()), vec![]),
-        };
+        S::HandOver { next } => (
+            "HandOver",
+            None,
+            match next {
+                Some(n) => format!("The stock goes on to setup {}.", n + 1),
+                None => "The setup is done.".into(),
+            },
+            vec![],
+        ),
+        S::Lathe(l) => (l.title(), lathe_op(l), format!("{}.", l.title()), vec![]),
+    };
     json!({
         "kind": kind,
         "operation": op.map(|oi| operation_ref(doc, si, oi)),
@@ -1883,7 +1878,12 @@ pub(crate) mod tests {
         // (LIO-688).
         let holes_read = at["step"]["features"].as_array().unwrap();
         assert!(!holes_read.is_empty(), "{at}");
-        assert!(holes_read.iter().all(|h| h["x"].is_number() && h["tip"].is_number()), "{at}");
+        assert!(
+            holes_read
+                .iter()
+                .all(|h| h["x"].is_number() && h["tip"].is_number()),
+            "{at}"
+        );
         assert!(at["step"]["operation"]["id"].is_string(), "{at}");
         assert_eq!(d.app.doc.guide, place);
         assert!(d.app.guide.is_none(), "the app's guide is not touched");

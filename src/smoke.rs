@@ -11857,7 +11857,10 @@ flood = { pin = 8 }
         assert!(t.iter().any(|s| s == "by hand, spindle off"), "{t:?}");
         assert!(!t.iter().any(|s| s.ends_with(" rpm")), "{t:?}");
         assert!(t.iter().any(|s| s == "Thread"), "{t:?}");
-        assert!(t.iter().any(|s| s == "M6×1") && t.iter().any(|s| s == "through"), "{t:?}");
+        assert!(
+            t.iter().any(|s| s == "M6×1") && t.iter().any(|s| s == "through"),
+            "{t:?}"
+        );
         let m5 = op_step(&a, "Thread M5×0.8");
         let t = texts_at(&mut a, m5);
         assert!(t.iter().any(|s| s == "M5×0.8"), "{t:?}");

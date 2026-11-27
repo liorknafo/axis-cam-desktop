@@ -1897,9 +1897,11 @@ pub mod tests {
     #[test]
     fn every_walk_of_the_adapter_plate_passes_and_its_page_lists_the_corners() {
         let (doc, mesh) = adapter_plate_setup_3();
+        let oi = doc.setups[0].operations.len() - 1;
         let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
-        assert_eq!(guide.done[0].plan.corner_walks.len(), 16);
-        let crate::guide::Features::Corners(c) = crate::guide::tests::features(&guide, 0) else {
+        let done = guide.done.iter().find(|d| d.op == oi).unwrap();
+        assert_eq!(done.plan.corner_walks.len(), 16);
+        let crate::guide::Features::Corners(c) = crate::guide::tests::features(&guide, oi) else {
             panic!("{:?}", guide.steps)
         };
         assert_eq!(c.len(), 4);
@@ -2047,7 +2049,10 @@ pub mod tests {
             assert_eq!(listed.len(), corners.len(), "{spindle}");
             for (r, c) in listed.iter().zip(&corners) {
                 assert!((r.radius - c.r).abs() < 1e-3, "{spindle}: {r:?}");
-                assert!((r.bottom - (c.bottom - guide.zero[2])).abs() < 1e-3, "{r:?}");
+                assert!(
+                    (r.bottom - (c.bottom - guide.zero[2])).abs() < 1e-3,
+                    "{r:?}"
+                );
             }
             assert!(listed.iter().any(|r| (r.radius - 3.).abs() < 1e-3));
             assert!(listed.iter().any(|r| (r.radius - 5.).abs() < 1e-3));

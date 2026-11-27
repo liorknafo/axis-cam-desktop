@@ -601,6 +601,10 @@ fn mouths_of(moves: &[Move], zero: [f32; 3]) -> Vec<f32> {
     }
     out.into_iter().map(|(_, z)| z).collect()
 }
+/// `turns` to a tenth, rounded down, a hair over a whole tenth kept.
+fn tenths_down(turns: f32) -> f32 {
+    (turns * 10. + 1e-3).floor() / 10.
+}
 /// Whether the mouth of the hole Ø`d` at `at` (stock frame), drilled from
 /// as high as `top` down to `bottom`, is opened in `before` so that a twist
 /// drill finds its centre: its axis is open, or the material on it starts
@@ -1328,11 +1332,19 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 // meets there.
                 Features::Box {
                     lo: std::array::from_fn(|k| {
-                        let v = if k == 2 { lo[2] } else { lo[k].max(left.min[k]) };
+                        let v = if k == 2 {
+                            lo[2]
+                        } else {
+                            lo[k].max(left.min[k])
+                        };
                         v - zero[k]
                     }),
                     hi: std::array::from_fn(|k| {
-                        let v = if k == 2 { hi[2].min(left.max[2]) } else { hi[k].min(left.max[k]) };
+                        let v = if k == 2 {
+                            hi[2].min(left.max[2])
+                        } else {
+                            hi[k].min(left.max[k])
+                        };
                         v - zero[k]
                     }),
                     through: open[2][0],
@@ -1363,8 +1375,8 @@ pub fn build(doc: &Document, mesh: &Mesh, si: usize) -> Result<Guide, String> {
                 // The finished size, the last pass's, and the holes as it
                 // bores them: no passes or head settings (LIO-688).
                 let (at, size) = (plan.stops.iter())
-                    .filter_map(|s| Some((s.at, s.size?)))
-                    .last()
+                    .rev()
+                    .find_map(|s| Some((s.at, s.size?)))
                     .unwrap_or((0, 2. * r));
                 let moves = &plan.moves[at.min(plan.moves.len())..];
                 let holes = holes_of(moves, zero);
@@ -1548,9 +1560,8 @@ fn hole_rows(
         crate::cam::number(op, "top").unwrap_or(0.).max(0.)
     };
     let tool = doc.tools.iter().find(|t| t.id == op.tool);
-    let cone = tool.is_some_and(|t| {
-        ["Chamfer mill", crate::model::CENTRE_DRILL].contains(&get(&t.p, "type"))
-    });
+    let cone = tool
+        .is_some_and(|t| ["Chamfer mill", crate::model::CENTRE_DRILL].contains(&get(&t.p, "type")));
     let through = matches!(crate::cam::breakthrough(op), Ok((true, _))) && !cone && !pins;
     let full = if cone {
         0.
@@ -2385,7 +2396,7 @@ pub mod tests {
         assert!((a - b).abs() < 1e-3, "{a} != {b}");
     }
     /// What operation `op`'s page lists.
-    pub(crate) fn features(guide: &Guide, op: usize) -> &Features {
+    pub fn features(guide: &Guide, op: usize) -> &Features {
         (guide.steps.iter())
             .find_map(|s| match s {
                 Step::Sheet {
@@ -2396,7 +2407,7 @@ pub mod tests {
             .unwrap_or_else(|| panic!("no page for operation {op}: {:?}", guide.steps))
     }
     /// The holes operation `op`'s page lists.
-    pub(crate) fn holes_of_op(guide: &Guide, op: usize) -> &[Hole] {
+    pub fn holes_of_op(guide: &Guide, op: usize) -> &[Hole] {
         match features(guide, op) {
             Features::Holes { holes, .. } => holes,
             f => panic!("{f:?}"),
@@ -2501,7 +2512,7 @@ pub mod tests {
     /// A 120 × 90 × 10 plate with Ø6 holes through at `at` (its middle at
     /// 0), drilled Ø6 on a manual mill; with `centred` a centre drilling of
     /// the same holes before it.
-    pub(crate) fn holes_job(at: &[[f32; 2]], centred: bool) -> (Document, Mesh) {
+    pub fn holes_job(at: &[[f32; 2]], centred: bool) -> (Document, Mesh) {
         use crate::cam::boring::tests::{drill, drilling, job};
         let outer = [
             (-60., -45., 0.),
@@ -2536,13 +2547,13 @@ pub mod tests {
         (doc, mesh)
     }
     /// The plate's 3 × 4 grid: Ø6 holes 20 apart in X, 15 in Y.
-    pub(crate) fn plate_grid() -> Vec<[f32; 2]> {
+    pub fn plate_grid() -> Vec<[f32; 2]> {
         (0..3)
             .flat_map(|r| (0..4).map(move |c| [-30. + 20. * c as f32, -15. + 15. * r as f32]))
             .collect()
     }
     /// The plate's bolt circle: six Ø6 holes on Ø60, the first at 30°.
-    pub(crate) fn plate_circle() -> Vec<[f32; 2]> {
+    pub fn plate_circle() -> Vec<[f32; 2]> {
         (0..6)
             .map(|k| (30. + 60. * k as f32).to_radians())
             .map(|a| [30. * a.cos(), 30. * a.sin()])
@@ -2682,7 +2693,10 @@ pub mod tests {
         else {
             panic!("{:?}", guide.steps[1])
         };
-        assert_eq!((*op, tool, *rpm, *through), (0, &doc.tools[3].id, Some(640.), false));
+        assert_eq!(
+            (*op, tool, *rpm, *through),
+            (0, &doc.tools[3].id, Some(640.), false)
+        );
         close(lo[2], -2.);
         close(hi[2], 0.);
         for k in 0..2 {
@@ -2978,8 +2992,6 @@ pub mod tests {
             let why = build(&doc, &mesh, 0).unwrap_err();
             assert!(!why.is_empty() && !why.starts_with(UNDER_CLAMPS), "{why}");
         }
-    }
-    #[test]
     }
     #[test]
     fn a_step_beside_a_hole_or_a_flat_face_does_not_centre_it_and_a_cone_does() {
