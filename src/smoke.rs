@@ -3682,6 +3682,104 @@ flood = { pin = 8 }
         assert!(problems(&a).is_empty(), "{:?}", problems(&a));
     }
 
+    /// LIO-699: a start at a step that is also a tool change (the Drill's
+    /// third hole, T3, after T1's tool run). The Control page shows the
+    /// Tool change tab, not Start at a step, so the run's line names the
+    /// Work zero tab's Keep this work zero, which is there and keeps it;
+    /// also where the check cannot tell the stock they left (`two_pass_app`'s
+    /// Face, Pocket and Drilling).
+    #[test]
+    fn a_start_at_a_step_at_a_tool_change_names_the_keep_on_the_page() {
+        use crate::run::Action as R;
+        use crate::ui::ControlTab;
+        use uc100::controller::State;
+        // 0: `run_app`, the Drill's third hole after T1's Face. 1:
+        // `two_pass_app`, the Drilling's third hole after the Face and
+        // Pocket. 2: `two_pass_app`'s Drilling run first, then Face pass 2,
+        // T1 after T3, on stock this run cut: the check cannot tell it.
+        for case in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut a = if case == 0 {
+                run_app(dir.path())
+            } else {
+                two_pass_app(dir.path())
+            };
+            zeroed(&mut a);
+            let _ = a.update(Message::Run(R::Setup(0)));
+            answer_skips(&mut a, 0);
+            let (run, oi, step) = match case {
+                0 => (0, 1, 2),
+                1 => (0, 2, 2),
+                _ => {
+                    let _ = a.update(Message::Run(R::Next(1)));
+                    let _ = a.update(Message::Run(R::KeepZero));
+                    (1, 0, 1)
+                }
+            };
+            assert!(problems(&a).is_empty(), "{case}: {:?}", problems(&a));
+            let _ = a.update(Message::Run(R::CycleStart));
+            tick_until(&mut a, 3.0, "the job", |s| s.state == Some(State::Run));
+            run_until(&mut a, 90.0, "the tool run", |r| r.done[run]);
+            tick_until(&mut a, 5.0, "Idle", |s| s.state == Some(State::Idle));
+            let _ = a.update(Message::Run(R::Steps(Some(oi))));
+            let _ = a.update(Message::Run(R::PickStep(oi, step)));
+            let _ = a.update(Message::Run(R::StartStep));
+            answer_skips(&mut a, 0);
+            assert_eq!(run_of(&a).at_step(), Some((oi, step)), "{case}");
+            assert!(run_of(&a).tool_change().is_some(), "{case}");
+            let blocked = conn(&a).partway_blocked();
+            assert_eq!(blocked.is_some(), case == 2, "{case}: {blocked:?}");
+            let wants = problems(&a);
+            let line = (wants.iter())
+                .find(|p| p.starts_with("This run starts "))
+                .unwrap_or_else(|| panic!("{case}: {wants:?}"));
+            assert!(
+                line.contains("(Keep this work zero, under Work zero)")
+                    && !line.contains("Start at a step"),
+                "{case}: {line}"
+            );
+            a.page = Page::Control;
+            let tabs = crate::ui::control_tabs(conn(&a));
+            assert!(
+                tabs.contains(&ControlTab::ToolChange)
+                    && tabs.contains(&ControlTab::WorkZero)
+                    && !tabs.contains(&ControlTab::Start),
+                "{case}: {tabs:?}"
+            );
+            let _ = a.update(Message::ControlTab(ControlTab::WorkZero));
+            let texts = page_texts(&a);
+            assert!(
+                texts.iter().any(|t| t == "Keep this work zero"),
+                "{case}: {texts:?}"
+            );
+            assert!(
+                !texts.iter().any(|t| t.contains("Start at a step")),
+                "{case}: {texts:?}"
+            );
+            if let Some(why) = blocked {
+                let said = format!(
+                    "{why} Zero Z on the stock top and Probe Z are off: {}.",
+                    crate::run::STEP_ZERO_BY_HAND_AT_TOOL_CHANGE
+                );
+                assert!(texts.contains(&said), "{case}: {texts:?}");
+            }
+            let clicks = crate::ui::probe::clicks(a.view(), WINDOW);
+            assert!(
+                (clicks.iter()).any(|m| matches!(m, Message::Run(R::KeepZero))),
+                "{case}: {clicks:?}"
+            );
+            let _ = a.update(Message::Run(R::KeepZero));
+            assert!(
+                !problems(&a)
+                    .iter()
+                    .any(|p| p.starts_with("This run starts ")),
+                "{case}: {:?}",
+                problems(&a)
+            );
+            let _ = a.update(Message::Disconnect);
+        }
+    }
+
     /// The Drill's tool run started at its operation, its work zero and
     /// tool kept: Cycle Start sent and running, `run_app`'s Face and Drill.
     fn drilling(a: &mut App) -> crate::run::OpSteps {
