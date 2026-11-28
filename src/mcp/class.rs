@@ -355,7 +355,7 @@ pub fn guide(a: &GuideAction) -> Class {
         | GuideAction::Measured(..)
         | GuideAction::Typed(..)
         | GuideAction::CrossReads(_) => Class::Machine,
-        GuideAction::Beat(_) | GuideAction::Built(..) => Class::Internal,
+        GuideAction::Built(..) => Class::Internal,
     }
 }
 

@@ -504,34 +504,17 @@ mod tests {
                 .count();
             assert!(moved <= 1, "{m:?}");
         }
-        // The guide: a Bore step a pass, each with the size to set and,
-        // after the first, the size to measure; the one hole each time.
+        // The guide's page gives the finished size of the one hole, no
+        // passes (LIO-688).
         let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
-        let passes: Vec<&crate::guide::Step> = (guide.steps.iter())
-            .filter(|s| matches!(s, crate::guide::Step::Bore { .. }))
-            .collect();
-        assert_eq!(passes.len(), 11);
-        for (k, s) in passes.iter().enumerate() {
-            let crate::guide::Step::Bore {
-                index,
-                of,
-                size,
-                before,
-                dial,
-                feed_out,
-                holes,
-                mouths,
-                ..
-            } = s
-            else {
-                unreachable!()
-            };
-            assert_eq!((*index, *of), (k + 1, 11));
-            assert_eq!(*size, sizes[k]);
-            assert_eq!(*before, k.checked_sub(1).map(|j| sizes[j]));
-            assert_eq!((*dial, *feed_out), (0.01, false));
-            assert_eq!((holes.len(), mouths.len()), (1, 1), "{holes:?}");
-        }
+        let bored = doc.setups[0].operations.len() - 1;
+        let crate::guide::Features::Holes {
+            diameter, holes, ..
+        } = crate::guide::tests::features(&guide, bored)
+        else {
+            panic!("{:?}", guide.steps)
+        };
+        assert_eq!((*diameter, holes.len()), (32., 1));
     }
     #[test]
     fn the_manual_mill_reams_and_its_guide_shows_each_hole() {
@@ -568,12 +551,6 @@ mod tests {
             crate::simulation::Motion::Feed
         );
         let guide = crate::guide::build(&doc, &mesh, 0).unwrap();
-        let holes = (guide.steps.iter())
-            .filter_map(|s| match s {
-                crate::guide::Step::Holes { op: 1, holes, .. } => Some(holes.len()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(holes, [1]);
+        assert_eq!(crate::guide::tests::holes_of_op(&guide, 1).len(), 1);
     }
 }

@@ -929,7 +929,7 @@ fn steps(app: &App, args: &Value) -> Result<Plan, Answer> {
         && let Some(built) = app.current_guide()
     {
         return Ok(Plan::Now(match built {
-            Ok(shown) => steps_of(doc, &shown.guide, &shown.lifts(), step, "cached"),
+            Ok(shown) => steps_of(doc, &shown.guide, step, "cached"),
             Err(why) => refused(why.clone()),
         }));
     }
@@ -937,10 +937,7 @@ fn steps(app: &App, args: &Value) -> Result<Plan, Answer> {
     work("steps", true, move |s| {
         let mesh = part(s)?;
         match guide::build(&s.doc, mesh, si) {
-            Ok(guide) => {
-                let lifts = crate::steps::Lifts::of(&s.doc, mesh, &guide);
-                steps_of(&s.doc, &guide, &lifts, step, "built")
-            }
+            Ok(guide) => steps_of(&s.doc, &guide, step, "built"),
             Err(why) => refused(why),
         }
     })
@@ -1149,15 +1146,8 @@ fn program_text(doc: &Document, job: &crate::post::JobPost, si: usize) -> Value 
 }
 
 /// The steps of `guide` read at `step` (None: the first), with its
-/// sections and where the machinist's own place is; a hole step says how
-/// high the tool goes before X and Y move (`lifts`, as its page does).
-fn steps_of(
-    doc: &Document,
-    guide: &guide::Guide,
-    lifts: &crate::steps::Lifts,
-    step: Option<usize>,
-    how: &str,
-) -> Answer {
+/// sections and where the machinist's own place is.
+fn steps_of(doc: &Document, guide: &guide::Guide, step: Option<usize>, how: &str) -> Answer {
     let n = guide.steps.len();
     let at = step.unwrap_or(0);
     if at >= n {
@@ -1181,24 +1171,7 @@ fn steps_of(
         })
         .collect();
     let section = guide.sections.iter().position(|s| s.steps.contains(&at));
-    let mut detail = step_detail(doc, guide, si, &guide.steps[at]);
-    // Over the stock and the clamps or the jaws between holes (LIO-449,
-    // LIO-538), as the page's first readout says.
-    if let guide::Step::Holes { op, .. } | guide::Step::Bore { op, .. } = &guide.steps[at] {
-        let z = lifts.z(doc, guide, *op);
-        let tapping = (doc.setups[si].operations.get(*op)).is_some_and(|o| o.tapping());
-        let lift = format!(
-            " Before X and Y move to each hole, {}go up to Z {z:.2}, clear of the stock and {}.",
-            if tapping {
-                "turn the tap back out and "
-            } else {
-                ""
-            },
-            lifts.holder()
-        );
-        detail["text"] = json!(detail["text"].as_str().unwrap_or("").to_string() + &lift);
-        detail["lift_z"] = json!((z * 100.).round() / 100.);
-    }
+    let mut detail = step_detail(doc, si, &guide.steps[at]);
     detail["index"] = json!(at);
     detail["section"] = json!(section.map(|k| &guide.sections[k].name));
     done(json!({
@@ -1214,328 +1187,137 @@ fn steps_of(
     }))
 }
 
-/// The axes by index.
-const AXES: [&str; 3] = ["X", "Y", "Z"];
-/// A DRO number to go to, as the step lists it.
-fn readout(t: &guide::Target) -> Value {
-    json!({
-        "order": t.order,
-        "axis": AXES.get(t.axis),
-        "reads": (t.shown * 1000.).round() / 1000.,
-        "centre": (t.centre * 1000.).round() / 1000.,
-        "edge": t.edge,
-        "feed": t.feed,
-    })
-}
-/// Holes as the step drills them: X, Y, the depth's Z and the mouth's.
-fn holes(at: &[[f32; 3]], mouths: &[f32]) -> Vec<Value> {
-    (at.iter().enumerate())
-        .map(|(k, h)| json!({"n": k + 1, "x": h[0], "y": h[1], "z": h[2], "mouth": mouths.get(k)}))
-        .collect()
-}
-
-/// What a step says: its kind, its operation, a line of text, its readouts
-/// and holes, and all it holds (`detail`).
-pub(crate) fn step_detail(
-    doc: &Document,
-    guide: &guide::Guide,
-    si: usize,
-    step: &guide::Step,
-) -> Value {
-    use guide::Step as S;
+/// What a step says: its kind, its operation, a line of text, on the mill
+/// what it cuts (LIO-688), and all it holds (`detail`).
+pub(crate) fn step_detail(doc: &Document, si: usize, step: &guide::Step) -> Value {
+    use guide::{Depth, Features, Step as S};
     let tool_name = |id: &str| {
         (doc.tools.iter().find(|t| t.id == id)).map_or(id.to_string(), |t| t.name().to_string())
     };
-    let (kind, op, text, readouts, at): (&str, Option<usize>, String, Vec<Value>, Vec<Value>) =
-        match step {
-            S::Hold { stock, vise, .. } => {
-                let [x, y, z] = stock.dimensions().map(plan_check::plain);
-                let held = match vise {
-                    Some(v) => format!(
-                        ", in the vise across {} gripping {} mm",
-                        ["X", "Y"][v.across.min(1)],
-                        plan_check::plain(v.grip)
-                    ),
-                    None => String::new(),
-                };
-                // The parallels it stands on, as the Hold page says them
-                // (LIO-537).
-                let held = match doc.setups.get(si).and_then(crate::parallels::sentence) {
-                    Some(on) => format!("{held}. {}", on.trim_end_matches('.')),
-                    None => held,
-                };
-                // The setup's notes say what holds and supports the part,
-                // as the Hold page shows them (LIO-487).
-                let notes = (doc.setups.get(si)).map_or("", |s| get(&s.p, "notes").trim());
-                let notes = if notes.is_empty() {
-                    String::new()
-                } else {
-                    format!(" Setup notes: {notes}")
-                };
-                (
-                    "Hold",
-                    None,
-                    format!("Hold the {x} × {y} × {z} mm stock{held}.{notes}"),
-                    vec![],
-                    vec![],
-                )
-            }
-            S::Zero {
-                corner,
-                touch,
-                finder,
-                ..
-            } => (
+    let r3 = |v: f32| (v * 1000.).round() / 1000.;
+    let (kind, op, text, features): (&str, Option<usize>, String, Vec<Value>) = match step {
+        S::Zero { stock, vise, .. } => {
+            let [x, y, z] = stock.dimensions().map(plan_check::plain);
+            let held = match vise {
+                Some(v) => format!(
+                    ", in the vise across {} gripping {} mm",
+                    ["X", "Y"][v.across.min(1)],
+                    plan_check::plain(v.grip)
+                ),
+                None => String::new(),
+            };
+            // The parallels it stands on, as the Zero page says them
+            // (LIO-537).
+            let held = match doc.setups.get(si).and_then(crate::parallels::sentence) {
+                Some(on) => format!("{held}. {}", on.trim_end_matches('.')),
+                None => held,
+            };
+            // The setup's notes say what holds and supports the part, as
+            // the Zero page shows them (LIO-487).
+            let notes = (doc.setups.get(si)).map_or("", |s| get(&s.p, "notes").trim());
+            let notes = if notes.is_empty() {
+                String::new()
+            } else {
+                format!(" Setup notes: {notes}")
+            };
+            (
                 "Zero",
                 None,
                 format!(
-                    "Set the work zero with a Ø{} edge finder: touch and set X {}, Y {}, Z {}.",
-                    plan_check::plain(*finder),
-                    plan_check::plain(touch[0]),
-                    plan_check::plain(touch[1]),
-                    plan_check::plain(touch[2])
-                ) + &format!(" Zero at {:?} of the stock.", rounded3(*corner)),
-                vec![],
-                vec![],
-            ),
-            S::Tool {
-                op, tool, rpm, top, ..
-            } => (
-                "Tool",
-                Some(*op),
-                format!(
-                    "Put in {} at {} rpm{}.",
-                    tool_name(tool),
-                    plan_check::plain(*rpm),
-                    top.map_or(String::new(), |t| format!(
-                        ", touch the top and set Z to {}",
-                        plan_check::plain(t)
-                    ))
+                    "The {x} × {y} × {z} mm stock{held}. The work zero: the stock runs from X {} to {}, Y {} to {}, Z {} to {}.{notes}",
+                    plan_check::plain(stock.min[0]),
+                    plan_check::plain(stock.max[0]),
+                    plan_check::plain(stock.min[1]),
+                    plan_check::plain(stock.max[1]),
+                    plan_check::plain(stock.min[2]),
+                    plan_check::plain(stock.max[2]),
                 ),
                 vec![],
-                vec![],
-            ),
-            S::TapIn { op, tool, .. } => (
-                "TapIn",
-                Some(*op),
-                format!("Put in the tap {}, the spindle off.", tool_name(tool)),
-                vec![],
-                vec![],
-            ),
-            S::Leave { op, at, number, .. } => (
-                "Leave",
-                Some(*op),
-                format!(
-                    "Leave the DRO's hole function after hole {number}: X and Y read work coordinates again, at X {} Y {}.",
-                    plan_check::plain(at[0]),
-                    plan_check::plain(at[1])
-                ),
-                vec![],
-                vec![],
-            ),
-            S::Comp { op, comp, diameter } => (
-                "Comp",
-                Some(*op),
-                format!(
-                    "Enter Ø{} in the DRO, compensation sides {comp:?}.",
-                    plan_check::plain(*diameter)
-                ),
-                vec![],
-                vec![],
-            ),
-            S::Pass {
-                op,
-                index,
-                of,
-                targets,
-                ..
-            } => (
-                "Pass",
-                Some(*op),
-                format!("Pass {index} of {of}: move to each DRO number in order."),
-                targets.iter().map(readout).collect(),
-                vec![],
-            ),
-            S::Face {
-                op,
-                tool,
-                rpm,
-                remove,
-                to,
-                size,
-                ..
-            } => (
-                "Face",
-                Some(*op),
-                match size {
-                    // To size (LIO-487): the planned depth is on the blank's
-                    // planned size, so it is about; the measured size sets
-                    // the last level, in the page's own words.
-                    Some(size) => {
-                        let (stock, across) = match guide.steps.first() {
-                            Some(S::Hold { stock, vise, .. }) => (*stock, vise.map(|v| v.across)),
-                            _ => (
-                                crate::mesh::Bounds {
-                                    min: [0.; 3],
-                                    max: [0.; 3],
-                                },
-                                None,
-                            ),
-                        };
-                        format!(
-                            "Face the top with {} at {} rpm, finishing the part to {} mm top to bottom: plan down to about Z {}, about {} mm off. {}",
-                            tool_name(tool),
-                            plan_check::plain(*rpm),
-                            plan_check::plain(*size),
-                            plan_check::plain(*to),
-                            plan_check::plain(*remove),
-                            crate::steps::to_size_lines(*size, &stock, across).join(" ")
-                        )
-                    }
-                    None => format!(
-                        "Face the top with {} at {} rpm down to Z {}, taking off {} mm.",
-                        tool_name(tool),
-                        plan_check::plain(*rpm),
-                        plan_check::plain(*to),
-                        plan_check::plain(*remove)
+            )
+        }
+        S::Sheet {
+            op,
+            tool,
+            rpm,
+            features,
+        } => {
+            let speed = match rpm {
+                Some(r) => format!("at {} rpm", plan_check::plain(*r)),
+                None => "by hand, the spindle off".into(),
+            };
+            let (what, listed): (String, Vec<Value>) = match features {
+                Features::Holes {
+                    diameter,
+                    thread,
+                    holes,
+                } => (
+                    format!(
+                        "{} hole(s), {}",
+                        holes.len(),
+                        thread
+                            .clone()
+                            .unwrap_or_else(|| format!("Ø{}", plan_check::plain(*diameter)))
                     ),
-                },
-                vec![],
-                vec![],
-            ),
-            S::Square {
-                op,
-                axis,
-                side,
-                shown,
-                remove,
-                down_to,
-                ..
-            } => (
-                "Square",
-                Some(*op),
-                format!(
-                    "Square the {}{} side to a DRO reading of {}, taking off {} mm, down to Z {}.",
-                    if *side < 0 { "−" } else { "+" },
-                    AXES[(*axis).min(2)],
-                    plan_check::plain(*shown),
-                    plan_check::plain(*remove),
-                    plan_check::plain(*down_to)
+                    (holes.iter().enumerate())
+                        .map(|(k, h)| {
+                            let (deep, tip) = match h.depth {
+                                Depth::Through { tip } => (None, tip),
+                                Depth::Blind { deep, tip } => (Some(r3(deep)), tip),
+                            };
+                            json!({"n": k + 1, "x": r3(h.at[0]), "y": r3(h.at[1]), "mouth": r3(h.mouth),
+                                "through": deep.is_none(), "deep": deep, "tip": r3(tip)})
+                        })
+                        .collect(),
                 ),
-                vec![],
-                vec![],
-            ),
-            S::Holes {
-                op,
-                holes: h,
-                mouths,
-                ..
-            } => (
-                "Holes",
-                Some(*op),
-                format!("Drill {} holes in order.", h.len()),
-                vec![],
-                holes(h, mouths),
-            ),
-            S::Pattern { op, .. } => (
-                "Pattern",
-                Some(*op),
-                "Type the hole pattern into the DRO.".into(),
-                vec![],
-                vec![],
-            ),
-            S::Bore {
-                op,
-                index,
-                of,
-                size,
-                holes: h,
-                mouths,
-                ..
-            } => (
-                "Bore",
-                Some(*op),
-                format!(
-                    "Boring pass {index} of {of}: set the head to Ø{} and bore each hole.",
-                    plan_check::plain(*size)
+                Features::Box { lo, hi, through } => (
+                    "a box".into(),
+                    vec![json!({"n": 1, "min": lo.map(r3), "max": hi.map(r3), "through": through})],
                 ),
-                vec![],
-                holes(h, mouths),
-            ),
-            S::Corner {
-                op,
-                index,
-                of,
-                corner,
-                corners,
-                radius,
-                targets,
-                ..
-            } => (
-                "Corner",
-                Some(*op),
-                format!(
-                    "Round corner {corner} of {corners} (R{}), walk {index} of {of}: move to each DRO number in order.",
-                    plan_check::plain(*radius)
+                Features::Slot {
+                    a,
+                    b,
+                    width,
+                    top,
+                    floor,
+                    through,
+                } => (
+                    "a slot".into(),
+                    vec![json!({"n": 1, "a": a.map(r3), "b": b.map(r3), "width": r3(*width),
+                        "top": r3(*top), "floor": r3(*floor), "through": through})],
                 ),
-                targets.iter().map(readout).collect(),
-                vec![],
-            ),
-            S::Slot {
-                op,
-                index,
-                of,
-                targets,
-                pass,
-                joined,
-                ..
-            } => (
-                "Slot",
-                Some(*op),
-                format!(
-                    "Slot pass {index} of {of}{}: move to each DRO number in order.",
-                    match pass {
-                        crate::slot::Kind::Outline { .. } if *joined =>
-                            ", straight along the sides between the bored ends",
-                        crate::slot::Kind::Finish if *joined =>
-                            ", the straight walls at size between the bored ends",
-                        _ => "",
-                    }
+                Features::Corners(c) => (
+                    format!("{} corner(s)", c.len()),
+                    (c.iter().enumerate())
+                        .map(|(k, c)| {
+                            json!({"n": k + 1, "place": c.place, "centre": c.centre.map(r3),
+                                "radius": r3(c.radius), "top": r3(c.top), "bottom": r3(c.bottom)})
+                        })
+                        .collect(),
                 ),
-                targets.iter().map(readout).collect(),
-                vec![],
-            ),
-            S::Check { op } => (
-                "Check",
+            };
+            (
+                "Sheet",
                 Some(*op),
-                "Measure the stock the operation left.".into(),
-                vec![],
-                vec![],
-            ),
-            S::HandOver { next } => (
-                "HandOver",
-                None,
-                match next {
-                    Some(n) => format!("The stock goes on to setup {}.", n + 1),
-                    None => "The setup is done.".into(),
-                },
-                vec![],
-                vec![],
-            ),
-            S::Lathe(l) => (
-                l.title(),
-                lathe_op(l),
-                format!("{}.", l.title()),
-                vec![],
-                vec![],
-            ),
-        };
+                format!("With {} {speed}: {what}.", tool_name(tool)),
+                listed,
+            )
+        }
+        S::HandOver { next } => (
+            "HandOver",
+            None,
+            match next {
+                Some(n) => format!("The stock goes on to setup {}.", n + 1),
+                None => "The setup is done.".into(),
+            },
+            vec![],
+        ),
+        S::Lathe(l) => (l.title(), lathe_op(l), format!("{}.", l.title()), vec![]),
+    };
     json!({
         "kind": kind,
         "operation": op.map(|oi| operation_ref(doc, si, oi)),
         "text": text,
-        "readouts": readouts,
-        "holes": at,
+        "features": features,
         "detail": format!("{step:?}"),
     })
 }
@@ -2068,7 +1850,7 @@ pub(crate) mod tests {
         assert_eq!(cached["outcome"], "done", "{cached}");
         assert_eq!(cached["guide"], "cached", "{cached}");
         assert_eq!(cached["step"]["index"], 1, "{cached}");
-        // Any step, with an earlier operation selected: the Holes.
+        // Any step, with an earlier operation selected: the Holes' page.
         d.app.selected = Some(0);
         let n = cached["steps"].as_u64().unwrap() as usize;
         let step = |d: &mut Direct, k: usize| {
@@ -2079,8 +1861,11 @@ pub(crate) mod tests {
             )
         };
         let holes = (0..n)
-            .find(|&k| step(&mut d, k)["step"]["kind"] == "Holes")
-            .expect("a Holes step");
+            .find(|&k| {
+                let s = step(&mut d, k);
+                s["step"]["kind"] == "Sheet" && s["step"]["text"].as_str().unwrap().contains("hole")
+            })
+            .expect("the Holes' page");
         let beyond = step(&mut d, n);
         assert_eq!(beyond["outcome"], "refused", "{beyond}");
         assert_eq!(d.app.doc.guide, place);
@@ -2088,16 +1873,17 @@ pub(crate) mod tests {
         d.app.guide = None;
         let at = step(&mut d, holes);
         assert_eq!(at["guide"], "built", "{at}");
-        assert_eq!(at["step"]["kind"], "Holes", "{at}");
-        // Up over the stock and its holding between holes, as the page
-        // says (LIO-538).
-        let lift = at["step"]["lift_z"].as_f64().expect("lift_z") as f32;
+        assert_eq!(at["step"]["kind"], "Sheet", "{at}");
+        // Each hole with its place and depth, as the page lists them
+        // (LIO-688).
+        let holes_read = at["step"]["features"].as_array().unwrap();
+        assert!(!holes_read.is_empty(), "{at}");
         assert!(
-            (at["step"]["text"].as_str().unwrap())
-                .contains(&format!("go up to Z {lift:.2}, clear of the stock and ")),
+            holes_read
+                .iter()
+                .all(|h| h["x"].is_number() && h["tip"].is_number()),
             "{at}"
         );
-        assert!(!at["step"]["holes"].as_array().unwrap().is_empty(), "{at}");
         assert!(at["step"]["operation"]["id"].is_string(), "{at}");
         assert_eq!(d.app.doc.guide, place);
         assert!(d.app.guide.is_none(), "the app's guide is not touched");

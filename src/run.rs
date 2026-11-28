@@ -2599,20 +2599,24 @@ impl Run {
     }
 
     /// At a tool change, Z was set since otherwise than by a Z set on the
-    /// Control page (MDI, the tablet, LIO-630): the Z work offset is
-    /// neither the one the last tool run started with nor the one the last
-    /// Z set here left, so whose Z it is is not known, and the new tool
-    /// waits for its own, as on the tablet (LIO-648). None while a Z set
-    /// is on its way: Cycle Start waits for the machine to show it.
+    /// Control page (MDI, the tablet, LIO-630): the Z work offset is not
+    /// the one the last Z set here left, or, with none set here since the
+    /// last tool run started, not the one that started with. Whose Z it is
+    /// is not known, and the new tool waits for its own, as on the tablet
+    /// (LIO-648). Set back to the last tool run's after a touch-off, it is
+    /// the old tool's, not the new one's (LIO-775). None while a Z set is
+    /// on its way: Cycle Start waits for the machine to show it, as it
+    /// does while the touch-off is not shown yet.
     pub fn z_elsewhere(&self, c: &Connection) -> bool {
-        if self.tool_change().is_none() {
+        if self.tool_change().is_none() || c.z_set_waits(self) {
             return false;
         }
         let offset = c.snapshot.work_offset[2];
         let unchanged = |z: f64| (offset - z).abs() < 1e-6;
-        (self.last.as_ref()).is_some_and(|(_, z)| !unchanged(*z))
-            && !c.z_set_waits(self)
-            && !(self.touched_for.as_ref()).is_some_and(|t| t.z.is_none_or(unchanged))
+        match &self.touched_for {
+            Some(t) => t.z.is_some_and(|z| !unchanged(z)),
+            None => (self.last.as_ref()).is_some_and(|(_, z)| !unchanged(*z)),
+        }
     }
 
     /// The start a Z set is pressed for (`forget_touch`): another picked
@@ -12605,6 +12609,16 @@ pub(crate) mod tests {
             says_at(&run, &moved, &wait(1)),
             "{:?}",
             run.problems(&moved, &doc)
+        );
+        // Set back otherwise to the one the last tool run started with:
+        // T1's Z, not T2's, so it waits too (LIO-775, the tablet's LIO-663).
+        let mut back = crate::control::Connection::open(&m, dir.path()).unwrap();
+        back.snapshot.work_offset[2] = offset - 5.;
+        assert!(run.touched() && run.z_elsewhere(&back));
+        assert!(
+            says_at(&run, &back, &wait(1)),
+            "{:?}",
+            run.problems(&back, &doc)
         );
         // The same tool next: no tool change, nothing asked.
         let mut run = fresh(1);

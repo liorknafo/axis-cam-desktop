@@ -2872,6 +2872,12 @@ pub struct Document {
     /// runs once and a count the user sets later stays.
     #[serde(default)]
     pub starter_drill_fixed: bool,
+    /// Whether `guide` counts a manual mill's steps as its zero page and a
+    /// page an operation (LIO-688): false in a project saved before, whose
+    /// places counted the old per-hole and per-pass steps, so they are
+    /// dropped once (`drop_old_steps_places`).
+    #[serde(default)]
+    pub steps_pages: bool,
     /// The workholding library: vises and clamps, carried to new projects
     /// like tools.
     #[serde(default)]
@@ -2936,6 +2942,7 @@ impl Default for Document {
             starter_materials: 0,
             starter_tools: 0,
             starter_drill_fixed: true,
+            steps_pages: true,
             workholding: vec![],
             file: None,
             sample_model: false,
@@ -3247,6 +3254,22 @@ impl Document {
     /// there is kept.
     /// Gives the unedited starter drill, saved with an end mill's three
     /// flutes, a drill's two: once (`starter_drill_fixed`).
+    /// Drops each manual mill setup's place in its Steps (`guide`) saved
+    /// before they were a page an operation (`steps_pages`, LIO-688): it
+    /// counted the old steps, so it would land on another page, most often
+    /// the hand-over with every operation ticked. Such a setup starts again
+    /// on its zero page. A lathe's steps are as they were: its place stays.
+    pub fn drop_old_steps_places(&mut self) {
+        if self.steps_pages {
+            return;
+        }
+        let mills: Vec<&str> = (self.setups.iter())
+            .filter(|s| !crate::lathe::is_lathe(&s.machine))
+            .map(|s| s.id.as_str())
+            .collect();
+        self.guide.retain(|id, _| !mills.contains(&id.as_str()));
+        self.steps_pages = true;
+    }
     pub fn fix_starter_drill(&mut self) {
         if self.starter_drill_fixed {
             return;

@@ -1861,7 +1861,7 @@ fn guide_help(a: &crate::GuideAction) -> (&'static str, &'static str) {
             "",
         ),
         Open(_) => (
-            "Open this setup in MACHINE: a setup on the manual mill shows its steps with the DRO numbers to move to, one on the lathe with its dial pictures, whether or not the CNC is connected.",
+            "Open this setup in MACHINE: a setup on the manual mill shows where its work zero is and a page an operation with each feature's place, size and depth, one on the lathe its steps with dial pictures, whether or not the CNC is connected.",
             "",
         ),
         Fix(Some(_), _) => (
@@ -1869,7 +1869,7 @@ fn guide_help(a: &crate::GuideAction) -> (&'static str, &'static str) {
             "",
         ),
         Fix(None, _) => ("Open this setup in planning to fix it.", ""),
-        Beat(_) | Built(..) => ("Show the steps of this manual setup.", ""),
+        Built(..) => ("Show the steps of this manual setup.", ""),
         CrossReads(crate::lathe::Reads::Diameter) => (
             "The diameter went down by the dial's reading: the cross-slide dial reads the diameter. Saved to this lathe in the library and in every setup on it; the cross-slide numbers then show.",
             "",
@@ -2480,7 +2480,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
         ),
         (Target::Setup, "parallels") => (
             "What the stock stands on in this setup: None for the table or the vise's floor, or parallels running front to back (along Y) or left to right (along X) that raise it by their height.",
-            "On parallels a through hole or slot may break through the part's underside over the open space between them. A cut into a parallel, or past their height into what they stand on, is refused, as a cut below the underside is without them. The parallels are drawn in the 3D view and on the manual Steps' Hold page.",
+            "On parallels a through hole or slot may break through the part's underside over the open space between them. A cut into a parallel, or past their height into what they stand on, is refused, as a cut below the underside is without them. The parallels are drawn in the 3D view and on the manual Steps' Zero page.",
             None,
         ),
         (Target::Setup, "parallel_at") => (
@@ -2979,7 +2979,7 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             Some(Manual(2)),
         ),
         (_, "turn_x" | "turn_y" | "turn_z") => (
-            "How far the axis moves in one handwheel turn, in mm. The steps use it to say how many turns a feed is.",
+            "How far the axis moves in one handwheel turn, in mm. Kept for your machine's record; the Steps pages give positions, not turns.",
             "",
             Some(Manual(3)),
         ),
@@ -3023,18 +3023,8 @@ pub fn field_help(key: &str, label: &str, target: Target) -> Help {
             "",
             Some(Manual(11)),
         ),
-        (_, "dro_matrix") => (
-            "Yes (the default) when the DRO has matrix holes: type a grid in once and it leads to each hole. The Steps page then gives a Drill's grid of holes as one pattern. No for a DRO without them.",
-            "",
-            None,
-        ),
-        (_, "dro_arc") => (
-            "Yes (the default) when the DRO has arc holes: type a circle of holes in once and it leads to each hole. The Steps page then gives a Drill's holes on a circle as one pattern. No for a DRO without them.",
-            "",
-            None,
-        ),
         (_, "edge_finder") => (
-            "The diameter of the edge finder that picks up the work zero, in mm. The Zero step takes its radius off a face it picks up a zero on; where it halves between two faces for a middle, the radius cancels.",
+            "The diameter of the edge finder that picks up the work zero, in mm. The Steps check that it can reach each face the zero is found from, above the jaws and clear of the clamps.",
             "",
             Some(Manual(12)),
         ),

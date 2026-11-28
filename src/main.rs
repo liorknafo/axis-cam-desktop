@@ -715,8 +715,6 @@ pub enum GuideAction {
     /// MANUFACTURE: operation `op` at the tab the problem is on, or the
     /// setup's editor.
     Fix(Option<usize>, String),
-    /// The page's clock, for the handwheel's beat.
-    Beat(Instant),
     /// The guide of the job with this fingerprint (`App::guide_key`), built.
     Built(u64, Result<std::sync::Arc<steps::Shown>, String>),
     /// The lathe's dial check answered: what its cross-slide dial reads,
@@ -1348,12 +1346,8 @@ pub struct App {
     pub guide: Option<(u64, Result<std::sync::Arc<steps::Shown>, String>)>,
     /// The fingerprint of the job a background run is building a guide for.
     guide_job: Option<u64>,
-    /// The readout the Steps page is at within its step, or the hole of a
-    /// Holes step.
+    /// The readout the Steps page is at within its step.
     pub guide_item: usize,
-    /// On a Holes or Bore screen, the readout of the hole the place is at
-    /// (LIO-375); 0 again on each hole.
-    pub guide_reached: usize,
     /// What is typed in a lathe step's measure box: its key and the text.
     pub guide_typed: Option<(String, String)>,
     /// How the Steps page was last entered, said over its screen until the
@@ -1362,9 +1356,6 @@ pub struct App {
     /// The Steps page entered while its guide is still being built: the
     /// setup (id) and the operation picked in planning, applied once built.
     steps_pending: Option<(String, Option<usize>)>,
-    /// When the step shown was opened, and the page's clock since
-    /// (`GuideAction::Beat`): the handwheel's beat.
-    pub guide_clock: (Instant, Instant),
     /// The checks before a run of a setup, once worked out (`current_ready`).
     pub ready: run::Ready,
     /// The fingerprint of the job a background run is checking a setup of.
@@ -2299,11 +2290,9 @@ impl App {
             guide: None,
             guide_job: None,
             guide_item: 0,
-            guide_reached: 0,
             steps_entry: None,
             steps_pending: None,
             guide_typed: None,
-            guide_clock: (Instant::now(), Instant::now()),
             ready: run::Ready::default(),
             ready_job: None,
             holding_note: std::cell::RefCell::new(None),
@@ -5475,9 +5464,11 @@ impl App {
             // Every Holes step of it (one at each A angle, say).
             (shown.guide.steps.iter())
                 .filter_map(|s| match s {
-                    guide::Step::Holes { op, uncentred, .. } if *op == oi => {
-                        Some(!uncentred.iter().any(|u| *u))
-                    }
+                    guide::Step::Sheet {
+                        op,
+                        features: guide::Features::Holes { holes, .. },
+                        ..
+                    } if *op == oi => Some(!holes.iter().any(|h| h.uncentred)),
                     _ => None,
                 })
                 .reduce(|a, b| a && b)
@@ -6510,7 +6501,6 @@ impl App {
             self.external("user: step guide moved");
         }
         self.guide_item = 0;
-        self.guide_clock.0 = Instant::now();
     }
     /// The hand setup `added` (its index) opened on the Work page, as Add
     /// setup's is (LIO-371), or why it could not be added.
@@ -6574,13 +6564,8 @@ impl App {
                 // A job edited while it was built gets a guide of its own.
                 if self.guide_key() == Some(key) {
                     self.guide = Some((key, result));
-                    self.guide_clock.0 = Instant::now();
                     self.apply_steps_entry();
                 }
-                return Task::none();
-            }
-            GuideAction::Beat(at) => {
-                self.guide_clock.1 = at;
                 return Task::none();
             }
             GuideAction::Open(si) => {
@@ -6622,14 +6607,6 @@ impl App {
         let Some((shown, at)) = self.guide_at() else {
             return Task::none();
         };
-        let holes = match &shown.guide.steps[at] {
-            guide::Step::Holes { holes, .. } | guide::Step::Bore { holes, .. } => holes.len(),
-            _ => 0,
-        };
-        // Each hole starts at its first readout.
-        if !matches!(action, GuideAction::Reached(_)) {
-            self.guide_reached = 0;
-        }
         // The place moved: what the page was entered with is said no more.
         if matches!(
             action,
@@ -6655,20 +6632,8 @@ impl App {
             }
         }
         match action {
-            GuideAction::Reached(i) if holes > 0 => self.guide_reached = i + 1,
-            GuideAction::Next if self.guide_item + 1 < holes => self.guide_item += 1,
             GuideAction::Next => self.guide_to(&shown, at + 1),
-            GuideAction::Back if holes > 0 && self.guide_item > 0 => self.guide_item -= 1,
-            GuideAction::Back => {
-                self.guide_to(&shown, at.saturating_sub(1));
-                // Back onto a Holes or Bore screen: its last hole (LIO-369).
-                if let Some(guide::Step::Holes { holes, .. } | guide::Step::Bore { holes, .. }) =
-                    shown.guide.steps.get(at.saturating_sub(1))
-                    && at > 0
-                {
-                    self.guide_item = holes.len().saturating_sub(1);
-                }
-            }
+            GuideAction::Back => self.guide_to(&shown, at.saturating_sub(1)),
             GuideAction::Go(i) => self.guide_to(&shown, i),
             GuideAction::Section(i) => {
                 if let Some(s) = shown.guide.sections.get(i)
@@ -11832,16 +11797,6 @@ impl App {
         if SHOP && self.computer.is_some() {
             subscriptions
                 .push(iced::time::every(Duration::from_secs(30)).map(|_| Message::SyncProjects));
-        }
-        // The handwheel's beat on a pass, only while its page shows.
-        if self.steps_page()
-            && let Some((shown, at)) = self.guide_at()
-            && matches!(shown.guide.steps[at], guide::Step::Pass { turns_per_minute, .. } if turns_per_minute > 0.)
-        {
-            subscriptions.push(
-                iced::time::every(Duration::from_millis(100))
-                    .map(|at| Message::Guide(GuideAction::Beat(at))),
-            );
         }
         Subscription::batch(subscriptions)
     }

@@ -76,6 +76,7 @@ pub fn load_reporting(path: &Path) -> Result<(Document, Vec<String>), String> {
         }
     }
     d.fix_starter_drill();
+    d.drop_old_steps_places();
     let mut notes = vec![];
     if d.number_tools() {
         notes.push(NUMBERED_TOOLS.to_string());
@@ -275,6 +276,32 @@ mod tests {
             .find(|t| t.name() == crate::model::STARTER_DRILL)
             .unwrap();
         assert_eq!(get(&t.p, "flutes"), "3");
+    }
+    /// LIO-688: a manual mill's place in its Steps saved before they were
+    /// a page an operation counted the old steps: it is dropped, so the
+    /// setup opens on its zero page; a lathe's stays, and a place saved
+    /// since stays too.
+    #[test]
+    fn a_mill_steps_place_saved_before_the_pages_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("places.axis.json");
+        let mut doc = Document::sample();
+        let mill = doc.setups[0].id.clone();
+        let mut lathe = doc.setups[0].clone();
+        lathe.id = "lathe".into();
+        lathe.machine = crate::lathe::defaults();
+        doc.setups.push(lathe);
+        doc.guide.insert(mill.clone(), 2);
+        doc.guide.insert("lathe".into(), 5);
+        save(&path, &doc).unwrap();
+        assert_eq!(load(&path).unwrap().guide.get(&mill), Some(&2));
+        let mut old = serde_json::to_value(&doc).unwrap();
+        old.as_object_mut().unwrap().remove("steps_pages");
+        std::fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+        let back = load(&path).unwrap();
+        assert!(back.steps_pages);
+        assert_eq!(back.guide.get(&mill), None);
+        assert_eq!(back.guide.get("lathe"), Some(&5));
     }
     #[test]
     fn loading_refuses_materials_that_share_an_id_or_have_none() {
